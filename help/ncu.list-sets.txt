@@ -1,0 +1,32 @@
+Error processing line 1 of /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/_sgl_kernel_editable.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 206, in addpackage
+    File "<string>", line 1, in <module>
+    File "/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/_sgl_kernel_editable.py", line 6, in <module>
+      import subprocess
+    File "/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/subprocess.py", line 104, in <module>
+      from _posixsubprocess import fork_exec as _fork_exec
+  ImportError: /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/lib-dynload/_posixsubprocess.cpython-312-x86_64-linux-gnu.so: undefined symbol: _Py_write_noraise
+
+Remainder of file ignored
+---------- --------------------------------------------------------------------------- ------- -----------------
+Identifier Sections                                                                    Enabled Estimated Metrics
+---------- --------------------------------------------------------------------------- ------- -----------------
+basic      LaunchStats, Occupancy, SpeedOfLight, WorkloadDistribution                  yes     190              
+detailed   ComputeWorkloadAnalysis, LaunchStats, MemoryWorkloadAnalysis, MemoryWorkloa no      557              
+           dAnalysis_Chart, Occupancy, SourceCounters, SpeedOfLight, SpeedOfLight_Roof                          
+           lineChart, WorkloadDistribution                                                                      
+full       ComputeWorkloadAnalysis, InstructionStats, LaunchStats, MemoryWorkloadAnaly no      5895             
+           sis, MemoryWorkloadAnalysis_Chart, MemoryWorkloadAnalysis_Tables, NumaAffin                          
+           ity, Nvlink_Tables, Nvlink_Topology, Occupancy, PmSampling, SchedulerStats,                          
+            SourceCounters, SpeedOfLight, SpeedOfLight_HierarchicalDoubleRooflineChart                          
+           , SpeedOfLight_HierarchicalHalfRooflineChart, SpeedOfLight_HierarchicalSing                          
+           leRooflineChart, SpeedOfLight_HierarchicalTensorRooflineChart, SpeedOfLight                          
+           _RooflineChart, WarpStateStats, WorkloadDistribution                                                 
+nvlink     Nvlink, Nvlink_Tables, Nvlink_Topology                                      no      52               
+pmsampling PmSampling, PmSampling_WarpStates                                           no      186              
+roofline   SpeedOfLight, SpeedOfLight_HierarchicalDoubleRooflineChart, SpeedOfLight_Hi no      5260             
+           erarchicalHalfRooflineChart, SpeedOfLight_HierarchicalSingleRooflineChart,                           
+           SpeedOfLight_HierarchicalTensorRooflineChart, SpeedOfLight_RooflineChart, W                          
+           orkloadDistribution                                                                                  
