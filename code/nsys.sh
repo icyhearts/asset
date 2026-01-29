@@ -8,6 +8,7 @@ cd /softhome/like/package/h100/package/sglang_kernel_src
 nows=`date +%Y_%m_%d___%H_%M_%S`
 bash /share_data/users/like/bash-bin/bin/kgp.sh 6 likf &&  && CUDA_VISIBLE_DEVICES=6  MEMG=75 /share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench > temp/out.log.$nows 2>&1 &
 
+/bin/bash /share_data/users/like/bash-bin/bin/kgp.sh 6 likf && CUDA_VISIBLE_DEVICES=6  MEMG=77 /share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench  >  /share_data/users/like/package/h100/package/simo_conda_sglang/temp/out.log.$nows 2>&1 &
 
 
 
