@@ -5,7 +5,7 @@ export CUDA_VISIBLE_DEVICES=7
 . /softhome/like/miniconda3/bin/activate simo_sglang
 which python
 cd /softhome/like/package/h100/package/sglang_kernel_src
-export bscale_dtype=""
+export bscale_dtype="bf16"
 
 nows=`date +%Y_%m_%d___%H_%M_%S`
 export MEMG=77
