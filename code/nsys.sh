@@ -1,7 +1,6 @@
 #~/opt/cuda-12.8/bin/ncu --set full --launch-count   --launch-skip --export temp 
-# --launch-count   1 --launch-skip  3
 set -x
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=6
 . /softhome/like/miniconda3/bin/activate simo_sglang
 which python
 cd /softhome/like/package/h100/package/sglang_kernel_src
