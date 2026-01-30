@@ -11,5 +11,5 @@ export CUDA_VISIBLE_DEVICES=7
 
  
 
-export bscale_dtype="";  /softhome/like/opt/cuda-12.8/bin/ncu  --metrics  sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread,launch__occupancy_limit_registers \
+export bscale_dtype="bf16";  /softhome/like/opt/cuda-12.8/bin/ncu  --metrics  sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread,launch__occupancy_limit_registers \
     python temp/load_gptq_awq.py --round 3 --warmup 2 --bscale_dtype "$bscale_dtype"
