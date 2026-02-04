@@ -1,0 +1,569 @@
+commit 8c893c3a831ba9fed3ecdf6a82845d8e421020e4
+Author: like <kli@siorigin.com>
+Date:   Wed Jan 21 10:08:02 2026 +0000
+
+    [2026/01/21___10:08:02*sgl-mmlu-test][debug]
+
+diff --git a/simo/extensions/sglang_simo/quantization/quantization.py b/simo/extensions/sglang_simo/quantization/quantization.py
+index edb1074..f443e62 100644
+--- a/simo/extensions/sglang_simo/quantization/quantization.py
++++ b/simo/extensions/sglang_simo/quantization/quantization.py
+@@ -64,6 +64,11 @@ from simo.ops.formats.mx.scale import ScaleModeEnum, ObserverMode
+ 
+ CONFIG_PATH = "simo_quantization/quant_config.json"
+ logger = logging.getLogger(__name__)
++# like_debug {
++tensor_info_func = (
++  lambda _tensor_: f"shape:{_tensor_.shape}, dtype:{_tensor_.dtype}, device:{_tensor_.device}"
++)
++# like_debug }
+ 
+ 
+ # from vllm code: vllm/model_executor/layers/quantization/compressed_tensors/utils.py
+@@ -402,6 +407,15 @@ class SIMOConfig(QuantizationConfig):
+     kv_cache_quant_algo: Optional[dict[str, Any]] = None,
+     flash_comm: Optional[bool] = None,
+   ) -> None:
++    # like_debug {
++    import inspect
++
++    current_stack = inspect.stack()
++    stack_info = []
++    for idx, frame_info in enumerate(current_stack):
++      stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}")
++    logger.info("=======TorchmoConfig ctor called," + "from_config stack:" + "| ".join(stack_info))
++    # like_debug }
+     """
+     Initializes the SIMO quantization configuration by attempting to load
+     from various sources in a specific order of priority:
+@@ -611,6 +625,17 @@ class SIMOConfig(QuantizationConfig):
+ 
+     # Extract the actual config
+     config_dict = full_config.get("quantization_config", full_config)
++    # like_debug {
++    import inspect
++
++    current_stack = inspect.stack()
++    stack_info = []
++    for idx, frame_info in enumerate(current_stack):
++      stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}")
++    logger.info(
++      "=======TorchmoConfig from_config_file called," + "from_config stack:" + "| ".join(stack_info)
++    )
++    # like_debug }
+ 
+     logger.info(f"Loaded config from {config_file}")
+     return cls.from_config(config_dict)
+@@ -681,6 +706,9 @@ class SIMOConfig(QuantizationConfig):
+     )
+     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+ 
++    # like_debug {
++    logger.info(f"self.excludes:{self.excludes}")
++    # like_debug }
+     if should_ignore_layer(prefix, ignore=self.excludes):
+       return UnquantizedLinearMethod()
+ 
+@@ -734,6 +762,9 @@ class SIMOLinearMethod(LinearMethodBase):
+     input_spec: QuantizeSpecType,
+     hadamard: bool = False,
+   ):
++    # like_debug {
++    logger.info(f"weight_spec:{weight_spec},input_spec:{input_spec}")
++    # like_debug }
+     self.quant_config = quant_config
+     self.weight_spec = weight_spec
+     self.input_spec = input_spec
+@@ -799,6 +830,23 @@ class SIMOLinearMethod(LinearMethodBase):
+       **kwargs,
+     ):
+       target_device = get_tp_group().device
++      # like_debug {
++      import os
++
++      if "1" == os.getenv("like_debug"):
++        import inspect
++
++        current_stack = inspect.stack()
++        stack_info = []
++        for idx, frame_info in enumerate(current_stack):
++          stack_info.append(
++            f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}"
++          )
++        logger.info(
++          f"param.device:{param.device}, param.dtype:{param.dtype}, param.shape:{param.shape}, loaded_weight.device:{loaded_weight.device}, loaded_weight.dtype:{loaded_weight.dtype}, target_device:{target_device}, "
++          + "|".join(stack_info)
++        )
++      # like_debug }
+       loaded_weight = loaded_weight.pin_memory().to(target_device, non_blocking=True)
+ 
+       kwargs = {"loaded_shard_id": loaded_shard_id} if loaded_shard_id is not None else {}
+@@ -809,6 +857,15 @@ class SIMOLinearMethod(LinearMethodBase):
+       packed_weight, weight_scale = self.weight_downcast_kernel(loaded_weight)
+ 
+       original_weight_loader(param, packed_weight, **kwargs)
++      # like_debug {
++      loaded_weight_info = tensor_info_func(loaded_weight)
++      packed_weight_info = tensor_info_func(packed_weight)
++      weight_scale_info = tensor_info_func(weight_scale)
++      log_str = f"original_weight_loader:{original_weight_loader},loaded_weight_info:{loaded_weight_info}, packed_weight_info:{packed_weight_info}, weight_scale_info:{weight_scale_info}"
++      if hasattr(layer, "prefix"):
++        log_str += f", layer prefix:{layer.prefix}"
++      logger.info(log_str.replace("\n", " "))
++      # like_debug }
+ 
+       if hasattr(layer, "weight_scale"):
+         original_weight_loader(layer.weight_scale, weight_scale, **kwargs)
+@@ -831,6 +888,31 @@ class SIMOLinearMethod(LinearMethodBase):
+     **extra_weight_attrs,
+   ):
+     layer.logical_widths = output_partition_sizes
++    # like_debug {
++    import inspect
++
++    current_stack = inspect.stack()
++    stack_info = []
++    for idx, frame_info in enumerate(current_stack):
++      frame = frame_info.frame
++      func_name = frame_info.function
++      class_name = None
++      if "self" in frame.f_locals:
++        class_name = type(frame.f_locals["self"]).__name__
++      elif "cls" in frame.f_locals:
++        class_name = frame.f_locals["cls"].__name__
++      if class_name:
++        method_name = f"{class_name}::{func_name}"
++      else:
++        method_name = func_name
++      stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{method_name}")
++    logger.info(
++      f"torchmo create_weights output_partition_sizes:{output_partition_sizes},"
++      + "|".join(stack_info)
++    )
++    if hasattr(layer, "prefix"):
++      self.prefix = layer.prefix
++    # like_debug }
+     output_size_per_partition = sum(output_partition_sizes)
+ 
+     if (
+@@ -905,6 +987,27 @@ class SIMOLinearMethod(LinearMethodBase):
+     # output = triton_scaled_mm(x_q, layer.weight, scale_a, self.gemm_type, output.dtype, bias)
+     if hasattr(layer, "weight_scale"):
+       x_q, scale_a = self.input_downcast_kernel(x)
++      # like_debug {
++      import os
++
++      env_file = os.getenv("debug_env_file", "/share_data/users/like/ipc.json")
++      env_data = dict()
++      if os.path.exists(env_file):
++        import json
++
++        env_data = json.load(open(env_file))
++      if env_data.get("debug", 0) == 1:
++        x_info = tensor_info_func(x)
++        x_q_info = tensor_info_func(x_q)
++        if isinstance(scale_a, torch.Tensor):
++          scale_a_info = tensor_info_func(scale_a)
++        else:
++          scale_a_info = None
++        log_str = f"x_info:{x_info}, x_q_info:{x_q_info}, scale_a_info:{scale_a_info}, input_upcast_kernel:{self.input_upcast_kernel}"
++        if hasattr(self, "prefix"):
++          log_str += f",self prefix:{self.prefix}"
++        logger.info(log_str.replace("\n", " "))
++      # like_debug }
+       qdq_x = self.input_upcast_kernel(x_q, scale_a, x.dtype)
+ 
+       dq_w = self.weight_upcast_kernel(layer.weight, layer.weight_scale, x.dtype)
+@@ -1159,6 +1262,48 @@ class SIMOFusedMoEMethod(FusedMoEMethodBase):
+     layer: torch.nn.Module,
+     dispatch_output,
+   ):
++    # like_debug {
++    import os
++    import json
++
++    env_file = os.getenv("debug_env_file", "/share_data/users/like/ipc.simo.json")
++    env_data = dict()
++    if os.path.exists(env_file):
++      with open(env_file) as ifp:
++        env_data = json.load(ifp)
++    if env_data.get("debug_pudb", 0) == 1:
++      from pudb.remote import set_trace
++
++      set_trace(term_size=(229, 62), port=env_data.get("debug_pudb_port", 5090))
++    if env_data.get("debug_log", 0) == 1:
++      import inspect
++
++      current_stack = inspect.stack()
++      stack_info = []
++      for idx, frame_info in enumerate(current_stack):
++        frame = frame_info.frame
++        func_name = frame_info.function
++        class_name = None
++        if "self" in frame.f_locals:
++          class_name = type(frame.f_locals["self"]).__name__
++        elif "cls" in frame.f_locals:
++          class_name = frame.f_locals["cls"].__name__
++        else:
++          code = frame.f_code
++          if hasattr(code, "co_qualname"):
++            qualname = code.co_qualname
++            # print(f"qualname:{qualname}")
++            if "." in qualname:
++              class_name = frame.f_code.co_qualname.rsplit(".", 1)[0]
++        if class_name:
++          method_name = f"{class_name}::{func_name}"
++        else:
++          method_name = func_name
++        stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{method_name}")
++      stack_str = "| ".join(stack_info)
++      log_str = f" stack_str:{stack_str}"
++      logger.info(log_str.replace("\n", " "))
++    # like_debug }
+     from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+ 
+     # Create quant_info at runtime with the actual weights (after process_weights_after_loading)
+diff --git a/simo/extensions/vllm_simo/__init__.py b/simo/extensions/vllm_simo/__init__.py
+index 78e8513..57e76c7 100644
+--- a/simo/extensions/vllm_simo/__init__.py
++++ b/simo/extensions/vllm_simo/__init__.py
+@@ -6,6 +6,19 @@ that modify vLLM behavior in a non-invasive way.
+ 
+ 
+ def register_simo_extensions():
++  # like_debug {
++  import os
++
++  env_file = os.getenv("debug_env_file", "/share_data/users/like/ipc.json")
++  env_data = dict()
++  if os.path.exists(env_file):
++    import json
++
++    env_data = json.load(open(env_file))
++  if env_data.get("skip_simo_vllm_register", 0) == 1:
++    return None
++
++  # like_debug }
+   """Register all SIMO extensions with vLLM.
+ 
+   This function registers all SIMO extensions by importing the modules,
+diff --git a/simo/extensions/vllm_simo/quantization/quantization_config.py b/simo/extensions/vllm_simo/quantization/quantization_config.py
+index 4b693a0..da623c3 100644
+--- a/simo/extensions/vllm_simo/quantization/quantization_config.py
++++ b/simo/extensions/vllm_simo/quantization/quantization_config.py
+@@ -49,6 +49,11 @@ CONFIG_PATH = "simo_quantization/quant_config.json"
+ 
+ # Quantization options and schemes
+ PER_QUANT_OPT = ["online_o_proj_rotation", "online_kv_b_proj_rotation", "online_down_proj_rotation"]
++# like_debug {
++tensor_info_func = (
++  lambda _tensor_: f"shape:{_tensor_.shape}, dtype:{_tensor_.dtype}, device:{_tensor_.device}"
++)
++# like_debug }
+ ACTIVATION_SCHEMES = ["static", "dynamic"]
+ KV_CACHE_QUANT_SCHEMES = ["mxfp4"]
+ FLASH_COMM_SCHEMES = ["fast_all2all"]
+@@ -162,6 +167,15 @@ class SIMOConfig(QuantizationConfig):
+     kv_cache_quant_algo: Optional[dict[str, Any]] = None,
+     flash_comm: Optional[str] = None,
+   ) -> None:
++    # like_debug {
++    import inspect
++
++    current_stack = inspect.stack()
++    stack_info = []
++    for idx, frame_info in enumerate(current_stack):
++      stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}")
++    logger.info("=======TorchmoConfig ctor called," + "from_config stack:" + "| ".join(stack_info))
++    # like_debug }
+     """
+     Initializes the SIMO quantization configuration by attempting to load
+     from various sources in a specific order of priority:
+@@ -487,6 +501,17 @@ class SIMOConfig(QuantizationConfig):
+ 
+     # Extract the actual config
+     config_dict = full_config.get("quantization_config", full_config)
++    # like_debug {
++    import inspect
++
++    current_stack = inspect.stack()
++    stack_info = []
++    for idx, frame_info in enumerate(current_stack):
++      stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}")
++    logger.info(
++      "=======TorchmoConfig from_config_file called," + "from_config stack:" + "| ".join(stack_info)
++    )
++    # like_debug }
+ 
+     logger.info(f"Loaded config from {config_file}")
+     return cls.from_config(config_dict)
+@@ -619,6 +644,12 @@ class SIMOConfig(QuantizationConfig):
+   def _find_matching_target(self, layer: torch.nn.Module) -> Optional[str]:
+     """Find the matching target specification for the layer."""
+     targets = self.target_to_specs.keys()
++    # like_debug {
++    layer_type = type(layer)
++    is_fused_moe = isinstance(layer, FusedMoE)
++    log_str = f"targets:{targets}, layer_type:{layer_type}, is_fused_moe:{is_fused_moe}"
++    logger.info(log_str.replace("\n", " "))
++    # like_debug }
+     if isinstance(layer, FusedMoE):
+       for candidate in ("FusedMoE", "Linear"):
+         if candidate in targets:
+@@ -723,6 +754,32 @@ class SIMOConfig(QuantizationConfig):
+     """
+     layer.prefix = prefix
+     tp_rank = get_tensor_model_parallel_rank()
++    # like_debug {
++    import inspect
++
++    current_stack = inspect.stack()
++    stack_info = []
++    for idx, frame_info in enumerate(current_stack):
++      stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}")
++    stack_str = "| ".join(stack_info)
++    logger.info(
++      "=======get_quant_method called, prefix:{prefix}, tp_rank:{tp_rank}, "
++      + "from_config stack:"
++      + stack_str
++    )
++    import os
++    import json
++
++    env_file = os.getenv("debug_env_file", "/share_data/users/like/ipc.simo.json")
++    env_data = dict()
++    if os.path.exists(env_file):
++      with open(env_file) as ifp:
++        env_data = json.load(ifp)
++    if env_data.get("debug_pudb", 0) == 1:
++      from pudb.remote import set_trace
++
++      set_trace(term_size=(229, 62), port=env_data.get("debug_pudb_port", 5090))
++    # like_debug }
+ 
+     # Attention layers have a dedicated KV cache path.
+     if isinstance(layer, (Attention, MLAAttention)):
+@@ -744,6 +801,11 @@ class SIMOConfig(QuantizationConfig):
+     o_proj_rotation, down_proj_rotation, hadamard_transform = self._should_apply_hadamard_transform(
+       prefix, layer
+     )
++    # like_debug {
++    logger.info(
++      f"type layer:{type(layer)}, o_proj_rotation:{o_proj_rotation}, down_proj_rotation:{down_proj_rotation}, hadamard_transform:{hadamard_transform}"
++    )
++    # like_debug }
+ 
+     # Determine the unquantized fallback for supported layer categories.
+     unquant_method = self._get_unquantized_method(layer, hadamard_transform)
+@@ -771,12 +833,26 @@ class SIMOConfig(QuantizationConfig):
+ 
+     # Find matching target specification
+     matched_target = self._find_matching_target(layer)
++    # like_debug {
++    import os
++    import json
++
++    env_file = os.getenv("debug_env_file", "/share_data/users/like/ipc.json")
++    env_data = json.load(open(env_file)) if os.path.exists(env_file) else dict()
++    if env_data.get("debug", 0) == 1:
++      logger.info(f"matched_target:{matched_target}")
++    # like_debug }
+     if not matched_target:
+       return unquant_method
+ 
+     # Parse quantization specifications
+     weight_spec, input_spec = self._parse_quantization_specs(matched_target)
+     gemm_type = self._get_gemm_type(input_spec, weight_spec)
++    # like_debug {
++    logger.info(
++      f"matched_target:{matched_target}, weight_spec:{weight_spec}, input_spec:{input_spec}"
++    )
++    # like_debug }
+ 
+     if tp_rank == 0:
+       logger.info(
+diff --git a/simo/extensions/vllm_simo/quantization/quantization_method.py b/simo/extensions/vllm_simo/quantization/quantization_method.py
+index b97f8fd..4be677a 100644
+--- a/simo/extensions/vllm_simo/quantization/quantization_method.py
++++ b/simo/extensions/vllm_simo/quantization/quantization_method.py
+@@ -86,6 +86,12 @@ __all__ = [
+   "HadamardUnquantizedLinearMethod",
+ ]
+ 
++# like_debug {
++tensor_info_func = (
++  lambda _tensor_: f"shape:{_tensor_.shape}, dtype:{_tensor_.dtype}, device:{_tensor_.device}"
++)
++# like_debug }
++
+ 
+ def get_downcast_kernel(
+   spec: QuantizeSpecType, hadamard_transform_size: int = 0
+@@ -249,6 +255,19 @@ class SIMOLinearMethod(LinearMethodBase):
+       **kwargs,
+     ):
+       target_device = get_tp_group().device
++      # like_debug {
++      import inspect
++
++      current_stack = inspect.stack()
++      stack_info = []
++      for idx, frame_info in enumerate(current_stack):
++        stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}")
++      logger.info(
++        f"param.device:{param.device}, param.dtype:{param.dtype}, param.shape:{param.shape}, loaded_weight.device:{loaded_weight.device}, loaded_weight.dtype:{loaded_weight.dtype}, target_device:{target_device}, "
++        + "|".join(stack_info)
++      )
++      # quantization_method.py:227] loaded_weight.device:cpu, loaded_weight.dtype:torch.bfloat16, target_device:cuda:0
++      # like_debug }
+       loaded_weight = loaded_weight.pin_memory().to(target_device, non_blocking=True)
+ 
+       kwargs = {"loaded_shard_id": loaded_shard_id} if loaded_shard_id is not None else {}
+@@ -270,9 +289,26 @@ class SIMOLinearMethod(LinearMethodBase):
+         loaded_weight = loaded_weight.to(torch.float32) / unified_global_scale
+ 
+       packed_weight, weight_scale = self.weight_downcast_kernel(loaded_weight)
++      # like_debug {
++      format_tensor = lambda _tensor_: f"shape:{_tensor_.shape}, dtype:{_tensor_.dtype}"
++      logstr = f"loaded_weight:{format_tensor(loaded_weight)}, packed_weight:{format_tensor(packed_weight)}, weight_scale:{format_tensor(weight_scale)}, weight spec:{self.weight_spec}"
++      logger.info(logstr.replace("\n", ""))
++      # like_debug }
+ 
+       original_weight_loader(param, packed_weight, **kwargs)
+ 
++      # like_debug {
++      tensor_info_func = (
++        lambda _tensor_: f"shape:{_tensor_.shape}, dtype:{_tensor_.dtype}, device:{_tensor_.device}"
++      )
++      loaded_weight_info = tensor_info_func(loaded_weight)
++      packed_weight_info = tensor_info_func(packed_weight)
++      weight_scale_info = tensor_info_func(weight_scale)
++      log_str = f"original_weight_loader:{original_weight_loader}, loaded_weight_info:{loaded_weight_info}, packed_weight_info:{packed_weight_info}, weight_scale_info:{weight_scale_info}"
++      if hasattr(layer, "prefix"):
++        log_str += f", layer prefix:{layer.prefix}"
++      logger.info(log_str.replace("\n", " "))
++      # like_debug }
+       if hasattr(layer, "weight_scale"):
+         original_weight_loader(layer.weight_scale, weight_scale, **kwargs)
+ 
+@@ -292,6 +328,30 @@ class SIMOLinearMethod(LinearMethodBase):
+     **extra_weight_attrs,
+   ):
+     layer.logical_widths = output_partition_sizes
++    # like_debug {
++    import inspect
++
++    current_stack = inspect.stack()
++    stack_info = []
++    for idx, frame_info in enumerate(current_stack):
++      frame = frame_info.frame
++      func_name = frame_info.function
++      class_name = None
++      if "self" in frame.f_locals:
++        class_name = type(frame.f_locals["self"]).__name__
++      elif "cls" in frame.f_locals:
++        class_name = frame.f_locals["cls"].__name__
++      if class_name:
++        method_name = f"{class_name}::{func_name}"
++      else:
++        method_name = func_name
++      stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{method_name}")
++    logger.info(
++      f"torchmo create_weights output_partition_sizes:{output_partition_sizes},"
++      + "|".join(stack_info)
++    )
++    # quantization_method.py:227] loaded_weight.device:cpu, loaded_weight.dtype:torch.bfloat16, target_device:cuda:0
++    # like_debug }
+     output_size_per_partition = sum(output_partition_sizes)
+ 
+     layer.input_scale = None
+@@ -516,6 +576,51 @@ class SIMOFusedMoEMethod(FusedMoEMethodBase):
+     hadamard: bool = False,
+   ):
+     super().__init__(layer.moe_config)
++    # like_debug {
++    logger.info(f"SIMOFusedMoEMethod called, layer.moe_config:{layer.moe_config}")
++    # like_debug }
++    # like_debug {
++    import os
++    import json
++
++    env_file = os.getenv("debug_env_file", "/share_data/users/like/ipc.simo.json")
++    env_data = dict()
++    if os.path.exists(env_file):
++      with open(env_file) as ifp:
++        env_data = json.load(ifp)
++    if env_data.get("debug_pudb", 0) == 1:
++      from pudb.remote import set_trace
++
++      set_trace(term_size=(229, 62), port=env_data.get("debug_pudb_port", 5090))
++    if env_data.get("debug_log", 0) == 1:
++      import inspect
++
++      current_stack = inspect.stack()
++      stack_info = []
++      for idx, frame_info in enumerate(current_stack):
++        frame = frame_info.frame
++        func_name = frame_info.function
++        class_name = None
++        if "self" in frame.f_locals:
++          class_name = type(frame.f_locals["self"]).__name__
++        elif "cls" in frame.f_locals:
++          class_name = frame.f_locals["cls"].__name__
++        else:
++          code = frame.f_code
++          if hasattr(code, "co_qualname"):
++            qualname = code.co_qualname
++            # print(f"qualname:{qualname}")
++            if "." in qualname:
++              class_name = frame.f_code.co_qualname.rsplit(".", 1)[0]
++        if class_name:
++          method_name = f"{class_name}::{func_name}"
++        else:
++          method_name = func_name
++        stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{method_name}")
++      stack_str = "| ".join(stack_info)
++      log_str = f" stack_str:{stack_str}"
++      logger.info(log_str.replace("\n", " "))
++    # like_debug }
+     self.quant_config = quant_config
+     self.weight_spec = weight_spec
+     self.input_spec = input_spec
+@@ -632,6 +737,19 @@ class SIMOFusedMoEMethod(FusedMoEMethodBase):
+       expert_id: int,
+       **kwargs,
+     ):
++      # like_debug {
++      loaded_weight_info = None if loaded_weight is None else tensor_info_func(loaded_weight)
++      log_str = f"loaded_weight_info:{loaded_weight_info}"
++      import inspect
++
++      current_stack = inspect.stack()
++      stack_info = []
++      for idx, frame_info in enumerate(current_stack):
++        stack_info.append(f"{idx},{frame_info.filename}:{frame_info.lineno}:{frame_info.function}")
++      stack_str = "| ".join(stack_info)
++      log_str += stack_str
++      logger.info(log_str.replace("\n", " "))
++      # like_debug }
+       target_device = get_tp_group().device
+       loaded_weight = loaded_weight.pin_memory().to(target_device, non_blocking=True)
+ 
+@@ -723,6 +841,17 @@ class SIMOFusedMoEMethod(FusedMoEMethodBase):
+     params_dtype: torch.dtype,
+     **extra_weight_attrs,
+   ):
++    # like_debug {
++    import os
++    import json
++
++    env_file = os.getenv("debug_env_file", "/share_data/users/like/ipc.json")
++    env_data = json.load(open(env_file)) if os.path.exists(env_file) else dict()
++    if env_data.get("debug", 0) == 1:
++      from pudb.remote import set_trace
++
++      set_trace(term_size=(200, 40), port=5090)
++    # like_debug }
+     quant_weight_attrs = extra_weight_attrs.copy()
+     weight_loader = extra_weight_attrs.get("weight_loader")
+     quant_loader = self.get_moe_weight_loader(layer, weight_loader)
