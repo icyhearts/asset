@@ -1,0 +1,103 @@
+vllm的代码位于/softhome/like/package/h100/package/vllm-for-conda-simo。
+sglang的代码位于/softhome/like/package/h100/package/sglang_kernel_src。
+simo/extensions/vllm_simo/quantization/quantization_method.py实现了 SIMOFusedMoEMethod, 这个类继承自vllm.model_executor.layers.fused_moe.FusedMoEMethodBase。
+simo/extensions/sglang_simo/quantization/quantization.py里面实现了SIMOLinearMethod，继承自sglang.srt.layers.quantization.base_config.LinearMethodBase。
+现在需求如下:
+1. simo/extensions/sglang_simo/quantization/quantization.py还缺一个SIMOFusedMoEMethod的实现,需要你 参考simo/extensions/vllm_simo/quantization/quantization_method.py, 帮我完成SIMO在sglang上的扩展类，
+2. SIMOFusedMoEMethod需要继承自 sglang.srt.layers.quantization.base_config.FusedMoEMethodBase, 把sglang.srt.layers.quantization.base_config.FusedMoEMethodBase的create_weights,create_moe_runner,apply给实现了。
+3.  你需要修改simo/extensions/sglang_simo/quantization/quantization.py里 SIMOConfig.get_quant_method函数，在isinstance(layer, FusedMoE)满足的情况下，返回实现的SIMOFusedMoEMethod实例。
+4.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_int8_per_block.json"}'命令启动
+5.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_int8_per_channel.json"}'命令启动
+6.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json"}'命令启动
+7.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_nvfp4_per_group.json"}'命令启动
+8.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_nvfp4_per_group.json"}'命令启动
+9.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a8_mxfp.json"}'命令启动
+10.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w6a6_mxfp.json"}'命令启动
+11.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_fp8_per_block.json"}'命令启动
+12.  能够用 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_fp8_per_channel.json"}'命令启动
+13. 完成后，写一个文档，放在temp/sglang.simo.FusedMoEMethodBase.md里面
+
+修改SIMOFusedMoEMethod, fp8量化时，也使用tritoin moe runner,不要使用deep_gemm moe runner
+
+测试 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7  SIMO_SGLANG_REGISTER=1 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_fp8_per_channel.json"}' 能不能运行，并用curl发请求，检查能不能收到sglang server的响应。
+测试 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7  SIMO_SGLANG_REGISTER=1 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_fp8_per_block.json"}' 能不能运行，并用curl发请求，检查能不能收到sglang server的响应。
+
+simo/extensions/sglang_simo/model_loader/loader.py实现了monkey patch, 支持从model_override_args里面提取quantization_config_file，这个monkey patch通过sitecustomize.py得到应用，只要你export SIMO_SGLANG_REGISTER=1,就可以支持从model_override_args里面提取quantization_config_file，你再试下
+
+
+测试 source ~/miniconda3/bin/activate  simo_sglang && CUDA_VISIBLE_DEVICES=7  SIMO_SGLANG_REGISTER=1 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30001 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json"}' 能不能运行，并用curl发请求，检查能不能收到sglang server的响应。如果不能运行，检查是什么原因？注意，不要直接修改改sglang的代码
+
+把关于w_kc的初始化的分析过程和答案，追加到 temp/answer.md里面
+
+关于w4a16_int4_per_group失败的原因， 你实现的SIMOFusedMoEMethod,在def create_moe_runner里面写了self.quant_info = TritonMoeQuantInfo,使用的是w13_weight=layer.w13_weight, w2_weight=layer.w2_weight,此时layer.w2_weight还是torch.int32类型的，apply函数直接使用self.quant_info,w13_weight和w2_weight自然是torch.int32打包的，实际上，process_weights_after_loading函数已经把layer.w13_weight转换成uint8:layer.w13_weight.contiguous().view(torch.uint8),你在apply函数需要使用layer.w13_weight实时构建新的TritonMoeQuantInfo，而不是使用提前保存好的错误的w13_weight。你分析是不是这个原因，如果是这个原因，修改你的实现，使w4a16_int4_per_group能够通过测试。修改完成后，按我之前的命令进行对于w4a16_int4_per_group进行测试。
+
+你实现的simo/extensions/sglang_simo/quantization/quantization.py的SIMOFusedMoEMethod.apply函数，为什么要先x_q, scale_a = self.input_downcast_kernel(x)量化，再self.input_upcast_kernel反量化？有什么必要吗？可以删除吗？
+
+
+1) 修改simo/extensions/sglang_simo/quantization/quantization.py, SIMOConfig 的构造函数，增加promote_trition_scale_precision_gptq_awq参数，并增加一个 promote_trition_scale_precision_gptq_awq成员 ，类型是bool，默认是None.
+2) 修改simo/extensions/sglang_simo/quantization/quantization.py, SIMOConfig.from_config函数，在flash_comm = config.get("flash_comm", None)后面，加一行从dict取promote_trition_scale_precision_gptq_awq成员的代码，把读到的promote_trition_scale_precision_gptq_awq传给return cls()这一行代码。
+3) 修改simo/extensions/sglang_simo/quantization/quantization.py, 给SIMOFusedMoEMethod加一个 promote_trition_scale_precision_gptq_awq 成员，类型是bool，数据从构造函数的参数 quant_config: SIMOConfig中获取, 要考虑到promote_trition_scale_precision_gptq_awq可能是None的情况。
+4) 修改simo/extensions/sglang_simo/quantization/quantization.py, SIMOFusedMoEMethod.apply做修改，如何self.promote_trition_scale_precision_gptq_awq是true, 把promote_trition_scale_precision_gptq_awq加到quant_info里面。
+5) 对simo/extensions/sglang_simo/quantization/quantization.py, SIMOFusedMoEMethod.process_weights_after_loading做修改，
+修改下面if语句的条件：
+      if self.weight_spec.dtype in ["int4", "int8"] and self.input_spec.dtype in [
+        "float16",
+        "bfloat16",
+      ]:
+增加一个限制条件：and (not self.promote_trition_scale_precision_gptq_awq) 时，才进行分支内的 weight scale的数据类型转换。
+6) 修改simo/extensions/sglang_simo/layers/fused_moe/fused_moe.py的fused_experts_none_to_triton函数，如果 quant_info.promote_trition_scale_precision_gptq_awq属性存在，提取出来传给fused_experts.
+7) 修改simo/extensions/sglang_simo/layers/fused_moe/fused_moe.py的 fused_experts 函数，增加 promote_trition_scale_precision_gptq_awq参数，传给inplace_fused_experts。
+8) 修改simo/extensions/sglang_simo/layers/fused_moe/fused_moe.py的 inplace_fused_experts 函数，增加 promote_trition_scale_precision_gptq_awq参数，传给fused_experts_impl.
+9) 修改simo/extensions/sglang_simo/layers/fused_moe/fused_moe.py的 fused_experts_impl函数，增加 promote_trition_scale_precision_gptq_awq参数，传给invoke_fused_moe_kernel.
+10) 把/share_data/users/like/package/h100/package/sglang_kernel_src/temp/fused_moe_kernel_gptq_awq_fp32_scale.py里面的fused_moe_kernel_gptq_awq_fp32_scale 函数和prepare_scale_for_kernel函数直接copy到 simo/extensions/sglang_simo/layers/fused_moe/fused_moe_triton_kernels.py里面.
+11) 修改simo/extensions/sglang_simo/layers/fused_moe/fused_moe.py的 invoke_fused_moe_kernel函数，增加 promote_trition_scale_precision_gptq_awq参数, 
+在if (use_int8_w8a16 or use_int4_w4a16) and block_shape is not None and block_shape[1] > 0 这个分支内部，再加一层if语句:
+
+如果 promote_trition_scale_precision_gptq_awq是true，并且B_scale.dtype是torch.float32, 参考/share_data/users/like/package/h100/package/sglang_kernel_src/temp/fused_moe_kernel_gptq_awq_fp32_scale.py调用 fused_moe_kernel_gptq_awq_fp32_scale函数的过程，调用prepare_scale_for_kernel准备B_scale_u16, stride_bse, stride_bsn, stride_bsk参数，调用fused_moe_kernel_gptq_awq_fp32_scale计算gemm.
+
+否则，走原来的流程，调用fused_moe_kernel_gptq_awq计算gemm
+
+12) 总之，SIMOConfig.from_config读到 promote_trition_scale_precision_gptq_awq并且是true的时候，要能够最终实现 fused_moe_kernel_gptq_awq_fp32_scale的调用，否则调用 fused_moe_kernel_gptq_awq.
+
+
+
+lm_eval离线方式对sglang进行测试和在线方式测试有哪些区别？为什么使用在线方式测试mmlu任务，promote_trition_scale_precision_gptq_awq=true的时候，比没有配置promote_trition_scale_precision_gptq_awq的时候得分更好。
+但是离线方式测试mmlu任务，promote_trition_scale_precision_gptq_awq=true的时候，比没有配置promote_trition_scale_precision_gptq_awq的时候得分反而变差了？
+具体如下：
+
+1)在线方式起服务：
+
+a) 没有配置promote_trition_scale_precision_gptq_awq:
+launch server:
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30113 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json"}' 
+lm_eval命令:
+HF_ENDPOINT=https://hf-mirror.com HF_DATASETS_CACHE=/share/users/like/huggingface_cache/ lm_eval --model local-completions --tasks mmlu --model_args model=/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/,base_url=http://0.0.0.0:30113/v1/completions,num_concurrent=1,timeout=999999,max_gen_toks=2048  --batch_size 16
+lm eval日志是 /share_data/users/like/package/h100/package/sglang_kernel_src/temp/mmlu.fp16scale.log.2026_02_04___10_24_14
+得分是|mmlu              |      2|none  |      |acc   |↑  |0.5515|±  |0.0040|
+
+b) promote_trition_scale_precision_gptq_awq=true:
+launch server:
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=4 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30123 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj-promote-scale-precision.json"}' --mem-fraction-static 0.75
+lm_eval command:
+HF_ENDPOINT=https://hf-mirror.com HF_DATASETS_CACHE=/share/users/like/huggingface_cache/ lm_eval --model local-completions --tasks mmlu --model_args model=/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/,base_url=http://0.0.0.0:30123/v1/completions,num_concurrent=1,timeout=999999,max_gen_toks=2048  --batch_size 16
+lm eval日志位于 /share_data/users/like/package/h100/package/sglang_kernel_src/temp/mmlu.promote-precision-online.log.2026_02_04___11_18_57
+mmlu得分结果:
+|mmlu              |      2|none  |      |acc   |↑  |0.5531|±  |0.0040|
+
+可以看到, promote_trition_scale_precision_gptq_awq=true的时候，mmlu得分比没有配置promote_trition_scale_precision_gptq_awq得分高。
+这是符合预期的，fp32的scale理论上比bf16的scale得分更高。
+
+2)离线方式测试 :
+
+a) 没有配置promote_trition_scale_precision_gptq_awq:
+测试命令位于 /share_data/users/like/package/h100/package/sglang_kernel_src/temp/lm-eval-offline-mmlu-w4a16-onlinequant.sh.
+lm eval日志: /share_data/users/like/package/h100/package/sglang_kernel_src/temp/mmlu_deepseek_v2_lite-offline_w4a16.log.quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json.2026_02_02___18_13_17
+mmlu得分是:|mmlu              |      2|none  |      |acc   |↑  |0.5518|±  |0.0040|
+
+b) promote_trition_scale_precision_gptq_awq=true
+lm eval测试脚本：/share_data/users/like/package/h100/package/sglang_kernel_src/temp/lm-eval-offline-mmlu-w4a16-onlinequant-fp32-trick.sh
+lm eval日志:/share_data/users/like/package/h100/package/sglang_kernel_src/temp/mmlu_deepseek_v2_lite-offline_w4a16.log.quant_config_w4a16_int4_per_group-exclude-kv_b_proj-promote-scale-precision.json.2026_02_02___17_54_12
+mmlu得分: |mmlu              |      2|none  |      |acc   |↑  |0.5509|±  |0.0040|
+可以看到, promote_trition_scale_precision_gptq_awq=true的时候，mmlu得分反而比 没有配置promote_trition_scale_precision_gptq_awq得分高, 即fp32的scale比bf16的scale得分低。
+分析一下，为什么离线方式测试，fp32的mmlu得分比bf16的scale得分低？
+要求：把答案追加在 temp/answer_sgl.md里面
