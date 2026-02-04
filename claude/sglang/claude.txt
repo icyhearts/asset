@@ -1,0 +1,385 @@
+
+对python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py的fused_experts_impl函数进行详细讲解，要求：答案写在 temp/answer_sgl.md里面
+python/sglang/srt/layers/quantization/fp8.py里面的Fp8Config支持离线量化的时候使用吗？在什么命令行参数或者什么模型下，会进入离线量化的分支或者函数里面?要求：答案追加在 temp/answer_sgl.md里面
+使用什么工具可以导出Fp8Config需要的模型格式？要求：答案追加在 temp/answer_sgl.md里面
+python/sglang/srt/layers/quantization/fp8.py, apply_with_router_logits函数有什么功能?是谁在调用它？要求：答案追加在 temp/answer_sgl.md里面
+python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py定义fused_experts_impl函数，intermediate_cache1的形状是(total_tokens, N), fused_experts_impl把intermediate_cache1传给invoke_fused_moe_kernel, invoke_fused_moe_kernel会调用fused_moe_kernel_gptq_awq函数，会尝试获取 C.stride(2), C就是intermediate_cache1，intermediate_cache1是2D的tensor, C.stride(2)的写法是否有bug?
+对python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py里面，fused_moe_kernel函数进行详细讲解，要求：答案追加在 temp/answer_sgl.md里面
+python/sglang/srt/layers/moe/moe_runner/triton.py, fused_experts_none_to_triton被注册到FusedOpPool里面，这个动作发生在什么时候？如果有别的代码import 了sglang/srt/layers/moe/moe_runner/triton.py的单个class，没有import 整个sglang/srt/layers/moe/moe_runner/triton.py文件，会触发fused_experts_none_to_triton被注册到FusedOpPool的动作吗？要求：答案追加在 temp/answer_sgl.md里面
+
+
+python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py里面，fused_experts会调用torch.ops.sglang.inplace_fused_experts, torch.ops.sglang.inplace_fused_experts是通过direct_register_custom_op注册的，最终还是会调用python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py自己实现的inplace_fused_experts, 为什么要先注册再调用torch.ops.sglang.inplace_fused_experts?为什么不直接调用python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py自己实现的inplace_fused_experts?要求：答案追加在 temp/answer_sgl.md里面
+
+如果我修改fused_experts，直接调用python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py自己实现的inplace_fused_experts, 不经过torch.ops.sglang.inplace_fused_experts, 会有什么影响？要求：答案追加在 temp/answer_sgl.md里面
+如果我想用monkey patch的方式，自己实现一个inplace_fused_experts, 比python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py的实现的函数签名多一个名字为ocp_mx_scheme的参数，也想通过direct_register_custom_op注册到torch.ops.sglang里面去，替换掉原来的python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py的实现, 希望torch.ops.sglang.inplace_fused_experts调用我的monkey patch的实现，有可行的方案吗？你不要改代码，先把方案提出来。要求：答案追加在 temp/answer_sgl.md里面
+
+我用真实数据对python/sglang/srt/layers/moe/fused_moe_triton/moe_align_block_size.py的moe_align_block_size函数进行测试，
+topk_ids.shape=[9, 6],topk_ids的数据数据如下：
+[[ 8, 12, 22, 23, 28, 11],
+        [ 2,  8, 12, 34, 59, 28],
+        [ 5,  8, 12, 26, 38, 20],
+        [ 8, 13, 27, 43, 57,  0],
+        [ 0,  8, 21, 22, 47, 26],
+        [ 3,  8,  9, 19, 47, 16],
+        [ 3,  8, 24, 34, 52, 26],
+        [ 1,  7,  8, 30, 46, 31],
+        [ 5,  8, 26, 38, 56, 20]]
+block_size=64, num_experts=64的情况下，python/sglang/srt/layers/moe/fused_moe_triton/moe_align_block_size.py的moe_align_block_size函数返回的num_tokens_post_padded=2048, sorted_token_ids的形状是torch.Size([4149]),
+expert_ids.shape =torch.Size([65]),expert_ids的数据是:[ 0,  1,  2,  3,  5,  7,  8,  9, 11, 12, 13, 16, 19, 20, 21, 22, 23, 24,
+        26, 27, 28, 30, 31, 34, 38, 43, 46, 47, 52, 56, 57, 59, 38,  0, 20,  0,
+         8,  0, 13,  0, 27,  0, 43,  0, 57,  0,  0,  0,  0,  0,  8,  0, 21,  0,
+        22,  0, 47,  0, 26,  0,  3,  0,  8,  0,  9],这3个返回值的形状和数值正常吗？为什么expert_ids会有重复的expert id, 为什么sorted_token_ids的形状是torch.Size([4149])，不能被block_size整除？要求：答案追加在 temp/answer_sgl.md里面
+
+
+python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py, invoke_fused_moe_kernel在某些条件下会调用fused_moe_kernel_gptq_awq函数，我的目标是让fused_moe_kernel_gptq_awq被调用。 使用/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/模型的前提下，如何对模型量化？python3 -m sglang.launch_server命令启动的时候，需要怎么传参数，能够触发fused_moe_kernel_gptq_awq的调用?  要求：答案追加在 temp/answer_sgl.md里面
+--torchao-config int4wo-128 能够触发fused_moe_kernel_gptq_awq的调用吗？--torchao-config int4wo-128表示什么类型的量化？是在线量化还是离线量化？会使用哪个FusedMoEMethodBase的子类? 要求：答案追加在 temp/answer_sgl.md里面
+如果先用 AutoGPTQ/AutoAWQ 对模型进行离线量化,启动时指定 --quantization moe_wna16, 对于Linear层和FusedMoE层，python/sglang/srt/model_loader/weight_utils.py的get_quant_config分别会返回哪种QuantizationConfig的子类？ 要求：答案追加在 temp/answer_sgl.md里面
+
+
+如果先用 AutoGPTQ/AutoAWQ 对模型进行离线量化,启动时指定 --quantization moe_wna16, MoE专家的权重是由awq提前量化好保存成safetensor, 还是MoeWNA16Method先加载fp16权重，再进行在线量化？ 要求：答案追加在 temp/answer_sgl.md里面
+
+--torchao-config int4wo-128 会使用哪种QuantizationConfig的子类?是在线量化吗？对于MoE模型，会调用fused_moe_kernel_gptq_awq吗？要求：答案追加在 temp/answer_sgl.md里面
+
+sglang server的服务端口是30113, lm_eval命令位于 /share_data/users/like/miniconda3/envs/simo_sglang/bin/lm_eval, pip安装的文件位于/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/,帮我分析， lm_eval --model local-completions在传--model_args参数的时候，base_url必须设置成http://0.0.0.0:30113/v1/completions吗？ lm_eval --model local-chat-completions在传--model_args参数的时候，base_url必须设置成http://0.0.0.0:30113/v1/chat/completions?  local-completions和local-chat-completions的base_url可以混淆着使用吗？要求：答案追加在 temp/answer_sgl.md里面
+
+lm_eval命令位于 /share_data/users/like/miniconda3/envs/simo_sglang/bin/lm_eval, pip安装的文件位于/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/,帮我分析， lm_eval --model local-completions 这种形式测试的时候，必须先启动一个sglang server, 不是很方便。 lm_eval支持没有sglang server的情况下离线测试吗？比如lm_eval --model sglang这样？ 如果使用lm_eval --model sglang --tasks mmlu这种离线形式，对/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/这个模型进行进行mmlu测试，等价于请求的v1/chat/completion还是v1/completion api?  针对我的需求:lm_eval --model sglang --tasks mmlu离线测试，对/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/这个模型进行进行mmlu测试，给出lm_val命令的详细命令行参数？要求：答案追加在 temp/answer_sgl.md里面
+
+lm_eval命令位于 /share_data/users/like/miniconda3/envs/simo_sglang/bin/lm_eval, pip安装的文件位于/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/,帮我分析， 使用在线测试的时候，先启动一个sglang server,下面的命令： lm_eval --model local-completions --tasks mmlu --model_args model=/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/,base_url=http://0.0.0.0:30113/v1/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048  --batch_size auto --num_fewshot 0, 会导致sglang servercuda out of memory, 是lm_eval的在线测试的参数设置的不合适吗？如何修复？要求：答案追加在 temp/answer_sgl.md里面
+
+
+
+temp/lm-eval-offline-mmlu-w4a16-onlinequant.sh想使用lm_eval进行mmlu任务测试，但是，
+```
+\"json_model_override_args\": {\"quantization_config_file\": \"/share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/${config_file}\"},
+```
+这部分参数不符合预期，预期结果是json_model_override_args是一个合法的json字符串，实际传到lm_eval变成了一个dict:
+```
+{'quantization_config_file': '/share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json'}
+```
+/share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/configs/model_config.py的 class ModelConfig的 __init__函数会使用这个字符:
+```
+        self.model_override_args = json.loads(model_override_args)
+```
+由于它是一个dict, json.loads无法从dict加载数据，从而报错。
+你需要修改temp/lm-eval-offline-mmlu-w4a16-onlinequant.sh, 实现我的需求：json_model_override_args通过shell命令传给lm_eval的参数是一个字符串，而不是dict
+
+修改后，可以运行了，但是报cuda oom错误，日志在temp/mmlu_deepseek_v2_lite-offline_w4a16.log。
+运行需要的环境如下：
+conda环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,lm_eval命令位于 /share_data/users/like/miniconda3/envs/simo_sglang/bin/lm_eval, pip安装的lm_eval 库位于/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/,
+sglang代码位于/softhome/like/package/h100/package/sglang_kernel_src。
+修改temp/lm-eval-offline-mmlu-w4a16-onlinequant.sh, 修复cuda oom错误
+
+
+帮我分析vllm的这个文件： /share_data/users/like/package/h100/package/vllm-for-conda-simo/vllm/engine/arg_utils.py, EngineArgs的max_num_seqs表示的是什么含义？要求：答案追加在 temp/answer_sgl.md里面
+
+/share_data/users/like/package/h100/package/vllm-for-conda-simo/examples/offline_inference/basic/generate.py是一个使用vllm Engine离线生成文本的例子，
+现在它生成的文本比较短，比如它的一个prompt的输出是:
+Prompt: 'The president of the United States is'
+Generated text: ' the head of state and the head of government of the United States. The president'
+请修改代码，让生成的文本更长
+
+/share_data/users/like/package/h100/package/sglang_kernel_src/examples/runtime/engine/offline_batch_inference.py是sglang的一个类似的离线生成文本的例子，sglang的例子如何控制生成文本的长度？
+
+需求:分析simo monkey patch在sglang上的速度比vllm的速度慢的原因.
+下面是代码情况和速度对比情况。
+1)
+/share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/quantization/quantization_method.py 实现了vllm的SIMOFusedMoEMethod,SIMOLinearMethod.
+/share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/quantization/quantization_config.py实现了vllm的SIMOConfig, 可以通过unquant_linear跳过Linear层的量化，通过unquant_moe跳过FusedMoe层的量化。
+Linear层实现的是伪量化。 FusedMoE是通过 /softhome/like/package/h100/package/vllm-for-conda-simo/simo/extensions/vllm_simo/layers/fused_moe/fused_moe.py 的函数fused_experts_impl，最终是调用vllm自己实现的kernel.
+
+2)
+/share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/quantization/quantization.py实现了vllm的SIMOConfig，SIMOFusedMoEMethod,SIMOLinearMethod, 也可以通过unquant_linear跳过Linear层的量化，通过unquant_moe跳过FusedMoe层的量化。
+Linear层实现的是伪量化。 FusedMoE是通过 /share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/layers/fused_moe/fused_moe_triton_kernels.py实现的invoke_fused_moe_kernel，invoke_fused_moe_kernel最终还是调用的fused_moe_kernel_gptq_awq或者fused_moe_kernel triton kernel.  invoke_fused_moe_kernel是通过monkey patch的方式替代了sglang的invoke_fused_moe_kernel函数.
+/share_data/users/like/package/h100/package/simo_conda_sglang/sitecustomize.py通过 SIMO_SGLANG_REGISTER环境变量，控制要不要apply simo对sglang的monkey patch.
+3)
+vllm的conda环境位于/share_data/users/like/miniconda3/envs/simo_vllm/.
+sglang的conda环境位于/share_data/users/like/miniconda3/envs/simo_sglang/.
+4)
+a) sglang代码位于softhome/like/package/h100/package/sglang_kernel_src, vllm的代码位于 /softhome/like/package/h100/package/vllm-for-conda-simo.
+b) /softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json 用于定义sglang使用simo patch时候的量化配置。
+/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json 用于定义vllm使用simo patch时候的量化配置。
+5) sglang在使用simo monkey patch进行 w4a16 int4量化下的性能, 比vllm 使用simo monkey patch在w4a16 int4量化下的性能差很多。下面是性能对比，以离线生成文件为例：
+6) 对于SGLang, 
+
+a)对FusedMoE层和Linear层都不量化，通过unquant_linear跳过Linear层的量化，通过unquant_moe跳过FusedMoe层的量化,相当于bf16的精度运行
+
+examples/runtime/engine/offline_batch_inference.py通过time.perf_counter()测量  llm.generate(prompts, sampling_params)的运行时间， print(f"time_consumed:{time_consumed}")打印出运行时间, 
+命令如下:
+. ~/miniconda3/bin/activate simo_sglang && cd /softhome/like/package/h100/package/sglang_kernel_src &&  SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=2 unquant_moe=1  unquant_linear=1  python examples/runtime/engine/offline_batch_inference.py  --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json"}'
+日志位于/share_data/users/like/package/h100/package/sglang_kernel_src/temp/offline_batch_inference.py.log.unlinear.unmoe.2026_01_24___18_15_40,
+运行结果打印出来是time_consumed:1.91049495000334
+b)对FusedMoE层和Linear层都进行量化，命令如下:
+. ~/miniconda3/bin/activate simo_sglang && cd /softhome/like/package/h100/package/sglang_kernel_src && SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=3 python examples/runtime/engine/offline_batch_inference.py --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json"}'
+日志位于 /share_data/users/like/package/h100/package/sglang_kernel_src/temp/offline_batch_inference.py.log.bothquant.2026_01_24___21_45_33, 
+运行结果打印出来是time_consumed:17.263566583002103
+可以看到，和对FusedMoE层和Linear层都不量化对比，耗时是17.263566583002103/1.91049495000334= 9.036174936223684倍，耗时增加很严重。
+7) 对于vllm
+a)对FusedMoE层和Linear层都不量化，通过unquant_linear跳过Linear层的量化，通过unquant_moe跳过FusedMoe层的量化,相当于bf16的精度运行
+. ~/miniconda3/bin/activate simo_vllm && cd /softhome/like/package/h100/package/vllm-for-conda-simo && CUDA_VISIBLE_DEVICES=6  unquant_moe=1  unquant_linear=1  python examples/offline_inference/basic/generate.py --model /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/       --tensor-parallel-size 1           --max-num-seqs 256 --gpu-memory-utilization 0.8  --max-tokens 256  --quantization simo      --hf-overrides='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json"}'
+运行的日志位于 /share_data/users/like/package/h100/package/vllm/temp/unquant_moe.unquant_linear.log.2026_01_25___17_06_07
+运行结果打印出来是time_consumed:2.0204824109969195
+
+b)对FusedMoE层和Linear层都进行量化，命令如下:
+
+. ~/miniconda3/bin/activate simo_vllm && cd /softhome/like/package/h100/package/vllm-for-conda-simo && CUDA_VISIBLE_DEVICES=7  python examples/offline_inference/basic/generate.py --model /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/       --tensor-parallel-size 1           --max-num-seqs 256 --gpu-memory-utilization 0.8  --max-tokens 256  --quantization simo      --hf-overrides='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json"}' 
+日志位于/share_data/users/like/package/h100/package/vllm/temp/both-quant.log.2026_01_26___17_54_28
+运行结果打印出来是time_consumed:6.732129392970819
+
+可以看到，vllm和sglang在不使用量化的时候，耗时是2.02s vs 1.91s, 差距很小.
+但是，vllm使用simo的量化，出现了耗时增加情况，增加的比例远小于sglang使用simo的量化: 6.73s vs 17.26s 。
+分析一下，为什么sglang使用simo量化导致的耗时增加，远大于vllm使用simo量化引起的耗时增加？
+要求：把原因追加在 temp/answer_sgl.md里面
+
+先帮我修改simo的sglang扩展部分的代码，把simo 对于sglang扩展中的运行时import开销解决，把运行时import改到模块顶层
+帮我修改simo的sglang扩展部分的代码，把simo 对于sglang扩展中的循环内内存分配问题解决，将内存分配移到循环外
+
+##
+循环内内存分配和运行时import开销已经解决，并没有看到明显的速度提升，
+多次运行以下命令：
+. ~/miniconda3/bin/activate simo_sglang && cd /softhome/like/package/h100/package/sglang_kernel_src && SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=2 python examples/runtime/engine/offline_batch_inference.py  --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json"}'
+运行结果打印出来分别是:
+time_consumed:19.19581713504158
+time_consumed:15.791747278999537
+time_consumed:17.052668317977805
+和simo vllm 扩展的运行结果6.772523088002345s对比，还有很大差距，还有什么可能的原因？
+更多的抽象层(MoeRunner等),这个不太像是主要原因，
+以vllm自己的fp8 online quant为例， /share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/layers/quantization/fp8.py实现了Fp8MoEMethod, Fp8MoEMethod.apply会调用MoeRunner.run -> fused_experts_none_to_triton ->fused_experts -> inplace_fused_experts  -> fused_experts_impl -> invoke_fused_moe_kernel, 调用链路也很长，但是Fp8MoEMethod性能很好，
+CUDA_VISIBLE_DEVICES=2 python examples/runtime/engine/offline_batch_inference.py --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization fp8打印出来结果是：
+ time_consumed:1.6948937510023825.
+你要分析出更加根本的导致simo的sglang扩展比simo的vllm扩展在FuseMoe上性能下降比例更高的原因
+
+1) 你的修改没有改善，
+. ~/miniconda3/bin/activate simo_sglang && cd /softhome/like/package/h100/package/sglang_kernel_src && SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=1 python examples/runtime/engine/offline_batch_inference.py --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json"}'
+结果是:
+time_consumed:17.06443838897394
+2) 先不考虑mx数据类型，因为/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json这个配置，使用的是w4a16 int4的仅权重量化，和mx没有关系。
+3) sglang代码仓库里面：
+/share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+有如下代码
+```
+direct_register_custom_op(
+    op_name="inplace_fused_experts",
+    op_func=inplace_fused_experts,
+    mutates_args=["hidden_states"],
+    fake_impl=inplace_fused_experts_fake,
+)
+```
+把inplace_fused_experts通过direct_register_custom_op注册成torch原生的op, simo的sglang扩展，没有注册成torch op,是普通的python函数，这个是导致巨大性能差异的原因吗？
+要求：把原因追加在 temp/answer_sgl.md里面
+
+1)
+sglang原生awq量化性能比simo的SIMOFusedMoEMethod在使用w4a16 int4量化性能好：
+CUDA_VISIBLE_DEVICES=2 python examples/runtime/engine/offline_batch_inference.py --model-path /share/users/like/package/hf-models/TechxGenus/DeepSeek-V2-Lite-Chat-AWQ/ --quantization moe_wna16
+日志保存在 /share_data/users/like/package/h100/package/sglang_kernel_src/temp/native-awq.offline_batch_inference.py.log.2026_01_27___16_38_19
+结果打印出来是:
+time_consumed:5.813337222032715
+2)
+另外一个奇怪的现象：
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=2 python examples/runtime/engine/offline_batch_inference.py --model-path /share/users/like/package/hf-models/TechxGenus/DeepSeek-V2-Lite-Chat-AWQ/ --quantization moe_wna16
+日志保存在 temp/simo.native-awq.offline_batch_inference.py.log.2026_01_27___17_32_47
+结果是:
+time_consumed:4.43395590397995
+
+一旦有SIMO_SGLANG_REGISTER=1这个环境变量，
+fused_experts_none_to_triton会被simo/extensions/sglang_simo/layers/fused_moe/fused_moe.py实现接管，从fused_experts_none_to_triton到fused_experts全都会走simo的实现
+--quantization moe_wna16会使用MoeWNA16Method进行moe的计算，MoeWNA16Method.apply会经过 self.runner.run -> 再调用simo实现的fused_experts_none_to_triton -> simo实现的fused_experts -> simo的inplace_fused_experts -> simo的fused_experts_impl,
+
+也就是说，MoeWNA16Method走self.runner.run -> 再调用simo实现的fused_experts_none_to_triton -> simo实现的fused_experts -> simo的inplace_fused_experts -> simo的fused_experts_impl
+会比
+SIMOFusedMoEMethod在走走self.runner.run -> 再调用simo实现的fused_experts_none_to_triton -> simo实现的fused_experts -> simo的inplace_fused_experts -> simo的fused_experts_impl
+这一路径，性能更好，这又是为什么？
+要求：把原因追加在 temp/answer_sgl.md里面
+
+帮我修复simo sglang的扩展的fused moe的scale dtype, 在`process_weights_after_loading`中添加scale dtype转换（参考vLLM扩展）
+
+
+在使用这个conda环境的情况下：
+. ~/miniconda3/bin/activate simo_sglang
+下面的命令可以正常跑：
+export CUDA_VISIBLE_DEVICES=3; export bscale_dtype="bf16";python temp/load_gptq_awq.py --round 3 --warmup 2 --bscale_dtype "$bscale_dtype"
+但是，用ncu跑，会报错:
+export CUDA_VISIBLE_DEVICES=3; export bscale_dtype="bf16";  ~/opt/cuda-12.8/bin/ncu --set full    --export temp/fused_moe_kernel_gptq_awq.$CUDA_VISIBLE_DEVICES.bscale_dtype-$bscale_dtype.ncu python temp/load_gptq_awq.py --round 3 --warmup 2 --bscale_dtype "$bscale_dtype"
+Error processing line 1 of /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/_sgl_kernel_editable.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 206, in addpackage
+    File "<string>", line 1, in <module>
+    File "/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/_sgl_kernel_editable.py", line 6, in <module>
+      import subprocess
+    File "/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/subprocess.py", line 104, in <module>
+      from _posixsubprocess import fork_exec as _fork_exec
+  ImportError: /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/lib-dynload/_posixsubprocess.cpython-312-x86_64-linux-gnu.so: undefined symbol: _Py_write_noraise
+
+Remainder of file ignored
+==PROF== Connected to process 342735 (/share_data/users/like/miniconda3/envs/simo_sglang/bin/python3.12)
+[2026-01-28 09:04:04] INFO utils.py:148: Note: detected 192 virtual cores but NumExpr set to maximum of 64, check "NUMEXPR_MAX_THREADS" environment variable.
+[2026-01-28 09:04:04] INFO utils.py:151: Note: NumExpr detected 192 cores but "NUMEXPR_MAX_THREADS" not set, so enforcing safe limit of 16.
+[2026-01-28 09:04:04] INFO utils.py:164: NumExpr defaulting to 16 threads.
+bench warm up count:2, bench round:3, bf16 scale:bf16
+Tensor 'B_scale' is on device: cuda:0, dtype:torch.float32, shape:torch.Size([64, 2816, 64])
+Tensor 'topk_weights' is on device: cuda:0, dtype:torch.float32, shape:torch.Size([14, 6])
+Tensor 'expert_ids' is on device: cuda:0, dtype:torch.int32, shape:torch.Size([67])
+Tensor 'num_tokens_post_padded' is on device: cuda:0, dtype:torch.int32, shape:torch.Size([1])
+Tensor 'sorted_token_ids' is on device: cuda:0, dtype:torch.int32, shape:torch.Size([1059])
+Tensor 'topk_ids' is on device: cuda:0, dtype:torch.int32, shape:torch.Size([14, 6])
+Tensor 'A' is on device: cuda:0, dtype:torch.bfloat16, shape:torch.Size([14, 2048])
+Tensor 'C' is on device: cuda:0, dtype:torch.bfloat16, shape:torch.Size([84, 2816])
+Tensor 'B' is on device: cuda:0, dtype:torch.uint8, shape:torch.Size([64, 2816, 1024])
+分析是什么原因导致无法在ncu里面跑。
+要求：把原因追加在 temp/answer_sgl.md里面
+
+###
+temp/load_gptq_awq.py 对fused_moe_kernel_gptq_awq 进行benchmark, B_scale从safetensor加载的时候是fp32类型，如果传入--bscale_dtype=bf16, 会把B_scale cast成bf16的数据。现在的现象是，fp32的B_scale, fused_moe_kernel_gptq_awq的耗时是2.06ms, bf16的scale, fused_moe_kernel_gptq_awq的耗时是0.247ms,几乎是8.3倍的关系。
+ncu 分析结果如下:
+其中,Baseline就fp32的scale, Current是bf16的scale:
+Compute (SM) Throughput [%]对比:
+Current,69.68
+Baseline 1,7.89 (782.82%)
+
+Memory Throughput [%]对比:
+Metric Result:
+Result,Value
+Current,58.15
+Baseline 1,93.78 (-38.00%)
+
+Stall MIO Throttle对比：
+Result,Value
+Current,0.03
+Baseline 1,19.44 (-99.85%)
+如何改善fused_moe_kernel_gptq_awq在fp32 scale下的性能？ 
+要求：把答案追加在 temp/answer_sgl.md里面
+
+/softhome/like/opt/cuda-12.8/bin/ncu  --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum python temp/load_gptq_awq.py xxxxx
+fp32的结果是
+  fused_moe_kernel_gptq_awq (5896, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+    Section: Command line profiler metrics
+    ----------------------------------------------- ----------- ------------
+    Metric Name                                     Metric Unit Metric Value
+    ----------------------------------------------- ----------- ------------
+    l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum               13,498,848
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum       sector   14,332,384
+    ----------------------------------------------- ----------- ------------
+bf16的结果是
+
+  fused_moe_kernel_gptq_awq (5896, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+    Section: Command line profiler metrics
+    ----------------------------------------------- ----------- ------------
+    Metric Name                                     Metric Unit Metric Value
+    ----------------------------------------------- ----------- ------------
+    l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum               13,498,848
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum       sector   14,332,384
+    ----------------------------------------------- ----------- ------------
+完全一样，如何解释
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+softhome/like/opt/cuda-12.8/bin/ncu  --metrics  dram__bytes_read.sum,lts__t_sector_hit_rate.pct,l1tex__t_sector_hit_rate.pct \
+    python temp/load_gptq_awq.py xxx
+fp32:
+  fused_moe_kernel_gptq_awq (5896, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+    Section: Command line profiler metrics
+    ---------------------------- ----------- ------------
+    Metric Name                  Metric Unit Metric Value
+    ---------------------------- ----------- ------------
+    dram__bytes_read.sum               Mbyte       133.60
+    l1tex__t_sector_hit_rate.pct           %        64.05
+    lts__t_sector_hit_rate.pct             %        42.33
+    ---------------------------- ----------- ------------
+bf16的结果：
+  fused_moe_kernel_gptq_awq (5896, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+    Section: Command line profiler metrics
+    ---------------------------- ----------- ------------
+    Metric Name                  Metric Unit Metric Value
+    ---------------------------- ----------- ------------
+    dram__bytes_read.sum               Mbyte       120.18
+    l1tex__t_sector_hit_rate.pct           %        67.07
+    lts__t_sector_hit_rate.pct             %        41.81
+    ---------------------------- ----------- ------------
+
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+/softhome/like/opt/cuda-12.8/bin/ncu  --metrics  sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread,launch__occupancy_limit_registers python temp/load_gptq_awq.py xxx
+fp32的结果：
+  fused_moe_kernel_gptq_awq (5896, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+    Section: Command line profiler metrics
+    ------------------------------------------------- --------------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ------------------------------------------------- --------------- ------------
+    launch__occupancy_limit_registers                           block            4
+    launch__registers_per_thread                      register/thread          128
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        24.25
+    ------------------------------------------------- --------------- ------------
+
+
+bf16的结果
+  fused_moe_kernel_gptq_awq (5896, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 9.0
+    Section: Command line profiler metrics
+    ------------------------------------------------- --------------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ------------------------------------------------- --------------- ------------
+    launch__occupancy_limit_registers                           block            4
+    launch__registers_per_thread                      register/thread          125
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        23.92
+    ------------------------------------------------- --------------- ------------
+如何解释这个结果?
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+在ncu-ui可以看到sass代码， bf16的sass代码被复制到了temp/sass.bf16.s里面， fp32的sass代码被复制到了temp/sass.fp32.s里面，对比fp32版本的sass代码和bf16的代码，分析fp32和bf16的kernel时间相差8倍多的原因。
+要求：把答案追加在 temp/answer_sgl.md里面
+有没有可能，在kernel外把fp32的scale，用torch.Tensor.view函数转换成bf16的数据，欺骗triton，用LDG.E.U16 加载scale，由于真实的数据其实是一个fp32被拆成两个相邻的bf16, 在kernel内部，把LDG.E.U16加载的相邻两个bf16的数据拼接成fp32的scale,再进行后续的计算?
+如果这个方案是可行的，把新的kernel写到temp/fused_moe_kernel_gptq_awq_fp32_scale.py里面，kernel名字叫fused_moe_kernel_gptq_awq_fp32_scale
+可行性分析追加到temp/answer_sgl.md里面。
+如果这个方案是可行的，把kernel详细解释追加到temp/answer_sgl.md里面。
+
+
+为什么
+        low_u32 = b_scale_low.to(tl.uint32)
+        high_u32 = b_scale_high.to(tl.uint32)
+这两行不需要bitcast=True
+但是
+        b_scale = combined_u32.to(tl.float32, bitcast=True)
+这一行需要bitcast=True
+
+要求：把答案追加在 temp/answer_sgl.md里面
+
+fused_moe_kernel_gptq_awq_fp32_scale里面，tl.load加载aptr的时候，需要两个方向的mask,
+tl.load(b_ptrs)，两个方向都没有mask, tl.store c_ptrs的时候需要两个方向的mask, tl.load bscale的时候，只需要k方向的mask,为什么有的地方不需要mask?  要求：把答案追加在 temp/answer_sgl.md里面
+
+为什么bscale的加载需要考虑evenKs是true还是false, b的加载完全不考虑evenKs是true还是false?要求：把答案追加在 temp/answer_sgl.md里面
+
+即使B是uint8, 越界读的数据是有限数，读取的内存越界，没有安全风险吗？cpu都会检查内存越界，gpu不会检查吗？address sanitizer能分析出这种越界行为吗？要求：把答案追加在 temp/answer_sgl.md里面
+
+你实现的fused_moe_kernel_gptq_awq_fp32_scale, sass代码位于 temp/sass.fp32-trick.s, 像以前一样，对比一下temp/sass.fp32-trick.s和了temp/sass.bf16.s, 分析一下两者的区别。要求：把答案追加在 temp/answer_sgl.md里面
+temp/sass.bf16.s
+
+
+使用temp/lm-eval-offline-mmlu-w4a16-onlinequant.sh进行mmlu_pro测试：
+. ~/miniconda3/bin/activate simo_sglang && cd /softhome/like/package/h100/package/sglang_kernel_src && bash  temp/lm-eval-offline-mmlu-w4a16-onlinequant.sh mmlu_pro
+日志在temp/mmlu_pro_deepseek_v2_lite-offline_w4a16.log.quant_config_w4a16_int4_per_group-exclude-kv_b_proj.json.2026_02_03___14_13_58
+但是
+. ~/miniconda3/bin/activate simo_sglang && cd /softhome/like/package/h100/package/sglang_kernel_src && bash  temp/lm-eval-offline-mmlu-w4a16-onlinequant.sh mmlu
+就不会报错。分析原因，要求：把答案追加在 temp/answer_sgl.md里面
+
+配置bash 历史，实现如下要求:
+1) 历史文件在 ~/.bash_eternal_history, 文件没有长度限制，
+2) history命令不限长度
+3) 历史文件要保证多个普通终端和多个tmux终端写入的安全，不丢命令，只可以追加命令，不允许某个终端覆盖其他终端的命令
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+HF_ENDPOINT=https://hf-mirror.com HF_DATASETS_CACHE=/share/users/like/huggingface_cache/ lm_eval --model local-chat-completions --tasks mmlu --model_args model=/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/,base_url=http://0.0.0.0:30113/v1/chat/completions,num_concurrent=1,timeout=999999,max_gen_toks=2048 --batch_size 128 --apply_chat_template --num_fewshot 0
+命令报错：
+日志在temp/mmlu.fp16scale.log.2026_02_03___17_14_39.
+分析日志，修改lm_eval命令对 sglang server进行mmlu任务测试。
+要求：把答案追加在 temp/answer_sgl.md里面
+
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=4 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --quantization simo --port 30123 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group-exclude-kv_b_proj-promote-scale-precision.json"}'
+启动sglang server, 日志在/softhome/like/package/h100/package/simo_conda_sglang/temp/simo.sglang.promote-precision-scale.mmlu.2026_02_04___10_42_18
+
+HF_ENDPOINT=https://hf-mirror.com HF_DATASETS_CACHE=/share/users/like/huggingface_cache/ lm_eval --model local-completions --tasks mmlu --model_args model=/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/,base_url=http://0.0.0.0:30123/v1/completions,num_concurrent=1,timeout=999999,max_gen_toks=2048  --batch_size 16
+进行mmlu任务测试。
+sglang日志报cuda out of memory 了，如何解决?  要求：把答案追加在 temp/answer_sgl.md里面
+
+lm_eval离线方式对sglang
