@@ -101,3 +101,8 @@ mmlu得分: |mmlu              |      2|none  |      |acc   |↑  |0.5509|±  |0
 可以看到, promote_trition_scale_precision_gptq_awq=true的时候，mmlu得分反而比 没有配置promote_trition_scale_precision_gptq_awq得分高, 即fp32的scale比bf16的scale得分低。
 分析一下，为什么离线方式测试，fp32的mmlu得分比bf16的scale得分低？
 要求：把答案追加在 temp/answer_sgl.md里面
+
+pip install . --no-build-isolation
+为什么没有把 simo/extensions/sglang_simo/layers/目录安装到/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/simo/extensions/sglang_simo/目录?
+如何修复?
+要求：把答案追加在 temp/answer_sgl.md里面
