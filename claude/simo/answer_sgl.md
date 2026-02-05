@@ -640,3 +640,111 @@ b_scale = combined_u32.to(tl.float32, bitcast=True)
 
 3. **完善CI测试流程**
    在CI中同时测试在线和离线方式，确保两种方式的结果一致
+
+---
+
+## 22. pip install 没有安装 sglang_simo/layers/ 目录的原因及修复
+
+### 问题描述
+
+执行 `pip install . --no-build-isolation` 后，`simo/extensions/sglang_simo/layers/` 目录没有被安装到 site-packages 目录下：
+
+```
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/simo/extensions/sglang_simo/
+├── __init__.py
+├── model_loader/     ✓ 已安装
+├── quantization/     ✓ 已安装
+└── layers/           ✗ 缺失！
+```
+
+### 根因分析
+
+#### 1. `setup.py` 中的包发现机制
+
+`setup.py` 第92行使用 `find_packages()` 来自动发现所有 Python 包：
+
+```python
+setup(
+  ...
+  packages=find_packages(exclude=["examples", "simo.csrc", "simo.csrc.*"]),
+  ...
+)
+```
+
+`find_packages()` 函数的工作原理是：**递归扫描目录树，只有包含 `__init__.py` 文件的目录才会被识别为 Python 包**。
+
+#### 2. 缺少 `__init__.py` 文件
+
+`simo/extensions/sglang_simo/layers/` 目录缺少 `__init__.py` 文件：
+
+```
+simo/extensions/sglang_simo/
+├── __init__.py                          ✓
+├── model_loader/
+│   └── __init__.py                      ✓
+├── quantization/
+│   └── __init__.py                      ✓
+└── layers/
+    ├── __init__.py                      ✗ 缺失！
+    └── fused_moe/
+        └── __init__.py                  ✓
+```
+
+由于 `layers/` 目录没有 `__init__.py`，`find_packages()` 不会将其识别为 Python 包。这同时导致其子包 `layers/fused_moe/` 也无法被发现，因为**父目录不是合法的包，子目录即使有 `__init__.py` 也不会被递归扫描到**。
+
+#### 3. 验证
+
+修复前，`find_packages()` 只发现了以下 sglang 相关包：
+
+```
+simo.extensions.sglang_simo
+simo.extensions.sglang_simo.model_loader
+simo.extensions.sglang_simo.quantization
+```
+
+注意 `simo.extensions.sglang_simo.layers` 和 `simo.extensions.sglang_simo.layers.fused_moe` **完全缺失**。
+
+### 修复方法
+
+创建空的 `__init__.py` 文件：
+
+```bash
+touch simo/extensions/sglang_simo/layers/__init__.py
+```
+
+修复后，`find_packages()` 正确发现所有包：
+
+```
+simo.extensions.sglang_simo
+simo.extensions.sglang_simo.layers              ← 新增
+simo.extensions.sglang_simo.layers.fused_moe    ← 新增
+simo.extensions.sglang_simo.model_loader
+simo.extensions.sglang_simo.quantization
+```
+
+### 修复后重新安装
+
+```bash
+# 重新安装以使修复生效
+pip install . --no-build-isolation
+
+# 或者开发模式安装
+pip install -e . --no-build-isolation
+```
+
+### 验证安装结果
+
+```bash
+# 检查 layers 目录是否已安装
+python3 -c "import simo.extensions.sglang_simo.layers.fused_moe; print('layers/fused_moe 安装成功')"
+
+# 或者检查 site-packages 目录
+ls -la $(python3 -c "import simo.extensions.sglang_simo as m; import os; print(os.path.dirname(m.__file__))")/layers/
+```
+
+### 经验教训
+
+在添加新的 Python 包目录时，必须确保：
+1. **每个包目录都包含 `__init__.py` 文件**（即使是空文件）
+2. **整个包层级链上的每一级都有 `__init__.py`** — 如果中间某一级缺少，其下所有子包都不会被 `find_packages()` 发现
+3. 可以通过 `python3 -c "from setuptools import find_packages; print(find_packages())"` 快速验证包发现是否正确
