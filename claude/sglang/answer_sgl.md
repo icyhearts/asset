@@ -7349,3 +7349,140 @@ source ~/env-bash.sh
 3. **不会重复记录**：交互式 shell 走 `PROMPT_COMMAND` + `history -a` 路径，非交互式 SSH 走这段代码。条件 `$- != *i*` 确保互斥。
 
 4. **依赖 bash 被 sshd 调用时自动 source `~/.bashrc`**：这是 bash 文档中描述的行为（bash 检测到 stdin 连接到网络/被 rshd/sshd 调用时会读取 `~/.bashrc`）。在当前系统（OpenSSH 8.9 + bash 5.1.16）上已验证有效。如果在某些系统上不生效，备选方案是设置 `BASH_ENV` 环境变量指向一个包含相同逻辑的脚本。
+
+---
+
+# 非交互式 SSH 历史记录代码逐行详解
+
+```bash
+if [[ $- != *i* ]] && [[ -n "$SSH_CONNECTION" ]] && [[ -n "$BASH_EXECUTION_STRING" ]]; then
+    mkdir -p ~/.bash_history_sessions
+    _hf=~/.bash_history_sessions/hist_$(hostname)
+    {
+        flock -x 200
+        printf '#%s\n' "$(date +%s)" >> "$_hf"
+        printf '%s\n' "$BASH_EXECUTION_STRING" >> "$_hf"
+    } 200>"${_hf}.lock"
+fi
+```
+
+## 第 1 行：三重条件判断
+
+```bash
+if [[ $- != *i* ]] && [[ -n "$SSH_CONNECTION" ]] && [[ -n "$BASH_EXECUTION_STRING" ]]; then
+```
+
+### `[[ $- != *i* ]]` — 非交互式 shell
+
+`$-` 是 bash 的特殊变量，保存当前 shell 的选项标志字符串。例如：
+- 交互式 shell：`$-` = `himBHs`（包含 `i`）
+- `bash -c "cmd"`：`$-` = `hBc`（不含 `i`）
+
+`!= *i*` 是 glob 模式匹配，意思是 `$-` 中**不包含** `i` 字符，即当前 shell **不是交互式的**。
+
+**为什么需要**：交互式 shell 已经有 `PROMPT_COMMAND` + `history -a` 机制来记录历史，这里只处理非交互式场景，避免重复记录。
+
+### `[[ -n "$SSH_CONNECTION" ]]` — 是 SSH 会话
+
+`$SSH_CONNECTION` 是 sshd 设置的环境变量，格式为 `客户端IP 客户端端口 服务端IP 服务端端口`，例如：
+```
+10.0.1.5 52234 10.0.1.100 22
+```
+
+`-n` 测试字符串非空。如果这个变量有值，说明当前是一个 SSH 会话。
+
+**为什么需要**：排除本地的 `bash -c "cmd"` 调用。cron 任务、脚本中的子 shell 等也是非交互式的，但它们不应该被记录到 SSH 历史中。这个条件确保只记录通过 SSH 远程执行的命令。
+
+### `[[ -n "$BASH_EXECUTION_STRING" ]]` — 有命令要执行
+
+`$BASH_EXECUTION_STRING` 是 bash 的内置变量，保存通过 `bash -c "..."` 传入的命令字符串。
+
+当执行 `ssh bjh3 "nvidia-smi"` 时，远程 sshd 调用 `bash -c "nvidia-smi"`，此时：
+```
+BASH_EXECUTION_STRING="nvidia-smi"
+```
+
+如果是 `ssh bjh3 "ls -la /tmp && df -h"`，则：
+```
+BASH_EXECUTION_STRING="ls -la /tmp && df -h"
+```
+
+`-n` 测试非空。如果没有命令字符串（例如某些 SSH 子系统调用），则不记录。
+
+### 三个条件的组合逻辑
+
+| 场景 | `$- != *i*` | `$SSH_CONNECTION` | `$BASH_EXECUTION_STRING` | 结果 |
+|------|:-----------:|:-----------------:|:------------------------:|:----:|
+| `ssh bjh3 "nvidia-smi"` | ✓ 非交互 | ✓ SSH 会话 | ✓ `"nvidia-smi"` | **记录** |
+| `ssh bjh3`（交互登录） | ✗ 交互式 | ✓ SSH 会话 | ✗ 空 | 不记录 |
+| 本地 `bash -c "ls"` | ✓ 非交互 | ✗ 非 SSH | ✓ `"ls"` | 不记录 |
+| cron 任务 | ✓ 非交互 | ✗ 非 SSH | 可能有 | 不记录 |
+| 本地交互式终端 | ✗ 交互式 | ✗ 非 SSH | ✗ 空 | 不记录 |
+
+## 第 2-3 行：准备历史文件
+
+```bash
+    mkdir -p ~/.bash_history_sessions
+    _hf=~/.bash_history_sessions/hist_$(hostname)
+```
+
+- `mkdir -p`：确保目录存在（`-p` 表示父目录不存在时递归创建，已存在也不报错）
+- `_hf`：用局部变量保存历史文件路径，避免重复拼接。`$(hostname)` 被替换为当前主机名，例如 `hist_gpu012.rd.sio-software.com`
+
+## 第 4-8 行：加锁写入
+
+```bash
+    {
+        flock -x 200
+        printf '#%s\n' "$(date +%s)" >> "$_hf"
+        printf '%s\n' "$BASH_EXECUTION_STRING" >> "$_hf"
+    } 200>"${_hf}.lock"
+```
+
+### `{ ... } 200>"${_hf}.lock"` — 分组命令 + 文件描述符重定向
+
+- `{ ... }` 是**分组命令**（group command），在**当前 shell** 中执行（不是子 shell）
+- `200>"${_hf}.lock"` 打开 lock 文件并绑定到**文件描述符 200**
+  - 200 是一个任意选择的高编号 fd（避开 0=stdin, 1=stdout, 2=stderr 和常用的 fd）
+  - 当 `}` 结束时，fd 200 自动关闭，锁也随之释放
+
+**为什么用 `{ }` 不用 `( )`**：`( )` 会创建子 shell（fork 子进程），`{ }` 在当前进程中执行。虽然在这个非交互式一次性场景中差异不大，但 `{ }` 更轻量且是正确实践（参见上一个 history 重复问题的分析）。
+
+### `flock -x 200` — 获取排他锁
+
+- `flock` 是 Linux 的文件锁工具
+- `-x`：排他锁（exclusive lock），同一时刻只有一个进程能持有
+- `200`：对文件描述符 200（即 lock 文件）加锁
+
+**工作流程**：
+1. `200>"${_hf}.lock"` 打开 lock 文件 → fd 200
+2. `flock -x 200` 尝试对 fd 200 加排他锁
+   - 如果没人持有锁 → 立即获得，继续执行
+   - 如果其他进程持有锁 → **阻塞等待**，直到锁释放
+3. 执行 `printf` 写入操作
+4. `}` 结束 → fd 200 关闭 → 锁自动释放
+
+**为什么需要锁**：同一台主机上可能有多个并发的非交互式 SSH 命令（例如批量管理脚本同时向多台机器发命令），它们会同时写入同一个历史文件。`flock` 保证写入操作的原子性，避免行交错。
+
+### `printf '#%s\n' "$(date +%s)"` — 写入时间戳
+
+- `date +%s`：输出 Unix 时间戳（自 1970-01-01 以来的秒数），例如 `1770361806`
+- `printf '#%s\n'`：格式化为 `#1770361806\n`
+- `>>`：追加到历史文件
+
+这是 bash history 文件的标准时间戳格式。以 `#` 开头的行被 bash 识别为时间戳行，`HISTTIMEFORMAT` 配置决定了 `history` 命令如何显示它。
+
+### `printf '%s\n' "$BASH_EXECUTION_STRING"` — 写入命令
+
+- 将完整的命令字符串追加到历史文件
+- 使用 `printf '%s\n'` 而不是 `echo`，因为 `echo` 对某些特殊字符（如 `-n`, `-e`, 反斜杠）有特殊处理，`printf '%s\n'` 则原样输出
+
+### 写入后文件内容示例
+
+执行 `ssh bjh3 "nvidia-smi"` 后，`hist_bjh3` 文件追加两行：
+```
+#1770361806
+nvidia-smi
+```
+
+这和交互式 shell 通过 `history -a` 写入的格式完全一致，所以 `history` 命令能正常读取和显示这些记录。

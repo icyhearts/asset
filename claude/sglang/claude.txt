@@ -414,3 +414,15 @@ ssh bjh3 "nvidia-smi"
 我希望bjh3机上中能够记录下nvidia-smi这个历史
 
 要求：把答案追加在 temp/answer_sgl.md里面
+
+详细解释下面的代码：
+if [[ $- != *i* ]] && [[ -n "$SSH_CONNECTION" ]] && [[ -n "$BASH_EXECUTION_STRING" ]]; then
+    mkdir -p ~/.bash_history_sessions
+    _hf=~/.bash_history_sessions/hist_$(hostname)
+    {
+        flock -x 200
+        printf '#%s\n' "$(date +%s)" >> "$_hf"
+        printf '%s\n' "$BASH_EXECUTION_STRING" >> "$_hf"
+    } 200>"${_hf}.lock"
+fi
+要求：把答案追加在 temp/answer_sgl.md里面
