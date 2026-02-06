@@ -6931,3 +6931,121 @@ lm_eval --model local-completions \
 | 触发条件 | lm-eval 的 loglikelihood 请求需要 echo+logprobs，产生巨大 logits 张量 |
 | 核心修复 | `--mem-fraction-static 0.75` 降低 KV Cache 占比 |
 | 辅助修复 | `--chunked-prefill-size 4096` + `--batch_size 8` |
+
+---
+
+# bash_eternal_history 在 NFS 上被截断的问题分析
+
+## 问题
+
+`~/env-bash.sh` 末尾的 bash_eternal_history 配置在 NFS (`/softhome` 挂载于 `nas.h3cx1w.com:/NAS/CAPFS/data/home`，NFS v4.2) 上运行时，多个 tmux 终端同时使用会导致历史文件被截断。
+
+## 当前配置分析
+
+```bash
+export HISTFILE=~/.bash_eternal_history
+export HISTSIZE=-1
+export HISTFILESIZE=-1
+shopt -s histappend
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}history -a"
+```
+
+这个配置在**本地文件系统**上基本可以工作，但在 **NFS 上存在根本性缺陷**。
+
+## 为什么在 NFS 上会被截断？有三大原因：
+
+### 原因 1：NFS 的 O_APPEND 不保证原子性
+
+`history -a` 底层使用 `O_APPEND` 模式打开文件并追加写入。在本地 ext4/xfs 文件系统上，内核保证 `O_APPEND` 的 seek+write 是原子操作。但 **NFS 协议本身不保证 O_APPEND 的原子性**：
+
+- NFS 客户端会缓存文件属性（文件大小、mtime 等），缓存时间通常为几秒到几十秒
+- 终端 A 写入后，终端 B 可能仍然使用缓存的旧文件大小
+- 两个终端可能写到同一个偏移位置，后写的覆盖先写的内容
+- 更严重的情况：一个终端写入时使用了过时的文件大小，导致文件被"截断"到旧的大小
+
+你的挂载选项 `local_lock=none` 意味着所有锁请求都发送到 NFS 服务器，但 **bash 的 history 机制根本不使用任何文件锁**——它只是简单地 open + append + close。
+
+### 原因 2：NFS 客户端属性缓存（ac/acregmin/acregmax）
+
+NFS 客户端默认启用属性缓存：
+- `acregmin=3`（普通文件最小缓存 3 秒）
+- `acregmax=60`（普通文件最大缓存 60 秒）
+
+这意味着在一个终端写入历史文件后的 3-60 秒内，其他终端看到的文件大小可能是旧的。当多个 tmux 窗口几乎同时执行命令时，竞争条件几乎必然发生。
+
+### 原因 3：多机器共享同一个 NFS home 目录
+
+如果你从不同的机器（不同的 NFS 客户端）登录到同一个 home 目录，问题更严重——不同机器之间的属性缓存完全独立，竞争窗口更大。
+
+## 解决方案
+
+### 方案 A：使用 flock 加锁写入（推荐，最简单）
+
+将 `PROMPT_COMMAND` 中的 `history -a` 替换为带文件锁的版本：
+
+```bash
+# 替换 env-bash.sh 中的 PROMPT_COMMAND 行为：
+__history_append_safe() {
+    # 使用 flock 对历史文件加排他锁后再追加
+    (
+        flock -x 200
+        history -a
+    ) 200>"${HISTFILE}.lock"
+}
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__history_append_safe"
+```
+
+优点：改动最小，多终端安全。`flock` 在 NFS v4 上可以正常工作（NFS v4 原生支持文件锁），你的挂载是 `vers=4.2`，所以支持。
+
+缺点：每次命令执行后有一次锁操作，但开销极小（微秒级）。
+
+### 方案 B：每个终端独立历史文件 + 定期合并（最安全）
+
+每个 shell 会话使用自己的历史文件，彻底避免并发问题：
+
+```bash
+# 每个会话独立的历史文件
+export HISTFILE=~/.bash_history_sessions/hist_$(hostname)_$$
+
+# 确保目录存在
+mkdir -p ~/.bash_history_sessions
+
+# 退出时合并到主文件（加锁）
+__merge_history_on_exit() {
+    (
+        flock -x 200
+        cat "$HISTFILE" >> ~/.bash_eternal_history
+    ) 200>~/.bash_eternal_history.lock
+}
+trap __merge_history_on_exit EXIT
+
+# 仍然使用 history -a 实时写入自己的会话文件（无竞争）
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}history -a"
+```
+
+优点：完全无竞争；每个会话的历史独立保存，即使某个文件损坏也不影响其他会话。
+
+缺点：需要定期清理 `~/.bash_history_sessions/` 中的旧文件；查看合并历史需要额外操作。
+
+### 方案 C：禁用 NFS 属性缓存（不推荐，但能解释问题）
+
+挂载时添加 `noac` 或 `actimeo=0`：
+```
+mount -o noac ...
+```
+这会禁用客户端属性缓存，每次文件操作都去服务器确认，但 **性能下降严重**，影响所有文件操作，不建议只为了 history 这么做。
+
+### 方案 D：使用 sqlite 存储历史（高级）
+
+使用 `bash-preexec` + 自定义脚本将历史写入 SQLite 数据库。SQLite 有完善的锁机制，在 NFS 上也能可靠工作（使用 WAL 模式时）。但实现复杂度较高。
+
+## 推荐
+
+**方案 A（flock 加锁）** 是性价比最高的方案。只需修改 `env-bash.sh` 中的一行 PROMPT_COMMAND，即可解决多 tmux 终端的截断问题。NFS v4.2 原生支持 flock，所以这在你的环境中可以可靠工作。
+
+如果你还从多台不同机器登录同一个 home 目录，建议使用 **方案 B（独立文件+合并）**，因为跨机器的 flock 可靠性取决于 NFS 服务器实现。
+
+## 额外建议：修复 .bashrc 中的隐患
+
+`.bashrc` 第 19-20 行设置了 `HISTSIZE=1000` 和 `HISTFILESIZE=2000`，虽然 `env-bash.sh` 后面会覆盖为 -1，但如果某些 shell 会话没有正确 source `env-bash.sh`（比如通过 ssh 执行远程命令时），就会使用这个小值，导致退出时历史文件被截断为 2000 行。建议将 `.bashrc` 中这两行也改为 -1，或者直接注释掉。
+
