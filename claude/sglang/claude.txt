@@ -383,3 +383,6 @@ HF_ENDPOINT=https://hf-mirror.com HF_DATASETS_CACHE=/share/users/like/huggingfac
 sglang日志报cuda out of memory 了，如何解决?  要求：把答案追加在 temp/answer_sgl.md里面
 
 lm_eval离线方式对sglang
+
+你的~/.bash_eternal_history配置，在nfs网络存储上可以工作吗?
+要求：把答案追加在 temp/answer_sgl.md里面
