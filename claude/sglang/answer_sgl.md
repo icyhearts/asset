@@ -7251,3 +7251,101 @@ __history_append_safe() {
 ```
 
 改动只有一处：`( )` → `{ }`。`flock` 仍然通过 fd 200 获取排他锁，`}` 结束时 fd 关闭、锁自动释放，行为和之前一致，但不再有子进程问题。
+
+---
+
+# 非交互式 SSH 命令写入远程主机 History
+
+## 问题
+
+执行 `ssh bjh3 "nvidia-smi"` 时，bjh3 上不会记录 `nvidia-smi` 到历史文件中。
+
+## 原因
+
+非交互式 SSH 在远程主机上执行的是 `bash -c "nvidia-smi"`：
+- 这是一个非交互式 shell（`$-` 中没有 `i`）
+- **没有提示符** → `PROMPT_COMMAND` 永远不会触发 → `history -a` 不会被调用
+- bash 退出时也不会自动保存历史（非交互式 shell 默认不维护历史）
+
+所以 `~/env-bash.sh` 中配置的 `PROMPT_COMMAND` + `history -a` 机制对非交互式 SSH 完全无效。
+
+## 关键发现
+
+经过实际测试验证（OpenSSH 8.9 + bash 5.1.16，Ubuntu）：
+
+**`~/.bashrc` 在非交互式 SSH 命令执行时会被 source。** bash 检测到自己被 sshd 调用时会自动读取 `~/.bashrc`（即使是非交互式）。但 `.bashrc` 中通常有如下守卫代码，会提前退出：
+
+```bash
+# If not running interactively, don't do anything
+case $- in
+    *i*) ;;
+      *) return;;    # ← 非交互式 shell 在这里就退出了
+esac
+```
+
+## 解决方案：在 `~/.bashrc` 守卫代码之前添加记录逻辑
+
+在 `~/.bashrc` 文件的 **最顶部**（`case $-` 之前）插入以下代码：
+
+```bash
+# ============================================================
+# 非交互式 SSH 命令历史记录
+# 当 ssh host "cmd" 执行时，sshd 调用 bash -c "cmd"
+# bash 会 source ~/.bashrc，利用这个时机记录命令
+# ============================================================
+if [[ $- != *i* ]] && [[ -n "$SSH_CONNECTION" ]] && [[ -n "$BASH_EXECUTION_STRING" ]]; then
+    mkdir -p ~/.bash_history_sessions
+    _hf=~/.bash_history_sessions/hist_$(hostname)
+    {
+        flock -x 200
+        printf '#%s\n' "$(date +%s)" >> "$_hf"
+        printf '%s\n' "$BASH_EXECUTION_STRING" >> "$_hf"
+    } 200>"${_hf}.lock"
+fi
+```
+
+### 三个条件缺一不可
+
+| 条件 | 含义 | 为什么需要 |
+|------|------|-----------|
+| `$- != *i*` | 非交互式 shell | 避免和交互式的 PROMPT_COMMAND 机制重复记录 |
+| `-n "$SSH_CONNECTION"` | 是 SSH 会话 | 排除本地 `bash -c` 调用（cron、脚本等） |
+| `-n "$BASH_EXECUTION_STRING"` | bash -c 传入了命令字符串 | 这就是用户要执行的命令，如 `nvidia-smi` |
+
+### `$BASH_EXECUTION_STRING` 是关键
+
+这是 bash 的内置变量，保存了 `bash -c "..."` 中传入的完整命令字符串。当 sshd 调用 `bash -c "nvidia-smi"` 时，`$BASH_EXECUTION_STRING` 的值就是 `nvidia-smi`。
+
+### 最终 `~/.bashrc` 结构
+
+```bash
+# --- 非交互式 SSH 命令记录（必须在 case $- 之前） ---
+if [[ $- != *i* ]] && [[ -n "$SSH_CONNECTION" ]] && [[ -n "$BASH_EXECUTION_STRING" ]]; then
+    mkdir -p ~/.bash_history_sessions
+    _hf=~/.bash_history_sessions/hist_$(hostname)
+    {
+        flock -x 200
+        printf '#%s\n' "$(date +%s)" >> "$_hf"
+        printf '%s\n' "$BASH_EXECUTION_STRING" >> "$_hf"
+    } 200>"${_hf}.lock"
+fi
+
+# --- 原有的守卫代码 ---
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+# ... 后续交互式 shell 配置 ...
+source ~/env-bash.sh
+```
+
+### 注意事项
+
+1. **用 `{ }` 而不是 `( )`**：和上一个问题的结论一致，`{ }` 是分组命令，在当前 shell 执行；`( )` 会创建子 shell。虽然这里是一次性写入（不存在上一个问题中的重复累积问题），但用 `{ }` 是好习惯。
+
+2. **NFS 环境友好**：`~/.bashrc` 在 NFS 上共享，所有主机自动生效。`hist_$(hostname)` 确保每台主机写自己的文件。`flock` 保证多终端并发安全。
+
+3. **不会重复记录**：交互式 shell 走 `PROMPT_COMMAND` + `history -a` 路径，非交互式 SSH 走这段代码。条件 `$- != *i*` 确保互斥。
+
+4. **依赖 bash 被 sshd 调用时自动 source `~/.bashrc`**：这是 bash 文档中描述的行为（bash 检测到 stdin 连接到网络/被 rshd/sshd 调用时会读取 `~/.bashrc`）。在当前系统（OpenSSH 8.9 + bash 5.1.16）上已验证有效。如果在某些系统上不生效，备选方案是设置 `BASH_ENV` 环境变量指向一个包含相同逻辑的脚本。
