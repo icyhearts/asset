@@ -7123,3 +7123,47 @@ PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__history_append_safe"
 
 加锁后，终端 B 在步骤 2 会被阻塞，等终端 A 完成后才能执行，此时读取到的文件大小已经是 1050，从正确的偏移追加。
 
+
+---
+
+# 长时间运行的命令会长时间持有锁吗？
+
+## 结论：不会。
+
+## 原因
+
+锁的获取和释放发生在 `PROMPT_COMMAND` 中，而 **`PROMPT_COMMAND` 仅在命令执行完毕、bash 准备显示下一个提示符之前才会触发**。
+
+时序如下：
+
+```
+1. 你输入: python train.py        （开始跑训练）
+2. bash 把控制权交给 train.py      （bash 在等待子进程结束）
+3.   ... 训练跑了 3 天 ...          （这期间 bash 什么都不做）
+4.   ... PROMPT_COMMAND 没有被触发 ...（没有加锁、没有写历史）
+5.   ... 锁文件没有被任何人持有 ...   （其他终端正常写入历史）
+6. train.py 结束，返回 bash
+7. bash 准备显示提示符 $
+8. 触发 PROMPT_COMMAND → __history_append_safe()
+9.   → flock -x 200     （加锁，微秒级）
+10.  → history -a        （写入 "python train.py" 这一条记录，微秒级）
+11.  → 子 shell 结束     （释放锁）
+12. 显示提示符 $
+```
+
+**锁的持有时间 = 第 9 步到第 11 步 = `history -a` 的执行时间 ≈ 微秒到毫秒级**。与你执行的命令本身耗时多久完全无关。
+
+## 更直观的理解
+
+`PROMPT_COMMAND` 的语义是"在显示 prompt 之前执行"，不是"在命令执行期间持续执行"。它的触发点是：
+
+```
+[命令结束] → [PROMPT_COMMAND 执行] → [显示 $ 提示符] → [等待用户输入]
+```
+
+在长命令执行期间（步骤 2-5），bash 自身处于 `waitpid()` 状态，整个 shell 都是挂起等待的，根本不会执行任何 PROMPT_COMMAND 逻辑。
+
+## 唯一可能的微小阻塞场景
+
+如果**恰好**两个终端在同一毫秒内都完成了命令、同时触发 `PROMPT_COMMAND`，其中一个会等另一个的 `history -a` 完成。但 `history -a` 通常只写几十到几百字节，耗时远小于 1 毫秒，用户完全感知不到。
+
