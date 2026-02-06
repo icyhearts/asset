@@ -7049,3 +7049,77 @@ mount -o noac ...
 
 `.bashrc` 第 19-20 行设置了 `HISTSIZE=1000` 和 `HISTFILESIZE=2000`，虽然 `env-bash.sh` 后面会覆盖为 -1，但如果某些 shell 会话没有正确 source `env-bash.sh`（比如通过 ssh 执行远程命令时），就会使用这个小值，导致退出时历史文件被截断为 2000 行。建议将 `.bashrc` 中这两行也改为 -1，或者直接注释掉。
 
+
+---
+
+# __history_append_safe 函数逐行解释
+
+```bash
+__history_append_safe() {
+```
+定义一个名为 `__history_append_safe` 的函数。以双下划线开头是 shell 编程的惯例，表示这是一个"内部/私有"辅助函数，避免与用户自定义函数名冲突。
+
+```bash
+    (
+```
+开启一个**子 shell（subshell）**。圆括号 `( ... )` 中的命令在一个独立的子进程中执行。这里使用子 shell 的目的是**限制文件描述符 200 的作用域**——子 shell 结束时，fd 200 自动关闭，锁也随之释放。如果不用子 shell 而是用花括号 `{ ... }`，fd 200 会留在当前 shell 中，需要手动关闭。
+
+```bash
+        flock -x 200
+```
+- `flock` 是 Linux 的文件锁工具，对指定的文件描述符加锁
+- `-x` 表示**排他锁（exclusive lock）**，同一时刻只有一个进程能持有该锁。其他进程执行到这里时会**阻塞等待**，直到锁被释放
+- `200` 是文件描述符编号（fd 200），指向后面重定向打开的 `.lock` 文件。选择 200 这个大编号是为了避免与 shell 常用的 fd 冲突（0=stdin, 1=stdout, 2=stderr, 3-9 偶尔被脚本使用）
+
+执行流程：如果另一个终端已经持有锁，当前终端会在这一行**阻塞等待**，直到对方的子 shell 结束释放锁。
+
+```bash
+        history -a
+```
+bash 内置命令，将当前 shell 会话中**尚未写入文件的新历史条目追加**到 `$HISTFILE` 中。注意是"追加（append）"，不是覆盖整个文件。因为前面 `flock -x` 已经拿到了排他锁，所以此时只有当前终端在写历史文件，不会与其他终端竞争。
+
+```bash
+    ) 200>"${HISTFILE}.lock"
+```
+这一行做了两件事：
+1. `)` 关闭子 shell
+2. `200>"${HISTFILE}.lock"` 是 **I/O 重定向语法**：将文件描述符 200 指向 `${HISTFILE}.lock` 文件（即 `~/.bash_eternal_history.lock`）。`>` 表示以写模式打开（如果文件不存在则创建）。这个 fd 200 在子 shell 启动时就会被打开，供内部的 `flock -x 200` 使用
+
+关键机制：子 shell 结束 → fd 200 被关闭 → **flock 自动释放锁**。这保证了锁的持有时间最短，仅覆盖 `history -a` 执行期间。
+
+`.lock` 文件本身的内容无关紧要（通常为空），它仅仅作为锁的"锚点"存在，供多个进程通过 `flock` 协商互斥。
+
+```bash
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__history_append_safe"
+```
+- `PROMPT_COMMAND` 是 bash 的特殊变量，其值会在**每次显示命令提示符之前**被执行（即每次你按回车执行完一条命令后，显示下一个 `$` 提示符之前）
+- `${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}` 是 bash 的**条件参数展开**语法：
+  - 如果 `PROMPT_COMMAND` 已经有值（非空），则展开为 `原有值` + 换行符 `\n`
+  - 如果 `PROMPT_COMMAND` 为空或未设置，则展开为空字符串
+- 效果：将 `__history_append_safe` **追加**到已有的 `PROMPT_COMMAND` 末尾，而不是覆盖它。这样不会破坏其他工具（如 conda、venv 等）设置的 PROMPT_COMMAND
+
+## 整体执行流程（时序）
+
+```
+用户在 tmux 终端 A 输入命令并回车
+  → bash 执行用户命令
+  → bash 准备显示下一个提示符
+  → 触发 PROMPT_COMMAND
+  → 调用 __history_append_safe()
+    → 打开子 shell，fd 200 指向 .lock 文件
+    → flock -x 200（如果终端 B 正在写，这里等待）
+    → 获得锁 → history -a 追加历史到文件
+    → 子 shell 结束 → fd 200 关闭 → 锁释放
+  → 显示提示符 $，等待下一条命令
+```
+
+## 为什么子 shell + flock 这个模式有效？
+
+不加锁时，两个终端同时 `history -a` 可能会：
+1. 终端 A：读取文件大小 = 1000 字节，准备从偏移 1000 写入
+2. 终端 B：读取文件大小 = 1000 字节（NFS 缓存了旧值），准备从偏移 1000 写入
+3. 终端 A：写入 50 字节到偏移 1000，文件变为 1050 字节
+4. 终端 B：写入 80 字节到偏移 1000，**覆盖了终端 A 的数据**，文件变为 1080 字节
+
+加锁后，终端 B 在步骤 2 会被阻塞，等终端 A 完成后才能执行，此时读取到的文件大小已经是 1050，从正确的偏移追加。
+

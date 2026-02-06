@@ -386,3 +386,14 @@ lm_eval离线方式对sglang
 
 ~/env-bash.sh 末尾有一些关于bash_eternal_history的配置， 在nfs网络存储上可以工作吗?为什么我打开多个tmux终端，还是发现了bash_eternal_history文件被截断的现象？如何避免bash_eternal_history被截断
 要求：把答案追加在 temp/answer_sgl.md里面
+
+对方案B的代码进行逐行解释：
+__history_append_safe() {
+    # 使用 flock 对历史文件加排他锁后再追加
+    (
+        flock -x 200
+        history -a
+    ) 200>"${HISTFILE}.lock"
+}
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__history_append_safe"
+要求：把答案追加在 temp/answer_sgl.md里面
