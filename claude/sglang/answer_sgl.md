@@ -7167,3 +7167,87 @@ PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__history_append_safe"
 
 如果**恰好**两个终端在同一毫秒内都完成了命令、同时触发 `PROMPT_COMMAND`，其中一个会等另一个的 `history -a` 完成。但 `history -a` 通常只写几十到几百字节，耗时远小于 1 毫秒，用户完全感知不到。
 
+
+---
+
+# Bash History 重复时间戳问题分析
+
+## 问题现象
+
+`~/.bash_history_sessions/hist_gpu012.rd.sio-software.com` 中同一时间戳非连续地重复出现多次。例如 `#1770361806` 出现了 4 次，`#1770361800` 出现了 19 次，且不是连续排列的。
+
+文件开头的实际内容：
+```
+#1770361800  history
+#1770361806  history -n
+#1770361800  history        ← 重复！
+#1770361808  history -n
+#1770361806  history -n     ← 重复！
+#1770361800  history        ← 重复！
+#1770361808  history -n     ← 重复！
+#1770361806  history -n     ← 重复！
+#1770361800  history        ← 重复！
+...
+```
+
+## 根因：`history -a` 在子 shell `( )` 中执行
+
+问题出在 `~/env-bash.sh` 第 70-75 行：
+
+```bash
+__history_append_safe() {
+    (                              # ← 这里 ( ) 创建了子 shell！
+        flock -x 200
+        history -a
+    ) 200>"${HISTFILE}.lock"
+}
+```
+
+### 为什么子 shell 会导致重复
+
+`history -a` 的工作原理：bash 内部维护一个 **"已写入位置"标记**（internal flush marker），记录上次 `history -a` 写到了内存历史列表的哪个位置。下次调用 `history -a` 时，只追加从该位置之后的新条目。
+
+但 `( )` 创建的是一个 **子进程**（fork）：
+
+1. 用户敲了 `cmd1`，触发 PROMPT_COMMAND
+2. `( )` fork 出子进程，子进程**继承**父 shell 的历史列表和"已写入位置"标记（假设位置 = 0）
+3. 子进程执行 `history -a`，把 `cmd1` 追加到文件，子进程内部标记更新为 1
+4. 子进程退出，**父 shell 的标记仍然是 0**（子进程的修改不会回传给父进程，这是 Unix fork 语义）
+5. 用户敲了 `cmd2`，再次触发 PROMPT_COMMAND
+6. 新的子进程继承父 shell 状态，标记仍然是 0
+7. `history -a` 认为从位置 0 开始都是"未写入"的，于是把 `cmd1` 和 `cmd2` **都追加**到文件
+8. 父 shell 标记依然是 0...
+
+每次 PROMPT_COMMAND 触发，子 shell 都会**把本会话从头到尾所有命令重新追加一遍**。
+
+### 为什么重复不连续
+
+因为同一台主机上有**多个终端/tmux 窗格**共用同一个 HISTFILE，各终端的 PROMPT_COMMAND 交替触发，写入顺序是交错的：
+
+```
+时刻1: 终端A的PROMPT_COMMAND → 追加 [A的全部命令]
+时刻2: 终端B的PROMPT_COMMAND → 追加 [B的全部命令]
+时刻3: 终端A的PROMPT_COMMAND → 再次追加 [A的全部命令]  ← 重复
+时刻4: 终端B的PROMPT_COMMAND → 再次追加 [B的全部命令]  ← 重复
+```
+
+所以文件中 A 和 B 的命令交替出现，同一时间戳的重复项之间夹杂着其他终端的命令。
+
+### 数据验证
+
+从实际数据来看，`#1770361800`（`history` 命令）出现了 **19 次**，说明该终端此后又触发了大约 19 次 PROMPT_COMMAND，每次都把这条最早的命令重新追加了一遍。越早的命令重复次数越多，越晚的越少——完全符合上述分析。
+
+## 修复方法
+
+将 `( )` 子 shell 改为 `{ }` 分组命令（group command）。`{ }` 在**当前 shell** 中执行，`history -a` 可以正确更新父 shell 的"已写入位置"标记：
+
+```bash
+__history_append_safe() {
+    {
+        flock -x 200
+        history -a
+    } 200>"${HISTFILE}.lock"
+}
+```
+
+改动只有一处：`( )` → `{ }`。`flock` 仍然通过 fd 200 获取排他锁，`}` 结束时 fd 关闭、锁自动释放，行为和之前一致，但不再有子进程问题。
