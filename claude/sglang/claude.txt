@@ -400,3 +400,10 @@ PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__history_append_safe"
 
 对于加锁的方案,如果一个终端在执行一个很长的命令，比如要跑几天的训练任务,会长时间持有锁导致其他终端长时间无法写入历史文件吗？
 要求：把答案追加在 temp/answer_sgl.md里面
+
+按照 ~/env-bash.sh的配置，按主机把历史文件写入 ~/.bash_history_sessions中以 hist_$hostname 命名的文件中，
+为什么会出现相同时间的命令记录？而且相同时间的命令出现的不是连续的，是间隔几行出现相同的时间戳，
+比如: hist_gpu012.rd.sio-software.com里面1770361806这个时间戳出现了4次，而且不连续出现。这是什么原因？
+
+现在的环境是使用nfs, 一个主机上有多个终端，多个tmux终端。
+要求：把答案追加在 temp/answer_sgl.md里面
