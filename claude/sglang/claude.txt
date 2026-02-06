@@ -407,3 +407,10 @@ PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__history_append_safe"
 
 现在的环境是使用nfs, 一个主机上有多个终端，多个tmux终端。
 要求：把答案追加在 temp/answer_sgl.md里面
+
+如何让非交互式ssh在远程主机执行的命令也写入到history文件中
+比如我当前在node01主机上，我执行:
+ssh bjh3 "nvidia-smi"
+我希望bjh3机上中能够记录下nvidia-smi这个历史
+
+要求：把答案追加在 temp/answer_sgl.md里面
