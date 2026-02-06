@@ -384,5 +384,5 @@ sglang日志报cuda out of memory 了，如何解决?  要求：把答案追加�
 
 lm_eval离线方式对sglang
 
-你的~/.bash_eternal_history配置，在nfs网络存储上可以工作吗?
+~/env-bash.sh 末尾有一些关于bash_eternal_history的配置， 在nfs网络存储上可以工作吗?为什么我打开多个tmux终端，还是发现了bash_eternal_history文件被截断的现象？如何避免bash_eternal_history被截断
 要求：把答案追加在 temp/answer_sgl.md里面
