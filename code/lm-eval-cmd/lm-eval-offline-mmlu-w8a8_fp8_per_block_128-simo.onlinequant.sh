@@ -2,7 +2,7 @@ set -x
 # task name: mmlu mmlu_pro  wikitext
 task_name=mmlu
 nowstr=$(date +%Y_%m_%d___%H_%M_%S)
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=6
 export SIMO_SGLANG_REGISTER=1
 tp_size=1
 
@@ -13,4 +13,5 @@ lm_eval --model sglang \
     --model_args "{${model_args_base}}" \
     --tasks $task_name \
     --batch_size auto \
-    --output_path ./results/${task_name}_deepseek_v2_lite_simo-w4a16.$config_file.$nowstr > temp/${task_name}_deepseek_v2_lite-offline_w4a16.log.$config_file.$nowstr 2>&1 &
+    --output_path ./results/${task_name}_deepseek_v2_lite_simo-w8a8.$config_file.$nowstr > temp/${task_name}_deepseek_v2_lite-offline_w8a8-per_block.log.$config_file.$nowstr 2>&1 
+echo "lm eval done"
