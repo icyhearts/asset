@@ -2,6 +2,7 @@ set -x
 # task name: mmlu mmlu_pro  wikitext
 task_name=mmlu
 nowstr=$(date +%Y_%m_%d___%H_%M_%S)
+export CUDA_VISIBLE_DEVICES=6
 export SIMO_SGLANG_REGISTER=1
 tp_size=1
 
