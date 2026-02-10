@@ -7,7 +7,7 @@ export SIMO_SGLANG_REGISTER=1
 tp_size=1
 
 model_path="/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/"
-model_args_base="\"pretrained\": \"${model_path}\",  \"tp_size\": ${tp_size}, \"dtype\": \"auto\", \"mem_fraction_static\": 0.75"
+model_args_base="\"pretrained\": \"${model_path}\",  \"tp_size\": ${tp_size}, \"dtype\": \"auto\", \"mem_fraction_static\": 0.5"
 lm_eval --model sglang \
     --model_args "{${model_args_base}}" \
     --tasks $task_name \
