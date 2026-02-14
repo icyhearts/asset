@@ -7755,3 +7755,58 @@ nvidia-smi
 CUDA_VISIBLE_DEVICES=6 lm-eval --model sglang --model_args '...' --tasks mmlu --batch_size auto
 ```
 
+
+---
+
+# GPU Reset 仍然失败 — Fabric Manager 阻塞 (2026-02-14 续)
+
+## 问题
+
+`lm-eval` 已经 kill，`lsof` 确认无用户进程持有 GPU 设备文件，但 `nvidia-smi -i 0 -r` 仍然报 "In use by another client"。
+
+## 原因
+
+这是 NVSwitch 拓扑（8×H100）的特殊情况。`nv-fabricmanager` (PID 1085769) 负责管理所有 GPU 之间的 NVSwitch fabric 互联。它在驱动层面持有所有 GPU 的控制权，即使 `lsof` 看不到它直接打开 `/dev/nvidia*` 设备文件，但它通过 NVSwitch 管理通道锁定了 GPU。
+
+确认状态：
+```
+所有 GPU 的 Fabric State: Completed, Status: Success
+GPU 0,1,2,3,4,7: GPU Recovery Action: Reset（仍然需要 reset）
+GPU 5,6: GPU Recovery Action: None（正常）
+```
+
+## 解决步骤（需要 sudo）
+
+必须先停 fabricmanager，再 reset GPU，最后重启 fabricmanager：
+
+```bash
+# 第 1 步：停止 Fabric Manager
+sudo systemctl stop nvidia-fabricmanager
+# 如果 systemctl 不行，直接 kill：
+# sudo kill 1085769
+
+# 第 2 步：Reset 所有异常 GPU
+sudo nvidia-smi -i 0 -r
+sudo nvidia-smi -i 1 -r
+sudo nvidia-smi -i 2 -r
+sudo nvidia-smi -i 3 -r
+sudo nvidia-smi -i 4 -r
+sudo nvidia-smi -i 7 -r
+
+# 第 3 步：重启 Fabric Manager
+sudo systemctl start nvidia-fabricmanager
+# 如果 systemctl 不行：
+# sudo /usr/bin/nv-fabricmanager -c /usr/share/nvidia/nvswitch/fabricmanager.cfg &
+
+# 第 4 步：验证
+nvidia-smi
+nvidia-smi -q 2>/dev/null | grep -E "(GPU 0000|GPU Recovery Action)" | paste - -
+```
+
+验证预期结果：
+- 所有 GPU 利用率回到 0%
+- 所有 GPU 的 `GPU Recovery Action` 变为 `None`
+- Fabric State 重新变为 `Completed`
+
+**注意**：停止 fabricmanager 会影响 GPU 5 上正在运行的 `perf_bench` 进程。如果 `perf_bench` 需要保留，需要提前考虑。如果可以接受 `perf_bench` 中断，则直接执行上述步骤。
+
