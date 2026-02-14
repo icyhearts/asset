@@ -7570,3 +7570,108 @@ CUDA_VISIBLE_DEVICES=6 python your_script.py
 2. 与集群管理员沟通 `gpu-monitor` 的配置，避免其占满 GPU SM 影响正常使用
 3. 考虑将 `gpu-monitor` 配置为只做轻量级检测而非 GPU 压力测试
 
+
+---
+
+# GPU 利用率异常分析（续）— 停止 gpu-monitor 后问题仍存在 (2026-02-14)
+
+## 修正结论
+
+停止 `gpu-monitor` 后问题未解决，说明 `gpu-monitor` 不是根因。
+
+## 真正的根因：GPU 硬件状态异常，需要 GPU Reset
+
+### 关键证据
+
+**`GPU Recovery Action: Reset`** — 这是决定性证据：
+
+```
+GPU 0 (19:00.0)  → GPU Recovery Action: Reset    ← 异常 (100% util, 0 MiB)
+GPU 1 (3B:00.0)  → GPU Recovery Action: Reset    ← 异常 (99% util, 0 MiB)
+GPU 2 (4C:00.0)  → GPU Recovery Action: Reset    ← 异常 (100% util, 0 MiB)
+GPU 3 (5D:00.0)  → GPU Recovery Action: Reset    ← 异常 (99% util, 0 MiB)
+GPU 4 (9B:00.0)  → GPU Recovery Action: Reset    ← 异常 (100% util, 0 MiB)
+GPU 5 (BB:00.0)  → GPU Recovery Action: None     ← 正常 (perf_bench 运行中)
+GPU 6 (CB:00.0)  → GPU Recovery Action: None     ← 正常 (空闲)
+GPU 7 (DB:00.0)  → GPU Recovery Action: Reset    ← 异常 (89% util, 0 MiB)
+```
+
+完美对应：所有异常 GPU（0,1,2,3,4,7）都显示 `GPU Recovery Action: Reset`，正常 GPU（5,6）显示 `None`。
+
+### 其他佐证
+
+1. **"System is not in ready state"** — 异常 GPU 的多个字段返回此状态：
+   - `GPU T.Limit Temp: System is not in ready state`
+   - `Max Clocks (Graphics/SM/Memory/Video): System is not in ready state`
+   - 这表明 GPU 内部状态机已陷入错误状态
+
+2. **高功耗但无进程** — 异常 GPU 功耗远高于空闲水平：
+   - GPU 1: 624W（满载级别功耗！而空闲 H100 约 60-80W）
+   - GPU 0: 233W, GPU 2: 300W, GPU 3: 339W, GPU 4: 220W, GPU 7: 247W
+   - SM 被卡死在执行状态，持续消耗大量电力
+
+3. **SM 时钟在最大频率** — 所有异常 GPU 的 SM 时钟维持在 1980 MHz（满频），但 Clocks Event Reasons 显示 `Idle: Active`，这是矛盾的：驱动认为 GPU 空闲，但 SM 实际在满载运行
+
+4. **无 ECC 错误** — SRAM/DRAM 纠错计数全为 0，NvLink 无错误。说明不是硬件损坏，而是 GPU 计算引擎状态异常（可能由之前崩溃的 CUDA 进程留下的僵尸 kernel 导致）
+
+### 根因推断
+
+之前某个 CUDA 进程（可能是多 GPU 训练/推理任务）在 GPU 0,1,2,3,4,7 上崩溃或被强制 kill，导致：
+- GPU 上正在执行的 CUDA kernel 没有正常终止
+- GPU SM 单元陷入"卡死"状态，持续报告 100% 利用率
+- 进程已退出所以没有显存占用，但 SM 硬件状态未被清理
+- NVIDIA 驱动检测到异常，标记 `GPU Recovery Action: Reset`
+
+## 解决方案
+
+### 方案 1：GPU Reset（需要 sudo，推荐）
+
+逐个 reset 异常 GPU：
+
+```bash
+# 对每个异常 GPU 执行 reset
+sudo nvidia-smi -i 0 -r
+sudo nvidia-smi -i 1 -r
+sudo nvidia-smi -i 2 -r
+sudo nvidia-smi -i 3 -r
+sudo nvidia-smi -i 4 -r
+sudo nvidia-smi -i 7 -r
+
+# 验证
+nvidia-smi
+```
+
+注意：如果 reset 失败报错 "GPU is in use"，需要先确保没有进程持有该 GPU 的文件描述符。
+
+### 方案 2：重新加载 NVIDIA 驱动（需要 sudo，如果方案 1 失败）
+
+```bash
+# 先 kill 所有使用 GPU 的进程
+sudo fuser -k /dev/nvidia*
+
+# 卸载并重新加载驱动
+sudo rmmod nvidia_uvm
+sudo rmmod nvidia_drm
+sudo rmmod nvidia_modeset
+sudo rmmod nvidia
+
+# 重新加载
+sudo modprobe nvidia
+sudo modprobe nvidia_uvm
+
+# 验证
+nvidia-smi
+```
+
+### 方案 3：重启机器（如果方案 1 和 2 都失败）
+
+```bash
+sudo reboot
+```
+
+### 建议的执行顺序
+
+1. 先尝试方案 1（GPU Reset），影响最小
+2. 如果某些 GPU reset 失败，尝试方案 2（重新加载驱动），但这会影响所有 GPU 上正在运行的进程（包括 GPU 5 上的 perf_bench 和 GPU 6 上的 sglang）
+3. 最后手段才用方案 3（重启）
+
