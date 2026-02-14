@@ -7675,3 +7675,83 @@ sudo reboot
 2. 如果某些 GPU reset 失败，尝试方案 2（重新加载驱动），但这会影响所有 GPU 上正在运行的进程（包括 GPU 5 上的 perf_bench 和 GPU 6 上的 sglang）
 3. 最后手段才用方案 3（重启）
 
+
+---
+
+# GPU Reset 失败分析 — 进程持有 GPU 设备文件 (2026-02-14 续)
+
+## Reset 失败原因
+
+`lm-eval` 进程 (PID 1676303) 及其子进程持有 GPU 0,1,2,3,4,7 的设备文件描述符，导致 `nvidia-smi -r` 无法执行：
+
+```
+PID 1676303  lm-eval          → 打开了 /dev/nvidia{0,1,2,3,4,7}
+PID 1676884  python3.12       → 打开了 /dev/nvidia{0,1,2,3,4,7} (multiprocessing resource tracker)
+PID 1676886  sglang::scheduler → 打开了 /dev/nvidia{0,1,2,3,4,7}
+PID 1676887  sglang::detokenizer → 打开了 /dev/nvidia{0,1,2,3,4,7}
+```
+
+**原因**：`lm-eval` 启动 sglang server 时没有设置 `CUDA_VISIBLE_DEVICES`，sglang 的 PyTorch 初始化对所有 8 张可见 GPU 创建了 CUDA context。虽然 `tp_size=1` 只在 GPU 6 上实际做推理，但其他 GPU 的 CUDA context 已经被打开并处于卡死状态。
+
+此外，`nv-fabricmanager` (PID 1085769, root) 也可能阻止 reset。
+
+## 解决步骤
+
+### 第 1 步：Kill lm-eval 进程树（不需要 sudo）
+
+```bash
+# kill 整个进程树
+kill 1676303
+
+# 如果普通 kill 无效（进程可能卡死），用 kill -9
+kill -9 1676886 1676887 1676884 1676303
+```
+
+### 第 2 步：确认设备文件已释放
+
+```bash
+lsof /dev/nvidia0 /dev/nvidia1 /dev/nvidia2 /dev/nvidia3 /dev/nvidia4 /dev/nvidia7 2>/dev/null
+```
+
+应该没有任何进程持有这些设备了（perf_bench 只持有 nvidia5）。
+
+### 第 3 步：执行 GPU Reset（需要 sudo）
+
+```bash
+sudo nvidia-smi -i 0 -r
+sudo nvidia-smi -i 1 -r
+sudo nvidia-smi -i 2 -r
+sudo nvidia-smi -i 3 -r
+sudo nvidia-smi -i 4 -r
+sudo nvidia-smi -i 7 -r
+```
+
+如果仍然失败（可能被 `nv-fabricmanager` 阻塞），需要：
+
+```bash
+# 暂停 fabricmanager 后再 reset
+sudo systemctl stop nvidia-fabricmanager
+sudo nvidia-smi -i 0 -r
+sudo nvidia-smi -i 1 -r
+sudo nvidia-smi -i 2 -r
+sudo nvidia-smi -i 3 -r
+sudo nvidia-smi -i 4 -r
+sudo nvidia-smi -i 7 -r
+sudo systemctl start nvidia-fabricmanager
+```
+
+### 第 4 步：验证
+
+```bash
+nvidia-smi
+# 确认 GPU 0,1,2,3,4,7 利用率回到 0%，GPU Recovery Action 变为 None
+```
+
+### 预防建议
+
+以后启动 lm-eval 时务必指定 `CUDA_VISIBLE_DEVICES`：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 lm-eval --model sglang --model_args '...' --tasks mmlu --batch_size auto
+```
+
