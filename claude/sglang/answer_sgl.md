@@ -7810,3 +7810,79 @@ nvidia-smi -q 2>/dev/null | grep -E "(GPU 0000|GPU Recovery Action)" | paste - -
 
 **注意**：停止 fabricmanager 会影响 GPU 5 上正在运行的 `perf_bench` 进程。如果 `perf_bench` 需要保留，需要提前考虑。如果可以接受 `perf_bench` 中断，则直接执行上述步骤。
 
+
+---
+
+# GPU Reset 再次失败 — 深入分析 (2026-02-14 续)
+
+## 新发现
+
+### Fabric Manager 日志揭示了根本原因
+
+```
+Feb 13 17:36:38 NVSwitch port connected to GPU 6 ... experienced an NVLink fatal error
+Feb 13 17:36:38 NVSwitch port connected to GPU 7 ... experienced an NVLink fatal error
+```
+
+**NVLink 在 2 月 13 日就发生了 fatal error**，影响了 NVSwitch 端口。这解释了为什么多张 GPU 的 SM 被卡死——NVLink 通信故障导致 GPU 上挂起的操作无法完成。
+
+### 当前状态
+
+- Fabric Manager 已成功停止
+- 所有用户进程已退出（nvidia-smi 显示 "No running processes"）
+- lsof 未发现任何进程持有 nvidia 设备文件
+- 但 `nvidia-smi -i 0 -r` 仍报 "In use by another client"
+
+### 剩余阻塞者
+
+1. **`dcgm-exporter` (PID 2675292)** — DCGM 通过驱动管理 API（非设备文件）访问 GPU，lsof 看不到，但它可能阻止 reset
+2. **Persistence Mode: Enabled** — 驱动常驻内存
+3. **NVSwitch 拓扑限制** — 8×H100 NVSwitch 配置下，可能需要同时 reset 所有 GPU
+
+## 解决步骤（需要 sudo，按顺序执行）
+
+```bash
+# 第 1 步：Kill dcgm-exporter
+sudo kill 2675292
+
+# 第 2 步：尝试 reset 所有 GPU（不指定 -i，一次性 reset 全部）
+sudo nvidia-smi -r
+
+# 如果上面不行，逐个尝试：
+# sudo nvidia-smi -i 0 -r && sudo nvidia-smi -i 1 -r && sudo nvidia-smi -i 2 -r && sudo nvidia-smi -i 3 -r && sudo nvidia-smi -i 4 -r && sudo nvidia-smi -i 7 -r
+```
+
+### 如果仍然失败：重新加载驱动
+
+```bash
+# 先关闭 persistence mode
+sudo nvidia-smi -pm 0
+
+# 卸载驱动模块（按依赖顺序）
+sudo rmmod nvidia_uvm
+sudo rmmod nvidia_drm
+sudo rmmod nvidia_modeset  
+sudo rmmod nvidia
+
+# 重新加载
+sudo modprobe nvidia
+sudo modprobe nvidia_uvm
+
+# 恢复 persistence mode
+sudo nvidia-smi -pm 1
+
+# 重启 Fabric Manager
+sudo systemctl start nvidia-fabricmanager
+
+# 重启 dcgm-exporter（如果需要）
+# sudo systemctl start dcgm-exporter  # 或查看它的启动方式
+```
+
+### 如果 rmmod 报 "Module is in use"：最后手段
+
+```bash
+sudo reboot
+```
+
+重启后记得检查 fabricmanager 和其他服务是否自动启动。
+
