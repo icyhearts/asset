@@ -7886,3 +7886,72 @@ sudo reboot
 
 重启后记得检查 fabricmanager 和其他服务是否自动启动。
 
+
+---
+
+# GPU Reset 全部失败 — 驱动内部状态锁死 (2026-02-14 续)
+
+## 分析
+
+`lsof /dev/nvidia*` 完全没有输出——没有任何用户态进程持有 GPU 设备文件。但 `nvidia-smi -r` 仍然报 "In use by another client"。
+
+关键发现 — `lsmod` 输出：
+```
+nvidia    11530240  40  nvidia_uvm,nvidia_peermem,nvidia_modeset
+nvidia_uvm  1757184  4
+```
+
+`nvidia` 模块的引用计数为 **40**，远高于正常值（persistence mode + 8 GPU 约为 11-12）。这说明 NVLink fatal error 导致驱动内部的引用计数没有正确释放，驱动状态已锁死。`nvidia-smi -r` 在这种情况下无法工作。
+
+## 结论
+
+**2 月 13 日的 NVLink fatal error 破坏了 NVIDIA 驱动内部状态**，导致：
+- GPU SM 卡死在执行状态（100% 利用率）
+- 驱动内部引用计数泄漏（40 个引用）
+- `nvidia-smi -r` 无法 reset（驱动认为 GPU 仍被占用）
+- 只能通过重载驱动或重启机器解决
+
+## 解决方案（需要 sudo）
+
+### 方案 1：尝试重载驱动（可能失败）
+
+```bash
+# 关闭 persistence mode
+sudo nvidia-smi -pm 0
+
+# 按依赖顺序卸载模块
+sudo rmmod nvidia_peermem
+sudo rmmod nvidia_uvm
+sudo rmmod nvidia_drm
+sudo rmmod nvidia_modeset
+sudo rmmod nvidia
+
+# 如果上面任何一步报 "Module is in use"，说明无法卸载，只能 reboot
+
+# 如果卸载成功，重新加载
+sudo modprobe nvidia
+sudo modprobe nvidia_uvm
+sudo modprobe nvidia_peermem
+
+# 恢复 persistence mode
+sudo nvidia-smi -pm 1
+
+# 重启 Fabric Manager
+sudo systemctl start nvidia-fabricmanager
+```
+
+### 方案 2：重启机器（最可靠）
+
+鉴于驱动内部状态已严重异常（引用计数泄漏 + NVLink fatal error），**重启是最可靠的方案**：
+
+```bash
+sudo reboot
+```
+
+重启后验证：
+```bash
+nvidia-smi
+nvidia-smi -q 2>/dev/null | grep -E "(GPU 0000|GPU Recovery Action)" | paste - -
+# 预期所有 GPU Recovery Action 都是 None
+```
+
