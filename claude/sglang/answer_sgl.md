@@ -7486,3 +7486,87 @@ nvidia-smi
 ```
 
 这和交互式 shell 通过 `history -a` 写入的格式完全一致，所以 `history` 命令能正常读取和显示这些记录。
+
+---
+
+# GPU 利用率异常分析 (2026-02-14)
+
+## 现象
+
+- GPU 0, 1, 2, 3, 4, 7：显存占用 0 MiB，但 GPU SM 利用率 89%~100%
+- GPU 5：`perf_bench` 进程正常使用（79120 MiB 显存，100% 利用率）
+- GPU 6：空闲（0% 利用率，0 MiB 显存）
+- 无法在这些 GPU 上启动新进程
+
+## 根因分析
+
+**罪魁祸首：`gpu-monitor` 系统守护进程 (PID 4167)**
+
+### 关键证据
+
+1. **`gpu-monitor` 进程异常**：
+   ```
+   PID 4167, root 用户, 79.2% CPU 占用
+   自 Jan 23 起持续运行, 累计 CPU 时间 17天5小时
+   命令: /usr/local/bin/gpu-monitor --config=/etc/gpu-monitor/config.yaml
+   ```
+   该进程是 Kubernetes 集群的 GPU 健康监控守护进程，配置了每 5 秒检测一次。它可能在 GPU 上持续运行 CUDA 诊断/压力测试 kernel，这些操作：
+   - 占用 GPU SM（计算单元）至接近 100%
+   - 不分配显著的 GPU 显存（显示 0 MiB）
+   - 以系统/驱动层级运行，**不会在 `nvidia-smi` 的进程列表中显示**
+
+2. **`nvidia-smi pmon` 确认无用户进程**：
+   ```
+   GPU 0-4, 7: 无进程, 但 SM 利用率 89-100%
+   GPU 5: perf_bench (PID 235798), 99% SM
+   GPU 6: 无进程, 0% SM
+   ```
+
+3. **GPU 温度异常提示**：
+   ```
+   GPU 0,1,2,3,4,7: "GPU T.Limit Temp: System is not in ready state"
+   GPU 5: "GPU T.Limit Temp: 34 C" (正常)
+   GPU 6: "GPU T.Limit Temp: 55 C" (正常)
+   ```
+   问题 GPU 显示 "System is not in ready state"，说明系统级组件在这些 GPU 上执行了某些操作导致其处于非正常就绪状态。
+
+4. **`lm-eval` 进程 (PID 1643662) 打开了所有 8 张 GPU 的设备文件**：
+   ```
+   lm-eval 通过 lsof 显示打开了 /dev/nvidia0 到 /dev/nvidia7
+   但 nvidia-smi 不显示它在任何 GPU 上有显存占用
+   ```
+   `lm-eval` 以 `--model sglang` 启动时，sglang 内部初始化了对所有 GPU 的 CUDA context（因为没有设置 `CUDA_VISIBLE_DEVICES`，尽管 `tp_size=1`），这可能也加剧了 GPU 的占用状态。
+
+5. **`dcgm-exporter` (PID 2675292) 也在运行**，它与 `gpu-monitor` 配合做 GPU 指标采集，可能也参与了 GPU 占用。
+
+## 结论
+
+主要原因是 **`gpu-monitor` 系统守护进程**（root 运行）在 GPU 0,1,2,3,4,7 上持续运行诊断/监控 CUDA kernel，导致 SM 利用率满载。次要原因是 **`lm-eval` 进程**未设置 `CUDA_VISIBLE_DEVICES` 而打开了所有 GPU 设备文件。
+
+## 解决方案
+
+### 立即解决（需要 sudo）
+
+```bash
+# 方案1：停止 gpu-monitor 守护进程（需要 sudo）
+sudo kill 4167
+# 或
+sudo systemctl stop gpu-monitor
+
+# 方案2：同时清理 lm-eval 进程（如果它已经卡住不需要了）
+kill 1643662
+```
+
+### 临时绕过（不需要 sudo）
+
+```bash
+# 在启动新任务时，只使用 GPU 6（当前唯一真正空闲的 GPU）
+CUDA_VISIBLE_DEVICES=6 python your_script.py
+```
+
+### 长期预防
+
+1. 启动 `lm-eval` 或 sglang 时始终设置 `CUDA_VISIBLE_DEVICES`，避免初始化不需要的 GPU
+2. 与集群管理员沟通 `gpu-monitor` 的配置，避免其占满 GPU SM 影响正常使用
+3. 考虑将 `gpu-monitor` 配置为只做轻量级检测而非 GPU 压力测试
+
