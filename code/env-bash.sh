@@ -51,7 +51,7 @@ export HISTFILESIZE=-1      # 历史文件的最大行数（-1 = 无限）
 export HISTTIMEFORMAT="%F %T  "
 
 # 4. 忽略重复和空格开头的命令（可选）
-export HISTCONTROL=ignoreboth
+#export HISTCONTROL=ignoreboth
 
 # 5. 多终端安全写入的核心配置
 # -a: 立即追加当前会话的新命令到历史文件（不覆盖）
