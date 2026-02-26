@@ -1,0 +1,6 @@
+set -x
+#VPN=v10.mioffice.cn
+VPN=vpn.corp.kuaishou.com
+/opt/cisco/anyconnect/bin/vpn disconnect $VPN
+ifconfig
+set +x

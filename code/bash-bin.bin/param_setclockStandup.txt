@@ -1,0 +1,1 @@
+notify-send -u critical "小心腰椎间盘突出和腰肌劳损,站起来"

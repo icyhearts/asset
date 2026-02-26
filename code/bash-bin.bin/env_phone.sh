@@ -1,0 +1,2 @@
+export K30=c63f2106
+export REDMI5P=888fd3620904

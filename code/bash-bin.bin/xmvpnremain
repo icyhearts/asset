@@ -1,0 +1,3 @@
+set -x
+/opt/cisco/anyconnect/bin/vpn stats  v.mioffice.cn | grep "Connection Information" -A 6
+set +x
