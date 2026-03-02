@@ -107,6 +107,8 @@ pip install . --no-build-isolation
 如何修复?
 要求：把答案追加在 temp/answer_sgl.md里面
 
+vllm的代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo
+sglang的代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src
 simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对vllm的method进行了扩展，支持nvfp4的量化。
 对于SIMOLinearMethod 
 init函数会在nvfp4数据类型的时候，初始化self.global_scale_factor.
@@ -167,5 +169,6 @@ output = torch.matmul(qdq_x, dq_w.T)
 在apply里面调用fused_experts_impl进行fused_experts的计算.
 
 simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod对 sglang的method进行了扩展，还不支持nvfp4的量化。
+下面是我的需求:
 参考simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对nvfp4的支持，修改simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod,使其支持nvfp4格式量化。
 可以把 sglang simo里面的SIMOLinearMethod里面的F.Linear和vllm_simo里面一样，换成torch.matmul
