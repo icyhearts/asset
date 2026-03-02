@@ -107,6 +107,6 @@ pip install . --no-build-isolation
 如何修复?
 要求：把答案追加在 temp/answer_sgl.md里面
 
-simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod，支持nvfp4的量化。
-simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod，还不支持nvfp4的量化。
-
+simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对vllm的method进行了扩展，支持nvfp4的量化。
+simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod对 sglang的method进行了扩展，还不支持nvfp4的量化。
+参考simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对nvfp4的支持，修改simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod,使其支持nvfp4格式量化。
