@@ -106,3 +106,6 @@ pip install . --no-build-isolation
 为什么没有把 simo/extensions/sglang_simo/layers/目录安装到/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/simo/extensions/sglang_simo/目录?
 如何修复?
 要求：把答案追加在 temp/answer_sgl.md里面
+
+simo/extensions/vllm_simo/quantization/quantization_method.py里面，支持nvfp4的量化。
+
