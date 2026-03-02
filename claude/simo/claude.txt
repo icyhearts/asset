@@ -110,6 +110,9 @@ pip install . --no-build-isolation
 simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对vllm的method进行了扩展，支持nvfp4的量化。
 对于SIMOLinearMethod 
 init函数会在nvfp4数据类型的时候，初始化self.global_scale_factor.
+在create_weights里面注册 weight_global_scale:
+layer.register_parameter("weight_global_scale", weight_global_scale)
+
 
 
 simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod对 sglang的method进行了扩展，还不支持nvfp4的量化。
