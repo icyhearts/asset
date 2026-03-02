@@ -138,7 +138,19 @@ original_weight_loader(layer.weight_global_scale, layer.unified_global_scale, **
         / self.global_scale_factor
       )
 
+然后input除以global input scale:
+ input_2d = (input_2d.to(torch.float32) / layer.input_global_scale).to(input_2d.dtype)
+input downcast:
+input_q, input_scale = self.input_downcast_kernel(input_2d)
+input upcast:
 
+ qdq_x = self.input_upcast_kernel(input_q, input_scale, output_dtype)
+
+对权重进行up cast:
+dq_w = self.weight_upcast_kernel(layer.weight, layer.weight_scale, output_dtype)
+
+进行最终的matmul:
+output = torch.matmul(qdq_x, dq_w.T)
 
 simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod对 sglang的method进行了扩展，还不支持nvfp4的量化。
 参考simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对nvfp4的支持，修改simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod,使其支持nvfp4格式量化。
