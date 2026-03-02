@@ -113,7 +113,24 @@ init函数会在nvfp4数据类型的时候，初始化self.global_scale_factor.
 在create_weights里面注册 weight_global_scale:
 layer.register_parameter("weight_global_scale", weight_global_scale)
 
+在online_weight_loader里面，对 weight_global_scale进行数据填充操作:
+original_weight_loader(layer.weight_global_scale, layer.unified_global_scale, **kwargs)
+还会生成 unified_global_scale:
+      if self.global_scale_factor is not None:
+        if len(layer.logical_widths) > 1 and hasattr(layer, "unified_global_scale"):
+          unified_global_scale = layer.unified_global_scale 
+        else:
+          unified_global_scale = (
+            loaded_weight.abs().to(torch.float32).amax() / self.global_scale_factor
+          )
+          layer.unified_global_scale = unified_global_scale
 
+在apply函数里面:
+生成 input_global_scale
+   layer.input_global_scale = (
+        input_2d.abs().to(torch.float32).amax(dim=-1, keepdim=True).clamp_min(1e-12)
+        / self.global_scale_factor
+      )
 
 simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod对 sglang的method进行了扩展，还不支持nvfp4的量化。
 参考simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对nvfp4的支持，修改simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod,使其支持nvfp4格式量化。
