@@ -125,12 +125,20 @@ original_weight_loader(layer.weight_global_scale, layer.unified_global_scale, **
           )
           layer.unified_global_scale = unified_global_scale
 
+对权重进行 除以globa scale:
+        loaded_weight = loaded_weight.to(torch.float32) / unified_global_scale
+再进行down cast:
+      packed_weight, weight_scale = self.weight_downcast_kernel(loaded_weight)
+
+
 在apply函数里面:
 生成 input_global_scale
    layer.input_global_scale = (
         input_2d.abs().to(torch.float32).amax(dim=-1, keepdim=True).clamp_min(1e-12)
         / self.global_scale_factor
       )
+
+
 
 simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod对 sglang的method进行了扩展，还不支持nvfp4的量化。
 参考simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对nvfp4的支持，修改simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod,使其支持nvfp4格式量化。
