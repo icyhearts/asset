@@ -12,5 +12,5 @@ lm_eval --model sglang \
     --model_args "{${model_args_base}}" \
     --tasks $task_name \
     --batch_size auto \
-    --output_path ./results/${task_name}_deepseek_v2_lite_simo.$config_file.$nowstr > temp/${task_name}_deepseek_v2_litelog.$config_file.$nowstr 2>&1 
+    --output_path ./results/${task_name}_deepseek_v2_lite_simo.$config_file.$nowstr > temp/${task_name}_deepseek_v2_litelog.$config_file.$nowstr 2>&1 &
 echo "lm eval done"
