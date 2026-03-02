@@ -157,7 +157,8 @@ output = torch.matmul(qdq_x, dq_w.T)
     if hasattr(layer, "input_global_scale") and layer.input_global_scale is not None:
       output = output * layer.input_global_scale
 
-对于
+对于 SIMOFusedMoEMethod
+同样是在init函数对 self.global_scale_factor进行初始化
 
 
 simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod对 sglang的method进行了扩展，还不支持nvfp4的量化。
