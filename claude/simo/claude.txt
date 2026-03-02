@@ -173,5 +173,7 @@ simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod�
 参考simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod和SIMOFusedMoEMethod对nvfp4的支持，修改simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod和SIMOFusedMoEMethod,使其支持nvfp4格式量化。
 可以把 sglang simo里面的SIMOLinearMethod里面的F.Linear和vllm_simo里面一样，换成torch.matmul
 
-参考simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod, apply函数,output的shape和dtype是按如下方式确定的 ：
+simo/extensions/vllm_simo/quantization/quantization_method.py里面SIMOLinearMethod, apply函数,output的shape和dtype是按如下方式确定的 ：
     return output.to(dtype=input.dtype).view(*output_shape)
+
+修改simo/extensions/sglang_simo/quantization/quantization.py里面SIMOLinearMethod, apply函数，返回output的dtype和shape推导方式，也和vllm_simo保持一致。
