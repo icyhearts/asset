@@ -880,3 +880,185 @@ DeepSeek-V2-Lite使用MLA（Multi-head Latent Attention）架构，`kv_b_proj`�
 | 数值精度累积误差 | 低 | 低 |
 
 **最可能的原因**是MMLU测试在nvfp4相关代码修复完成之前运行。建议在所有修复完成并重新安装后，使用完全相同的config文件重新测试。
+
+---
+
+## 24. 深度分析：修复后SGLang nvfp4 MMLU仍为0.4378（2026-03-03）
+
+### 24.1 问题背景
+
+所有之前的代码修复（get_downcast_kernel、get_upcast_kernel、apply方法、global_scale_factor支持）已应用并重新安装（`pip install -e . --no-build-isolation`）。但SGLang nvfp4 MMLU得分仍为**0.4378**，与vLLM的**0.5298**相差0.092。
+
+kv_b_proj在SGLang中被正确排除，因为DeepSeek-V2的SGLang实现中，kv_b_proj不通过linear.forward()前向计算，而是直接使用torch.bmm对权重进行矩阵乘法（见`deepseek_v2.py`的`q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)`），量化后的权重会导致dtype不匹配。
+
+### 24.2 关键证据：只有nvfp4出现问题
+
+对比所有量化格式的MMLU得分：
+
+| 格式 | vLLM | SGLang | 差异 |
+|------|------|--------|------|
+| w8a8_fp8_per_block | 0.5683 | 0.5687 | +0.0004 |
+| w8a8_fp8_per_channel | 0.5604 | 0.5607 | +0.0003 |
+| w6a6_mxfp | 0.5624 | 0.5652 | +0.0028 |
+| w4a16_int4 | 0.5444 | 0.5531 | +0.0087 |
+| w4a4_mxfp | 0.4908 | 0.4915 | +0.0007 |
+| **w4a4_nvfp** | **0.5298** | **0.4378** | **-0.0920** |
+
+**所有其他格式SGLang和vLLM得分几乎完全一致（差异<0.01），唯独nvfp4相差0.092。** 这证明问题出在nvfp4特有的代码路径中，而非框架级别的差异。
+
+### 24.3 穷举代码对比结果
+
+对以下nvfp4特有的代码路径进行了逐行对比，均发现功能等价：
+
+| 代码路径 | SGLang文件:行号 | vLLM文件:行号 | 结论 |
+|----------|----------------|---------------|------|
+| `get_downcast_kernel` | quantization.py:296-340 | quantization_method.py:85-128 | **完全相同** |
+| `get_upcast_kernel` | quantization.py:342-372 | quantization_method.py:131-161 | **完全相同** |
+| `online_moe_weight_loader` | quantization.py:1032-1117 | quantization_method.py:605-694 | **完全相同** |
+| `SIMOLinearMethod.apply()` | quantization.py:935-968 | quantization_method.py:386-440 | **功能等价** |
+| `SIMOFusedMoEMethod.apply()` | quantization.py:1323-1358 | quantization_method.py:967-1006 | **调用相同函数** |
+| `fused_experts_impl` | fused_moe.py:1-367 | 共享代码 | **完全相同** |
+| `create_weights`（MoE） | quantization.py:1120-1242 | quantization_method.py:696-851 | **功能等价** |
+| `process_weights_after_loading` | quantization.py:1244-1288 | quantization_method.py:853-895 | **功能等价** |
+| `global_scale_factor计算` | quantization.py:1017-1023 | quantization_method.py:587-593 | **完全相同** |
+| `_load_per_tensor_weight_scale` | layer.py:325-344 | vLLM layer等价 | **功能等价** |
+
+### 24.4 发现的关键架构差异：FusedMoEQuantConfig创建时机
+
+**这是唯一发现的结构性差异。**
+
+#### vLLM的延迟初始化（正确方式）
+
+```
+vLLM FusedMoE.__init__:
+  1. create_weights() → 创建空参数
+  2. 权重加载 → 填充参数数据
+  3. process_weights_after_loading() → 重新包装参数
+  4. 首次推理时 ensure_moe_quant_config_init() → 延迟创建FusedMoEQuantConfig
+```
+
+vLLM的`FusedMoE`层实现了延迟初始化模式（`layer.py:1486-1492`）：
+```python
+def ensure_moe_quant_config_init(self):
+    if self.quant_method.moe_quant_config is None:
+        # Note: the moe_quant_config can't be constructed until after
+        # weight loading post processing.
+        self.quant_method.moe_quant_config = (
+            self.quant_method.get_fused_moe_quant_config(self)
+        )
+```
+
+注释明确说明：**"moe_quant_config不能在权重加载后处理完成之前构建"**。
+
+#### SGLang的提前初始化（可能有问题）
+
+```
+SGLang FusedMoE.__init__:
+  1. create_weights() → 创建空参数
+  2. create_moe_runner() → 立即创建FusedMoEQuantConfig ← ⚠️ 权重还未加载！
+  3. 权重加载 → 填充参数数据
+  4. process_weights_after_loading() → 重新包装参数
+```
+
+SGLang的`FusedMoE.__init__`（`layer.py:292-306`）在权重加载之前就调用了`create_moe_runner()`：
+```python
+self.quant_method.create_weights(layer=self, ...)  # 步骤1
+self.quant_method.create_moe_runner(self, self.moe_runner_config)  # 步骤2 - 此时权重为空！
+```
+
+### 24.5 引用有效性分析
+
+`FusedMoEQuantConfig`存储的是参数对象的**引用**（而非副本）：
+
+```python
+# create_moe_runner中：
+self.moe_quant_config = FusedMoEQuantConfig.make(
+    w1_scale=layer.w13_weight_scale,         # 引用到Parameter对象
+    g1_alphas=layer.w13_weight_global_scale,  # 引用到Parameter对象
+    ...
+)
+```
+
+理论上引用应该保持有效：
+- **global scale**: `w13_weight_global_scale`在`process_weights_after_loading`中**不被替换**，权重加载通过in-place修改`param.data[expert_id][idx]`填充数据，引用有效
+- **weight scale**: `w13_weight_scale`在`process_weights_after_loading`中**被替换**为新Parameter，但如果`.contiguous()`是no-op（已经连续），新旧Parameter共享同一底层存储
+
+**但是，如果底层tensor在process_weights_after_loading中因`.contiguous()`创建了新拷贝（原tensor不连续），则旧引用指向的数据可能是正确的但不是最终的。**
+
+### 24.6 为什么其他格式不受影响
+
+其他量化格式（mxfp4、fp8等）不需要`global_scale`，也不使用`FusedMoEQuantConfig`中的`alpha_or_gscale`字段。它们仍然使用`_w1.scale`引用，但由于scale数据通过in-place操作加载到已连续的tensor中，即使引用指向旧Parameter，数据仍然正确。
+
+**nvfp4的独特之处**在于它使用了`alpha_or_gscale`（全局缩放因子），这是nvfp4特有的功能。如果这个引用因为任何原因（如PyTorch内部的tensor别名管理）变得无效或读到未初始化的值，就会导致精度问题。
+
+### 24.7 推荐的运行时调试方案
+
+由于静态代码分析无法确定最终根因（代码路径功能等价），需要通过运行时插桩对比中间值：
+
+#### 方案1：验证global scale引用有效性
+
+在SGLang的`SIMOFusedMoEMethod.apply()`开头添加一次性检查：
+```python
+# 在apply()方法开头添加（仅第一次调用时打印）
+if not hasattr(self, '_debug_checked'):
+    self._debug_checked = True
+    gs = self.moe_quant_config._w1.alpha_or_gscale
+    print(f"[DEBUG] g1_alphas is layer ref: {gs is layer.w13_weight_global_scale}")
+    print(f"[DEBUG] g1_alphas data_ptr match: {gs.data_ptr() == layer.w13_weight_global_scale.data_ptr()}")
+    print(f"[DEBUG] g1_alphas values: {gs}")
+    print(f"[DEBUG] layer.w13_weight_global_scale values: {layer.w13_weight_global_scale}")
+
+    ws = self.moe_quant_config._w1.scale
+    print(f"[DEBUG] w1_scale is layer ref: {ws is layer.w13_weight_scale}")
+    print(f"[DEBUG] w1_scale data_ptr match: {ws.data_ptr() == layer.w13_weight_scale.data_ptr()}")
+```
+
+#### 方案2：对比权重加载后的global scale值
+
+在`process_weights_after_loading`结尾添加：
+```python
+if hasattr(layer, 'w13_weight_global_scale'):
+    print(f"[DEBUG] w13_weight_global_scale: {layer.w13_weight_global_scale}")
+    print(f"[DEBUG] w2_weight_global_scale: {layer.w2_weight_global_scale}")
+```
+
+#### 方案3：对比fused_experts_impl的中间值
+
+在`fused_experts_impl`的全局scale计算处添加：
+```python
+if use_nvfp4_global_scale:
+    print(f"[DEBUG] g1_alphas: {g1_alphas}")
+    print(f"[DEBUG] g2_alphas: {g2_alphas}")
+    print(f"[DEBUG] g1_alphas is None: {g1_alphas is None}")
+    print(f"[DEBUG] g1_alphas.shape: {g1_alphas.shape if g1_alphas is not None else 'N/A'}")
+    print(f"[DEBUG] global_scale_factor: {global_scale_factor}")
+```
+
+#### 方案4（最直接）：修复timing问题
+
+将SGLang的`create_moe_runner`改为延迟初始化模式，与vLLM一致：
+
+```python
+# 在SIMOFusedMoEMethod.apply()中延迟创建moe_quant_config：
+def apply(self, layer, dispatch_output):
+    if self.moe_quant_config is None:
+        self.moe_quant_config = self._create_moe_quant_config(layer)
+    # ... 原有逻辑
+```
+
+**这是最可能解决问题的方案**，因为它直接复制了vLLM已验证工作的延迟初始化模式。
+
+### 24.8 总结
+
+| 发现 | 详情 |
+|------|------|
+| **问题范围** | 仅nvfp4受影响，其他5种格式正常 |
+| **代码对比** | 所有nvfp4相关代码路径功能等价 |
+| **架构差异** | SGLang提前创建FusedMoEQuantConfig，vLLM延迟创建 |
+| **根因推测** | FusedMoEQuantConfig中对weight_scale/global_scale的引用可能因提前创建而指向未加载或被替换的Parameter |
+| **建议修复** | 将create_moe_runner改为延迟初始化（方案4），或先运行方案1验证引用有效性 |
+
+**优先级排序**：
+1. 先运行方案1（验证引用），确认是否是timing问题
+2. 如果引用无效 → 实施方案4（延迟初始化）
+3. 如果引用有效 → 运行方案3，逐步对比fused_experts_impl中间值
