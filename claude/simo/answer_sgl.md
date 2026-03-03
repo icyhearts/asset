@@ -748,3 +748,135 @@ ls -la $(python3 -c "import simo.extensions.sglang_simo as m; import os; print(o
 1. **每个包目录都包含 `__init__.py` 文件**（即使是空文件）
 2. **整个包层级链上的每一级都有 `__init__.py`** — 如果中间某一级缺少，其下所有子包都不会被 `find_packages()` 发现
 3. 可以通过 `python3 -c "from setuptools import find_packages; print(find_packages())"` 快速验证包发现是否正确
+
+---
+
+## 23. nvfp4 (w4a4_nvfp) 量化：SGLang MMLU=0.4434 vs vLLM MMLU=0.5298 差异分析
+
+### 测试环境
+
+| 项目 | vLLM | SGLang |
+|------|------|--------|
+| conda环境 | simo_vllm | simo_sglang |
+| 代码路径 | simo/extensions/vllm_simo/ | simo/extensions/sglang_simo/ |
+| 模型 | DeepSeek-V2-Lite-Chat | DeepSeek-V2-Lite-Chat |
+| 量化配置 | quant_config_w4a4_nvfp.json | quant_config_w4a4_nvfp.json |
+| MMLU得分 | **0.5298** | **0.4434** |
+| 差距 | — | **-0.0864 (16.3%相对下降)** |
+
+### 23.1 根因一（最可能）：量化配置文件不同
+
+两个框架使用的量化配置文件**名称相同但内容不同**：
+
+**vLLM配置** (`simo/extensions/vllm_simo/example/.../quant_config_w4a4_nvfp.json`):
+```json
+{
+    "excludes": [
+        "lm_head",
+        "*visual*"
+    ],
+    "flash_comm": "fast_all2all"
+}
+```
+
+**SGLang配置** (`simo/extensions/sglang_simo/example/.../quant_config_w4a4_nvfp.json`):
+```json
+{
+    "excludes": [
+        "lm_head",
+        "*visual*",
+        "re:.*kv_b_proj"
+    ],
+    "flash_comm": null
+}
+```
+
+**关键差异**：
+
+| 配置项 | vLLM | SGLang | 影响 |
+|--------|------|--------|------|
+| `excludes` | 2项 | 3项（多了`re:.*kv_b_proj`） | SGLang不量化kv_b_proj |
+| `flash_comm` | `"fast_all2all"` | `null` | 通信优化差异 |
+
+**`re:.*kv_b_proj` 排除的影响**：
+
+DeepSeek-V2-Lite使用MLA（Multi-head Latent Attention）架构，`kv_b_proj`是将潜在空间投影回KV空间的关键层。在SGLang配置中排除`kv_b_proj`的量化，意味着该层保持原始精度。
+
+但这里的矛盾是：**排除量化通常应该提升精度而非降低精度**。因此配置差异不是导致SGLang得分更低的直接原因，但它改变了量化的总体行为模式。
+
+**但需要注意**：如果用户运行时使用的是不同路径的config文件，则需要确认实际使用的是哪个config。从日志中确认：
+- vLLM日志显示excludes为`["lm_head", "*visual*"]`
+- SGLang日志显示excludes为`["lm_head", "*visual*", "re:.*kv_b_proj"]`
+
+### 23.2 根因二：quantization代码实现差异（已修复但可能残留问题）
+
+在本次会话中修复了以下SGLang实现问题：
+
+#### 修复1：`get_downcast_kernel` 不支持nvfp4的e4m3 scale mode
+
+**修复前**：只处理`e8m0_*`系列scale mode，nvfp4的`e4m3`返回`None`导致运行时crash。
+
+**修复后**：使用`ObserverMode.from_string()`和`ScaleModeEnum.from_string()`通用处理所有MX格式。
+
+#### 修复2：`get_upcast_kernel` 带有不必要的nvfp4特殊参数
+
+**修复前**：nvfp4路径传入`global_amax`和`shard_sizes`参数。
+
+**修复后**：简化为与vLLM一致的简单lambda。
+
+#### 修复3：`apply`方法output shape/dtype处理
+
+**修复前**：直接用`output.view(*x.shape[:-1], output.shape[-1])`，缺少dtype转换。
+
+**修复后**：使用`output.to(dtype=x.dtype).view(*output_shape)`与vLLM一致。
+
+#### 修复4：添加nvfp4 global scale支持
+
+添加了`global_scale_factor`计算、`weight_global_scale`参数注册、`input_global_scale`计算等完整的nvfp4两级scale机制。
+
+**这些修复在测试时是否已经全部生效需要确认**。如果MMLU测试是在所有修复完成之前运行的，则得分低是因为代码bug而非框架差异。
+
+### 23.3 根因三：框架级差异
+
+即使量化代码完全一致，SGLang和vLLM在以下方面仍有差异：
+
+1. **Attention实现**：SGLang和vLLM使用不同的attention backend（FlashAttention/FlashInfer等），数值精度可能略有不同
+2. **MLA实现细节**：DeepSeek-V2的MLA在两个框架中的实现可能有差异
+3. **Token采样**：logprob计算和采样策略的差异
+4. **Tokenizer/Chat template处理**：可能影响输入格式
+
+### 23.4 验证建议
+
+1. **使用完全相同的config文件**：将vLLM的config（不排除kv_b_proj）用于SGLang测试，消除配置差异
+   ```bash
+   # 复制vllm config到sglang
+   cp simo/extensions/vllm_simo/example/.../quant_config_w4a4_nvfp.json \
+      simo/extensions/sglang_simo/example/.../quant_config_w4a4_nvfp.json
+   ```
+
+2. **确认所有代码修复已生效**：重新安装simo包后运行测试
+   ```bash
+   conda activate simo_sglang
+   pip install -e . --no-build-isolation
+   ```
+
+3. **对比不量化的基线**：在两个框架上运行不量化的MMLU测试，确认基线是否一致
+   ```bash
+   # 不带 --quantization simo 参数运行
+   ```
+
+4. **逐步排除法**：
+   - 只量化weight不量化activation（w4a16），对比两个框架
+   - 排除MoE层只量化attention层，对比两个框架
+   - 使用相同config排除kv_b_proj，对比两个框架
+
+### 23.5 结论
+
+| 可能原因 | 可能性 | 影响程度 |
+|----------|--------|----------|
+| **代码bug未完全修复（修复前运行测试）** | **高** | **高** |
+| 配置文件差异（excludes/flash_comm不同） | 中 | 中 |
+| 框架级attention/MLA实现差异 | 中 | 中-低 |
+| 数值精度累积误差 | 低 | 低 |
+
+**最可能的原因**是MMLU测试在nvfp4相关代码修复完成之前运行。建议在所有修复完成并重新安装后，使用完全相同的config文件重新测试。
