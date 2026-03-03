@@ -203,6 +203,9 @@ simo_sglang的日志位于 ：logs-2026-3-3-14-19/DeepSeek-V2-Lite-Chat-16B_A2.4
 
 要求：把答案追加在 temp/answer_sgl.md里面
 
-现在使用的是修复后的代码，并重新安装
+现在使用的是修复后的代码，并重新安装:
    pip install -e . --no-build-isolation
+simo_sglang lm-eval测试的日志位于:
 logs_2026_03_03___17_33_09/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
+kv_b_proj之所以要exclude，是因为deepseek 模型sglang的实现，kv_b_proj不是直接使用linear.forward函数进行前向，而是
+得分是0.4378,没有区别。继续分析原因
