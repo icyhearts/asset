@@ -202,3 +202,7 @@ simo_sglang的日志位于 ：logs-2026-3-3-14-19/DeepSeek-V2-Lite-Chat-16B_A2.4
 为什么同样是w4a4_nvfp量化，simo_sglang比simo_vllm得分少很多？分析原因
 
 要求：把答案追加在 temp/answer_sgl.md里面
+
+现在使用的是修复后的代码，并重新安装
+   pip install -e . --no-build-isolation
+logs_2026_03_03___17_33_09/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
