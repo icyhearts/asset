@@ -194,3 +194,11 @@ lm-eval 使用simo_vllm 进行w4a4 nvfp4量化 mmlu任务测试的命令是 ：
 
 lm-eval 使用simo_sglang 进行w4a4 nvfp4量化 mmlu任务测试的命令是 ：
 /share_data/users/like/miniconda3/envs/simo_sglang/bin/python3.12 /share_data/users/like/miniconda3/envs/simo_sglang/bin/lm-eval --model sglang --model_args {"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_nvfp.json"}", "tp_size": 1, "dtype": "auto", "mem_fraction_static": 0.5} --tasks mmlu --batch_size auto
+
+simo_vllm 的日志位于: logs_simo_1524/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log, mmlu得分是 0.5298,
+
+simo_sglang的日志位于 ：logs-2026-3-3-14-19/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log, mmlu得分 0.4434|
+
+为什么同样是w4a4_nvfp量化，simo_sglang比simo_vllm得分少很多？分析原因
+
+要求：把答案追加在 temp/answer_sgl.md里面
