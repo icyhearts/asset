@@ -1062,3 +1062,101 @@ def apply(self, layer, dispatch_output):
 1. 先运行方案1（验证引用），确认是否是timing问题
 2. 如果引用无效 → 实施方案4（延迟初始化）
 3. 如果引用有效 → 运行方案3，逐步对比fused_experts_impl中间值
+
+---
+
+## 25. 方案1调试结果分析（2026-03-04）
+
+### 25.1 调试输出总结
+
+日志文件：`logs_2026_03_04___11_45_22/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log`
+
+共26个MoE层输出调试信息，**每个层的结论完全一致**：
+
+| 检查项 | 结果 | 含义 |
+|--------|------|------|
+| `g1_alphas is layer ref` | **全部 True** | config引用和layer参数是同一对象 |
+| `g1_alphas data_ptr match` | **全部 True** | 底层数据指针完全一致 |
+| `g2_alphas is layer ref` | **全部 True** | w2全局scale引用有效 |
+| `g2_alphas data_ptr match` | **全部 True** | 底层数据指针完全一致 |
+| `w1_scale is layer ref` | **全部 False** | process_weights_after_loading替换了Parameter对象 |
+| `w1_scale data_ptr match` | **全部 True** | 但底层存储相同（.contiguous()是no-op） |
+
+### 25.2 全局scale值分析
+
+**g1_alphas（w13_weight_global_scale）**：每个层所有64个expert值相同（unified），不同层有不同值：
+
+```
+Layer 1:  5.6312e-05  (weight_amax ≈ 0.151)
+Layer 2:  2.0000e-04  (weight_amax ≈ 0.538)
+Layer 3:  6.3942e-05  (weight_amax ≈ 0.172)
+Layer 4:  8.1380e-05  (weight_amax ≈ 0.219)
+...
+```
+
+值在 `5.6e-05` ~ `2.0e-04` 范围内，对应原始权重 amax 在 `0.15` ~ `0.54` 范围内。对于 `global_scale_factor = 6.0 * 448.0 = 2688.0`，这些值合理且正常。
+
+**g2_alphas（w2_weight_global_scale）**：每个expert有独立值（per-expert），第一层示例：
+```
+expert 0: 1.2788e-04   expert 1: 1.1408e-04   expert 2: 1.2062e-04 ...
+```
+范围 `8.0e-05` ~ `2.0e-04`，合理。
+
+**g1_alphas 和 layer.w13_weight_global_scale 值完全一致**，g2_alphas 和 layer.w2_weight_global_scale 值也完全一致。
+
+### 25.3 结论：timing假设被排除
+
+**FusedMoEQuantConfig提前创建（timing）假设被彻底排除。** 尽管SGLang在权重加载前就创建了config：
+
+1. 全局scale参数未被`process_weights_after_loading`替换，引用始终有效
+2. 权重scale虽然Parameter对象被替换（`is layer ref: False`），但底层存储未变（`data_ptr match: True`），因为`.contiguous()`对已连续tensor是no-op
+3. 所有26个MoE层的全部引用均通过验证
+
+### 25.4 MMLU得分变化
+
+| 运行 | 得分 | 与vLLM差距 |
+|------|------|-----------|
+| 修复前（0303） | 0.4378 | -0.0920 |
+| 本次运行（0304） | **0.4630** | **-0.0668** |
+| vLLM参考 | 0.5298 | 0 |
+
+得分从0.4378提升到0.4630（+0.025），但未做代码修改（仅添加调试打印）。这可能来自：
+- CUDA非确定性（不同GPU状态、调度顺序）
+- 或0.4378本身就在随机波动范围内
+
+**无论如何，0.4630仍低于vLLM的0.5298，存在0.067的差距。**
+
+### 25.5 排除总结与下一步分析方向
+
+**已排除的假设：**
+- ~~FusedMoEQuantConfig提前创建导致引用无效~~ → 引用全部有效
+- ~~全局scale值未正确加载~~ → 值正确且一致
+- ~~w1_scale底层数据不一致~~ → data_ptr匹配
+
+**MoE路径已验证正确，问题可能在以下未验证的路径：**
+
+1. **LINEAR层的nvfp4全局scale**：q_proj、kv_a_proj_with_mqa、o_proj、gate_up_proj、down_proj等attention和shared_expert linear层也使用nvfp4全局scale。需要验证：
+   - `layer.weight_global_scale`在`process_weights_after_loading`后是否正确（PerTensorScaleParameter → .max() → 标量）
+   - 对于merged projection（如gate_up_proj有2个shard），unified_global_scale是否正确应用
+
+2. **权重加载顺序差异**：`unified_w13_global_scale`由第一个加载的w1/w3权重的amax决定。如果SGLang和vLLM的权重迭代顺序不同，可能计算出不同的全局scale，导致不同的量化噪声。
+   - 建议：在`online_moe_weight_loader`中添加打印，记录第一次计算unified_w13_global_scale时的expert_id和shard_id
+   - 在vLLM侧添加相同打印进行对比
+
+3. **对比vLLM的全局scale值**：在vLLM的`SIMOFusedMoEMethod.apply`中添加相同的调试打印，对比每一层的g1_alphas和g2_alphas数值是否与SGLang一致
+
+4. **fused_experts_impl中间值对比**：在`fused_experts_impl`中添加打印，对比以下中间值：
+   ```python
+   # 在fused_experts_impl的chunk循环中添加（仅第一次打印）
+   if chunk == 0 and not hasattr(fused_experts_impl, '_debug_checked'):
+       fused_experts_impl._debug_checked = True
+       print(f"[DEBUG-FE] w1 upcast sample: {w1[0, 0, :8]}")
+       print(f"[DEBUG-FE] input sample: {curr_hidden_states[0, :8]}")
+       print(f"[DEBUG-FE] w1_output_scale: {w1_output_scale}")
+       print(f"[DEBUG-FE] cache1 sample: {intermediate_cache1[0, 0, :8]}")
+   ```
+
+**建议优先级：**
+1. **方案3**（对比vLLM全局scale值）：最快定位差异来源
+2. **方案2**（检查权重加载顺序）：如果scale值不同，确认是否因加载顺序导致
+3. **方案4**（fused_experts_impl中间值对比）：如果scale值相同，深入对比推理计算
