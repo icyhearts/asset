@@ -217,3 +217,10 @@ kv_b_proj之所以要exclude，是因为deepseek 模型sglang的实现， python
 方案A：对比权重加载产生的全局scale数值（最高优先级）
 方案B：对比LINEAR层全局scale数值
 方案C：逐层输出对比
+
+
+sglang的日志位于temp/logs_sglang_simo_2026_03_04___17_17_46/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
+vllm的日志位于   temp/logs_vllm_simo_2026_03_04___18_27_02/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
+
+
+lm-eval --model vllm报错了，日志位于temp/logs_vllm_simo_2026_03_04___17_39_16, 分析日志，修复问题 
