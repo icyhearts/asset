@@ -209,7 +209,7 @@ simo_sglang lm-eval测试的日志位于: logs_2026_03_03___17_33_09/DeepSeek-V2
 kv_b_proj之所以要exclude，是因为deepseek 模型sglang的实现， python/sglang/srt/models/deepseek_v2.py里面, kv_b_proj不是直接使用linear.forward函数进行前向，而是直接使用torch.bmm把输入和linear layer的权重进行矩阵乘法，如果对权重进行量化，无法走到simo linear method自定义的apply函数，torch.bmm会把bp16 input和量化后的权重进行bmm，类型不匹配。实现见.
 继续分析原因, 要求：把答案追加在 temp/answer_sgl.md里面
 
-`
+
 在SGLang的`SIMOFusedMoEMethod.apply()`开头添加一次性检查这个修改已经加上，lm-eval测试的日志在 logs_2026_03_04___11_45_22/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log, 分析一下这个日志，
 要求：把答案追加在 temp/answer_sgl.md里面
 
