@@ -213,4 +213,7 @@ kv_b_proj之所以要exclude，是因为deepseek 模型sglang的实现， python
 在SGLang的`SIMOFusedMoEMethod.apply()`开头添加一次性检查这个修改已经加上，lm-eval测试的日志在 logs_2026_03_04___11_45_22/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log, 分析一下这个日志，
 要求：把答案追加在 temp/answer_sgl.md里面
 
-现在你帮我把你提到的4种方案的调试打印都加上。
+现在你帮我把以下方案的调试打印都加上:
+方案A：对比权重加载产生的全局scale数值（最高优先级）
+方案B：对比LINEAR层全局scale数值
+方案C：逐层输出对比
