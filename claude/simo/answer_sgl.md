@@ -1160,3 +1160,187 @@ expert 0: 1.2788e-04   expert 1: 1.1408e-04   expert 2: 1.2062e-04 ...
 1. **方案3**（对比vLLM全局scale值）：最快定位差异来源
 2. **方案2**（检查权重加载顺序）：如果scale值不同，确认是否因加载顺序导致
 3. **方案4**（fused_experts_impl中间值对比）：如果scale值相同，深入对比推理计算
+
+---
+
+## 26. 穷举代码对比分析（2026-03-04 session 3）
+
+### 26.1 分析范围
+
+在MoE timing假设被排除后，对SGLang和vLLM的SIMO nvfp4代码路径进行了**完全穷举对比**，覆盖以下所有代码路径：
+
+| 代码路径 | SGLang文件 | vLLM文件 | 对比结果 |
+|---------|-----------|---------|---------|
+| get_downcast_kernel | sglang quantization.py:296 | vllm quantization_method.py:85 | ✅ 完全相同 |
+| get_upcast_kernel | sglang quantization.py:342 | vllm quantization_method.py:131 | ✅ 完全相同 |
+| LINEAR create_weights | sglang quantization.py:849-933 | vllm quantization_method.py:303-384 | ✅ 功能等价 |
+| LINEAR process_weights_after_loading | sglang quantization.py:786-810 | vllm quantization_method.py:210-261 | ✅ nvfp4路径等价 |
+| LINEAR apply | sglang quantization.py:935-968 | vllm quantization_method.py:386-440 | ✅ 功能等价 |
+| LINEAR online_weight_loader | sglang quantization.py:813-847 | vllm quantization_method.py:263-301 | ✅ 完全相同 |
+| MoE create_weights | sglang quantization.py:1120-1242 | vllm quantization_method.py:696-851 | ✅ 功能等价 |
+| MoE process_weights_after_loading | sglang quantization.py:1244-1288 | vllm quantization_method.py:853-895 | ✅ 完全相同 |
+| MoE online_moe_weight_loader | sglang quantization.py:1032-1117 | vllm quantization_method.py:605-694 | ✅ 完全相同 |
+| MoE create_moe_runner / get_fused_moe_quant_config | sglang quantization.py:1290-1321 | vllm quantization_method.py:897-921 | ✅ 参数相同 |
+| MoE apply → fused_experts_impl | sglang quantization.py:1323-1377 | vllm quantization_method.py:967-1006 | ✅ 同一函数 |
+| fused_experts_impl | simo/.../fused_moe.py:15-366 | 同一文件 | N/A |
+| dispatch_fused_moe_kernel | simo/.../fused_moe_triton_kernels.py | 同一文件 | N/A |
+| FusedMoEQuantConfig.make | simo/.../config.py:264-364 | 同一文件 | N/A |
+| QuantizeSpecMX | simo/quantization/config.py:411-474 | 同一文件 | N/A |
+| parse_quantize_spec | 两者都调用同一函数 | 同一文件 | N/A |
+
+### 26.2 确认的关键参数一致性
+
+对于nvfp4_e2m1量化：
+
+```
+nvfp4 spec解析结果（两个框架完全相同）:
+  ├─ 类型: QuantizeSpecMX (不是QuantizeSpecFP)
+  ├─ dtype: "nvfp4_e2m1"
+  ├─ scale_mode: "e4m3" → ScaleModeEnum.E4M3
+  ├─ observer_mode: "abs_max" → ObserverMode.ABS_MAX
+  ├─ block_size: 16 (从group_size=16同步)
+  ├─ group_size: 16
+  └─ axis: -1
+
+weight_granularity: PER_GROUP (QuantizeSpecMX → always PER_GROUP)
+input_granularity: PER_GROUP
+global_scale_factor: 6.0 * 448.0 = 2688.0
+
+downcast_kernel: downcast_to_mxfmt(..., dtype=nvfp4_e2m1, block_size=16, scale_mode=e4m3)
+upcast_kernel: upcast_from_mxfmt(..., dtype=nvfp4_e2m1)
+
+FusedMoEQuantConfig:
+  ├─ _a1.dtype = "nvfp4_e2m1" → use_nvfp4_w4a4 = True
+  ├─ _w1.dtype = "nvfp4_e2m1"
+  ├─ block_shape = [0, 16] (PER_GROUP)
+  ├─ _w1.alpha_or_gscale = layer.w13_weight_global_scale
+  ├─ _w2.alpha_or_gscale = layer.w2_weight_global_scale
+  └─ fast_all2all = False (TP=1, dp_size=1)
+```
+
+### 26.3 fast_all2all分析
+
+**SGLang**: `self.fast_all2all = False` (硬编码, quantization.py:1025)
+**vLLM**: `self.fast_all2all = (dp_size > 1 and use_ep and flash_comm == "fast_all2all" and ...)` (quantization_method.py:595-600)
+
+在TP=1测试中，vLLM的dp_size=1，所以`fast_all2all = False`。两个框架在fused_experts_impl中走**完全相同的路径**（非fast_all2all路径）。
+
+### 26.4 config差异分析
+
+| 配置项 | SGLang | vLLM | 影响 |
+|-------|--------|------|------|
+| excludes | `["lm_head", "*visual*", "re:.*kv_b_proj"]` | `["lm_head", "*visual*"]` | SGLang排除kv_b_proj → **应该更有利于SGLang** |
+| flash_comm | null | "fast_all2all" | TP=1时无影响 |
+| 其他参数 | 相同 | 相同 | 无影响 |
+
+**kv_b_proj排除影响**: SGLang中kv_b_proj使用bf16未量化权重（因为torch.bmm直接使用权重，不经过linear.forward），理论上应该**提高**精度。vLLM中kv_b_proj被nvfp4量化。因此config差异不能解释SGLang精度更低的现象。
+
+### 26.5 SGLang FusedMoE层的_load_per_tensor_weight_scale差异
+
+发现SGLang和vLLM的`_load_per_tensor_weight_scale`有一个细微差异：
+
+**SGLang** (`sglang/.../fused_moe_triton/layer.py:325-344`):
+```python
+if shard_id in ("w1", "w3"):
+    idx = 0 if shard_id == "w1" else 1
+    if self.moe_runner_config.is_gated:        # ← 额外的is_gated检查
+        param_data[expert_id][idx] = loaded_weight
+    else:
+        param_data[expert_id] = loaded_weight   # ← 非gated时覆盖整行
+```
+
+**vLLM** (`vllm/.../fused_moe/layer.py:907-911`):
+```python
+if shard_id in ("w1", "w3"):
+    idx = 0 if shard_id == "w1" else 1
+    param_data[expert_id][idx] = loaded_weight  # ← 总是按索引存储
+```
+
+**影响评估**: DeepSeek-V2-Lite使用SiLU gated MoE，`is_gated=True`，所以两者走相同路径。**无影响**。
+
+### 26.6 结论
+
+**穷举对比结果：SIMO量化代码在SGLang和vLLM中对nvfp4路径功能完全等价。**
+
+代码层面找不到差异。0.067的MMLU gap必须从以下方向继续排查：
+
+### 26.7 下一步调试方案
+
+#### 方案A：对比权重加载产生的全局scale数值（最高优先级）
+
+在SGLang和vLLM两侧添加相同的调试打印，直接对比unified_w13_global_scale和unified_w2_global_scale的数值。
+
+**在SGLang的`online_moe_weight_loader`中添加**：
+```python
+# 在计算unified_w13_global_scale后添加（约line 1060）：
+if shard_id in ("w1", "w3", "gate_proj", "up_proj"):
+    if not hasattr(layer, "_debug_w13_scale_printed"):
+        layer._debug_w13_scale_printed = True
+        print(f"[DEBUG-WEIGHT] layer={layer._name if hasattr(layer, '_name') else '?'} "
+              f"unified_w13_global_scale={layer.unified_w13_global_scale:.10e} "
+              f"from expert_id={expert_id} shard_id={shard_id} "
+              f"weight_amax={loaded_weight.abs().to(torch.float32).amax():.10e}")
+
+# 在计算unified_w2_global_scale后添加（约line 1066）：
+if shard_id in ("w2", "down_proj"):
+    if not hasattr(layer, "_debug_w2_count"):
+        layer._debug_w2_count = 0
+    if layer._debug_w2_count < 3:
+        layer._debug_w2_count += 1
+        print(f"[DEBUG-WEIGHT] layer=? expert_id={expert_id} "
+              f"unified_w2_global_scale={layer.unified_w2_global_scale:.10e} "
+              f"weight_amax={loaded_weight.abs().to(torch.float32).amax():.10e}")
+```
+
+在vLLM的`online_moe_weight_loader`中添加相同打印。对比两侧的数值。
+
+#### 方案B：对比LINEAR层全局scale数值
+
+在SGLang和vLLM的`SIMOLinearMethod.apply`中添加一次性打印：
+```python
+if not hasattr(self, '_debug_linear_checked'):
+    self._debug_linear_checked = True
+    if hasattr(layer, 'weight_global_scale') and layer.weight_global_scale is not None:
+        print(f"[DEBUG-LINEAR] prefix={layer.prefix if hasattr(layer, 'prefix') else '?'} "
+              f"weight_global_scale={layer.weight_global_scale} "
+              f"shape={layer.weight_global_scale.shape}")
+```
+
+#### 方案C：逐层输出对比
+
+在SGLang和vLLM中给模型每一层的输出添加hook，记录每层的hidden_states统计信息（mean, std, abs_max）。然后对比两个框架中每一层的输出是否一致。这可以精确定位是哪一层开始出现分歧。
+
+```python
+# 在模型加载后添加
+def add_debug_hooks(model):
+    for name, module in model.named_modules():
+        if hasattr(module, 'forward'):
+            original_forward = module.forward
+            def make_hook(n, orig_fwd):
+                def hooked_forward(*args, **kwargs):
+                    output = orig_fwd(*args, **kwargs)
+                    if isinstance(output, torch.Tensor) and output.is_floating_point():
+                        if not hasattr(module, '_debug_fwd_count'):
+                            module._debug_fwd_count = 0
+                        if module._debug_fwd_count < 1:
+                            module._debug_fwd_count += 1
+                            print(f"[LAYER-OUT] {n}: "
+                                  f"mean={output.float().mean():.6e} "
+                                  f"std={output.float().std():.6e} "
+                                  f"absmax={output.float().abs().max():.6e}")
+                    return output
+                return hooked_forward
+            module.forward = make_hook(name, original_forward)
+```
+
+#### 方案D：隔离MoE vs LINEAR（终极排查）
+
+创建两个特殊的量化配置：
+1. **仅量化MoE**：将excludes设为排除所有attention linear layers
+2. **仅量化LINEAR**：不量化FusedMoE层
+
+这可以精确确定精度gap是来自MoE路径还是LINEAR路径。
+
+**建议执行顺序**: A → B → C → D
+
+方案A和B只需添加几行打印代码，对比数值即可快速定位。如果全局scale数值在两个框架间不一致，则问题在权重加载阶段。如果一致，则问题在推理计算阶段，需要用方案C逐层对比。
