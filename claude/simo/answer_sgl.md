@@ -1344,3 +1344,157 @@ def add_debug_hooks(model):
 **建议执行顺序**: A → B → C → D
 
 方案A和B只需添加几行打印代码，对比数值即可快速定位。如果全局scale数值在两个框架间不一致，则问题在权重加载阶段。如果一致，则问题在推理计算阶段，需要用方案C逐层对比。
+
+---
+
+## 27. 调试打印日志分析 — 根因定位 (2026-03-04)
+
+### 日志来源
+- SGLang: `temp/logs_sglang_simo_2026_03_04___17_17_46/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log`
+- vLLM: `temp/logs_vllm_simo_2026_03_04___18_27_02/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log`
+
+### MMLU分数
+| 框架 | MMLU | humanities | other | social_sci | stem |
+|------|------|-----------|-------|------------|------|
+| vLLM | **0.5298** | 0.4714 | 0.6035 | 0.6146 | 0.4618 |
+| SGLang | **0.4355** | 0.3983 | 0.4989 | 0.4859 | 0.3793 |
+| 差异 | **-0.0943** | -0.0731 | -0.1046 | -0.1287 | -0.0825 |
+
+SGLang精度显著低于vLLM，且本次运行(0.4355)比上次(0.4630)还低，说明问题具有**不确定性**。
+
+### 调试打印数量统计
+| 调试标签 | SGLang | vLLM |
+|----------|--------|------|
+| DEBUG-LINEAR-WEIGHT (Plan A) | 157 | 162 |
+| DEBUG-LINEAR-APPLY (Plan B+C) | 6750 | 3140 |
+| DEBUG-LINEAR-OUTPUT (Plan C) | 70464 | 28932 |
+| DEBUG-MOE-WEIGHT (Plan A) | 210 | 104 |
+| DEBUG-MOE-APPLY (Plan C) | 780 | 780 |
+| DEBUG-MOE-OUTPUT (Plan C) | 780 | 780 |
+
+### 方案A结果：权重加载时全局scale对比
+
+#### LINEAR权重全局scale
+以 `(weight_amax, logical_widths, loaded_shard_id)` 为key匹配：
+- **匹配: 133, 不匹配: 0**
+- 结论：所有匹配到的LINEAR权重全局scale值完全一致。
+
+#### MoE权重全局scale
+以 `weight_amax` 为key匹配：
+- **W13 匹配: 24, 不匹配: 0**
+- **W2 匹配: 56, 不匹配: 0**
+- 结论：对于相同amax的权重，全局scale计算公式 `scale = amax / global_scale_factor` 结果完全一致。
+
+**但这个结论有误导性！** 方案A只证明了 `scale = amax / factor` 的计算是正确的，并没有验证**同一层的同一参数是否使用了相同的scale**。
+
+### 方案B+C结果：推理时全局scale对比 — 发现根因！
+
+#### MoE层 w13_gscale 逐层对比（推理时的实际值）
+
+| 层 | vLLM w13_gscale | SGLang w13_gscale | 比率 | 匹配 |
+|----|-----------------|-------------------|------|------|
+| 1 | 6.5395e-05 | 5.8855e-05 | 1.111 | NO |
+| 2 | **2.0000e-04** | 6.5032e-05 | **3.075** | NO |
+| 3 | 7.7384e-05 | 1.0000e-04 | 0.774 | NO |
+| 4 | 8.1380e-05 | 8.0654e-05 | 1.009 | NO |
+| 5 | 6.6485e-05 | 1.0000e-04 | 0.665 | NO |
+| 6 | 8.7920e-05 | 8.7920e-05 | 1.000 | YES |
+| 7 | 8.1017e-05 | 8.1017e-05 | 1.000 | YES |
+| 8 | 8.4287e-05 | 8.4287e-05 | 1.000 | YES |
+| 9 | **2.0000e-04** | 9.8819e-05 | **2.024** | NO |
+| 10 | 1.0000e-04 | 1.0000e-04 | 1.000 | YES |
+| 11 | 1.0000e-04 | 7.0844e-05 | 1.412 | NO |
+| 12 | 7.4477e-05 | 8.1380e-05 | 0.915 | NO |
+| 13 | 1.0000e-04 | 1.0000e-04 | 1.000 | YES |
+| 14 | 1.0000e-04 | 8.5377e-05 | 1.171 | NO |
+| 15 | 8.7556e-05 | 9.1916e-05 | 0.953 | NO |
+| 16 | 1.0000e-04 | 9.8092e-05 | 1.019 | NO |
+| 17 | 7.9564e-05 | 6.2125e-05 | 1.281 | NO |
+| 18 | 8.0290e-05 | 9.4459e-05 | 0.850 | NO |
+| 19 | 5.8855e-05 | 5.8855e-05 | 1.000 | YES |
+| 20 | 8.7193e-05 | 6.2488e-05 | 1.395 | NO |
+| 21 | **2.0000e-04** | 5.3769e-05 | **3.720** | NO |
+| 22 | 6.3578e-05 | 8.1380e-05 | 0.781 | NO |
+| 23 | 1.0000e-04 | 6.2125e-05 | 1.610 | NO |
+| 24 | 1.0000e-04 | 7.1208e-05 | 1.404 | NO |
+| 25 | 1.0000e-04 | 1.0000e-04 | 1.000 | YES |
+| 26 | 6.0672e-05 | 6.8301e-05 | 0.888 | NO |
+
+**w13 匹配: 7/26 (27%)**
+**w2 匹配: 1/26 (4%)**
+
+#### LINEAR层 gate_up_proj 全局scale对比
+
+可通过层名匹配的gate_up_proj层：
+- 匹配: 18/27
+- 不匹配: 9/27 (layers 3, 9, 12, 16, 17, 18, 22, 25, 26)
+
+### 根因分析
+
+#### 直接原因
+
+`unified_w13_global_scale` 是从**第一个被加载的expert的权重amax**计算得来的。SGLang和vLLM加载safetensor分片的顺序不同，导致不同的expert被用作"参考expert"：
+
+| 框架 | 首个加载的expert | 首个shard |
+|------|-----------------|-----------|
+| vLLM | 几乎总是 expert 0 | 总是 w1 |
+| SGLang | 随机 (13, 11, 18, 15, 16...) | w1 或 w3 随机 |
+
+#### 关键代码路径
+
+```python
+# simo/extensions/{sglang_simo,vllm_simo}/quantization/quantization{,_method}.py
+# online_moe_weight_loader 中:
+if shard_id in ("w1", "w3", "gate_proj", "up_proj"):
+    if hasattr(layer, "unified_w13_global_scale"):
+        unified_global_scale = layer.unified_w13_global_scale  # 复用已有scale
+    else:
+        weight_amax = loaded_weight.abs().to(torch.float32).amax()
+        unified_global_scale = weight_amax / self.global_scale_factor
+        layer.unified_w13_global_scale = unified_global_scale  # 首次设置
+```
+
+**问题**: `unified_w13_global_scale` 取决于第一个加载的expert的amax。不同expert的amax差异巨大（例如layer 21: expert 0 amax=0.447 → scale=1.66e-4, 而SGLang的首个expert amax=0.145 → scale=5.38e-5, 相差3.7倍）。
+
+#### 为什么只影响nvfp4？
+
+其他量化格式不使用两级(global+local)缩放机制：
+- **FP8, MXFP4/6/8**: 使用MX格式的e8m0 scale mode，不需要global scale → 不受影响
+- **INT4 per_group**: 使用local per-group scale，不需要global scale → 不受影响
+- **nvfp4_e2m1**: 唯一使用 `global_scale_factor = 6.0 * 448.0 = 2688.0` 两级缩放的格式 → **受影响**
+
+#### 为什么SGLang MMLU分数有波动？
+
+SGLang每次运行加载expert的顺序可能不同（取决于safetensor文件的读取顺序），因此每次运行的 `unified_w13_global_scale` 都可能不同：
+- Run 1: 0.4378
+- Run 2: 0.4630
+- Run 3: 0.4355
+
+而vLLM几乎总是先加载expert 0 (确定性加载顺序)，因此分数稳定在0.5298。
+
+### 修复建议
+
+**核心修复**: `unified_w13_global_scale` 应该使用所有expert中权重amax的**最大值**，而不是第一个加载的expert的amax。
+
+```python
+# 修复方案: 两阶段加载
+# 阶段1: 预扫描所有expert的amax
+# 阶段2: 使用max(amax)计算unified_global_scale
+
+# 但这需要两次遍历权重文件，不够实用。
+
+# 更实用的方案: 在process_weights_after_loading中重新计算scale
+# 1. 在weight loading阶段，记录每个expert分别使用的global_scale
+# 2. 在process_weights_after_loading中：
+#    - 找到所有expert中amax的最大值
+#    - 重新计算统一的global_scale
+#    - 对每个expert的量化权重进行scale调整（rescale）
+```
+
+**最简修复**: 让SGLang和vLLM使用相同的expert加载顺序（确保expert 0总是第一个被加载）。但这是治标不治本的方案，因为第一个expert的amax可能不是最优的参考值。
+
+**最佳修复**: 使用所有experts的权重amax最大值作为unified_global_scale。可以在 `process_weights_after_loading` 中实现：
+1. 在加载阶段，每个expert用自己的amax/factor作为临时scale
+2. 在 `process_weights_after_loading` 中，计算所有expert中最大的amax
+3. 用这个最大amax重新计算统一scale
+4. 对每个expert的已量化权重进行rescale补偿
