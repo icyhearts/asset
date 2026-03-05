@@ -221,7 +221,6 @@ kv_b_proj之所以要exclude，是因为deepseek 模型sglang的实现， python
 
 lm-eval --model sglang的日志位于temp/logs_sglang_simo_2026_03_04___17_17_46/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
 lm-eval --model  vllm的日志位于   temp/logs_vllm_simo_2026_03_04___18_27_02/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
-
+现在是使用的你的加了打印调试的代码，分析两个日志.
+要求：把答案追加在 temp/answer_sgl.md里面
 temp/logs_vllm_simo_2026_03_04___18_27_02/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
-
-lm-eval --model vllm报错了，日志位于temp/logs_vllm_simo_2026_03_04___17_39_16, 分析日志，修复问题 
