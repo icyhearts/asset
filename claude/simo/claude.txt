@@ -224,3 +224,10 @@ lm-eval --model  vllm的日志位于   temp/logs_vllm_simo_2026_03_04___18_27_02
 现在是使用的你的加了打印调试的代码，分析两个日志.
 要求：把答案追加在 temp/answer_sgl.md里面
 temp/logs_vllm_simo_2026_03_04___18_27_02/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp1_quant-simo_w4a4_nvfp.log
+
+
+# Q1
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm的代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo
+sglang的代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src
