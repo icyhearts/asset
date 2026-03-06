@@ -1498,3 +1498,189 @@ SGLang每次运行加载expert的顺序可能不同（取决于safetensor文件�
 2. 在 `process_weights_after_loading` 中，计算所有expert中最大的amax
 3. 用这个最大amax重新计算统一scale
 4. 对每个expert的已量化权重进行rescale补偿
+
+---
+
+## 28. Safetensor遍历顺序分析 — SGLang vs vLLM (2026-03-04)
+
+### 问题
+
+SGLang调用 `SIMOFusedMoEMethod.online_moe_weight_loader` 时，是按什么顺序遍历 safetensor 里面的 tensor，然后把 tensor 填充到 layer 的 parameter 里面的？决定遍历顺序的代码在哪里？vLLM 同理。
+
+### SGLang 调用链
+
+```
+model_runner.load_model()
+  → DefaultModelLoader._load_model_weights()                 [loader.py]
+    → DefaultModelLoader._get_weights_iterator()              [loader.py:501-521]
+      → safetensors_weights_iterator()                        [weight_utils.py:713-736]
+    → model.load_weights(weights_iterator)
+      → DeepseekV2ForCausalLM.do_load_weights()               [deepseek_weight_loader.py:96-256]
+        → 对每个 (name, loaded_weight) 匹配 expert_params_mapping
+          → FusedMoE.make_expert_params_mapping()              [layer.py:1023-1048]
+        → param.weight_loader(param, loaded_weight, shard_id, expert_id)
+          → SIMOFusedMoEMethod.online_moe_weight_loader()      [quantization.py]
+```
+
+#### 1. 选择迭代器: `loader.py:501-521`
+
+```python
+# loader.py line 501-521
+elif use_safetensors:
+    weight_loader_disable_mmap = (
+        get_global_server_args().weight_loader_disable_mmap
+    )
+    if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+        weights_iterator = fastsafetensors_weights_iterator(hf_weights_files)
+    elif use_multithread:
+        weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
+            hf_weights_files, ...)
+    else:
+        weights_iterator = safetensors_weights_iterator(
+            hf_weights_files, disable_mmap=weight_loader_disable_mmap)
+```
+
+默认走最后一个分支: `safetensors_weights_iterator()`。
+
+#### 2. 迭代器实现: `weight_utils.py:713-736` (**决定遍历顺序的关键代码**)
+
+```python
+# weight_utils.py line 713-736
+def safetensors_weights_iterator(
+    hf_weights_files: List[str],
+    disable_mmap: bool = False,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    for st_file in tqdm(hf_weights_files, ...):
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+                for name in sorted(result.keys()):    # ← 字母序
+                    yield name, result[name]
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                for name in f.keys():                 # ← 文件内部顺序
+                    yield name, f.get_tensor(name)
+```
+
+**关键结论:**
+- **mmap模式 (默认)**: `f.keys()` — 返回 safetensor 文件**内部存储顺序**，不是字母序。这个顺序由模型保存时的序列化顺序决定，**不保证 expert_id 有序**。
+- **disable_mmap模式**: `sorted(result.keys())` — 返回**字母序**。
+
+#### 3. 多线程迭代器: `weight_utils.py:830-885` (备选路径)
+
+```python
+# weight_utils.py line 882
+for name in sorted(state_dict.keys()):    # ← 始终字母序
+    yield name, state_dict[name]
+```
+
+多线程迭代器始终使用 `sorted()` (字母序)。
+
+#### 4. 权重匹配: `deepseek_weight_loader.py:230-256`
+
+```python
+# deepseek_weight_loader.py line 230-256
+for mapping in expert_params_mapping:
+    param_name, weight_name, expert_id, shard_id = mapping
+    if weight_name not in name:
+        continue
+    name = name.replace(weight_name, param_name)
+    param = params_dict[name]
+    weight_loader = param.weight_loader
+    weight_loader(param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id)
+    break
+```
+
+`expert_params_mapping` 由 `FusedMoE.make_expert_params_mapping()` (layer.py:1023-1048) 生成，遍历顺序是 `expert_id in range(num_experts)` × `(w1, w2, w3)`。但这只是**匹配映射**的顺序，实际加载顺序取决于 `weights_iterator` yield 的顺序。
+
+#### SGLang 结论
+
+**默认配置下 (mmap=True, 单线程)**: tensor 的遍历顺序 = safetensor 文件内部存储顺序 (`f.keys()`)。这个顺序**不是字母序，不保证 expert_id 有序**。实际观察到的顺序是 expert 13 → 11 → 18 → ... 这样的非确定性顺序。
+
+---
+
+### vLLM 调用链
+
+```
+DefaultModelLoader.load_weights()
+  → DefaultModelLoader._get_weights_iterator()                [default_loader.py:184-229]
+    → safetensors_weights_iterator()                          [weight_utils.py:674-732]
+  → model.load_weights(weights_iterator)
+    → DeepseekV2ForCausalLM.load_weights()                    [deepseek_v2.py]
+      → 对每个 (name, loaded_weight) 匹配 expert_params_mapping
+        → FusedMoE.make_expert_params_mapping()
+      → param.weight_loader(param, loaded_weight, shard_id, expert_id)
+        → SIMOFusedMoEMethod.online_moe_weight_loader()       [quantization_method.py]
+```
+
+#### 1. 选择迭代器: `default_loader.py:209-229`
+
+```python
+# default_loader.py line 209-229
+elif use_safetensors:
+    if self.load_config.load_format == "fastsafetensors":
+        weights_iterator = fastsafetensors_weights_iterator(hf_weights_files, ...)
+    else:
+        if extra_config.get("enable_multithread_load"):
+            weights_iterator = multi_thread_safetensors_weights_iterator(...)
+        else:
+            weights_iterator = safetensors_weights_iterator(
+                hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                self.load_config.safetensors_load_strategy,    # ← 默认 "lazy"
+            )
+```
+
+默认走: `safetensors_weights_iterator()`, strategy = `"lazy"`。
+
+#### 2. 迭代器实现: `weight_utils.py:674-732` (**决定遍历顺序的关键代码**)
+
+```python
+# weight_utils.py line 674-732
+def safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    safetensors_load_strategy: str = "lazy",
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    for st_file in tqdm(hf_weights_files, ...):
+        if safetensors_load_strategy == "eager":
+            with open(st_file, "rb") as f:
+                state_dict = load(f.read())
+            yield from state_dict.items()             # ← dict插入序 (Python 3.7+)
+        elif safetensors_load_strategy == "torchao":
+            ...
+        else:  # "lazy" (默认)
+            with safe_open(st_file, framework="pt") as f:
+                for name in f.keys():                 # ← 文件内部顺序
+                    param = f.get_tensor(name)
+                    yield name, param
+```
+
+**关键结论:**
+- **lazy模式 (默认)**: `f.keys()` — 返回 safetensor 文件**内部存储顺序**，与 SGLang 的 mmap 模式一样。
+- **eager模式**: `state_dict.items()` — dict 插入顺序 (Python 3.7+ 保证有序，顺序取决于 `safetensors.torch.load` 的实现)。
+
+#### vLLM 结论
+
+**默认配置下 (lazy策略, 单线程)**: tensor 的遍历顺序 = safetensor 文件内部存储顺序 (`f.keys()`)。这与 SGLang 的默认路径**完全一致**。
+
+---
+
+### 核心对比
+
+| 特性 | SGLang (默认) | vLLM (默认) |
+|------|--------------|-------------|
+| 迭代器 | `safetensors_weights_iterator()` | `safetensors_weights_iterator()` |
+| 关键代码 | `weight_utils.py:734` `f.keys()` | `weight_utils.py:730` `f.keys()` |
+| 遍历顺序 | safetensor 文件内部顺序 | safetensor 文件内部顺序 |
+| 多线程路径 | `sorted()` 字母序 | 无 `sorted()` |
+| disable_mmap | `sorted()` 字母序 | N/A |
+
+**理论上**两者默认路径的遍历顺序应该相同 (都用 `f.keys()`)。但实际 debug log 显示 SGLang 先加载 expert 13, 11, 18... 而 vLLM 先加载 expert 0。可能的原因：
+
+1. **safetensor 文件不同**: SGLang 和 vLLM 可能读取了不同的 `.safetensors` shard 文件 (模型路径不同，或者文件分片方式不同)
+2. **`hf_weights_files` 排序不同**: 两个框架获取文件列表的排序方式可能不同，如果 expert 分布在不同 shard 文件中
+3. **`f.keys()` 行为差异**: `safetensors` 库版本不同可能导致 `f.keys()` 返回顺序不同
+4. **TP 分片逻辑差异**: 如果使用了 tensor parallelism，两个框架可能过滤了不同的 shard 文件
+
+**推荐验证**: 在两个框架中分别打印 `hf_weights_files` 列表和每个文件的 `f.keys()` 前几个 key，确认实际遍历顺序。
