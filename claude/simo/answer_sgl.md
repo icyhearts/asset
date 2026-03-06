@@ -1510,12 +1510,13 @@ SGLang调用 `SIMOFusedMoEMethod.online_moe_weight_loader` 时，是按什么顺
 ### SGLang 调用链
 
 ```
-model_runner.load_model()
-  → DefaultModelLoader._load_model_weights()                 [loader.py]
-    → DefaultModelLoader._get_weights_iterator()              [loader.py:501-521]
-      → safetensors_weights_iterator()                        [weight_utils.py:713-736]
-    → model.load_weights(weights_iterator)
-      → DeepseekV2ForCausalLM.do_load_weights()               [deepseek_weight_loader.py:96-256]
+DefaultModelLoader.load_model()                                [loader.py:653]
+  → self._get_all_weights(model_config, model)                 [获取 weights_iterator]
+    → self._get_weights_iterator()                             [loader.py:501-521]
+      → safetensors_weights_iterator()                         [weight_utils.py:713-736]
+  → self.load_weights_and_postprocess(model, weights, ...)     [loader.py:685]
+    → model.load_weights(weights)                              [loader.py:686]
+      → DeepseekV2ForCausalLM.do_load_weights()                [deepseek_weight_loader.py:96-256]
         → 对每个 (name, loaded_weight) 匹配 expert_params_mapping
           → FusedMoE.make_expert_params_mapping()              [layer.py:1023-1048]
         → param.weight_loader(param, loaded_weight, shard_id, expert_id)
