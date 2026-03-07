@@ -247,3 +247,9 @@ sglang的代码位于 /share_data/users/like/package/h100/package/sglang_kernel_
 决定遍历顺序的代码在哪里？帮我找出来
 vllm也是同样的道理, vllm决定遍历safetenso顺序的代码在哪里？帮我找出来
 要求：把答案追加在 temp/answer_sgl.md里面
+
+写一个脚本like-usefule/kill_high_mem.sh ，第1个参数mem_gib是以GiB为单位的数字，表示内存占用,第2个参数program表示进程名
+在脚本里面实现如下功能:
+把操作系统里面所有包含program的进程找出来，把它们占用的内存求和，如果总内存占用超过mem_gib,把所有包含program的进程kill掉。
+temp/chrome.txt展示了一个主机上所有chrome进程占用内存的情况。
+在脚本里要详细注释功能。
