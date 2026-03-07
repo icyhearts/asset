@@ -253,3 +253,5 @@ vllm也是同样的道理, vllm决定遍历safetenso顺序的代码在哪里？�
 把操作系统里面所有包含program的进程找出来，把它们占用的内存求和，如果总内存占用超过mem_gib,把所有包含program的进程kill掉。
 temp/chrome.txt展示了一个主机上所有chrome进程占用内存的情况。
 在脚本里要详细注释功能。
+
+再加上第3个参数表示日志文件路径，修改like-usefule/kill_high_mem.sh脚本，在执行kill前，向日志文件打印当前时间，实际内存占用总和，内存 mem_gi的值
