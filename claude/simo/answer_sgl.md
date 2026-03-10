@@ -1832,3 +1832,88 @@ pytest -n 4 tests/vllm_simo/e2e_test/test_basic_generate.py
 ```
 
 但对于 GPU 测试通常不适合并发，因为多组测试会争抢 GPU 显存。
+
+---
+
+## 31. SGLang 测试 finally 中如何清理现场（对标 vLLM）
+
+### vLLM 的清理方式 (`tests/vllm_simo/e2e_test/test_basic_generate.py:216-224`)
+
+```python
+finally:
+    if llm is not None:
+        llm.reset_mm_cache()
+        del llm
+    from vllm.distributed import cleanup_dist_env_and_memory
+    cleanup_dist_env_and_memory()
+```
+
+### SGLang 当前的清理方式 (`tests/sglang_simo/e2e_test/test_basic_generate.py:248-250`)
+
+```python
+finally:
+    if llm is not None:
+        del llm
+```
+
+只做了 `del llm`，没有调用 shutdown 和分布式环境清理。
+
+### SGLang 提供的清理 API
+
+#### 1. `Engine.shutdown()` — 杀掉 Engine 启动的所有子进程
+
+文件: `sglang/srt/entrypoints/engine.py:453-455`
+
+```python
+def shutdown(self):
+    """Shutdown the engine"""
+    kill_process_tree(os.getpid(), include_parent=False)
+```
+
+`Engine.__init__` 中已通过 `atexit.register(self.shutdown)` 注册了退出时自动调用 (engine.py:159)，但显式调用更可靠，可以确保在 `del` 之前子进程已终止。
+
+#### 2. `cleanup_dist_env_and_memory()` — 清理分布式环境和 GPU 显存
+
+文件: `sglang/srt/distributed/parallel_state.py:2117-2142`
+
+```python
+def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
+    destroy_model_parallel()          # 销毁 TP/PP/MoE 等并行组
+    destroy_distributed_environment() # 销毁 world process group
+    with contextlib.suppress(AssertionError):
+        torch.distributed.destroy_process_group()
+    if shutdown_ray:
+        import ray
+        ray.shutdown()
+    gc.collect()                      # 垃圾回收
+    if not _is_cpu:
+        torch.cuda.empty_cache()      # 清空 CUDA 缓存
+        if hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()  # 清空 host pinned memory (PyTorch >= 2.5)
+```
+
+这与 vLLM 的 `cleanup_dist_env_and_memory()` 功能一致。
+
+### 推荐的 SGLang finally 写法
+
+```python
+finally:
+    if llm is not None:
+        llm.shutdown()   # 杀掉 Engine 启动的所有子进程 (调度器、detokenizer 等)
+        del llm
+    from sglang.srt.distributed.parallel_state import (
+        cleanup_dist_env_and_memory,
+    )
+    cleanup_dist_env_and_memory()
+```
+
+### 对比
+
+| 清理步骤 | vLLM | SGLang |
+|---------|------|--------|
+| 清理模型缓存 | `llm.reset_mm_cache()` | 不需要（SGLang Engine 没有 mm_cache） |
+| 关闭引擎/杀子进程 | `del llm`（vLLM LLM 没有 spawn 子进程） | `llm.shutdown()`（杀掉 Engine spawn 的子进程树） |
+| 释放引用 | `del llm` | `del llm` |
+| 清理分布式 + GPU 显存 | `vllm.distributed.cleanup_dist_env_and_memory()` | `sglang.srt.distributed.parallel_state.cleanup_dist_env_and_memory()` |
+
+**注意**: SGLang `Engine` 会 spawn 多个子进程（scheduler、detokenizer 等），必须调用 `shutdown()` 来杀掉它们，否则即使 `del llm` 后这些子进程仍在运行、占用 GPU 显存。vLLM 的 `LLM` 类是单进程的，`del` 就够了。不过由于本测试文件的 `_run_single_case` 已经在独立的 spawn 子进程中运行，子进程退出时 OS 会回收所有资源，所以 `shutdown()` + `cleanup_dist_env_and_memory()` 主要是确保**子进程内的清理**在 `_run_single_case` 返回前完成，避免竞态条件。
