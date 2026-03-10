@@ -271,3 +271,8 @@ Traceback (most recent call last):
                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ValueError: Invalid format specifier ' "/share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_nvfp_4_over_6.json"' for object of type 'str'
 请修复
+
+
+tests/vllm_simo/e2e_test/test_basic_generate.py
+def _get_test_cases，实现不好理解，用普通的 for循环解释一下它的原理，
+要求：把答案追加在 temp/answer_sgl.md里面

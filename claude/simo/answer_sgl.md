@@ -1685,3 +1685,80 @@ def safetensors_weights_iterator(
 4. **TP 分片逻辑差异**: 如果使用了 tensor parallelism，两个框架可能过滤了不同的 shard 文件
 
 **推荐验证**: 在两个框架中分别打印 `hf_weights_files` 列表和每个文件的 `f.keys()` 前几个 key，确认实际遍历顺序。
+
+---
+
+## 29. `_get_test_cases()` 列表推导式的等价 for 循环解释
+
+### 原始代码 (`tests/vllm_simo/e2e_test/test_basic_generate.py:42-60`)
+
+```python
+def _get_test_cases():
+  return [
+    {
+      "model_path": model_path,
+      "attention_backend": attention_backend,
+      "quant_config": str(quant_config),
+      "case_id": f"{Path(model_path).name}-{quant_config.stem}",
+    }
+    for model_path, attention_backend in _MODEL_CASES
+    for quant_config in _QUANT_CONFIGS
+    if not any(quant_config.match(p) for p in _EXCLUDE_QUANT_CONFIGS)
+    if (
+      quant_config not in _KVQUANT_CONFIGS
+      or (attention_backend == "TRITON_MLA" and "mla" in quant_config.name)
+      or (attention_backend == "TRITON_ATTN" and "gqa" in quant_config.name)
+    )
+  ]
+```
+
+### 等价的 for 循环写法
+
+```python
+def _get_test_cases():
+  result = []
+
+  # 外层循环: 遍历所有模型 (model_path, attention_backend) 组合
+  # _MODEL_CASES 例如: [("/share_data/.../DeepSeekV2-Lite", "TRITON_MLA")]
+  for model_path, attention_backend in _MODEL_CASES:
+
+    # 内层循环: 遍历所有量化配置文件
+    # _QUANT_CONFIGS = _KVQUANT_CONFIGS + _WEIGHT_CONFIGS
+    # 即 kv_cache_quant/ 和 online_quantization/ 下的所有 .json 文件
+    for quant_config in _QUANT_CONFIGS:
+
+      # 过滤条件1: 排除黑名单中的配置
+      # 如果 quant_config 匹配 _EXCLUDE_QUANT_CONFIGS 中的任意 glob 模式，跳过
+      if any(quant_config.match(p) for p in _EXCLUDE_QUANT_CONFIGS):
+        continue
+
+      # 过滤条件2: kv_cache 配置必须与 attention_backend 匹配
+      # 分三种情况放行:
+      #   a) 不是 kv_cache 配置 (是 online_quantization 配置) → 直接放行
+      #   b) 是 kv_cache 配置 + backend 是 TRITON_MLA + 文件名含 "mla" → 放行
+      #   c) 是 kv_cache 配置 + backend 是 TRITON_ATTN + 文件名含 "gqa" → 放行
+      # 其他情况 (比如 TRITON_MLA 后端配了 gqa 的 kv_cache 配置) → 跳过
+      is_kvquant = quant_config in _KVQUANT_CONFIGS
+      if is_kvquant:
+        mla_match = (attention_backend == "TRITON_MLA" and "mla" in quant_config.name)
+        gqa_match = (attention_backend == "TRITON_ATTN" and "gqa" in quant_config.name)
+        if not (mla_match or gqa_match):
+          continue
+
+      # 两个过滤条件都通过，加入结果
+      result.append({
+        "model_path": model_path,
+        "attention_backend": attention_backend,
+        "quant_config": str(quant_config),
+        "case_id": f"{Path(model_path).name}-{quant_config.stem}",
+      })
+
+  return result
+```
+
+### 逻辑总结
+
+这是一个 **模型 × 量化配置** 的笛卡尔积，加上两层过滤:
+
+1. **黑名单过滤**: `_EXCLUDE_QUANT_CONFIGS` 中的 glob 模式命中的配置被排除
+2. **backend 兼容性过滤**: kv_cache 量化配置必须与 attention backend 类型匹配 (MLA 后端只用 mla 配置，GQA/TRITON_ATTN 后端只用 gqa 配置)；online_quantization 配置不受此限制，对所有 backend 都生效
