@@ -276,3 +276,6 @@ ValueError: Invalid format specifier ' "/share_data/users/like/package/h100/pack
 tests/vllm_simo/e2e_test/test_basic_generate.py
 def _get_test_cases，实现不好理解，用普通的 for循环解释一下它的原理，
 要求：把答案追加在 temp/answer_sgl.md里面
+
+如果我使用pytest命令运行 tests/vllm_simo/e2e_test/test_basic_generate.py, test_vllm_simo_generate_smoke函数会多进程并发地运行不同参数吗？是一组测试参数一个进程还是怎么样跑？
+要求：把答案追加在 temp/answer_sgl.md里面
