@@ -1917,3 +1917,49 @@ finally:
 | 清理分布式 + GPU 显存 | `vllm.distributed.cleanup_dist_env_and_memory()` | `sglang.srt.distributed.parallel_state.cleanup_dist_env_and_memory()` |
 
 **注意**: SGLang `Engine` 会 spawn 多个子进程（scheduler、detokenizer 等），必须调用 `shutdown()` 来杀掉它们，否则即使 `del llm` 后这些子进程仍在运行、占用 GPU 显存。vLLM 的 `LLM` 类是单进程的，`del` 就够了。不过由于本测试文件的 `_run_single_case` 已经在独立的 spawn 子进程中运行，子进程退出时 OS 会回收所有资源，所以 `shutdown()` + `cleanup_dist_env_and_memory()` 主要是确保**子进程内的清理**在 `_run_single_case` 返回前完成，避免竞态条件。
+
+---
+
+## 32. pytest 报错 `unrecognized arguments: --cov --cov-report`
+
+### 报错信息
+
+```
+ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]
+pytest: error: unrecognized arguments: --cov --cov-report
+  inifile: /share_data/users/like/package/h100/package/simo_conda_sglang/pyproject.toml
+```
+
+### 原因
+
+`pyproject.toml` 第45行配置了 pytest 默认参数：
+
+```toml
+[tool.pytest.ini_options]
+addopts = "--cov --cov-report term-missing -v"
+```
+
+`--cov` 和 `--cov-report` 是 `pytest-cov` 插件提供的参数。`simo_sglang` 环境中没有安装 `pytest-cov`，pytest 不认识这些参数就报错了。
+
+### 解决方案
+
+#### 方案1: 安装 pytest-cov（推荐，不改配置）
+
+```bash
+conda activate simo_sglang
+pip install pytest-cov
+```
+
+#### 方案2: 运行时用 `-o` 覆盖 addopts（不改配置、不装包）
+
+```bash
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=3 pytest -o "addopts=-v" tests/sglang_simo/e2e_test/test_basic_generate.py
+```
+
+`-o addopts=-v` 会覆盖 `pyproject.toml` 中的 `addopts`，只保留 `-v`，去掉 `--cov` 相关参数。
+
+#### 方案3: 用 `--override-ini` 清空 addopts
+
+```bash
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=3 pytest --override-ini="addopts=" tests/sglang_simo/e2e_test/test_basic_generate.py
+```

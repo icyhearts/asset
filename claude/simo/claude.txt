@@ -299,3 +299,18 @@ tests/vllm_simo/e2e_test/test_basic_generate.py里面，_run_single_case函数�
 ```
 tests/sglang_simo/e2e_test/test_basic_generate.py 写了sglang相关的单元测试，finally语句里面，如何进行和vllm相似的清理现场？
 要求：把答案追加在 temp/answer_sgl.md里面
+
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm的代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo
+sglang的代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src
+pytest tests/sglang_simo/e2e_test/test_basic_generate.py有如下报错，如何解决？
+```
+(simo_sglang) gpu009|2026-03-10 16:43:34[like@ simo_conda_sglang] SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=3 pytest tests/sglang_simo/e2e_test/test_basic_generate.py
+ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]
+pytest: error: unrecognized arguments: --cov --cov-report
+  inifile: /share_data/users/like/package/h100/package/simo_conda_sglang/pyproject.toml
+  rootdir: /share_data/users/like/package/h100/package/simo_conda_sglang
+```
+
+要求：把答案追加在 temp/answer_sgl.md里面
