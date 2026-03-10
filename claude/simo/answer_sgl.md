@@ -1762,3 +1762,73 @@ def _get_test_cases():
 
 1. **黑名单过滤**: `_EXCLUDE_QUANT_CONFIGS` 中的 glob 模式命中的配置被排除
 2. **backend 兼容性过滤**: kv_cache 量化配置必须与 attention backend 类型匹配 (MLA 后端只用 mla 配置，GQA/TRITON_ATTN 后端只用 gqa 配置)；online_quantization 配置不受此限制，对所有 backend 都生效
+
+---
+
+## 30. pytest 运行 test_vllm_simo_generate_smoke 的执行模型
+
+### 问题
+
+使用 `pytest tests/vllm_simo/e2e_test/test_basic_generate.py` 运行时，`test_vllm_simo_generate_smoke` 的多组参数是并发跑还是串行跑？
+
+### 答案：串行，不并发
+
+**pytest 默认是单进程、串行执行所有测试用例。** 不同参数组合不会并发运行。
+
+### 执行流程
+
+假设 `_get_test_cases()` 返回了 N 组参数（例如 8 个量化配置），pytest 的执行过程如下：
+
+```
+pytest 主进程 (单进程, 串行调度)
+│
+├─ 参数组1: test_vllm_simo_generate_smoke[DeepSeekV2-Lite-quant_config_A]
+│    └─ _run_single_case_in_process()
+│         └─ spawn 子进程 → 加载模型 → 推理 → 断言 → 子进程退出
+│         └─ proc.join() 阻塞等待子进程结束
+│         └─ _kill_process() 清理
+│    (完成后才进入下一组)
+│
+├─ 参数组2: test_vllm_simo_generate_smoke[DeepSeekV2-Lite-quant_config_B]
+│    └─ _run_single_case_in_process()
+│         └─ spawn 子进程 → 加载模型 → 推理 → 断言 → 子进程退出
+│         └─ proc.join() 阻塞等待
+│    (完成后才进入下一组)
+│
+├─ ... (逐个串行)
+│
+└─ 参数组N: test_vllm_simo_generate_smoke[DeepSeekV2-Lite-quant_config_N]
+     └─ ...
+```
+
+### 涉及两层"进程"概念，不要混淆
+
+| 层级 | 谁创建的 | 并发吗 | 说明 |
+|------|---------|--------|------|
+| pytest 调度层 | pytest 框架 | **否，串行** | pytest 默认单线程逐个执行每组参数的测试函数 |
+| 测试用例内部 | `_run_single_case_in_process()` | 每组参数 spawn **1个**子进程 | 用 `mp.get_context("spawn")` 创建子进程执行实际推理，主进程 `proc.join()` 阻塞等待它结束 |
+
+**关键代码** (`test_basic_generate.py:98-100`):
+
+```python
+proc.start()          # spawn 一个子进程
+try:
+    proc.join(timeout=timeout_s)   # 阻塞等待子进程结束
+```
+
+`proc.join()` 会阻塞 pytest 主进程，直到子进程退出。所以每组参数一定是前一组跑完、子进程退出、清理之后，才轮到下一组。
+
+### 为什么每组参数要 spawn 子进程？
+
+代码注释写了：`"avoid CUDA + fork issues"`。原因是 CUDA runtime 在 fork 后的子进程中行为未定义，而 vLLM 加载模型会初始化 CUDA context。用 spawn 创建全新进程可以确保每组测试拿到干净的 CUDA 环境，上一组测试的 GPU 显存也能被完全释放。
+
+### 如何才能并发？
+
+默认 pytest 不并发。如果想并发需要安装 `pytest-xdist` 插件并使用 `-n` 参数：
+
+```bash
+# 4 个 worker 并发 (需要安装 pytest-xdist)
+pytest -n 4 tests/vllm_simo/e2e_test/test_basic_generate.py
+```
+
+但对于 GPU 测试通常不适合并发，因为多组测试会争抢 GPU 显存。
