@@ -255,3 +255,19 @@ temp/chrome.txt展示了一个主机上所有chrome进程占用内存的情况�
 在脚本里要详细注释功能。
 
 再加上第3个参数表示日志文件路径，修改like-usefule/kill_high_mem.sh脚本，在执行kill前，向日志文件打印当前时间，实际内存占用总和，内存 mem_gi的值
+
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm的代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo
+sglang的代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src
+
+ SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=3 python3 tests/sglang_simo/e2e_test/test_basic_generate.py 报错:
+
+Traceback (most recent call last):
+  File "/share_data/users/like/package/h100/package/simo_conda_sglang/tests/sglang_simo/e2e_test/test_basic_generate.py", line 116, in <module>
+    _run_single_case(sgl=sglang, model_path=model_path, attention_backend=attention_backend, quant_config=quant_config)
+  File "/share_data/users/like/package/h100/package/simo_conda_sglang/tests/sglang_simo/e2e_test/test_basic_generate.py", line 69, in _run_single_case
+    json_model_override_args=f'{"quantization_config_file": "{str(quant_config_file)}"}'
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Invalid format specifier ' "/share_data/users/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_nvfp_4_over_6.json"' for object of type 'str'
+请修复
