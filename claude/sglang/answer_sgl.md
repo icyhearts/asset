@@ -8470,3 +8470,335 @@ SGLang 已经有 FP4 (fp4_e2m1) 的实现，可以作为添加新量化格式的
 
 ---
 
+
+---
+
+# `self.model.quant_config` 属性的来源与设置过程
+
+## 一、问题背景
+
+在 `model_runner.py:1675` 中：
+```python
+def configure_kv_cache_dtype(self):
+    if self.server_args.kv_cache_dtype == "auto":
+        quant_config = getattr(self.model, "quant_config", None)
+        kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+```
+
+`self.model` 是已加载的模型实例（如 `DeepseekV2ForCausalLM`），其 `quant_config` 属性是一个 `QuantizationConfig` 子类的实例（或 None）。
+
+---
+
+## 二、完整调用链
+
+```
+ModelRunner.__init__()
+    │
+    ├─ self.model = self.loader.load_model(...)       # model_runner.py:981
+    │   │
+    │   ├─ quant_config = _get_quantization_config()  # loader.py:668
+    │   │   │
+    │   │   ├─ model_config.quantization              # 来自 --quantization 参数或 config.json 自动检测
+    │   │   │
+    │   │   └─ get_quant_config()                     # weight_utils.py:179
+    │   │       │
+    │   │       ├─ 优先：hf_config.quantization_config  # 来自模型的 config.json
+    │   │       ├─ 备选：hf_config.compression_config   # compressed-tensors 格式
+    │   │       └─ 兜底：读取 hf_quant_config.json 文件  # ModelOpt 格式
+    │   │
+    │   └─ model = _initialize_model(..., quant_config)  # loader.py:671
+    │       │
+    │       └─ model_class(config=hf_config, quant_config=quant_config)  # loader.py:277
+    │           │
+    │           └─ self.quant_config = quant_config    # 模型 __init__ 中存储
+    │
+    └─ self.configure_kv_cache_dtype()                 # model_runner.py:588
+        │
+        └─ getattr(self.model, "quant_config", None)   # 读取上面存储的值
+```
+
+---
+
+## 三、各环节详细分析
+
+### 3.1 模型加载入口
+
+**文件**: `python/sglang/srt/model_executor/model_runner.py:977-984`
+
+```python
+self.loader = get_model_loader(
+    load_config=self.load_config,
+    model_config=self.model_config,
+)
+self.model = self.loader.load_model(
+    model_config=self.model_config,
+    device_config=DeviceConfig(self.device, self.gpu_id),
+)
+```
+
+### 3.2 DefaultModelLoader.load_model()
+
+**文件**: `python/sglang/srt/model_loader/loader.py:653-682`
+
+```python
+def load_model(self, *, model_config, device_config) -> nn.Module:
+    target_device = torch.device(device_config.device)
+    quant_config = _get_quantization_config(model_config, self.load_config)  # ← 创建 quant_config
+    with set_default_torch_dtype(model_config.dtype):
+        with target_device:
+            model = _initialize_model(model_config, self.load_config, quant_config)  # ← 传入模型构造函数
+        self.load_weights_and_postprocess(model, self._get_all_weights(model_config, model), target_device)
+    return model.eval()
+```
+
+### 3.3 `_get_quantization_config()` — 创建 QuantizationConfig 对象
+
+**文件**: `python/sglang/srt/model_loader/loader.py:192-254`
+
+```python
+def _get_quantization_config(model_config, load_config) -> Optional[QuantizationConfig]:
+    if model_config.quantization is not None:
+        quant_config = get_quant_config(model_config, load_config, packed_modules_mapping, remap_prefix)
+        return quant_config
+    return None   # ← 如果没有指定量化方法，返回 None
+```
+
+**关键**: 只有当 `model_config.quantization` 不为 None 时才会创建 quant_config。
+
+### 3.4 `model_config.quantization` 的来源
+
+**文件**: `python/sglang/srt/configs/model_config.py:110, 881-948`
+
+`model_config.quantization` 有两个来源：
+
+#### 来源一：命令行参数 `--quantization`
+
+```python
+# server_args.py 中的 --quantization 参数
+self.quantization = quantization  # model_config.py:110
+```
+
+#### 来源二：自动检测（config.json / hf_quant_config.json）
+
+```python
+# model_config.py:881-918
+self.quantization = self.quantization.lower() if self.quantization is not None else None
+
+# 从 HF config 和 ModelSlim config 自动解析量化方法
+hf_config = self._parse_quant_hf_config()     # 解析 config.json 中的 quantization_config
+modelslim_config = self._find_quant_modelslim_config()  # 解析 quant_model_description.json
+
+if quant_cfg is not None:
+    quant_method = quant_cfg.get("quant_method", "")
+    # ... 匹配和校验 ...
+    if self.quantization is None:
+        self.quantization = quant_method  # 自动设置量化方法
+```
+
+### 3.5 `get_quant_config()` — 从配置文件读取量化参数
+
+**文件**: `python/sglang/srt/model_loader/weight_utils.py:179-258`
+
+这个函数决定了 quant_config 的**数据来源**，有三个优先级：
+
+#### 优先级1：config.json 中的 `quantization_config` 字段
+
+```python
+hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
+# 示例 config.json:
+# {
+#   "quantization_config": {
+#     "quant_algo": "FP8",
+#     "kv_cache_quant_algo": "FP8",
+#     "kv_cache_scheme": {"type": "float", "num_bits": 8}
+#   }
+# }
+if hf_quant_config is not None:
+    return quant_cls.from_config(hf_quant_config)  # ← 直接用 config.json 的数据
+```
+
+#### 优先级2：config.json 中的 `compression_config` 字段（compressed-tensors 格式）
+
+```python
+hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+```
+
+#### 优先级3：独立的量化配置文件
+
+```python
+# 搜索模型目录下的量化配置文件
+possible_config_filenames = quant_cls.get_config_filenames()
+# 常见文件：hf_quant_config.json, quant_config.json 等
+```
+
+对于 ModelOpt 量化模型，还有一个特殊路径（在 `_parse_quant_hf_config` 中）：
+如果模型目录下存在 `hf_quant_config.json`，会直接读取：
+
+```python
+# model_config.py:733-739
+elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+    with open(quant_config_file) as f:
+        quant_config_dict = json.load(f)
+    quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+```
+
+### 3.6 `_initialize_model()` — 将 quant_config 传入模型构造函数
+
+**文件**: `python/sglang/srt/model_loader/loader.py:257-277`
+
+```python
+def _initialize_model(model_config, load_config, quant_config=None) -> nn.Module:
+    model_class, _ = get_model_architecture(model_config)
+    kwargs = {
+        "config": model_config.hf_config,
+        "quant_config": quant_config,       # ← 传入模型类构造函数
+    }
+    return model_class(**kwargs)             # ← 例如 DeepseekV2ForCausalLM(**kwargs)
+```
+
+### 3.7 模型类中存储 quant_config
+
+以 DeepSeek V2 为例：
+
+**文件**: `python/sglang/srt/models/deepseek_v2.py:2785-2807`
+
+```python
+class DeepseekV2ForCausalLM(nn.Module):
+    def __init__(self, config, quant_config=None, prefix=""):
+        super().__init__()
+        self.quant_config = quant_config    # ← line 2807，存储为实例属性
+        self.model = DeepseekV2Model(config, quant_config, ...)
+```
+
+几乎所有模型类都有相同模式，例如 `LlamaForCausalLM` (`llama.py:470`)：
+```python
+self.quant_config = quant_config
+```
+
+---
+
+## 四、`kv_cache_quant_algo` 属性的来源
+
+`kv_cache_quant_algo` 只在特定的量化配置类中存在：
+
+### 4.1 ModelOptQuantConfig 基类
+
+**文件**: `python/sglang/srt/layers/quantization/modelopt_quant.py:267-277`
+
+```python
+class ModelOptQuantConfig(QuantizationConfig):
+    def __init__(self, kv_cache_quant_algo, exclude_modules, packed_modules_mapping):
+        self.kv_cache_quant_algo = kv_cache_quant_algo
+```
+
+### 4.2 ModelOptFp8Config — FP8 量化的 from_config 解析
+
+**文件**: `python/sglang/srt/layers/quantization/modelopt_quant.py:418-472`
+
+```python
+@classmethod
+def from_config(cls, config):
+    # 格式1: config.json 的 quantization_config（扁平格式）
+    kv_cache_scheme = config.get("kv_cache_scheme")
+    if isinstance(kv_cache_scheme, dict):
+        if kv_cache_scheme.get("type") == "float" and kv_cache_scheme.get("num_bits") == 8:
+            kv_cache_quant_method = "FP8"              # ← 从 kv_cache_scheme 推导
+
+    # 格式2: hf_quant_config.json（嵌套格式）
+    quantization_section = cls.get_from_keys(config, ["quantization"])
+    kv_cache_quant_method = quantization_section.get("kv_cache_quant_algo")  # ← 直接读取字段
+
+    return cls(kv_cache_quant_method=kv_cache_quant_method, ...)
+```
+
+### 4.3 ModelOptFp4Config — FP4 量化的 from_config 解析
+
+**文件**: `python/sglang/srt/layers/quantization/modelopt_quant.py:994-1073`
+
+```python
+@classmethod
+def from_config(cls, config):
+    kv_cache_quant_algo = None
+
+    # 扁平格式
+    kv_cache_scheme = config.get("kv_cache_scheme")
+    if isinstance(kv_cache_scheme, dict):
+        if kv_cache_scheme.get("type") == "float" and kv_cache_scheme.get("num_bits") == 8:
+            kv_cache_quant_algo = "FP8"
+    elif isinstance(kv_cache_scheme, str):
+        if scheme_name in ("FP8", "FLOAT8"):
+            kv_cache_quant_algo = "FP8"
+
+    # 嵌套格式
+    kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
+
+    return cls(kv_cache_quant_algo=kv_cache_quant_algo, ...)
+```
+
+---
+
+## 五、典型场景分析
+
+### 场景1：普通模型（如 Llama、DeepSeek-V2-Lite）+ 无量化
+
+- `--quantization` 未指定
+- config.json 中没有 `quantization_config`
+- `model_config.quantization = None`
+- `_get_quantization_config()` 返回 `None`
+- `model.quant_config = None`
+- `configure_kv_cache_dtype()` 中 `getattr(self.model, "quant_config", None)` → `None`
+- `kv_cache_quant_algo = None`，不进入 FP8 分支
+- **结果**: `self.kv_cache_dtype = self.dtype`（使用模型原始精度）
+
+### 场景2：ModelOpt FP8 量化模型（如 nvidia/Llama-3.1-8B-Instruct-FP8）
+
+- config.json 或 hf_quant_config.json 中包含：
+  ```json
+  {
+    "quantization": {
+      "quant_algo": "FP8",
+      "kv_cache_quant_algo": "FP8"
+    }
+  }
+  ```
+- 自动检测 `model_config.quantization = "modelopt_fp8"`
+- `get_quant_config()` → `ModelOptFp8Config(kv_cache_quant_method="FP8")`
+- `model.quant_config = ModelOptFp8Config实例`
+- `model.quant_config.kv_cache_quant_algo = "FP8"`
+- **结果**: 自动设置 `self.kv_cache_dtype = torch.float8_e4m3fn`
+
+### 场景3：用户显式指定 `--kv-cache-dtype fp8_e4m3`
+
+- 不走 `"auto"` 分支
+- 不查看 `model.quant_config`
+- 直接设置 `self.kv_cache_dtype = torch.float8_e4m3fn`
+
+---
+
+## 六、数据来源总结
+
+| 数据层级 | 来源 | 关键文件:行号 |
+|---------|------|-------------|
+| `model_config.quantization` (字符串) | 命令行 `--quantization` 或从 config.json 自动检测 | `configs/model_config.py:110, 881-948` |
+| `quant_config` (QuantizationConfig对象) | `_get_quantization_config()` → `get_quant_config()` | `model_loader/loader.py:192-254`, `weight_utils.py:179-258` |
+| quant_config 的**数据内容** | ①config.json的`quantization_config` ②`hf_quant_config.json` ③`compression_config` | `weight_utils.py:195-207` |
+| `kv_cache_quant_algo` (字符串) | config.json中的`kv_cache_quant_algo`字段 或从`kv_cache_scheme`推导 | `modelopt_quant.py:440-449, 1005-1024` |
+| `model.quant_config` 属性 | `_initialize_model()` 传入构造函数，模型类存储 | `loader.py:266-277`, `deepseek_v2.py:2807` |
+
+---
+
+## 七、关键结论
+
+1. **`self.model.quant_config`** 是在模型初始化时由 loader 传入的，最终存储在模型类的 `__init__` 中（如 `deepseek_v2.py:2807`）。
+
+2. **数据的根源**是模型目录下的配置文件：
+   - **主要来源**: `config.json` 中的 `quantization_config` 字段
+   - **备选来源**: 独立的 `hf_quant_config.json` 文件（ModelOpt 格式）
+   - 这些文件由模型训练/量化工具（如 NVIDIA TensorRT Model Optimizer）生成
+
+3. **对于普通非量化模型**（如用户命令中的 DeepSeek-V2-Lite-Chat），`quant_config` 为 `None`，`kv_cache_quant_algo` 也为 `None`，auto 模式下不会启用 FP8 KV Cache。需要用户显式指定 `--kv-cache-dtype fp8_e4m3` 才会生效。
+
+4. **`kv_cache_quant_algo` 属性**只存在于 `ModelOptQuantConfig` 及其子类（`ModelOptFp8Config`、`ModelOptFp4Config`、`PetitNvFp4Config`）中，普通的 `Fp8Config`、`GPTQConfig` 等不具备此属性。
+
+---
+
