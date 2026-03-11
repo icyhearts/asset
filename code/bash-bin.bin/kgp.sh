@@ -56,7 +56,8 @@ for gpu_index in "${GPU_IDS[@]}"; do
     fi
 
     echo "[KILL] GPU $gpu_index PID $pid owned by $owner"
-    kill -30 "$pid"
+    #kill -30 "$pid"
+    kill -9 "$pid"
   done
 done
 
