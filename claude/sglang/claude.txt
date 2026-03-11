@@ -435,5 +435,8 @@ gpu monitor已经停了，还没有解决问题
 继续分析
 要求：把答案追加在 temp/answer_sgl.md里面
 
+sglang启动时，如果需要kv cache量化功能，可以加上--kv-cache-dtype fp8_e4m3参数，完整命令如下：
 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --port 30123 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3  --mem-fraction-static 0.75
+分析 --kv-cache-dtype fp8_e4m3参数会在哪里生效，如何影响kv cache的生成和使用，找出相关代码。
+如果想实现自己定义的量化格式，比如mxfp8格式kv cache量化，修改入口在哪里？
 要求：把答案追加在 like-useful/answer_sgl.md里面
