@@ -434,3 +434,6 @@ fi
 gpu monitor已经停了，还没有解决问题
 继续分析
 要求：把答案追加在 temp/answer_sgl.md里面
+
+CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --port 30123 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3  --mem-fraction-static 0.75
+要求：把答案追加在 like-useful/answer_sgl.md里面
