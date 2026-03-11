@@ -7955,3 +7955,518 @@ nvidia-smi -q 2>/dev/null | grep -E "(GPU 0000|GPU Recovery Action)" | paste - -
 # 预期所有 GPU Recovery Action 都是 None
 ```
 
+
+---
+
+# SGLang `--kv-cache-dtype fp8_e4m3` 参数完整分析
+
+## 一、参数解析入口
+
+### 1.1 命令行参数定义
+
+**文件**: `python/sglang/srt/server_args.py:3079-3085`
+
+```python
+parser.add_argument(
+    "--kv-cache-dtype",
+    type=str,
+    default=ServerArgs.kv_cache_dtype,  # 默认值: "auto"
+    choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+    help='Data type for kv cache storage...',
+)
+```
+
+### 1.2 数据类字段
+
+**文件**: `python/sglang/srt/server_args.py:314`
+
+```python
+kv_cache_dtype: str = "auto"
+```
+
+默认值为`"auto"`，即使用模型本身的dtype（一般是bf16或fp16）。
+
+---
+
+## 二、dtype 转换：从字符串到 torch dtype
+
+### 2.1 `configure_kv_cache_dtype()` 方法
+
+**文件**: `python/sglang/srt/model_executor/model_runner.py:1673-1719`
+
+这是核心转换逻辑，在 `ModelRunner.__init__()` 初始化时调用（line 588）：
+
+```python
+def configure_kv_cache_dtype(self):
+    if self.server_args.kv_cache_dtype == "auto":
+        # 从模型的 quant_config 自动推断
+        quant_config = getattr(self.model, "quant_config", None)
+        kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+        if isinstance(kv_cache_quant_algo, str) and kv_cache_quant_algo.upper() == "FP8":
+            self.kv_cache_dtype = torch.float8_e4m3fn  # NVIDIA GPU
+        else:
+            self.kv_cache_dtype = self.dtype  # 回退到模型dtype
+    elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+        self.kv_cache_dtype = torch.float8_e4m3fn   # ← 命令行指定fp8_e4m3时走这里
+    elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+        self.kv_cache_dtype = torch.float8_e5m2
+    elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+        self.kv_cache_dtype = torch.bfloat16
+    elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+        self.kv_cache_dtype = torch.float4_e2m1fn_x2
+```
+
+### 2.2 字符串 ↔ torch dtype 映射表
+
+**文件**: `python/sglang/srt/model_executor/model_runner.py:223-228`
+
+```python
+TORCH_DTYPE_TO_KV_CACHE_STR = {
+    torch.float8_e4m3fn: "fp8_e4m3",
+    torch.float8_e4m3fnuz: "fp8_e4m3",
+    torch.float8_e5m2: "fp8_e5m2",
+    torch.bfloat16: "bf16",
+}
+```
+
+---
+
+## 三、KV Cache 内存池分配
+
+配置完 dtype 后，`init_memory_pool()` 使用 `self.kv_cache_dtype` 分配 KV Cache 内存。
+
+### 3.1 KVCache 基类的 store_dtype 处理
+
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py:618-622`
+
+```python
+if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+    # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8
+    self.store_dtype = torch.uint8
+else:
+    self.store_dtype = dtype
+```
+
+**关键设计**: FP8 tensor在PyTorch中不支持 `index_put` 操作，因此底层存储统一用 `torch.uint8`，读取时再通过 `.view(self.dtype)` 转换回 FP8 dtype。
+
+### 3.2 MHA（Multi-Head Attention）KV Cache 分配
+
+**文件**: `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:664-682`
+
+```python
+# init_memory_pool() 中，对于普通 MHA 模型
+self.token_to_kv_pool = MHATokenToKVPool(
+    self.max_total_num_tokens,
+    page_size=self.page_size,
+    dtype=self.kv_cache_dtype,        # ← fp8_e4m3fn
+    head_num=...,
+    head_dim=...,
+    layer_num=...,
+    device=...,
+)
+```
+
+MHATokenToKVPool 内部（`memory_pool.py:801-825`）为每层分配 k_buffer 和 v_buffer：
+
+```python
+self.k_buffer = [
+    torch.zeros(
+        (self.size + self.page_size, self.head_num, self.head_dim),
+        dtype=self.store_dtype,   # ← torch.uint8（FP8时）
+        device=self.device,
+    )
+    for _ in range(self.layer_num)
+]
+# v_buffer 同理
+```
+
+### 3.3 MLA（Multi-head Latent Attention）KV Cache 分配
+
+**文件**: `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:556-568`
+
+DeepSeek V2 使用 MLA 架构，KV Cache 是 latent 向量（不是分离的 K/V），分配如下：
+
+```python
+self.token_to_kv_pool = MLATokenToKVPool(
+    self.max_total_num_tokens,
+    page_size=self.page_size,
+    dtype=self.kv_cache_dtype,        # ← fp8_e4m3fn
+    kv_lora_rank=self.model_config.kv_lora_rank,      # 通常 512
+    qk_rope_head_dim=self.model_config.qk_rope_head_dim,  # 通常 64
+    layer_num=...,
+    device=...,
+)
+```
+
+MLATokenToKVPool 内部（`memory_pool.py:1440-1446`）分配统一 kv_buffer：
+
+```python
+self.kv_buffer = [
+    torch.zeros(
+        (self.size + self.page_size, 1, self.kv_cache_dim),  # kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        dtype=self.store_dtype,  # ← torch.uint8（FP8时）
+        device=self.device,
+    )
+    for _ in range(self.layer_num)
+]
+```
+
+### 3.4 内存容量计算
+
+**文件**: `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:47-114`
+
+`get_cell_size_per_token()` 方法根据 kv_cache_dtype 计算每 token 的内存占用：
+
+```python
+kv_size = torch._utils._element_size(self.kv_cache_dtype)
+# fp8_e4m3fn → kv_size = 1 byte（对比 bf16 的 2 bytes，节省一半内存）
+```
+
+FP8 相比 BF16，**每 token 的 KV Cache 内存减半**，因此可以存放更多 token。
+
+---
+
+## 四、KV Cache 写入（量化过程）
+
+### 4.1 MHA 路径：set_kv_buffer()
+
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py:951-988`
+
+```python
+def set_kv_buffer(self, layer, loc, cache_k, cache_v, k_scale=None, v_scale=None, ...):
+    if cache_k.dtype != self.dtype:  # 如果计算精度(bf16) != 存储精度(fp8)
+        if k_scale is not None:
+            cache_k.div_(k_scale)     # 应用缩放因子（如果有）
+        if v_scale is not None:
+            cache_v.div_(v_scale)
+        cache_k = cache_k.to(self.dtype)  # bf16 → fp8_e4m3fn（PyTorch 直接 cast）
+        cache_v = cache_v.to(self.dtype)
+
+    if self.store_dtype != self.dtype:  # fp8 时需要 view 为 uint8 来写入
+        cache_k = cache_k.view(self.store_dtype)  # fp8 → uint8
+        cache_v = cache_v.view(self.store_dtype)
+
+    # 写入到 k_buffer/v_buffer 对应位置
+    _set_kv_buffer_impl(cache_k, cache_v, self.k_buffer[...], self.v_buffer[...], loc, ...)
+```
+
+**量化方式**: 对于 MHA 路径，使用 PyTorch 原生 `.to(torch.float8_e4m3fn)` 进行 cast。如果有 k_scale/v_scale（从量化参数文件加载），会先除以 scale 再 cast。
+
+### 4.2 MLA 路径：set_mla_kv_buffer()
+
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py:1509-1548`
+
+```python
+def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+    if self.nsa_kv_cache_store_fp8:
+        # NSA 模型的特殊 FP8 路径：分块量化
+        cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
+            cache_k_nope, cache_k_rope
+        )
+        # nope_fp8: (num_tokens, 1, 528) uint8 [fp8_data(512) | scales(16)]
+        # rope_fp8: (num_tokens, 1, 128) uint8 [bf16_bytes(128)]
+        set_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
+    else:
+        # 普通 MLA 的 FP8 路径：直接 cast
+        if cache_k_nope.dtype != self.dtype:
+            cache_k_nope = cache_k_nope.to(self.dtype)  # bf16 → fp8
+            cache_k_rope = cache_k_rope.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k_nope = cache_k_nope.view(self.store_dtype)  # fp8 → uint8
+            cache_k_rope = cache_k_rope.view(self.store_dtype)
+        set_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+```
+
+### 4.3 NSA 模型的 Triton 分块量化
+
+**文件**: `python/sglang/srt/layers/attention/nsa/quant_k_cache.py`
+
+`quantize_k_cache_separate()` 使用 Triton kernel 进行分块量化：
+- **NOPE 部分**: 按 tile_size=128 分块，每块计算 `scale = max(|values|) / 448.0`，然后量化到 FP8
+- **ROPE 部分**: 直接拷贝原始 BF16 数据（不量化）
+- 输出布局：`[fp8_nope_data | fp32_scales | bf16_rope_data]`
+
+### 4.4 融合 RoPE + 量化（FlashInfer 路径）
+
+**文件**: `python/sglang/srt/layers/attention/utils.py:324-406`
+
+对于 FlashInfer MLA 后端，提供了融合的 RoPE + FP8 量化 kernel：
+
+```python
+def mla_quantize_and_rope_for_fp8(q, q_rope, k, k_rope, positions, cos_sin_cache, ...):
+    flashinfer.rope.mla_rope_quantize_fp8(
+        q_rope=q_rope, k_rope=k_rope,
+        q_nope=q_nope, k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache, pos_ids=pos_ids,
+        quantize_dtype=attn_dtype,  # fp8_e4m3fn
+        ...
+    )
+```
+
+这个 kernel 将 RoPE 旋转位置编码和 FP8 量化合并为一个操作，减少中间内存访问。
+
+---
+
+## 五、KV Cache 读取（反量化过程）
+
+### 5.1 MHA 路径：get_kv_buffer()
+
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py:924-949`
+
+```python
+def _get_key_buffer(self, layer_id):
+    if self.store_dtype != self.dtype:
+        return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        # uint8 → view as fp8_e4m3fn（零拷贝，只是重新解释字节）
+    return self.k_buffer[layer_id - self.start_layer]
+```
+
+读取时只是 `.view()` 操作，**没有显式的反量化**。Flash Attention 等内核直接接受 FP8 输入。
+
+### 5.2 MLA 路径：get_key_buffer()
+
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py:1468-1475`
+
+```python
+def get_key_buffer(self, layer_id):
+    if self.store_dtype != self.dtype:
+        return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+    return self.kv_buffer[layer_id - self.start_layer]
+```
+
+同样是零拷贝 view 操作。
+
+### 5.3 NSA 模型的反量化
+
+**文件**: `python/sglang/srt/layers/attention/nsa/dequant_k_cache.py:120-150`
+
+NSA 模型需要显式反量化（因为有分块 scale）：
+
+```python
+# Triton kernel: _dequantize_k_cache_fast_kernel
+y_q = tl.load(ptr_q, mask=mask, other=0.0).to(tl.float32)
+y_s = tl.load(ptr_s)
+y = (y_q * y_s).to(output_ptr.dtype.element_ty)  # fp8_value * fp32_scale → bf16
+```
+
+---
+
+## 六、Attention Backend 中的 FP8 处理
+
+### 6.1 FlashAttention Backend
+
+**文件**: `python/sglang/srt/layers/attention/flashattention_backend.py`
+
+#### forward_extend()（line 783-794）和 forward_decode()（line 1143-1150）：
+
+```python
+# FP8 KV Cache 时，query 也需要 cast 到 fp8 以匹配 KV cache dtype
+if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+    if layer.k_scale is not None:
+        descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+        k_descale = layer.k_scale.expand(descale_shape)
+        v_descale = layer.v_scale.expand(descale_shape)
+    q = q.to(self.kv_cache_dtype)       # bf16 → fp8（query也转fp8）
+    q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+    k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+```
+
+FA3 kernel 接受 FP8 的 Q/K/V 和 descale 参数，内部进行 FP8 矩阵乘法然后通过 descale 恢复精度。
+
+### 6.2 FlashInfer Backend
+
+**文件**: `python/sglang/srt/layers/attention/flashinfer_backend.py:136-144`
+
+FlashInfer 根据 kv_cache_dtype 决定是否使用 tensor core：
+
+```python
+self.decode_use_tensor_cores = should_use_tensor_core(
+    kv_cache_dtype=model_runner.kv_cache_dtype, ...
+)
+# FP8 时强制使用 tensor core（line 1658-1659）
+if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    return True
+```
+
+### 6.3 DeepSeek V2 模型中的 FP8 特殊处理
+
+**文件**: `python/sglang/srt/models/deepseek_v2.py:1114`
+
+```python
+self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+```
+
+在 forward_mha 方法中（`forward_mha.py`），对于 AMD GPU (aiter) 的 FP8 路径：
+
+```python
+kv_cache_dtype = fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+q, _, _, k = fused_qk_rope_cat_and_cache_mla(
+    q_nope_out, q_pe, k_nope, k_pe,
+    forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id),
+    forward_batch.out_cache_loc, positions, cos, sin,
+    self.attn_mqa.k_scale, self.rotary_emb.is_neox_style,
+    q_out_dtype=kv_cache_dtype,  # ← 输出也用 FP8 dtype
+)
+```
+
+---
+
+## 七、KV Cache 量化缩放因子（Scale）
+
+### 7.1 RadixAttention 层的 scale 属性
+
+**文件**: `python/sglang/srt/layers/radix_attention.py:83-84`
+
+```python
+self.k_scale = None
+self.v_scale = None
+```
+
+### 7.2 Scale 的加载
+
+**文件**: `python/sglang/srt/model_executor/model_runner.py:998-1019`
+
+```python
+if self.server_args.kv_cache_dtype == "fp8_e4m3":
+    if self.server_args.quantization_param_path is not None:
+        if callable(getattr(self.model, "load_kv_cache_scales", None)):
+            self.model.load_kv_cache_scales(self.server_args.quantization_param_path)
+    else:
+        logger.warning(
+            "Using FP8 KV cache but no scaling factors provided. "
+            "Defaulting to scaling factors of 1.0. "
+            "This may lead to less accurate results!"
+        )
+```
+
+**注意**: 如果不提供 `--quantization-param-path`，scale 默认为 None（等效于 1.0），直接做 `torch.Tensor.to(fp8)` cast。
+
+---
+
+## 八、完整数据流总结
+
+```
+命令行 --kv-cache-dtype fp8_e4m3
+    │
+    ▼
+server_args.kv_cache_dtype = "fp8_e4m3"  (server_args.py:314)
+    │
+    ▼
+configure_kv_cache_dtype()  (model_runner.py:1698-1702)
+    │ self.kv_cache_dtype = torch.float8_e4m3fn
+    ▼
+init_memory_pool()  (model_runner_kv_cache_mixin.py:339)
+    │ 分配 KV buffer，store_dtype=uint8
+    │ 内存减半（每元素1字节 vs bf16的2字节）
+    ▼
+推理时 forward():
+    │
+    ├─ Prefill/Extend:
+    │   ├─ 模型计算得到 K, V（bf16 精度）
+    │   ├─ set_kv_buffer() / set_mla_kv_buffer()
+    │   │   ├─ MHA: cache_k.to(fp8_e4m3fn) → .view(uint8) → 写入buffer
+    │   │   └─ MLA: cache_k_nope.to(fp8) → .view(uint8) → triton kernel写入
+    │   └─ attention计算: Q也cast到fp8，FA3/FlashInfer接受fp8 Q/K/V
+    │
+    └─ Decode:
+        ├─ 新token的K/V → set_kv_buffer()（同上量化写入）
+        ├─ 读取历史KV: get_kv_buffer() → .view(fp8_e4m3fn)（零拷贝）
+        └─ attention计算: 使用fp8 tensor core加速
+```
+
+---
+
+## 九、如果想实现自定义量化格式（如 MXFP8）的修改入口
+
+### 9.1 需要修改的文件清单
+
+#### （1）参数定义层
+
+**文件**: `python/sglang/srt/server_args.py:3079-3085`
+
+在 argparse choices 中添加新格式：
+```python
+choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1", "mxfp8"],  # 添加 "mxfp8"
+```
+
+#### （2）dtype 转换层
+
+**文件**: `python/sglang/srt/model_executor/model_runner.py:1673-1719`
+
+在 `configure_kv_cache_dtype()` 中添加新分支：
+```python
+elif self.server_args.kv_cache_dtype == "mxfp8":
+    self.kv_cache_dtype = torch.float8_e4m3fn  # 底层仍用 fp8 dtype
+    self.kv_cache_quant_method = "mxfp8"       # 需要新增字段标记量化方式
+```
+
+**注意**: MXFP8 和普通 FP8 的区别在于量化方式（MXFP8 使用共享指数），底层 tensor dtype 可能仍是 fp8_e4m3fn，但需要额外的 scale/exponent buffer。
+
+#### （3）内存池分配层（核心修改）
+
+**文件**: `python/sglang/srt/mem_cache/memory_pool.py`
+
+在 KVCache 基类和具体实现类（`MHATokenToKVPool` / `MLATokenToKVPool`）中：
+
+- **分配**: 除了数据 buffer 外，还需要分配 **共享指数 buffer**（MXFP8 每 N 个元素共享一个指数）
+- **set_kv_buffer()** (`line 951`): 实现 MXFP8 量化逻辑替换 `cache_k.to(self.dtype)`
+- **get_kv_buffer()** (`line 948`): 实现 MXFP8 反量化逻辑（不能简单 `.view()`）
+- **get_cell_size_per_token()** (`model_runner_kv_cache_mixin.py:47`): 更新内存容量计算
+
+参考现有 FP4 实现 `MLATokenToKVPoolFP4` / `MHATokenToKVPoolFP4`（需要额外的 scale buffer），MXFP8 可以类似设计。
+
+#### （4）Attention Backend 层
+
+**文件**: 需要修改所有用到的 attention backend
+
+- `flashattention_backend.py:783-794, 1143-1150`: 修改 Q/K/V 的 cast 和 descale 逻辑
+- `flashinfer_backend.py:138`: 修改 tensor core 判断逻辑
+- 可能需要自定义 attention kernel 来支持 MXFP8 格式
+
+#### （5）量化/反量化 kernel
+
+需要新增文件（类似 NSA 的 `quant_k_cache.py` / `dequant_k_cache.py`）：
+
+- 实现 MXFP8 的量化 Triton/CUDA kernel
+- 实现 MXFP8 的反量化 kernel
+- 可以放在 `python/sglang/jit_kernel/` 下（JIT kernel）或 `sgl-kernel/csrc/` 下（AOT kernel）
+
+### 9.2 最简修改路径（推荐）
+
+如果 MXFP8 和 FP8 的 tensor 存储布局兼容（都是 1 byte/element），最简方案：
+
+1. **`server_args.py`**: 添加 choices
+2. **`model_runner.py:configure_kv_cache_dtype()`**: 添加 elif 分支
+3. **`memory_pool.py:set_kv_buffer()` / `set_mla_kv_buffer()`**: 替换量化函数（把 `.to(fp8)` 换成自定义 MXFP8 量化）
+4. **`memory_pool.py:get_kv_buffer()`**: 如果需要反量化才能给 attention kernel 用，则替换 `.view()` 为反量化函数
+5. **添加 scale buffer**: 在 KVCache 子类中分配额外的 shared exponent buffer
+
+### 9.3 参考：现有 FP4 量化格式的实现方式
+
+SGLang 已经有 FP4 (fp4_e2m1) 的实现，可以作为添加新量化格式的参考：
+
+- `MHATokenToKVPoolFP4` / `MLATokenToKVPoolFP4` - 额外分配了 `kv_scale_buffer`
+- `model_runner_kv_cache_mixin.py:543-555, 645-663` - 根据 dtype 选择不同的 Pool 类
+- 内存容量计算中包含 scale buffer 的开销
+
+### 9.4 关键入口文件汇总表
+
+| 修改目的 | 文件 | 关键行号 |
+|---------|------|---------|
+| 命令行参数 | `server_args.py` | 3079-3085 |
+| dtype转换 | `model_executor/model_runner.py` | 1673-1719 |
+| Scale加载 | `model_executor/model_runner.py` | 998-1019 |
+| 内存容量计算 | `model_executor/model_runner_kv_cache_mixin.py` | 47-114 |
+| 内存池选择 | `model_executor/model_runner_kv_cache_mixin.py` | 484-682 |
+| KV buffer 分配 | `mem_cache/memory_pool.py` | 618-622, 801-825, 1440-1446 |
+| KV Cache 写入(MHA) | `mem_cache/memory_pool.py` | 951-988 |
+| KV Cache 写入(MLA) | `mem_cache/memory_pool.py` | 1509-1548 |
+| KV Cache 读取 | `mem_cache/memory_pool.py` | 924-949, 1468-1475 |
+| Attention FP8处理 | `layers/attention/flashattention_backend.py` | 783-794, 1143-1150 |
+| FlashInfer FP8处理 | `layers/attention/flashinfer_backend.py` | 136-144, 1617-1663 |
+| NSA分块量化 | `layers/attention/nsa/quant_k_cache.py` | 全文 |
+| NSA反量化 | `layers/attention/nsa/dequant_k_cache.py` | 全文 |
+| 融合RoPE+FP8量化 | `layers/attention/utils.py` | 324-406 |
+
+---
+
