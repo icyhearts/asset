@@ -440,3 +440,9 @@ CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/mo
 分析 --kv-cache-dtype fp8_e4m3参数会在哪里生效，如何影响kv cache的生成和使用，找出相关代码。
 如果想实现自己定义的量化格式，比如mxfp8格式kv cache量化，修改入口在哪里？
 要求：把答案追加在 like-useful/answer_sgl.md里面
+
+python/sglang/srt/model_executor/model_runner.py configure_kv_cache_dtype函数if self.server_args.kv_cache_dtype == "auto":时，会尝试执行quant_config = getattr(self.model, "quant_config", None)
+
+self.model的quant_config属性是在哪里被设置的？quant_config的数据来自哪里？
+
+要求：把答案追加在 like-useful/answer_sgl.md里面
