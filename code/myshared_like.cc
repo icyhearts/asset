@@ -18,14 +18,14 @@ class SharedPtr {
     }
     // move ctor
     SharedPtr(SharedPtr &&other) {
-      ptr = other.ptr_;
+      ptr_ = other.ptr_;
       ref_count_ = other.ref_count_;
       other.ptr_ = nullptr;
       other.ref_count_ = nullptr;
 
     }
     // copy assign
-    SharedPtr &SharedPtr(const SharedPtr &other) {
+    SharedPtr &operator=(const SharedPtr &other) {
       if (this != &other) {
         release();
         ptr_ = other.ptr_;
@@ -38,7 +38,7 @@ class SharedPtr {
 
     }
     // move asign
-    SharedPtr &SharedPtr(SharedPtr &&other) {
+    SharedPtr &operator=(SharedPtr &&other) {
       if (this != &other) {
         release();
         ptr_ = other.ptr_;
@@ -58,14 +58,17 @@ class SharedPtr {
       ref_count_ = ptr_ ? new std::atomic<int>(1) : nullptr;
     }
     void swap(SharedPtr &other) {
-      std::swap(ptr_, othe.ptr_);
-      std::swap(ref_count_, othe.ref_count_);
+      std::swap(ptr_, other.ptr_);
+      std::swap(ref_count_, other.ref_count_);
     }
 
     T *get() {return ptr_; }
     T *operator->() {return ptr_;}
     T &operator*() {
       return *ptr_;
+    }
+    int use_count() {
+      return ref_count_ ? ref_count_->load() : 0;
     }
     explicit operator bool() {return ptr_ != nullptr;}
 
