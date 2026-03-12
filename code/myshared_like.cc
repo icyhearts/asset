@@ -16,6 +16,13 @@ class SharedPtr {
     // move ctor
     SharedPtr(const SharedPtr &&other) {
     }
+    // copy assign
+    SharedPtr &SharedPtr(const SharedPtr &other) {
+
+    }
+    // move asign
+    SharedPtr &SharedPtr(const SharedPtr &&other) {
+    }
   private:
     void release() {
       if (ref_count_) {
