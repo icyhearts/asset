@@ -26,10 +26,28 @@ class SharedPtr {
     }
     // copy assign
     SharedPtr &SharedPtr(const SharedPtr &other) {
+      if (this != &other) {
+        release();
+        ptr_ = other.ptr_;
+        ref_count_ = other.ref_count_;
+        if (ref_count_) {
+          ref_count_->fetch_add(1);
+        }
+      }
+      return *this;
 
     }
     // move asign
     SharedPtr &SharedPtr(SharedPtr &&other) {
+      if (this != &other) {
+        release();
+        ptr_ = other.ptr_;
+        ref_count_ = other.ref_count_;
+
+        other.ptr_ = nullptr;
+        other.ref_count_ = nullptr;
+      }
+      return *this;
     }
     ~SharedPtr () {
       release();
