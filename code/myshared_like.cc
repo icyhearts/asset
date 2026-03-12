@@ -7,21 +7,22 @@ template <typename T>
 class SharedPtr {
   public:
     SharedPtr(T *ptr = nullptr): ptr_(ptr), ref_count_(ptr_ ? new std::atomic<int>(1): nullptr) {
-      ptr_
     }
     // copy ctor
     SharedPtr(const SharedPtr &other) {
+      ptr_ = other.ptr_;
+      ref_count_ = other.ref_count_;
 
     }
     // move ctor
-    SharedPtr(const SharedPtr &&other) {
+    SharedPtr(SharedPtr &&other) {
     }
     // copy assign
     SharedPtr &SharedPtr(const SharedPtr &other) {
 
     }
     // move asign
-    SharedPtr &SharedPtr(const SharedPtr &&other) {
+    SharedPtr &SharedPtr(SharedPtr &&other) {
     }
   private:
     void release() {
