@@ -17,6 +17,14 @@ class SharedPtr {
     SharedPtr(const SharedPtr &&other) {
     }
   private:
+    void release() {
+      if (ref_count_) {
+        delete ref_count_;
+        delete ptr_;
+      }
+      ref_count_ = nullptr;
+      ptr_ = nullptr;
+    }
     T* ptr_;
     std::atomic<int>* ref_count_;
 };
