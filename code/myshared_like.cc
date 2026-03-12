@@ -62,6 +62,14 @@ class SharedPtr {
       std::swap(ref_count_, othe.ref_count_);
     }
 
+    T *get() {return ptr_; }
+    T *operator->() {return ptr_;}
+    T &operator*() {
+      if (ptr_) {
+        return *ptr_;
+      }
+    }
+
   private:
     void release() {
       if (ref_count_) {
