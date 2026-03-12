@@ -67,7 +67,7 @@ class SharedPtr {
     T &operator*() {
       return *ptr_;
     }
-    operator bool() {return ptr_ != nullptr;}
+    explicit operator bool() {return ptr_ != nullptr;}
 
   private:
     void release() {
@@ -87,5 +87,46 @@ struct Foo {
     ~Foo() { printf("  Foo(%d) destroyed\n", val); }
 };
 
-int main () {
+int main() {
+    printf("=== 1. Constructor ===\n");
+    SharedPtr<Foo> p1(new Foo(1));
+    printf("  p1.use_count=%d, val=%d\n\n", p1.use_count(), p1->val);
+
+    printf("=== 2. Copy Constructor ===\n");
+    SharedPtr<Foo> p2(p1);
+    printf("  p1.use_count=%d, p2.use_count=%d\n\n", p1.use_count(), p2.use_count());
+
+    printf("=== 3. Move Constructor ===\n");
+    SharedPtr<Foo> p3(std::move(p2));
+    printf("  p2.use_count=%d, p3.use_count=%d\n\n", p2.use_count(), p3.use_count());
+
+    printf("=== 4. Copy Assignment ===\n");
+    SharedPtr<Foo> p4(new Foo(4));
+    p4 = p1;
+    printf("  p1.use_count=%d, p4.use_count=%d, val=%d\n\n",
+           p1.use_count(), p4.use_count(), p4->val);
+
+    printf("=== 5. Move Assignment ===\n");
+    SharedPtr<Foo> p5(new Foo(5));
+    p5 = std::move(p3);
+    printf("  p3.use_count=%d, p5.use_count=%d, val=%d\n\n",
+           p3.use_count(), p5.use_count(), p5->val);
+
+    printf("=== 6. Reset (with new pointer) ===\n");
+    p5.reset(new Foo(6));
+    printf("  p5.use_count=%d, val=%d\n\n", p5.use_count(), p5->val);
+
+    printf("=== 7. Reset (to nullptr) ===\n");
+    p5.reset();
+    printf("  p5.use_count=%d\n\n", p5.use_count());
+
+    printf("=== 8. Swap ===\n");
+    SharedPtr<Foo> pa(new Foo(10));
+    SharedPtr<Foo> pb(new Foo(20));
+    printf("  before: pa.val=%d, pb.val=%d\n", pa->val, pb->val);
+    pa.swap(pb);
+    printf("  after:  pa.val=%d, pb.val=%d\n\n", pa->val, pb->val);
+
+    printf("=== 9. Destructor (leaving scope) ===\n");
+    return 0;
 }
