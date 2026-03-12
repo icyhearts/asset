@@ -446,3 +446,8 @@ python/sglang/srt/model_executor/model_runner.py configure_kv_cache_dtype函数i
 self.model的quant_config属性是在哪里被设置的？quant_config的数据来自哪里？
 
 要求：把答案追加在 like-useful/answer_sgl.md里面
+
+实现一个简单的shared_ptr, 要求实现如下接口:
+只有一个指针的constructor,
+copy constructor, move constructor,
+copy assign, move assign
