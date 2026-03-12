@@ -6,7 +6,8 @@
 template <typename T>
 class SharedPtr {
   public:
-    SharedPtr(T *ptr = nullptr) {
+    SharedPtr(T *ptr = nullptr): ptr_(ptr), ref_count_(ptr_ ? new std::atomic<int>(1): nullptr) {
+      ptr_
     }
   private:
     T* ptr_;
