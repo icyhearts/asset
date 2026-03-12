@@ -451,5 +451,5 @@ self.model的quant_config属性是在哪里被设置的？quant_config的数据�
 只有一个指针的constructor,
 copy constructor, move constructor,
 copy assign, move assign,
-destructor, reset.
+destructor, reset, swap.
 要有引用计数，引用计数的更新要保证线程安全。
