@@ -454,3 +454,5 @@ copy assign, move assign,
 destructor, reset, swap.
 要有引用计数，引用计数的更新要保证原子操作。
 要求：实现在 /softhome/like/asset/code/myshared.cc里面，有main函数调用,每个接口都都要有调用，每种接口加一行日志打印
+
+release函数，如果this->ptr_是空指针，还是安全的一个函数吗？如果不安全，请修复
