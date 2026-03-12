@@ -57,6 +57,10 @@ class SharedPtr {
       ptr_ = ptr;
       ref_count_ = ptr_ ? new std::atomic<int>(1) : nullptr;
     }
+    void swap(SharedPtr &other) {
+      std::swap(ptr_, othe.ptr_);
+      std::swap(ref_count_, othe.ref_count_);
+    }
 
   private:
     void release() {
