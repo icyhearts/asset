@@ -27,6 +27,10 @@ class SharedPtr {
     // move asign
     SharedPtr &SharedPtr(SharedPtr &&other) {
     }
+    ~SharedPtr () {
+      release();
+    }
+
   private:
     void release() {
       if (ref_count_) {
