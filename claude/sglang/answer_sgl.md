@@ -8802,3 +8802,54 @@ def from_config(cls, config):
 
 ---
 
+
+---
+
+# 为什么类模板内部可以用 `SharedPtr` 而不需要写 `SharedPtr<T>`
+
+## 问题
+
+在 `SharedPtr<T>` 的 copy constructor 中：
+```cpp
+SharedPtr(const SharedPtr& other);   // 可以编译
+```
+为什么不需要写成：
+```cpp
+SharedPtr(const SharedPtr<T>& other);  // 也可以编译，但不是必须的
+```
+
+## 答案：C++ 的 Injected Class Name（注入类名）
+
+这是 C++ 标准规定的语言特性，不是编译器的特殊宽容。
+
+**规则**：在类模板的作用域内部，模板类名本身会被"注入"为一个名字，直接指代当前的完整特化类型。即在 `SharedPtr<T>` 的定义体 `{ ... }` 内部，裸写 `SharedPtr` 等价于 `SharedPtr<T>`。
+
+**标准依据**（C++17 [temp.local]/1）：
+
+> Like normal (non-template) classes, class templates have an injected-class-name. The injected-class-name can be used as a template-name or a type-name. When it is used as a type-name, it is equivalent to the template-name followed by the template-parameters of the class template enclosed in `<>`.
+
+## 作用域边界
+
+```cpp
+template <typename T>
+class SharedPtr {
+    // ---- 以下是类作用域内部，SharedPtr == SharedPtr<T> ----
+
+    SharedPtr(const SharedPtr& other);          // OK，SharedPtr 就是 SharedPtr<T>
+    SharedPtr& operator=(const SharedPtr& other); // OK
+
+    // ---- 类作用域结束 ----
+};
+
+// ---- 以下是类作用域外部，必须写完整 ----
+
+template <typename T>
+SharedPtr<T>::SharedPtr(const SharedPtr<T>& other) {  // 必须写 SharedPtr<T>::
+    // 但在函数体内部又进入了类作用域，裸写 SharedPtr 又 OK 了
+}
+```
+
+**总结**：两种写法都合法，类作用域内部写 `SharedPtr` 更简洁，写 `SharedPtr<T>` 也不会错。这不是省略，而是语言特性。
+
+---
+

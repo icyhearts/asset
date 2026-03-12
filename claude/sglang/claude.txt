@@ -456,3 +456,6 @@ destructor, reset, swap.
 要求：实现在 /softhome/like/asset/code/myshared.cc里面，有main函数调用,每个接口都都要有调用，每种接口加一行日志打印
 
 release函数，如果this->ptr_是空指针，还是安全的一个函数吗？如果不安全，请修复
+
+为什么copy constructor的参数类型是const SharedPtr&, 不需要带上模板，即const SharedPtr<T>&? 
+要求：把答案追加在 like-useful/answer_sgl.md里面
