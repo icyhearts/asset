@@ -12,10 +12,13 @@ class SharedPtr {
     SharedPtr(const SharedPtr &other) {
       ptr_ = other.ptr_;
       ref_count_ = other.ref_count_;
-
+      if (ref_count_) {
+        ref_count_->fetch_add(1);
+      }
     }
     // move ctor
     SharedPtr(SharedPtr &&other) {
+
     }
     // copy assign
     SharedPtr &SharedPtr(const SharedPtr &other) {
