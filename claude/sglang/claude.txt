@@ -448,9 +448,9 @@ self.model的quant_config属性是在哪里被设置的？quant_config的数据�
 要求：把答案追加在 like-useful/answer_sgl.md里面
 
 实现一个简单的shared_ptr, 要求实现如下接口:
-只有一个指针的constructor,
+只有一个指针作为参数的constructor,
 copy constructor, move constructor,
 copy assign, move assign,
 destructor, reset, swap.
-要有引用计数，引用计数的更新要保证线程安全。
-要求：实现在 like-useful/myshared.cc里面，有main函数调用,每个接口都都要有调用，每种接口加一行日志打印
+要有引用计数，引用计数的更新要保证原子操作。
+要求：实现在 /softhome/like/asset/code/myshared.cc里面，有main函数调用,每个接口都都要有调用，每种接口加一行日志打印
