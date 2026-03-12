@@ -453,3 +453,4 @@ copy constructor, move constructor,
 copy assign, move assign,
 destructor, reset, swap.
 要有引用计数，引用计数的更新要保证线程安全。
+要求：实现在 like-useful/myshared.cc里面，有main函数调用,每个接口都都要有调用，每种接口加一行日志打印
