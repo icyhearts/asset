@@ -65,10 +65,9 @@ class SharedPtr {
     T *get() {return ptr_; }
     T *operator->() {return ptr_;}
     T &operator*() {
-      if (ptr_) {
-        return *ptr_;
-      }
+      return *ptr_;
     }
+    operator bool() {return ptr_ != nullptr;}
 
   private:
     void release() {
