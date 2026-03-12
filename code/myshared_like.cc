@@ -18,6 +18,10 @@ class SharedPtr {
     }
     // move ctor
     SharedPtr(SharedPtr &&other) {
+      ptr = other.ptr_;
+      ref_count_ = other.ref_count_;
+      other.ptr_ = nullptr;
+      other.ref_count_ = nullptr;
 
     }
     // copy assign
