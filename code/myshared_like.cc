@@ -9,6 +9,9 @@ class SharedPtr {
     SharedPtr(T *ptr = nullptr): ptr_(ptr), ref_count_(ptr_ ? new std::atomic<int>(1): nullptr) {
       ptr_
     }
+    // copy ctor
+    SharedPtr() {
+    }
   private:
     T* ptr_;
     std::atomic<int>* ref_count_;
