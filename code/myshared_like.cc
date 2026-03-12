@@ -10,7 +10,11 @@ class SharedPtr {
       ptr_
     }
     // copy ctor
-    SharedPtr() {
+    SharedPtr(const SharedPtr &other) {
+
+    }
+    // move ctor
+    SharedPtr(const SharedPtr &&other) {
     }
   private:
     T* ptr_;
