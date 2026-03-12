@@ -450,4 +450,6 @@ self.model的quant_config属性是在哪里被设置的？quant_config的数据�
 实现一个简单的shared_ptr, 要求实现如下接口:
 只有一个指针的constructor,
 copy constructor, move constructor,
-copy assign, move assign
+copy assign, move assign,
+destructor, reset.
+要有引用计数，引用计数的更新要保证线程安全。
