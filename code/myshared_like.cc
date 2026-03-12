@@ -52,6 +52,11 @@ class SharedPtr {
     ~SharedPtr () {
       release();
     }
+    void reset(T *ptr = nullptr) {
+      release();
+      ptr_ = ptr;
+      ref_count_ = ptr_ ? new std::atomic<int>(1) : nullptr;
+    }
 
   private:
     void release() {
