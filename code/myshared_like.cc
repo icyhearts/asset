@@ -74,7 +74,7 @@ class SharedPtr {
 
   private:
     void release() {
-      if (ref_count_) {
+      if (ref_count_ && ref_count_->fetch_sub(1) == 1) {
         delete ref_count_;
         delete ptr_;
       }
