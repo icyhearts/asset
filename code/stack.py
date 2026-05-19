@@ -25,3 +25,4 @@ for idx, frame_info in enumerate(current_stack):
 stack_str = "| ".join(stack_info)
 with open('/tmp/stack.txt','w') as ofp:
     ofp.write(stack_str)
+
