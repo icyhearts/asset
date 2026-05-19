@@ -51,12 +51,12 @@ for gpu_index in "${GPU_IDS[@]}"; do
     [[ -z "$owner" ]] && continue
 
     if [[ "$owner" == "$PROTECTED_USER" ]]; then
-      echo "[SKIP] GPU $gpu_index PID $pid owned by $owner"
+      #echo "[SKIP] GPU $gpu_index PID $pid owned by $owner"
       continue
     fi
 
     echo "[KILL] GPU $gpu_index PID $pid owned by $owner"
-    kill -30 "$pid"
+    kill -11 "$pid"
     #kill -9 "$pid"
   done
 done

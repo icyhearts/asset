@@ -459,3 +459,441 @@ release函数，如果this->ptr_是空指针，还是安全的一个函数吗？
 
 为什么copy constructor的参数类型是const SharedPtr&, 不需要带上模板，即const SharedPtr<T>&? 
 要求：把答案追加在 like-useful/answer_sgl.md里面
+
+写一个bash脚本: /softhome/like/asset/code/bash-bin.bin/make_soft_link.sh ,  第1个命令行参数是 src_dir, 第2个参数是dst_dir，第3个参数是可选参数 suffix.
+
+对于 src_dir目录下的所有文件，如果有suffix参数，把以suffix为后缀的文件在dst_dir下创建一个相同文件名的软件链接,
+如果没有suffix参数，把所有文件都在dst_dir下面创建一个同名软链接.
+
+
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+sglang启动命令如下：
+ python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton
+ 分析: python/sglang/srt/model_executor/model_runner.py里面, ModelRunner..max_total_num_tokens这个成员是如何初始化的？
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+sglang启动命令如下：
+debug_env_file=/share/users/like/ipc.sglang.2.json CUDA_VISIBLE_DEVICES=7   python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton
+我启动了pudb调试，然后用curl向sglang server发送请求:
+curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco just is ", "max_tokens": 20, "temperature": 0 }'
+由于调试过程中，不满足sglang watchdog的超时限制，sglang server崩溃了，日志在/share_data/users/like/package/h100/package/simo_conda_sglang/temp/simo.sglang.promote-precision-scale.mmlu.2026_03_16___15_11_15.
+ 分析日志，如何修改代码，临时解除watchdog的超时限制，满足pudb调试的需求.
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+python/sglang/srt/layers/attention/triton_backend.py的TritonAttnBackend.__init__函数有如下代码,
+```
+        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+            build_unified_kv_indices,
+            extend_attention_fwd,
+            extend_attention_fwd_unified,
+        )
+....
+        self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+```
+torch.compiler.disable(extend_attention_fwd)这行代码有什么作用？最终
+TritonAttnBackend.forward_extend调用 extend_attention_fwd的时候，调用的是哪里的实现?
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+sglang启动命令如下：
+debug_env_file=/share/users/like/ipc.sglang.2.json CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton
+在prefill阶段和decode阶段，调用attention kernel是triton实现还是flash attention实现？
+具体实现的kernel代码在哪里？
+attention kernel读取key和value的时候，是全部来自kv cache，还是部分来自kv cache,部分来自实时计算的key和value?
+attention kernel是如何处理读取量化的key和value并反量化的？
+要求：prefill和decode阶段都要分析， 把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令如下：
+debug_env_file=/share/users/like/ipc.sglang.2.json CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton
+
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py里面，
+def extend_attention_fwd这个函数，下面这行代码:
+```
+batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
+```
+qo_indptr参数有什么含义？batch_size为什么等于qo_indptr.shape[0] - 1，而不是qo_indptr.shape[0]？
+
+要求：prefill和decode阶段都要分析， 把答案追加在 like-useful/answer_sgl.md里面
+
+
+Q)
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令如下：
+debug_env_file=/share/users/like/ipc.sglang.2.json CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton
+
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py里面，
+def extend_attention_fwd这个函数,
+kv_indptr参数和 kv_indices参数，分别是什么含义？数据是如何填充的？用例子说明。
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+
+在你的例子中:
+```
+假设 batch 中有 3 个 seq，情况如下：
+
+| seq | prefix_len | extend_len | 总 seq_len |
+|-----|-----------|-----------|-----------|
+| seq0 | 4 | 3 | 7 |
+| seq1 | 0 | 5 | 5 |
+| seq2 | 6 | 2 | 8 |
+```
+总seq_len是表示一条prompt中token个数吗？
+prefix_len是表示命中kv cache的前缀token个数吗？
+extend_len是表示总token中没有命中kv cache的token的个数吗？
+prefix_len=0和extend_len=0,分别意味什么？
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令如下：
+debug_env_file=/share/users/like/ipc.sglang.2.json CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+extend_attention_fwd函数在调用_fwd_kernel前，如果我想打印出prefix_len和extend_len,应该如何打印?
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+
+如下curl命令可以向sglang server发送只有一条prompt的请求.
+curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco has many", "max_tokens": 20, "temperature": 0 }' > temp/curl.log 2>&1 &
+把它改成发送多条prompt的命令.
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令如下:
+CUDA_VISIBLE_DEVICES=6 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30125 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3  --mem-fraction-static 0.7 --attention-backend triton  --watchdog-timeout 2592000 > temp/sglang.launch_server.`nowstr.sh` 2>&1 &
+日志在temp/sglang.launch_server.2026_03_19___10_38_53
+
+第1次curl命令:
+curl http://localhost:30125/v1/completions -H "Content-Type: application/json" -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": [ "San Francisco has many beautiful parks and", "San Francisco has many famous restaurants and", "San Francisco has many historic landmarks and" ], "max_tokens": 20, "temperature": 0 }'
+curl得到的响应如下: { "id": "099cf170a01f45ab98ce7c0a21f3cad6", "object": "text_completion", "created": 1773889017, "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "choices": [ { "index": 0, "text": " gardens, but one of the most unique and fascinating is the Japanese Tea Garden in Golden Gate Park.", "logprobs": null, "finish_reason": "length", "matched_stop": null }, { "index": 1, "text": " eateries, but one of the most iconic is the Fisherman's Grotto. Located on", "logprobs": null, "finish_reason": "length", "matched_stop": null }, { "index": 2, "text": " buildings, but one of the most iconic is the Palace of Fine Arts. This stunning structure was built", "logprobs": null, "finish_reason": "length", "matched_stop": null } ], "usage": { "prompt_tokens": 24, "total_tokens": 84, "completion_tokens": 60, "prompt_tokens_details": null, "reasoning_tokens": 0 }, "metadata": { "weight_version": "default" } }
+
+curl命令发送后，sglang 日志如下:
+[2026-03-19 10:56:56] Prefill batch, #new-seq: 3, #new-token: 21, #cached-token: 3, token usage: 0.00, #running-req: 0, #queue-req: 0, input throughput (token/s): 0.01, cuda graph: False
+
+第2次curl命令:
+curl http://localhost:30125/v1/completions -H "Content-Type: application/json" -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": [ "San Francisco just play "], "max_tokens": 20, "temperature": 0 }'
+响应：
+{"id":"f9b6f0859f45499cb424c2809b4ed67b","object":"text_completion","created":1773889609,"model":"/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/","choices":[{"index":0,"text":"2 games in 3 days, and they are going to play 2 more games in 3","logprobs":null,"finish_reason":"length","matched_stop":null}],"usage":{"prompt_tokens":6,"total_tokens":26,"completion_tokens":20,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
+sglang日志：
+[2026-03-19 11:06:49] Prefill batch, #new-seq: 1, #new-token: 3, #cached-token: 3, token usage: 0.00, #running-req: 0, #queue-req: 0, input throughput (token/s): 0.04, cuda graph: False
+[2026-03-19 11:06:49] Decode batch, #running-req: 1, #token: 19, token usage: 0.00, cuda graph: True, gen throughput (token/s): 0.05, #queue-req: 0
+[2026-03-19 11:06:49] INFO:     127.0.0.1:54798 - "POST /v1/completions HTTP/1.1" 200 OK
+
+第3次curl命令
+curl http://localhost:30125/v1/completions -H "Content-Type: application/json" -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": [ "java language is", "python language is"], "max_tokens": 20, "temperature": 0 }'
+curl得到响应：
+{"id":"1ec256db7d584993a3d28d9feabd8738","object":"text_completion","created":1773890437,"model":"/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/","choices":[{"index":0,"text":" used for developing android apps\nJava is a popular programming language used for developing Android apps. It is","logprobs":null,"finish_reason":"length","matched_stop":null},{"index":1,"text":" a high-level, interpreted language that is widely used for various purposes such as web development, scientific computing","logprobs":null,"finish_reason":"length","matched_stop":null}],"usage":{"prompt_tokens":8,"total_tokens":48,"completion_tokens":40,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
+sglang日志:
+[2026-03-19 11:20:36] Prefill batch, #new-seq: 2, #new-token: 6, #cached-token: 2, token usage: 0.00, #running-req: 0, #queue-req: 0, input throughput (token/s): 0.00, cuda graph: False
+[2026-03-19 11:20:37] INFO:     127.0.0.1:51408 - "POST /v1/completions HTTP/1.1" 200 OK
+
+问题:
+sglang日志中的Prefill batch里面的#new-seq等于请求有几条prompt的个数吗？ #new-token和#cached-token，与之前对话中的prefix_len,extend_len之间，有什么关系？
+ Decode batch里面的#token:是输入输出总token数，还是只包含输出token数？
+ 为什么 Prefill batch的时候，cuda graph是False, Decode batch的时候，cuda graph是 True?
+为什么第2次curl发请求，sglang日志有 Prefill batch和Decode batch的日志，第1次和第3次发 curl请求，sglang日志只有Prefill batch的日志没有Decode batch?
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+ debug_env_file=/share/users/like/ipc.sglang.2.json CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton --watchdog-timeout 2592000 > ~/package/h100/package/simo_conda_sglang/temp/simo.sglang.promote-precision-scale.mmlu.`nowstr.sh` 2>&1 &
+然后，第1次curl命令是:
+curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco is a", "max_tokens": 20, "temperature": 0 }'
+第2次curl命令是
+ curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco has many", "max_tokens": 20, "temperature": 0 }' > temp/curl.log 2>&1 &
+
+在第2次curl命令时，开始pudb调试，在python/sglang/srt/layers/attention/triton_ops/extend_attention.py的extend_attention_fwd里面， _fwd_kernel调用前，pudb打印相关tensor的形状,结果如下:
+Tensor 'kv_indices'   shape:torch.Size([3])
+Tensor 'kv_indptr'  dtype:torch.int32, shape:torch.Size([2])
+Tensor 'qo_indptr'  dtype:torch.int32, shape:torch.Size([2])
+Tensor 'k_extend'  dtype:torch.bfloat16, shape:torch.Size([2, 8, 128])
+Tensor 'o_extend'  dtype:torch.bfloat16, shape:torch.Size([2, 32, 128])
+Tensor 'q_extend'  dtype:torch.bfloat16, shape:torch.Size([2, 32, 128])
+Tensor 'v_extend'  dtype:torch.bfloat16, shape:torch.Size([2, 8, 128])
+Tensor 'k_buffer'  dtype:torch.float8_e4m3fn, shape:torch.Size([654033, 8, 128])
+Tensor 'v_buffer'  dtype:torch.float8_e4m3fn, shape:torch.Size([654033, 8, 128])
+
+部分tensor的数据打印出来:
+kv_indices:tensor([ 1,  9, 10], device='cuda:0')
+kv_indptr:tensor([0, 3], device='cuda:0', dtype=torch.int32)
+qo_indptr:tensor([0, 2], device='cuda:0', dtype=torch.int32)
+
+这次prefill, query有2个token吗？ key和value有3个token命中 cache, 2个没有命中，是吗？
+在prefill阶段，为什么query 2个token, key有5个token，query和key的token个数不一样？
+query有2个token, key中有2+3=5个token, 根据MHA公式, Q * K^T, 计算出来的 attention weights,是什么形状的？
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+对于prefix caching中，Q只需要计算extend部分，再展开讲解一下，为什么不需要计算 BOS  San  Francisco这部分的Q?
+BOS  San  Francisco对于BOS  San  Francisco  has  many的 attention weight都不需要计算了吗？
+MHA里面，output=softmax(Q * K^T) * V, BOS  San  Francisco这部分命中cache的Q查询token,不需要和value做矩阵乘法了吗？
+这和原始的MHA公式在数学上还等价吗？
+在第2次curl命令的例子中， 按原始的MHA论文, 单个head的output的形状应该是5 x head_dim,sglang的output形状是2 x head_dim,如何理解sglang output的形状和论文公式的形状不一致？
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+
+以上面第2次curl的例子为例子，对 like-useful/load_trition_attention_backend_forward_extend.py 的_fwd_kernel进行详细讲解。
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+矩阵乘法，C=AxB, A shape=[m, k], B shape=[k, n], C shape=[m, n]
+
+
+对python/sglang/srt/layers/logits_processor.py的LogitsProcessor forward函数进行讲解
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+python/sglang/srt/layers/logits_processor.py 465行，明明是注释，没有有效代码,重新讲解 .
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+
+python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton --watchdog-timeout 2592000
+
+Q)
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令如下:
+python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton --watchdog-timeout 2592000
+sglang日志位于:temp/sglang_server.2026_03_21___09_33_37.
+pudb调试的时候, 在python/sglang/srt/layers/attention/triton_backend.py的 forward_decode里面了打了断点
+
+多次尝试过如下curl命令:
+```
+  150  2026-03-21 09:48:57  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco is a", "max_tokens": 20, "temperature": 0 }'
+  152  2026-03-21 09:58:13  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco has many", "max_tokens": 20, "temperature": 0 }' > temp/curl.log 2>&1 &
+  156  2026-03-21 13:25:28  cat temp/curl.log
+  157  2026-03-21 13:25:56  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco and Beijing ", "max_tokens": 20, "temperature": 0 }' > temp/curl.log 2>&1 &
+  159  2026-03-21 14:08:27  cat temp/curl.log
+  160  2026-03-21 14:09:03  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco goes to ", "max_tokens": 20, "temperature": 0 }' > temp/curl.log 2>&1 &
+  162  2026-03-21 14:11:09  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco just ", "max_tokens": 20, "temperature": 0 }' > temp/curl.log 2>&1 &
+  164  2026-03-21 14:11:28  cat temp/curl.log
+  165  2026-03-21 14:11:50  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "San Francisco has one  ", "max_tokens": 20, "temperature": 0 }' > temp/curl.log 2>&1 &
+  167  2026-03-21 14:19:04  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "you and me ", "max_tokens": 200, "temperature": 0 }' > temp/curl.log 2>&1 &
+  169  2026-03-21 14:25:47  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "you has 2 ", "max_tokens": 200, "temperature": 0 }' > temp/curl.log 2>&1 &
+  171  2026-03-21 14:26:08  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "you and him", "max_tokens": 50, "temperature": 0 }' > temp/curl.log 2>&1 &
+  173  2026-03-21 14:26:22  curl http://localhost:30124/v1/completions  -H "Content-Type: application/json"  -d '{ "model": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/", "prompt": "you and him", "max_tokens": 50, "temperature": 0 }' > temp/curl.log 2>&1 &
+```
+都无法触发在断点停下，是什么原因?
+python/sglang/srt/layers/attention/triton_backend.py的 forward_decode函数，如何能够进入这个函数?
+要求：1:讲解代码的时候，代码文件路径用绝对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+
+写一个 debugpy + nvim-dap调试python多进程代码的例子。
+示例代码写在 like-useful/demo_debugpy里面，
+
+要求：1: 要讲解如何启动，如何attach, 讲解需要安装哪些包和插件。
+2:把答案追加在 like-useful/answer_sgl.md里面
+
+dap.adapters.python_attach和dap.configurations.python分别有什么作用?
+dap.adapters.python_attach里面有port配置，dap.configurations.python也有port配置,两个port有什么区别?
+现在我想让2个worker都被调试，需要让worker监听不同的端口吗？
+修改python代码和dap_config.lua，满足调试2个work的需求。
+要求： 把答案追加在 like-useful/answer_sgl.md里面
+
+sglang如何配置日志使用自定义json，帮我写一个json配置，让sglang使用自定义的json。
+日志里面要有日期和时间，pid,文件名basename，行号, 函数名, 日志message.
+要求： 1:json放在like-useful/custom_sglang.json. 
+2:把答案追加在 like-useful/answer_sgl.md里面
+
+
+
+对python/sglang/srt/layers/attention/triton_ops/decode_attention.py的 _decode_grouped_att_m_fwd和_fwd_grouped_kernel_stage1进行讲解,重点是_fwd_grouped_kernel_stage1的实现.
+
+要求： 把答案追加在 like-useful/answer_sgl.md里面
+
+Q)
+
+对python/sglang/srt/layers/attention/triton_ops/decode_attention.py的 _decode_softmax_reducev_fwd和 _fwd_kernel_stage2 进行讲解,重点是 _fwd_kernel_stage2 的实现.
+
+要求： 把答案追加在 like-useful/answer_sgl.md里面
+
+
+python/sglang/srt/mem_cache/memory_pool.py的_set_kv_buffer_impl在什么情况下会调用store_cache? store_cache真实的实现是cuda实现的吗？store_cache代码在哪里？完成的功能和_set_kv_buffer_impl下面这些naive代码一样吗？
+``
+        k_cache[indices] = k
+        v_cache[indices] = v
+```
+要求： 把答案追加在 like-useful/answer_sgl.md里面
+
+
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令如下:
+python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30125 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp4_e2m1 --mem-fraction-static 0.7 --attention-backend triton --watchdog-timeout 2592000 --disable-cuda-graph
+
+对 /share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/mem_cache/memory_pool.py的MHATokenToKVPoolFP4所有函数进行讲解。
+在使用MHATokenToKVPoolFP4的时候，triton attention kernel,包括prefill阶段和decode阶段的trition attention kernel是会在kernel进行fp4 kv cache反量化，还是由MHATokenToKVPoolFP4的某个函数反量化bf16 kv cache，再把bf16 kv cache送给trition attention kernel?
+
+要求： 把答案追加在 like-useful/answer_sgl.md里面
+
+给出fp4 e2m1格式,所有正数的二进制到浮点数的计算过程
+要求： 把答案追加在 like-useful/answer_sgl.md里面
+
+
+/share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/mem_cache/memory_pool.py
+里面,MHATokenToKVPoolFP4.set_kv_buffer, loc参数表示存储k v cache时候的下标值，loc是由哪里的代码计算出来的？
+如果要实现自定义的kv cache量化类，比如实现mxfp8的kv cache量化，需要关心loc的计算吗？需要关心radix tree的增删改查吗？
+要求： 把答案追加在 like-useful/answer_sgl.md里面
+
+
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令如下:
+python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton --watchdog-timeout 2592000
+在这种配置下，回答：
+prefill阶段, python/sglang/srt/layers/attention/triton_ops/extend_attention.py 的_fwd_kernel, attention计算分为2个stage
+stage1的计算，qk = tl.dot(q.to(k.dtype), k) ，使用的是矩阵乘法是fp8还是bf16的？
+stage1的计算，acc = acc * re_scale[:, None] + tl.dot(p, v)，使用的是矩阵乘法是fp8还是bf16的？
+stage2的计算，qk = tl.dot(q, k, out_dtype=tl.float32)，使用的是矩阵乘法是fp8还是bf16的？
+stage2的计算，acc = acc * re_scale[:, None] + tl.dot(p, v)，使用的是矩阵乘法是fp8还是bf16的？
+
+decode 阶段,回答:
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py的 _fwd_grouped_kernel_stage1完成stage1计算
+qk = tl.dot(q, k.to(q.dtype)), 使用的是矩阵乘法是fp8还是bf16的？
+acc += tl.dot(p.to(v.dtype), v), 使用的是矩阵乘法是fp8还是bf16的？
+
+为什么sglang在有些地方使用fp8 矩阵乘法，有些地方使用bf16矩阵乘法？ 使用fp8矩阵乘法的地方会不会有数据溢出风险？
+
+要求：1:讲解代码的时候，代码文件路径使用相对代码仓库的相对路径, 2:把答案追加在 like-useful/answer_sgl.md里面
+
+cuda位于/share/users/like/opt/cuda-12.8/
+写一个使用nvidai hopper gpu tma搬运数据的例子，要有main函数，有CMakeLists.txt.
+
+要求：1: 把相关代码写在 /softhome/like/asset/code/tma_demo目录。2:把代码追加在 like-useful/answer_sgl.md里面
+3: 讲解过程最好有图示
+
+
+代码里面使用了很多内联汇编，比如
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;"
+                 :
+                 : "r"((uint32_t)__cvta_generic_to_shared(&mbarrier)),
+                   "r"((uint32_t)1) // arrival count = 1 (one TMA op)
+                 : "memory");
+先对cuda 内联汇编的语法进行讲解，再讲解tma_demo里面的内联汇编的代码,包括如何和c++代码进行参数的传递，输出输入约束，clobbered_registers。
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+tma_demo.cu里面，下面的代码:
+  for (int r = threadIdx.x; r < TILE_ROWS; r += blockDim.x) {
+    for (int c = 0; c < TILE_COLS; c++) {
+      smem_tile[r][c] *= 2.0f;
+    }
+  }
+一个thread block有128个线程。
+只有tid=0...31的线程才进入循环吧？
+tid=0..31的线程执行了TILE_COLS次smem_tile[r][c] *= 2.0f?
+tid>=32的线程无法进入循环吗？
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+为什么 tma_load_2d 需要 mbarrier， tma_store_2d不需要 mbarrier?
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+
+"cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+指令，cluster是什么样在范围？是warp还是thread block?
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+tma_demo代码里面：
+  __syncthreads();
+
+  // ── Step 5: TMA store (thread 0 issues the copy) ──
+  // Fence to make shared memory writes visible to TMA engine
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+
+为什么同时需要 __syncthreads和fence？只有其中一个不足以保证 shared memory write被TMA可见吗？
+两个同步语句分别有什么功能?
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+关于 fence.proxy 的概念，把参考文献列出来,我要看原始文献。
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+
+cuda位于/share/users/like/opt/cuda-12.8/
+写一个针对h100 gpu优化的fp16 matmul cuda kernel, 放在~/asset/code/tma_demo/目录，并修改CMakeLists.txt，把cuda kernel也编译并运行。
+要求：
+1: 有main函数的调用 
+2: A矩阵和B矩阵都是row major
+3: 要用到h100 gpu的tma
+4: 要使用软件流水线技术
+5: 要把cuda计算结果和cpu结果对比，保证结果正确性。
+6: 要能够处理任意形状的输入矩阵，不局限于32的整数倍的输入形状.  输入形状M,N,K可以通过命令行参数输入，如果没有命令行参数, M=512,N=1024,K=2048
+7: 在main函数对kernel进行多次调用，打印出运行时间，打印出实际体现出的算力TFLOPS.
+
+对实现的fp16_matmul.cu进行讲解， 要求：把答案追加在 like-useful/answer_sgl.md里面
+
+对于Llama模型,  python3 -m sglang.launch_server --attention-backend triton的时候，使用的attention kernel来自
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py _fwd_kernel
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py _fwd_grouped_kernel_stage1和
+
+
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/  --quantization simo --port 30123 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --mem-fraction-static 0.75 --attention-backend triton
+
+
+
+Q)
+对于Llama模型,  python3 -m sglang.launch_server --attention-backend triton的时候，使用的attention kernel来自
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py extend_attention_fwd会调用 kernel: _fwd_kernel,  extend_attention_fwd是如何设计 grid的 ？每个是program处理多少数据?
+``
+grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+```
+里面，max_len_extend 和BLOCK_M分别是什么含义?
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py, _fwd_grouped_kernel_stage1的grid是如何设计的？一个 program要处理多少数据的计算？
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+
+python/sglang/srt/model_executor/model_runner.py
+_forward_raw函数有如下的if else判断 ：
+```
+        if forward_batch.forward_mode.is_decode():
+            ...
+        elif forward_batch.forward_mode.is_split_prefill():
+            ...
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            ...
+        elif forward_batch.forward_mode.is_idle():
+            ...
+```
+is_split_prefill为true的条件是什么？比如,需要用什么模型触发？需要什么样的客户端的请求?需要如何启动sglang server? python3 -m sglang.launch_server 的时候需要传什么参数？
+is_idle为true的条件是什么？比如,需要用什么模型触发？需要什么样的客户端的请求?需要如何启动sglang server? python3 -m sglang.launch_server 的时候需要传什么参数？
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+python/sglang/srt/managers/scheduler.py event_loop_overlap函数，recv_reqs = self.recv_requests()是阻塞的吗？如果没有客户端请求，recv_reqs = self.recv_requests()会阻塞吗？在sglang server启动过程中，我没有显式地用 curl向server发请求, recv_reqs = self.recv_requests()也接收到了请求，并能进入batch_result = self.run_batch(batch)这一行代码，这是什么原因？
+要求：把答案追加在 like-useful/answer_sgl.md里面
+
+
+sglang 代码位于 /softhome/like/package/h100/package/sglang_kernel_src
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang启动命令：
+SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ --port 30124 --host 0.0.0.0 --tp-size 1 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.7 --attention-backend triton --watchdog-timeout 2592000 --disable-cuda-graph --skip-server-warmup 
+在这种情况下，
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py _fwd_grouped_kernel_stage1 会和 使用 Llama模型有什么区别？
+kernel 的 参数的计算和 llama模型有什么区别?
+
+要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
+
+
+sglang 代码位于 /softhome/like/package/h100/package/sglang_kernel_src
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang代码的python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py init_memory_pool函数，会 生成 ReqToTokenPool实例，
+```
+                self.req_to_token_pool = ReqToTokenPool(...
+```
+req_to_token_pool 有什么用？和kv cache有关吗？如果要实现自定义的kv cache，需要关心 req_to_token_pool的实现吗？
+要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
+
+
+sglang 代码位于 /softhome/like/package/h100/package/sglang_kernel_src
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang代码的 python/sglang/srt/layers/attention/utils.py concat_and_cast_mha_k_triton会调用concat_and_cast_mha_k_kernel, 对 concat_and_cast_mha_k_kernel 这个 kernel 进行详细的解释，讲解它的功能和实现原理。
+
+要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
+
+python/sglang/srt/mem_cache/utils.py set_mla_kv_buffer_triton会调用set_mla_kv_buffer_kernel, 对set_mla_kv_buffer_kernel进行讲解
+要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
+
+sglang 代码位于 /softhome/like/package/h100/package/sglang_kernel_src
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
+sglang代码的 python/sglang/srt/mem_cache/memory_pool.py, MLATokenToKVPool.get_key_buffer 和get_value_buffer 为什么都都从 self.kv_buffer 同一个内存池里面取数据？取的时候为什么取出来的shape不一样？get_key_buffer取完整tensor, get_value_buffer 只取前self.kv_lora_rank的维度，这是为什么？
+要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面

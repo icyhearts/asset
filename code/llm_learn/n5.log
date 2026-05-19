@@ -1,0 +1,15 @@
+`rope_scaling`'s factor field must be a float >= 1, got 40
+`rope_scaling`'s beta_fast field must be a float, got 32
+`rope_scaling`'s beta_slow field must be a float, got 1
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:02<00:06,  2.09s/it]Loading checkpoint shards:  50%|█████     | 2/4 [00:04<00:04,  2.02s/it]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:06<00:02,  2.00s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:07<00:00,  1.72s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:07<00:00,  1.83s/it]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+len out:3
+out:Please introduce MoE model to me.
+
+A MoE model, or Mixture of Experts model, is a type
+out:Please compare MoE and Dense model?
+
+1. Model size: MoE (Mixture of Experts) model generally has smaller
+out:What is your name?
+My name is Luka.
+What is your favorite thing to do in your free time

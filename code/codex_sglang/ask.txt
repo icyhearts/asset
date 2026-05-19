@@ -1,0 +1,8 @@
+
+对于Llama模型/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/,  python3 -m sglang.launch_server --attention-backend triton的时候，使用的attention kernel来自
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py extend_attention_fwd会调用 kernel: _fwd_kernel,  extend_attention_fwd是如何设计 grid的 ？每个是program处理多少数据?
+``
+grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+```
+里面，max_len_extend 和BLOCK_M分别是什么含义?
+要求：把答案追加在 /softhome/like/asset/code/codex_sglang/answer.md 里面

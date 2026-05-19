@@ -1,0 +1,10 @@
+
+cd /share/users/like/package/h100/package/sglang_kernel_src
+git reset --hard HEAD
+git fetch gitlab $current_branch
+git checkout -B $current_branch gitlab/$current_branch
+git branch
+git rev-parse HEAD
+dst_commit=$(git rev-parse HEAD)
+[[ "$src_commit" == "$dst_commit" ]] && echo "equal" || echo "not equal"
+

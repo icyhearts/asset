@@ -334,3 +334,1213 @@ tests/sglang_simo/e2e_test/test_basic_generate.py:188:27: B905 [*] `zip()` witho
 ```
 如何修复?
 要求：把答案追加在 temp/answer_sgl.md里面
+
+vllm conda环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/.
+vllm代码位于/softhome/like/package/h100/package/vllm-for-conda-simo.
+simo对vllm的attention实现进行了替换，比如simo/extensions/vllm_simo/v1/attention/backends/triton_attn.py里面有一些monkey patch, 替换了vllm原来的函数或者类。
+vllm启动命令:
+CUDA_VISIBLE_DEVICES=4 vllm serve --quantization simo --model /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --hf-overrides '{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --gpu-memory-utilization 0.5 --attention-config '{"backend": "TRITON_ATTN"}' --port 30120 > temp/vllm.serve.log.`nowstr.sh` 2>&1 &
+该启动命令会按照simo目录下的json配置，对kv cache进行量化。
+分析：在这个启动命令下，vllm进行deepseek模型推理的时候，attention的实现是在哪个函数里面？
+prefill阶段和decode分别使用的哪个kernel?
+对prefill阶段和decode阶段的attention kernel都进行讲解。
+要求：1:代码路径使用绝对路径。2:把答案追加在 temp/answer_sgl.md里面
+
+
+key和value矩阵从bf16量化成mxfp8的过程发生在哪里？
+
+对kv cache存储格式进行讲解：
+   KV Cache使用**Planar Layout**:
+   ```
+   每个KV head的存储: [packed_data (PACKED_HEAD_SIZE bytes) | scale_data (SCALE_HEAD_SIZE bytes)]
+
+PACKED_HEAD_SIZE是多大？SCALE_HEAD_SIZE是多大？
+是先把 data全部存完，再存scale? 还是按32个元素+1个scale交替存储？
+在 simo/extensions/vllm_simo/v1/attention/backends/simo_gqa.py里面，unified_attention函数的调用前，我打印了key_cache.shape, value_cache.shape：
+key_cache.shape, value_cache.shape = (torch.Size([22420, 16, 8, 132]), torch.Size([22420, 16, 8, 132]))
+如何解释这个shape?
+
+
+
+vllm conda环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/.
+vllm代码位于/softhome/like/package/h100/package/vllm-for-conda-simo.
+vllm启动命令:
+CUDA_VISIBLE_DEVICES=4 vllm serve --quantization simo --model /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --hf-overrides '{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --gpu-memory-utilization 0.5 --attention-config '{"backend": "TRITON_ATTN"}' --port 30120 > temp/vllm.serve.log.`nowstr.sh` 2>&1 &
+在这种启动命令下， 对simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py simo_triton_reshape_and_cache_flash函数和reshape_and_cache_kernel_flash函数进行讲解，
+要求：1:代码路径使用绝对路径。2:把答案追加在 temp/answer_sgl.md里面
+
+
+对simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py simo_triton_reshape_and_cache_flash函数和reshape_and_cache_kernel_flash函数进行讲解，
+要求：1:代码路径使用绝对路径。2:把答案追加在 temp/answer_sgl.md里面
+
+
+
+在 simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py 里面，simo_triton_reshape_and_cache_flash函数里面，我打印了key_cache.shape, value_cache.shape：
+key_cache.shape, value_cache.shape = (torch.Size([22420, 16, 8, 132]), torch.Size([22420, 16, 8, 132]))
+如何解释这个shape?
+要求：把答案追加在 temp/answer_sgl.md里面
+
+假设有如下参数：
+MX_FORMAT_ID=3
+OBSERVER_MODE=1
+HADAMARD_TRANSFORM_SIZE=0
+QUANT_SCALE_ROUNDING_MODE=1
+MX_BLOCK_SIZE=32
+详细解释
+simo/ops/kernels/downcast/_downcast_to_mxfmt.py的_compute_and_pack_mxfmt函数.
+
+要求：把答案追加在 temp/answer_sgl.md里面
+###
+
+vllm conda环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/.
+vllm代码位于/softhome/like/package/h100/package/vllm-for-conda-simo.
+我想调试reshape_and_cache_kernel_flash这个函数，
+/share_data/users/like/package/h100/package/other/vllm/like-useful/load_simo_vllm_downcast_mx_fp8_kv_cache.py 代码从safetensors加载数据，并调用 reshape_and_cache_kernel_flash, 
+不加TRITON_INTERPRET=1环境变量，可以正常运行. 
+以TRITON_INTERPRET=1 模式运行的时候，会报错，日志在 /share_data/users/like/package/h100/package/simo_conda_sglang/temp/run_load.log
+原因是什么？如何解决以TRITON_INTERPRET=1 模式运行这个代码?
+要求：把答案追加在 temp/answer_sgl.md里面
+
+上一个TRITON_INTERPRET=1的问题不用管了。
+先回答下面的问题：
+simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py里面的 reshape_and_cache_kernel_flash函数，以mx格式存储kv cache的时候，是如何处理 head_dim != 32的整数倍的情况的？比如head_dim=144，planar layout的数据是如何存储的？是先把每个head的维度都padding到32的整数倍吗？
+
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+vllm conda环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/.
+vllm代码位于/softhome/like/package/h100/package/vllm-for-conda-simo.
+
+
+sglang仓库python/sglang/srt/layers/attention/attention_registry.py 有 register_attention_backend函数的定义，并被调用多次，注册了不同的attention backend.
+需要实现一个simo自定义的attention backend,继承自sglang仓库的python/sglang/srt/layers/attention/triton_backend.py 的TritonAttnBackend, 对TritonAttnBackend的forward_extend和forward_decode进行重写。
+
+
+#
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+/share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+init_memory_pool函数，会根据相同的配置,有很多if else分支，给 self.token_to_kv_pool 进行赋值。
+如果我想在不改sglang codebase代码的情况下，增加if else分支， 实现自定义的KVCache类，比如实现一个子类，继承自MHATokenToKVPool,
+让 init_memory_pool在某个分支中使用自定义KVCache类，如何实现？
+sglang有注册KVCache的注册机制，允许用户添加自定义KVCache吗？
+一种方法是使用monkey patch, 在SIMO代码仓库 重新写一个init_memory_pool，在monkey patch init_memory_pool里面，使用自定义 KVCache。
+有monkey patch之外的方法吗？
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+sglang codebase的python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py, init_memory_pool函数，会对 self.token_to_kv_pool_allocator进行初始化， self.token_to_kv_pool_allocator有什么作用？它的成员函数在什么情况下会被调用?如果要实现自定义 KVCache类，比如，实现mx数据类型的kv cache量化，需要关心  self.token_to_kv_pool_allocator的实现吗？需要实现自定义的 self.token_to_kv_pool_allocator吗？
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+1.  simo  codebase simo/extensions/vllm_simo/quantization/quantization_method.py 实现了 SIMOKVCacheMethod,  simo/extensions/vllm_simo/quantization/quantization_config.py 在 `if isinstance(layer, (Attention, MLAAttention)) and self.kv_cache_quant_algo` 的时候，会返回 SIMOKVCacheMethod.
+你需要参考 vllm_simo的做法，在 simo code base simo/extensions/sglang_simo/quantization/quantization.py里面，针对sglang, 实现类似的 SIMOKVCacheMethod, 并在 SIMOConfig.get_quant_method里面返回 SIMOKVCacheMethod, 返回 SIMOKVCacheMethod 条件是: `if isinstance(layer, RadixAttention)`. RadixAttention的定义位于 /share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/layers/radix_attention.py.
+
+2. sglang codebase /share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/mem_cache/memory_pool.py 实现了MHATokenToKVPool, 你需要在 simo codebase simo/extensions/sglang_simo/mem_cache/ 里面实现一个自定义的 SIMOMHATokenToKVPool, 继承自 MHATokenToKVPool, 实现相应的接口。
+
+3.  vllm_simo kv cache支持的kv cache量化数据类型, sglang的SIMOMHATokenToKVPool应该都支持.
+对于一个token的key/value cache, SIMOMHATokenToKVPool的内存布局应该参照 vllm_simo 中 kv cache内存布局，使用planar布局，以8个head的llama模型为例：先存key/value的 head0 packed, head1 packed, ..., head7 packed. 再存head0 scale, head1 scale, ..., head7 scale. scale以e8m0格式存储。
+你需要在  simo codebase simo/extensions/sglang_simo/mem_cache/ 实现一个triton kernel set_kv_buffer_kernel，在SIMOMHATokenToKVPool的set_kv_buffer 调用 set_kv_buffer_kernel, 把bf16的key/value按照  planar layout存进key/value cache.
+
+4. 你需要在 simo codebase simo/extensions/sglang_simo/mem_cache/ 里面实现一个 sglang init_memory_pool的monkey patch，叫做 _patched_init_memory_pool,
+sglang init_memory_pool函数位于/share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py.
+_patched_init_memory_pool先调用 init_memory_pool，再判断是否需要使用simo版本的kv cache, 执行self.token_to_kv_pool = SIMOMHATokenToKVPool(...), 生成  SIMOMHATokenToKVPool 实例。
+
+5.  sglang codebase python/sglang/srt/layers/attention/attention_registry.py 实现了 register_attention_backend,可以注册attention backend.
+你需要在  simo codebase simo/extensions/sglang_simo/attention/ 里面实现 SIMOTritonAttnBackend,继承自 sglang code base的 python/sglang/srt/layers/attention/triton_backend.py 定义的 TritonAttnBackend. 通过 register_attention_backend 注册到 ATTENTION_BACKENDS 这个dict里面，注册的key是 "triton_simo".
+SIMOTritonAttnBackend需要重写基类的 forward_extend和forward_decode函数。
+
+6. sglang的 TritonAttnBackend.forward_extend 最终会调用 sgalng codebase python/sglang/srt/layers/attention/triton_ops/extend_attention.py的 _fwd_kernel, 你需要对_fwd_kernel进行增强，放到 simo codebase simo/extensions/sglang_simo/attention/ 里面，增加读取 mx planar layout的kv cache的功能.
+
+7. sglang的 TritonAttnBackend.forward_decode 最终会调用 sglang codebase python/sglang/srt/layers/attention/triton_ops/decode_attention.py的 _fwd_grouped_kernel_stage1, 你需要对 _fwd_grouped_kernel_stage1 进行增强， 放到 simo codebase simo/extensions/sglang_simo/attention/ 里面，增加读取 mx planar layout的kv cache的功能.
+
+8. 在 simo code base simo/extensions/sglang_simo里面实现一个monkey patch,  对sglang codebase的 python/sglang/srt/server_args.py进行patch, 向 ATTENTION_BACKEND_CHOICES 变量加一个 "triton_simo" 字符串。
+
+9.  对代码进行讲解：讲解内容追加在 temp/answer_sgl.md里面
+
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+sglang启动命令应该是: SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --quantization simo --port 30123 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --mem-fraction-static 0.75
+
+如果gpu 7被占用，可以改成其他gpu
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+修改simo/extensions/sglang_simo/quantization/quantization.py 的 SIMOKVCacheMethod, 让它继承 sglang codebase python/sglang/srt/layers/quantization/kv_cache.py的BaseKVCacheMethod
+
+
+sglang init_memory_pool函数位于/share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py.
+simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py 的 apply_init_memory_pool_patch,  应该patch的是 ModelRunnerKVCacheMixin.init_memory_pool, 不是ModelRunner.init_memory_pool
+完成这个修改。
+
+/softhome/like/asset/code/codex_simo/ask.txt
+
+in simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py,
+the code:
+```
+self.token_to_kv_pool = SIMOMHATokenToKVPool
+```
+will extract attribute from old_pool to feed into SIMOMHATokenToKVPool's constructor.
+then delete old_pool to release old_pool's memory.
+Modify as this:
+for all needed parameter by SIMOMHATokenToKVPool's constructor, extract from old_pool and store parameter in a dict, then delete old_pool to release memory, then call SIMOMHATokenToKVPool's constructor with needed parameters from the dict.
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py的先释放old_pool，再生成 SIMOMHATokenToKVPool的做法没有生效.
+sglang启动命令是:
+ SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --quantization simo --port 30123 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --mem-fraction-static 0.75 --attention-backend triton
+ 日志位于 temp/launch_server.kvquant_mxfp8.log.2026_04_02___14_41_00
+ 还是oom了。分析原因。
+
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+在simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py里面 执行刚才的修复建议 ： 在创建新 pool 前，先断开 allocator 对旧 pool 的引用。
+创建完新 pool, 把allocator指向新pool
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+sglang启动命令是:
+ SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --quantization simo --port 30123 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --mem-fraction-static 0.75 --attention-backend triton
+sglang 日志位于 temp/launch_server.kvquant_mxfp8.log.2026_04_02___15_21_03
+
+oom问题还是没有解决。 分析原因。 要求：把答案追加在 temp/answer_sgl.md里面
+
+simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py里面已经执行了:
+```
+  allocator = getattr(self, "token_to_kv_pool_allocator", None)
+  if allocator is not None and hasattr(allocator, "_kvcache"):
+    allocator._kvcache = None
+
+  self.token_to_kv_pool = None
+  ``
+所有的对old_pool的引用都断开了，为什么old_pool的显存还没有释放？
+如何解决这个oom问题?
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+sglang启动命令是:
+ 我就是想用_patched_init_memory_pool替换sglang的 init_memory_pool, _patched_init_memory_pool如果不调用 original_func, 就需要copy大量 original_func的代码。
+ 一旦调用original_func，旧的pool会在original_func里面生成。
+ 如何具体实现方案A? 只建一次新pool，避免双峰显存占用。
+
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+刚才提到的方案:
+```
+- **不要**在 `original_func` 后“替换 pool”；
+- 改为在调用 `original_func` 前，**临时把** `model_runner_kv_cache_mixin.MHATokenToKVPool` **指向一个 SIMO 代理类**；
+- `original_func` 内部会按原流程创建 `token_to_kv_pool` + `allocator`，但创建出来的已经是 SIMO pool；
+- `try/finally` 恢复原类，避免污染其它路径。
+```
+你来实现它.
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+
+vllm启动命令是debug_env_file=/share/users/like/ipc.simo-vllm.json  CUDA_VISIBLE_DEVICES=5 vllm serve --quantization simo --model /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --hf-overrides '{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --gpu-memory-utilization 0.5 --attention-config '{"backend": "TRITON_ATTN"}' --port 30120 --enforce-eager
+报错日志位于 temp/vllm.serve.log.2026_04_02___17_35_34
+分析日志错误原因，如何解决？
+
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py里面 ，有一些函数/类/变量等，未import就直接用了，修复这些问题。
+
+simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py在 在MX_FORMAT_ID == MXFP6_E3M2 的情况下，对reshape_and_cache_kernel_flash进行讲解。
+
+    packed_key, key_scale = _compute_and_pack_mxfmt(...)这行代码 返回的 packed_key 和 key_scale 是什么形状？ 什么类型？
+数据是如何分布的？ _compute_and_pack_mxfmt 在mxpf6的情况下，有没有存储浪费？
+尤其是下面这个分支，重点讲解,用图画出数据存储过程:
+````
+    if IS_FP6:
+      # MXFP6: uint32 → 3 bytes, stored in SIPU layout [b2, b1, b0]
+      FP6_N: tl.constexpr = TILE_SIZE // 4
+      k_flat = tl.reshape(packed_key, (FP6_N,))
+      v_flat = tl.reshape(packed_val, (FP6_N,))
+
+      u32_offs = tl.arange(0, FP6_N)
+      base = head_tile_idx * PACKED_TILE_SIZE
+      offs_b2 = base + 3 * u32_offs
+      offs_b1 = base + 3 * u32_offs + 1
+      offs_b0 = base + 3 * u32_offs + 2
+
+      # Key: extract and store 3 bytes per uint32
+      kb0 = (k_flat & 0xFF).to(tl.uint8)
+      kb1 = ((k_flat >> 8) & 0xFF).to(tl.uint8)
+      kb2 = ((k_flat >> 16) & 0xFF).to(tl.uint8)
+      tl.store(key_cache_ptr + packed_base + offs_b0, kb0, mask=offs_b0 < PACKED_HEAD_SIZE)
+      tl.store(key_cache_ptr + packed_base + offs_b1, kb1, mask=offs_b1 < PACKED_HEAD_SIZE)
+      tl.store(key_cache_ptr + packed_base + offs_b2, kb2, mask=offs_b2 < PACKED_HEAD_SIZE)
+      # Value
+      vb0 = (v_flat & 0xFF).to(tl.uint8)
+      vb1 = ((v_flat >> 8) & 0xFF).to(tl.uint8)
+      vb2 = ((v_flat >> 16) & 0xFF).to(tl.uint8)
+      tl.store(value_cache_ptr + packed_base + offs_b0, vb0, mask=offs_b0 < PACKED_HEAD_SIZE)
+      tl.store(value_cache_ptr + packed_base + offs_b1, vb1, mask=offs_b1 < PACKED_HEAD_SIZE)
+      tl.store(value_cache_ptr + packed_base + offs_b2, vb2, mask=offs_b2 < PACKED_HEAD_SIZE)
+```
+要求：把答案追加在 temp/answer_sgl.md里面
+
+对比main分支和sgl-gqa-kv-cache分支，对sgl-gqa-kv-cache分支产生的diff进行code review.要求如下:
+1: 忽略coding style和设计模式相关的问题
+2: 关注有没有python语法错误
+3: 关注有没有会导致计算结果出错的地方
+要求：把答案追加在 temp/code_review.md里面
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+sglang启动命令是:
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --quantization simo --port 30122 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --mem-fraction-static 0.65 --attention-backend triton_simo --disable-cuda-graph
+sglang日志位于 temp/launch_server.no-pudb.log.2026_04_10___15_10_06
+分析日志崩溃报错原因。给出修复建议。
+要求：把答案追加在 temp/code_review.md里面
+
+上一个Lk/Lv的 bug已经修复。
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+sglang启动命令是:
+SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --quantization simo --port 30122 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --mem-fraction-static 0.65 --attention-backend triton_simo --disable-cuda-graph
+sglang日志位于 temp/launch_server.no-pudb.log.2026_04_10___16_19_22
+分析日志崩溃报错原因。给出修复建议。
+要求：把答案追加在 temp/code_review.md里面
+
+以下assert已经加上:
+```
++  assert cache_k.stride(-1) == 1
++  assert cache_v.stride(-1) == 1
++  assert loc.numel() == cache_k.shape[0] == cache_v.shape[0]
++  assert int(loc.min()) >= 0
++  assert int(loc.max()) < k_buffer.shape[0]
+```
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+
+kv cache 量化与写入的函数位于simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py的simo_set_kv_buffer
+simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py的
+_decode_grouped_att_m_fwd和_decode_softmax_reducev_fwd分别负责stage1和stage2的 decode attention计算。
+_decode_grouped_att_m_fwd会读取量化的kv cache，计算partial的attention
+_decode_softmax_reducev_fwd是sglang自带的函数，进行reduce操作，完成最终的attention计算。
+
+
+sglang启动命令:
+TRITON_DEBUG=1 TRITON_LOGGING=1 CUDA_LAUNCH_BLOCKING=1 SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --quantization simo --port 30121 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --mem-fraction-static 0.65 --attention-backend triton_simo --disable-cuda-graph --watchdog-timeout 2592000 --skip-server-warmup
+崩溃日志位于： temp/launch_server.repeat_launch.log.2026_04_12___18_26_26
+分析日志"an illegal memory access was encountered"这个错误的根本原因,找出是哪个kernel的哪一行代码导致的内存越界
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+
+1) simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py set_kv_buffer_kernel 是参考 simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py的 reshape_and_cache_kernel_flash, 实现的sglang kv cache 量化与写入，你需要对set_kv_buffer_kernel进行修改，让它支持 mxint8/mxfp6/mxfp4 格式。
+
+2) simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 的 _fwd_kernel 参考了 simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py 的 kernel_unified_attention_3d 函数, 进行sglang prefill阶段 attention计算， 你需要修改 _fwd_kernel，让它支持  mxint8/mxfp6/mxfp4 格式。同时，需要修改相应的上层函数的调用方，适配kernel的修改。
+
+3) simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py的 _fwd_grouped_kernel_stage1 是参考了 simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py 的 kernel_unified_attention_3d函数, 进行sglang decode阶段的 attention 计算，你需要修改 _fwd_grouped_kernel_stage1， 让它支持 mxint8/mxfp6/mxfp4 格式。同时，需要修改相应的上层函数的调用方，适配kernel的修改。
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 的_fwd_grouped_kernel_stage1函数在 mxint8的时候， 加载k是以transpose形式加载的:
+```
+                # Transposed K loading for 8-bit formats (MXFP8 E4M3/E5M2, MXINT8)
+                offs_buf_k = (
+                    kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * PACKED_HEAD_SIZE
+                    + offs_d[:, None]
+                )
+                offs_buf_k_scale = (
+                    kv_loc[:, None] * stride_buf_kbs + SCALE_PLANE_OFFSET
+                    + cur_kv_head * SCALE_HEAD_SIZE
+                    + offs_d_scale[None, :]
+                )
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                    other=0.0,
+                )
+                k_scale = tl.load(
+                    K_Buffer + offs_buf_k_scale,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_d_scale[None, :]),
+                    other=0.0,
+                )
+```
+这种transpose加载的k矩阵，形状是[K,N], k_scale形状是[N, K//group_size], 这样的K和K_scale的形状，直接送给_unpack_and_dequant_mxfmt，会不会出错？
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+
+修复这个问题，把 MXINT8 从 8-bit 转置加载分支移出来，改为非转置加载（和 FP6/FP4 走同一条路径），在 decode_attention.py 和 extend_attention.py 中都需要修改. 即：mxint8使用非转置加载，然后软件反量化，
+```
+                    K_dequant = tl.trans(_unpack_and_dequant_mxfmt(k, k_scale, MX_FORMAT_ID))
+                    qk = tl.dot(q, K_dequant)
+```
+mxfp8仍旧使用转置加载+tl.dot_scaled，mxfp8不需要软件反量化.
+
+
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+在simo代码里面 simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py set_kv_buffer_kernel
+会调用_compute_and_pack_mxfmt:
+```
+packed_key, key_scale = _compute_and_pack_mxfmt
+```
+在MX_FORMAT_ID == MXFP4_E2M1)的时候，_compute_and_pack_mxfmt
+_compute_and_pack_mxfmt返回的packed_key, key_scale分别是什么shape? 什么data type?
+数据是如何 pack的? 一个字节高4位和低4位分别是什么数据？
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+
+在MX_FORMAT_ID == MXFP6_E3M2的时候， simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py的 _fwd_kernel 是如何从k buffer中加载k packed和k scale？如何加载 v packed和 v scale?
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+###
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+
+1) simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py set_kv_buffer_kernel 是参考 simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py的 reshape_and_cache_kernel_flash, 实现的sglang kv cache 量化与写入，你需要对set_kv_buffer_kernel进行修改，让它支持 FP8_E4M3 per group/FP8_E5M2 per group/INT8 per group 的kv cache量化 格式。
+
+2) simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 的 _fwd_kernel 参考了 simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py 的 kernel_unified_attention_3d 函数, 进行sglang prefill阶段 attention计算， 你需要修改 _fwd_kernel，让它支持  FP8_E4M3 per group/FP8_E5M2 per group/INT8 per group 的kv cache量化 格式  。同时，需要修改相应的上层函数的调用方，适配kernel的修改。
+
+3) simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py的 _fwd_grouped_kernel_stage1 是参考了 simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py 的 kernel_unified_attention_3d函数, 进行sglang decode阶段的 attention 计算，你需要修改 _fwd_grouped_kernel_stage1， 让它支持 FP8_E4M3 per group/FP8_E5M2 per group/INT8 per group 的kv cache量化格式。同时，需要修改相应的上层函数的调用方，适配kernel的修改。
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+sglang启动命令是:
+ SIMO_SGLANG_REGISTER=1 CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path  /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights/ --quantization simo --port 30122 --host 0.0.0.0 --tp-size 1 --json-model-override-args='{"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_fp8_per_group.json"}' --mem-fraction-static 0.65  --attention-backend triton_simo --disable-cuda-graph  --watchdog-timeout 2592000 --skip-server-warmup
+
+修改后，fp8 pergroup kv cache量化运行报错:ValueError: Unsupported KV cache quantization dtype: fp8_e4m3
+日志位于 temp/launch_server.log.2026_04_15___14_34_57
+修复这个错误。
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+1) simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py和simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py
+都实现了_load_pg_scale_f32_scalar, _dequant_pg_fused, _load_fp6_packed, 两个文件的实现是否完全一样？
+如果完全一样，把这些函数提取出来，放到  simo/utils/common.py 里面，simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py和simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 从  simo/utils/common.py 里面 import 需要的函数。
+
+2)_dequant_pg_fused 的 BLOCK_N 参数如果没有被用到，把 _dequant_pg_fused 的 BLOCK_N参数去掉，调用者那里也不要传递 BLOCK_N 参数。
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+
+
+/share_data/users/like/package/h100/package/sglang_kernel_src/python/sglang/srt/server_args.py ServerArgs的定义，有disable_cuda_graph的定义和含义。
+
+simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant_kv_cache_quant.sh 在使用 lm-eval测试的时候，给sglang构建参数，试图传 disable_cuda_graph=True. 但是运行的时候报错了，日志位于 temp/llm_eval_online_quant_kv_cache_quant.sh.log.2026_04_16___15_13_08.
+这个错误可能和 json字符串的义有关。应该如何正确地在 simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant_kv_cache_quant.sh 中设置 disable_cuda_graph=True ?
+
+要求：把答案追加在 temp/answer_sgl.md里面
+
+我尝试使用如下命令执行脚本，脚本里面会执行lm-eval进行gsm8k的测评：
+CUDA_VISIBLE_DEVICES=6 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant_kv_cache_quant.sh
+lm-eval报错了，日志位于：
+temp/llm_eval_online_quant_kv_cache_quant.sh.log.2026_04_20___10_55_37
+分析日志，分析进程崩溃原因。
+要求：把答案追加在 temp/answer_sgl.md里面
+
+我尝试使用如下命令执行脚本，脚本里面会执行lm-eval进行gsm8k的测评：
+CUDA_VISIBLE_DEVICES=6 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant_kv_cache_quant.sh
+lm-eval报错了，日志位于：
+temp/llm_eval_online_quant_kv_cache_quant.sh.log.2026_04_20___11_30_09
+分析日志，分析进程崩溃原因。
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang
+lm-eval 安装于  /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval
+
+调用lm-eval的shell脚本位于 simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant_kv_cache_quant.sh,命令如下: CUDA_VISIBLE_DEVICES=6 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant_kv_cache_quant.sh
+
+python/sglang/srt/utils/common.py 的get_available_gpu_memory 是从run_scheduler_process 函数一步步调用进来的，lm-eval是否通过fork或者spawn子进程的方式调用的run_scheduler_process函数？ get_available_gpu_memory 的 device参数是如何从lm-eval一步步传进来的？
+要求：把答案追加在 temp/answer_sgl.md里面
+
+
+
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位 /data/like/miniconda3/envs/simo_sglang/
+vllm conda环境位 /data/like/miniconda3/envs/simo_vllm
+
+lm-eval进行sglang 测试时，命令是:
+lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/share/users/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_mxfp.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5}' --tasks wikitext --batch_size auto
+
+
+日志位于 /share_data/users/like/package/h100/package/simo_conda_sglang/logs/wikitext.llama3.1-70B_tp8_quant-simo_w4a4_mxfp.log
+wikitext 任务word_perplexity=27.6423
+
+lm-eval进行 vllm测试，命令是
+ lm_eval --model vllm --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_ocp_w4a4_mxfp.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6}' --tasks wikitext --batch_size auto
+ 日志位于 /share_data/users/like/package/h100/package/simo_conda_vllm/logs/wikitext.llama3.1-70B_tp8_quant-simo_ocp_w4a4_mxfp.log
+ wikitext 任务 word_perplexity=10.2393
+
+ sglang_simo LinearMethod实现位于 simo/extensions/sglang_simo/quantization/quantization.py 的 SIMOLinearMethod
+ vllm_simo LinearMethod实现位于 simo/extensions/vllm_simo/quantization/quantization_method.py  的 SIMOLinearMethod
+ 对比两种 SIMOLinearMethod 的w4a4 mxfp实现差异，分析word_perplexity 相差很大的原因。
+ 如何调试这种大模型的量化模型精度问题？
+
+ 要求：把答案追加在 temp/answer_sgl.md里面
+
+
+##
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位 /data/like/miniconda3/envs/simo_sglang/
+vllm conda环境位 /data/like/miniconda3/envs/simo_vllm
+
+lm-eval进行sglang 测试时，命令是:
+SIMO_SGLANG_REGISTER=1 debug_env_file=/share/users/like/ipc.sglang.3.json lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_mxfp.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true}' --tasks wikitext --batch_size auto > temp/lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+
+
+
+日志位于 /share/users/like/package/h100/package/simo_conda_sglang/temp/lm-eval-mxfp4.log.2026_04_27___00_19_11
+wikitext 任务word_perplexity=27.6423
+
+lm-eval进行 vllm测试，命令是
+ debug_env_file=/share/users/like/ipc.sglang.3.json lm_eval --model vllm --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_ocp_w4a4_mxfp.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size auto > temp/vllm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+
+ 日志位于 /share/users/like/package/h100/package/simo_conda_sglang/temp/vllm.lm-eval-mxfp4.log.2026_04_27___00_02_27
+ wikitext 任务 word_perplexity=10.2593
+
+ sglang_simo LinearMethod实现位于 simo/extensions/sglang_simo/quantization/quantization.py 的 SIMOLinearMethod
+ vllm_simo LinearMethod实现位于 simo/extensions/vllm_simo/quantization/quantization_method.py  的 SIMOLinearMethod
+
+我在
+simo/extensions/sglang_simo/quantization/quantization.py 的 SIMOLinearMethod.apply 函数打印了
+```
+      log_str = f"debug_ppl: layer_prefix:{layer_prefix}, qdq_x_abs_max:{qdq_x_abs_max}, qdq_x_abs_mean:{qdq_x_abs_mean}, dq_w_abs_max:{dq_w_abs_mean}, output_abs_max:{output_abs_max}, output_abs_mean:{output_abs_mean}"
+      logger.info(log_str)
+ ```
+
+simo/extensions/vllm_simo/quantization/quantization_method.py  的 SIMOLinearMethod.apply 函数也打印了日志:
+```
+      log_str = f"debug_ppl: layer_prefix:{layer_prefix}, qdq_x_abs_max:{qdq_x_abs_max}, qdq_x_abs_mean:{qdq_x_abs_mean}, dq_w_abs_max:{dq_w_abs_mean}, output_abs_max:{output_abs_max}, output_abs_mean:{output_abs_mean}"
+      logger.info(log_str)
+``
+分析 sglang, vllm SIMOLinearMethod.apply打印的均值、最大值，有什么差异？
+ 要求：把答案追加在 /softhome/like/asset//code/codex_simo/answer.md 里面
+ 要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+SIMO_SGLANG_REGISTER=1 debug_env_file=/share/users/like/ipc.sglang.3.json lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_mxfp.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true}' --tasks wikitext --batch_size auto > temp/lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+这条lm-eval测试命令，会使用什么attention 后端？会导致sglang_simo的kv cache 量化代码被 触发吗？
+ 要求：把答案追加在 temp/answer_sgl.md 里面
+
+####### w4a4 + w8a8
+
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位 /data/like/miniconda3/envs/simo_sglang/
+vllm conda环境位 /data/like/miniconda3/envs/simo_vllm
+为了看量化前后的数据分布差异，我在 simo/extensions/sglang_simo/quantization/quantization.py 的 SIMOLinearMethod.apply 函数打印了 ```
+      log_str = f"debug_ppl: layer_prefix:{layer_prefix}, qdq_x_abs_max:{qdq_x_abs_max}, qdq_x_abs_mean:{qdq_x_abs_mean}, dq_w_abs_max:{dq_w_abs_max}, dq_w_abs_mean:{dq_w_abs_mean}, output_abs_max:{output_abs_max}, output_abs_mean:{output_abs_mean}"
+      logger.info(log_str) ```
+simo/extensions/vllm_simo/quantization/quantization_method.py  的 SIMOLinearMethod.apply 函数也打印了日志: ```
+      log_str = f"debug_ppl: layer_prefix:{layer_prefix}, qdq_x_abs_max:{qdq_x_abs_max}, qdq_x_abs_mean:{qdq_x_abs_mean}, dq_w_abs_max:{dq_w_abs_max}, dq_w_abs_mean:{dq_w_abs_mean}, output_abs_max:{output_abs_max}, output_abs_mean:{output_abs_mean}"
+      logger.info(log_str) ```
+下面是数据.  # w4a4 mxfp4:
+lm-eval进行sglang w4a4mxfp 测试时，命令是:
+SIMO_SGLANG_REGISTER=1 debug_env_file=/share/users/like/ipc.sglang.3.json lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_mxfp.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true}' --tasks wikitext --batch_size auto > temp/lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+日志位于 /share/users/like/package/h100/package/simo_conda_sglang/temp/sglang.lm-eval-mxfp4.log.2026_04_27___11_10_29 
+lm-eval进行 vllm w4a4mxfp 测试，命令是
+ debug_env_file=/share/users/like/ipc.sglang.3.json lm_eval --model vllm --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_ocp_w4a4_mxfp.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size auto > temp/vllm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+ 日志位于 /share/users/like/package/h100/package/simo_conda_sglang/temp//vllm.lm-eval-mxfp4.log.2026_04_27___13_10_11 
+ # w8a8 mxfp8
+lm-eval进行sglang w8a8mxfp 测试时，命令是:
+SIMO_SGLANG_REGISTER=1 debug_env_file=/share/users/like/ipc.sglang.3.json lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w8a8_mxfp.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true}' --tasks wikitext --batch_size auto > temp/lm-eval-w8a8_mxfp.log.`nowstr.sh` 2>&1 &
+日志位于 /share/users/like/package/h100/package/simo_conda_sglang/temp/lm-eval-w8a8_mxfp.log.2026_04_27___14_17_08
+lm-eval进行 vllm w8a8mxfp 测试，命令是
+debug_env_file=/share/users/like/ipc.sglang.3.json lm_eval --model vllm --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_ocp_w8a8_mxfp.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size auto > temp/vllm.lm-eval-w8a8mxfp.log.`nowstr.sh` 2>&1
+日志位于/share/users/like/package/h100/package/simo_conda_sglang/temp/vllm.lm-eval-w8a8mxfp.log.2026_04_27___15_09_25
+
+1)分析代码，sglang_simo在 w8a8mxfp8 量化下和vllm_simo word_perplexity 基本相同，在w4a4mxfp 量化下， 比vllm_simo的 word_perplexity差很多。为什么会有这样的差异.
+
+2)在w8a8mxfp时，sglang_simo和vllm_simo打印的均值和最大值，有什么差异？
+3)在w4a4mxfp时，sglang_simo和vllm_simo打印的均值和最大值，有什么差异？
+
+4)另外，我还有一份sglang_simo没有打印均值的日志:/share/users/like/package/h100/package/simo_conda_sglang/temp/{llm_eval_online_quant.sh.hf-ppl.80b-tp8.sh.2026_04_23___08_12_41,llm_eval_online_quant.sh.hf-ppl.80b-tp8.sh.2026_04_23___08_36_12}
+
+vllm_simo没有打印均值的日志： /share/users/like/package/h100/package/simo_conda_sglang/temp/llm_vlm_eval_online_quant.sh.hf-ppl.80b-tp8.sh.log.2026_04_23___22_51_32
+sglang_simo 和 vllm_simo 没有打印均值的日志显示，多数数据类型的 word_perplexity是基本相似的，只有 w4a4mxfp 的 word_perplexity 差异巨大，分析原因。
+ 要求：把答案追加在 /softhome/like/asset/code/codex_simo/answer.md  里面
+ 要求：把答案追加在 temp/answer_sgl.md 里面
+
+###
+当前 lm-eval进行 vllm w4a4mxfp 测试，命令是
+ debug_env_file=/share/users/like/ipc.sglang.3.json lm_eval --model vllm --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_ocp_w4a4_mxfp.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size auto > temp/vllm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+ 按照当前的情况，vllm_simo也没有启用hadamard rotation吧？hadamard rotation真的是两者在w4a4 mxfp量化下 word_perplexity 差异巨大的原因吗？
+ 要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+当前 lm-eval进行 vllm w4a4mxfp 测试，命令是
+ debug_env_file=/share/users/like/ipc.sglang.3.json lm_eval --model vllm --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_ocp_w4a4_mxfp.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size auto > temp/vllm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+ 修改命令，使用 vllm/engine/arg_utils.py attention_config这个配置项，指定triton attention backend
+ 要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+
+#### triton attn lm-eval
+sglang代码位于 /share_data/users/like/package/h100/package/sglang_kernel_src/
+vllm代码位于 /share_data/users/like/package/h100/package/vllm-for-conda-simo/
+simo代码位于  /share_data/users/like/package/h100/package/simo_conda_sglang
+sglang conda环境位 /data/like/miniconda3/envs/simo_sglang/
+vllm conda环境位 /data/like/miniconda3/envs/simo_vllm
+为了看量化前后的数据分布差异，我在 simo/extensions/sglang_simo/quantization/quantization.py 的 SIMOLinearMethod.apply 函数打印了 ```
+      log_str = f"debug_ppl: layer_prefix:{layer_prefix}, qdq_x_abs_max:{qdq_x_abs_max}, qdq_x_abs_mean:{qdq_x_abs_mean}, dq_w_abs_max:{dq_w_abs_max}, dq_w_abs_mean:{dq_w_abs_mean}, output_abs_max:{output_abs_max}, output_abs_mean:{output_abs_mean}"
+      logger.info(log_str) ```
+simo/extensions/vllm_simo/quantization/quantization_method.py  的 SIMOLinearMethod.apply 函数也打印了日志: ```
+      log_str = f"debug_ppl: layer_prefix:{layer_prefix}, qdq_x_abs_max:{qdq_x_abs_max}, qdq_x_abs_mean:{qdq_x_abs_mean}, dq_w_abs_max:{dq_w_abs_max}, dq_w_abs_mean:{dq_w_abs_mean}, output_abs_max:{output_abs_max}, output_abs_mean:{output_abs_mean}"
+      logger.info(log_str) ```
+下面是数据.  # w4a4 mxfp4:
+lm-eval进行sglang w4a4mxfp 测试时，命令是:
+SIMO_SGLANG_REGISTER=1 debug_env_file=/share/users/like/ipc.sglang.3.json lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_mxfp.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true, "attention_backend":"triton"}' --tasks wikitext --batch_size auto > temp/sglang.attention-backend.trition.lm-eval-mxfp4.log.`nowstr.sh` 2>&1
+
+日志位于 /share/users/like/package/h100/package/simo_conda_sglang/temp/sglang.attention-backend.trition.lm-eval-mxfp4.log.2026_04_27___17_15_21
+
+lm-eval进行 vllm w4a4mxfp 测试，命令是
+ debug_env_file=/share/users/like/ipc.sglang.3.json lm_eval --model vllm --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-70B/safetensor_weights", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/softhome/like/package/h100/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_ocp_w4a4_mxfp.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true, "attention_config": {"backend":"TRITON_ATTN"} }' --tasks wikitext --batch_size auto > temp/triton.attention-backend.vllm.lm-eval-w4a4mxfp.log.`nowstr.sh` 2>&1 &
+
+ 日志位于 /share/users/like/package/h100/package/simo_conda_sglang/temp/triton.attention-backend.vllm.lm-eval-w4a4mxfp.log.2026_04_27___18_17_14
+ 现在sglang_simo和vllm_simo已经是triton backend了，
+分析代码，sglang_simo在 在w4a4mxfp 量化下， 比vllm_simo的 word_perplexity差很多。为什么会有这样的差异.
+比较 sglang_simo 和vllm_simo 打印出的均值和最大值的差异。
+ 要求：把答案追加在 temp/answer_sgl.md 里面
+
+ 要求：把答案追加在 /softhome/like/asset/code/codex_simo/answer.md  里面
+
+把 /share_data/users/like/bash-bin/bin/kgp-loop.sh  /share_data/users/like/bash-bin/bin/kgp.sh两个 shell脚本的功能，用单个c++文件重新实现.
+要求:
+1) /share_data/users/like/bash-bin/bin/kgp-loop.sh 增加一个额外命令行参数 sig_num, /share_data/users/like/bash-bin/bin/kgp.sh 发送kill信号的时候， 使用 命令行参数 sig_num。
+2) 写好CMakeLists.txt, 项目放在 /softhome/like/asset/code/cpp_guard目录， 生成成的elf文件叫 kgp.
+3) 不要使用三方库，只能用c++标准库，允许使用子进程调用 shell 命令，比如调用 grep, ps, nvidia-smi，这些系统存在的命令.
+4) 对代码进行讲解， 讲解内容追加在 /softhome/like/asset/code/codex_simo/answer.md  里面。
+
+temp/llm_eval_online_quant.sh.hf-ppl.80b-tp8.sh.2026_04_23___08_12_41 180行，有sglang的bf16的结果,
+temp/llm_vlm_eval_online_quant.sh.hf-ppl.80b-tp8.sh.log.2026_04_23___22_51_32 4397行，有vllm的bf16结果, word_perplexity 是接近的。 继续分析.
+ 要求：把答案追加在 temp/answer_sgl.md 里面
+
+方案B：单元测试验证Triton内核
+代码写在 like-useful/debug_ppl.py 里面
+simo_sglang环境运行结果：
+```
+(simo_sglang) gpu018|2026-04-28 06:59:27[like@ simo_conda_sglang] python3 like-useful/debug_ppl.py
+q checksum: 7984053
+s checksum: 515191.0
+dq checksum: -54.25
+dq abs mean: 0.78515625
+error abs mean: 0.08610832691192627
+```
+
+simo_vllm环境运行结果：
+```
+(simo_vllm) gpu018|2026-04-28 07:00:40[like@ simo_conda_vllm] python3 like-useful/debug_ppl.py
+q checksum: 7984053
+s checksum: 515191.0
+dq checksum: -54.25
+dq abs mean: 0.78515625
+error abs mean: 0.08610832691192627
+```
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/
+sglang codebase的python/sglang/srt/layers/rotary_embedding.py,
+Llama3RotaryEmbedding 和 RotaryEmbedding 都实现了 _compute_inv_freq函数，两个类的实现有什么区别？在数学上有什么不同？
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/
+sglang codebase的python/sglang/srt/layers/rotary_embedding.py 实现了 Llama3RotaryEmbedding 
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/
+vllm codebase的 vllm/model_executor/layers/rotary_embedding/llama3_rope.py 实现了 Llama3RotaryEmbedding,
+sglang的Llama3RotaryEmbedding和 vllm 的实现有什么区别？是否完全一样？
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/
+sglang code base的examples/runtime/engine/offline_batch_inference-debug-ppl.py, 实现了如下目的：
+通过max_new_tokens=1,实现只生成一个token。
+通过temperature=0，取消输出多样性，使输出固定。
+prompts固定为一条prompt.
+这样方便调试精度问题。
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/
+
+把 vllm codebase的examples/offline_inference/llm_engine_example.py 复制成 examples/offline_inference/llm_engine_example-debug-ppl.py.
+保持和sglang一样的输出固定的模式,要求:
+只生成一个new token
+取消输出多样性，使输出固定
+prompts固定为一条prompt，和sglang的prompt一样。
+
+帮我写一个 bash脚本 /softhome/like/asset/code/lite-copy-hf-model.sh ，实现把一个模型目录 轻量级 copy成另外一个模型目录。
+接受2个命令行参数: src_dir, dst_dir
+要求:
+1. 把 src_dir 除了 .safetensors 之外的文件 递归copy 到 dst_dir, 使用archive模式copy, 不要追踪软链接，软链接保持软链接的属性。
+2. 对于所有 src_dir的 .safetensors 文件，在dst_dir 建一个软链接，指向 src_dir 的 .safetensors 文件。软链接使用相对路径。
+
+sglang代码位于 /data//like/package/sglang_kernel_src/
+sglang code base python/sglang/srt/layers/utils/multi_platform.py为什么要定义enter_torch_compile和leave_torch_compile函数？分别是谁调用这2个函数？
+
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/
+sglang code base 的python/sglang/srt/layers/layernorm.py实现了RMSNorm
+sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/
+vllm code base的vllm/model_executor/layers/layernorm.py实现了RMSNorm
+vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+
+考虑/data/like/hf-models/llama3.1-70B这个模型,
+sglang的RMSNorm 的 self.weight 在构造函数初始化后，在哪里填充成真正的权重？
+sglang的RMSNorm和vllm的RMSNorm, forward_native函数中数学上是等价的吗？有没有可能在相同的输入，sglang和vllm的 RMSNorm.forward_native 产生不同的输出？
+
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/
+vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+在/data/like/package/vllm-for-conda-simo 目录执行如下命令，
+CUDA_VISIBLE_DEVICES=1 debug_env_file=/dev/shm/like/ipc.vllm.1.json  python3 ../vllm-for-conda-simo/examples/offline_inference/llm_engine_example-debug-ppl.py  --model /data/like/hf-models/llama3.1-70B-strip-layers/    --quantization simo    --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}'   --gpu-memory-utilization 0.5 --enforce-eager   > temp/llm_engine_example-debug-ppl.py.log.`nowstr.sh` 2>&1 &
+日志位于 ：
+/share_data/users/like/package/h100/package/other/vllm/temp/llm_engine_example-debug-ppl.py.log.2026_05_09___17_34_04
+分析日志，找出报错原因和修复方法
+
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+sglang code base 的 python/sglang/srt/layers/linear.py  实现的 RowParallelLinear.forward，会调用output = tensor_model_parallel_all_reduce(output_parallel)，
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+vllm code base的  vllm/model_executor/layers/linear.py 实现的 RowParallelLinear.forward，会调用output = tensor_model_parallel_all_reduce(output_parallel),
+
+考虑/data/like/hf-models/llama3.1-70B这个模型, sglang和vllm都使用 tp_size = 8, sglang 8个 GPU和vllm的8个GPU产生了相同的 8个output_parallel,即:
+sglang gpu 0 output_parallel = vllm gpu 0 output_parallel,
+sglang gpu 1 output_parallel = vllm gpu 1 output_parallel,
+...
+sglang gpu 7 output_parallel = vllm gpu 7 output_parallel,
+tensor_model_parallel_all_reduce是否有可能产生不同的all reduce结果？
+只考虑 /data/like/hf-models/llama3.1-70B模型，  nvidia H100 GPU, tp_size=8, sglang和vllm的tensor_model_parallel_all_reduce实现有什么区别?
+sglang和vllm的tensor_model_parallel_all_reduce实现能保证 bitwise 结果严格一致吗？
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+写3个python代码进行验证:
+1) sglang的例子写在 like-useful/sglang_all_reduce.py.
+sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/, sglang使用 tp_size=8的配置，读取下面的safetensor:
+rank 0读取 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-0-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+rank 1读取 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-1-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+剩余rank分别读取:
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-2-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-3-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-4-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-5-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-6-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-7-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+每个rank从 safetensor中取出  key="row_parallel_quant_method_out"对应的torch tensor,
+然后8个rank 使用 sglang提供的 tensor_model_parallel_all_reduce 对 key="row_parallel_quant_method_out" 的 tensor进行all reduce操作，rank 0把 all reduce 结果保存到  /data/like/temp/sglang.safetensors, safetensor key="rank_0_all_reduce".
+2) vllm 的例子写在 like-useful/vllm_all_reduce.py.
+vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/, 使用 tp_size=8的配置，读取下面的safetensor:
+rank 0读取 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-0-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+rank 1读取 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-1-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+剩余rank分别读取:
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-2-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-3-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-4-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-5-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-6-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-7-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-0.safetensors
+每个rank从 safetensor中取出  key="row_parallel_quant_method_out"对应的torch tensor,
+然后8个rank 使用 vllm提供的 tensor_model_parallel_all_reduce 对 key="row_parallel_quant_method_out" 的 tensor进行all reduce操作，rank 0把 all reduce 结果保存到  /data/like/temp/vllm.safetensors, safetensor key="rank_0_all_reduce".
+3) 再写一个代码 like-useful/validate-sglang-vllm-all-reduce.py, 读取 /data/like/temp/sglang.safetensors, /data/like/temp/vllm.safetensors, 对比 sglang和vllm的 all reduce结果是否一致。
+
+
+
+
+考虑 /data/like/hf-models/llama3.1-70B-strip-layers 这个模型, 在 tp size=8的情况下，我现在怀疑sglang和vllm的 tensor_model_parallel_all_reduce在完全相同的输入下，输出无法保证bitwise相同。
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+sglang code base 的 python/sglang/srt/layers/linear.py  实现的 RowParallelLinear.forward，会调用output = tensor_model_parallel_all_reduce(output_parallel)，
+我加了如下debug代码: 
+                  if debug_ppl_validate_all_reduce_safetensor_dir:
+                      if layer_prefix == "model.layers.0.self_attn.o_proj" and _forward_raw_counter[0] == 0:
+会从 load_safe_tensor_path = f"{debug_ppl_validate_all_reduce_safetensor_dir}/rank-{my_tp_rank}-prefix-{layer_prefix}-forwardcount-{_forward_raw_counter[0]}-1.safetensors"
+即 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/ 里面读取 每个rank对应的tensor,进行all reduce, 再把结果写到 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/validate_all_reduce_rank-[0-7].sglang.safetensors
+
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+vllm code base的  vllm/model_executor/layers/linear.py 实现的 RowParallelLinear.forward，会调用output = tensor_model_parallel_all_reduce(output_parallel),
+我加了如下debug代码: 
+                  if debug_ppl_validate_all_reduce_safetensor_dir:
+                      if layer_prefix == "model.layers.0.self_attn.o_proj" and _forward_raw_counter[0] == 0:
+会从 load_safe_tensor_path = f"{debug_ppl_validate_all_reduce_safetensor_dir}/rank-{my_tp_rank}-prefix-{layer_prefix}-forwardcount-{_forward_raw_counter[0]}-1.safetensors"
+即 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/ 里面读取 每个rank对应的tensor,进行all reduce, 再把结果写到 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/validate_all_reduce_rank-[0-7].vllm.safetensors
+
+验证过程如下:
+1) sglang使用如下命令进行离线测试, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/:
+ cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1 python3 /data/like/package/sglang_kernel_src/examples/runtime/engine/offline_batch_inference-debug-ppl.py --model-path /data/like/hf-models/llama3.1-70B-strip-layers/ --quantization simo --tp-size 8 --json-model-override-args='{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}' --mem-fraction-static 0.65 --disable-cuda-graph --watchdog-timeout 2592000 --skip-server-warmup --attention-backend fa3 --enable-deterministic-inference > templ/offline_batch_inference-qdqx_safetensor.online-quant.log.`nowstr.sh` 2>&1 &
+
+sglang 日志是 temp/llm_engine_example-debug-ppl.py.log.2026_05_11___11_59_49
+
+2) vllm使用如下命令进行离线测试, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/:
+ cp /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json ; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-vllm/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm  ; CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.vllm.1.json  python3 ../vllm-for-conda-simo/examples/offline_inference/llm_engine_example-debug-ppl.py  --model /data/like/hf-models/llama3.1-70B-strip-layers/    --quantization simo    --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}'   --gpu-memory-utilization 0.5 --enforce-eager --tensor-parallel-size 8  > temp/llm_engine_example-debug-ppl.py.log.`nowstr.sh` 2>&1 &
+ vllm日志是 temp/llm_engine_example-debug-ppl.py.log.2026_05_11___11_59_49
+
+sglang 和 vllm 读取的safetensor都是从/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online 读取的, sglang的8 个rank和vllm的8个rank读取的safetensor是一一对应相同的， /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/validate_all_reduce_rank-0.sglang.safetensors和 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/validate_all_reduce_rank-0.vllm.safetensors 保存的all reduce的结果safetensor居然并不是bitwise相同的，这是什么原因？
+
+在我的sglang 离线测试命令下， sglang code base 的 python/sglang/srt/layers/linear.py  RowParallelLinear.forward, 调用的 tensor_model_parallel_all_reduce 最核心的实现, 在哪里？从tensor_model_parallel_all_reduce到核心实现的调用链路是怎样的？
+在我的vllm 离线测试命令下， vllm code base 的 vllm/model_executor/layers/linear.py  RowParallelLinear.forward, 调用的 tensor_model_parallel_all_reduce 最核心的实现, 在哪里？从tensor_model_parallel_all_reduce到核心实现的调用链路是怎样的？
+要求：把答案追加在 temp/codex_answer.md 里面
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+
+要求：把答案追加在 temp/codex_answer.md 里面
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+sglang code base 的 python/sglang/srt/layers/linear.py  实现的 RowParallelLinear.forward，会调用output = tensor_model_parallel_all_reduce(output_parallel)，
+我加了如下debug代码: 
+                  if debug_ppl_validate_all_reduce_safetensor_dir:
+                      if layer_prefix == "model.layers.0.self_attn.o_proj" and _forward_raw_counter[0] == 0:
+会从 load_safe_tensor_path = f"{debug_ppl_validate_all_reduce_safetensor_dir}/rank-{my_tp_rank}-prefix-{layer_prefix}-forwardcount-{_forward_raw_counter[0]}-1.safetensors"
+即 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/ 里面读取 每个rank对应的tensor,进行all reduce, 再把结果写到 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/validate_all_reduce_rank-[0-7].sglang.safetensors
+sglang使用如下命令进行离线测试, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/:
+ cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1 python3 /data/like/package/sglang_kernel_src/examples/runtime/engine/offline_batch_inference-debug-ppl.py --model-path /data/like/hf-models/llama3.1-70B-strip-layers/ --quantization simo --tp-size 8 --json-model-override-args='{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}' --mem-fraction-static 0.65 --disable-cuda-graph --watchdog-timeout 2592000 --skip-server-warmup --attention-backend fa3 --enable-deterministic-inference > templ/offline_batch_inference-qdqx_safetensor.online-quant.log.`nowstr.sh` 2>&1 &
+
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+vllm code base的  vllm/model_executor/layers/linear.py 实现的 RowParallelLinear.forward，会调用output = tensor_model_parallel_all_reduce(output_parallel),
+我加了如下debug代码: 
+                  if debug_ppl_validate_all_reduce_safetensor_dir:
+                      if layer_prefix == "model.layers.0.self_attn.o_proj" and _forward_raw_counter[0] == 0:
+会从 load_safe_tensor_path = f"{debug_ppl_validate_all_reduce_safetensor_dir}/rank-{my_tp_rank}-prefix-{layer_prefix}-forwardcount-{_forward_raw_counter[0]}-1.safetensors"
+即 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/ 里面读取 每个rank对应的tensor,进行all reduce, 再把结果写到 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/validate_all_reduce_rank-[0-7].vllm.safetensors
+vllm使用如下命令进行离线测试, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/:
+ cp /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json ; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-vllm/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm  ; CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.vllm.1.json  python3 ../vllm-for-conda-simo/examples/offline_inference/llm_engine_example-debug-ppl.py  --model /data/like/hf-models/llama3.1-70B-strip-layers/    --quantization simo    --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}'   --gpu-memory-utilization 0.5 --enforce-eager --tensor-parallel-size 8  > temp/llm_engine_example-debug-ppl.py.log.`nowstr.sh` 2>&1 &
+
+现在要求你:
+1)修改 sglang code base 的 python/sglang/srt/layers/linear.py  RowParallelLinear.forward，
+debug代码里面: 
+                  if debug_ppl_validate_all_reduce_safetensor_dir:
+                      if layer_prefix == "model.layers.0.self_attn.o_proj" and _forward_raw_counter[0] == 0:
+                        不再使用 tensor_model_parallel_all_reduce ，而是使用torch.distributed.all_reduce, 然后把all reduce结果保存成safetensor
+2)修改 vllm code base 的 vllm/model_executor/layers/linear.py RowParallelLinear.forward
+debug代码里面: 
+                  if debug_ppl_validate_all_reduce_safetensor_dir:
+                      if layer_prefix == "model.layers.0.self_attn.o_proj" and _forward_raw_counter[0] == 0:
+                        不再使用 tensor_model_parallel_all_reduce ，而是使用torch.distributed.all_reduce, 然后把all reduce结果保存成safetensor
+3)要保证 sglang 和vllm debug代码里面all reduce结果相同, bitwise相同,需要加哪些环境变量或者命令行参数?
+要求：把答案追加在 temp/answer_sgl.md 里面
+
+###
+conda 环境位于/data/like/miniconda3/envs/simo_sglang/.
+写一个 python代码 like-useful/torch_all_reduce.py. 使用8 个GPU进行  torch.distributed.all_reduce
+要从命令行参数读取一个 suffix 参数.
+每个进程分别读取 /data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online/rank-[0-7]-prefix-model.layers.0.self_attn.o_proj-forwardcount-0-1.safetensors
+每个rank从 safetensor中取出  key="row_parallel_quant_method_out"对应的torch tensor,
+然后8个rank 使用 vllm提供的 tensor_model_parallel_all_reduce 对 key="row_parallel_quant_method_out" 的 tensor进行 torch.distributed.all_reduce  操作，rank 0把 all reduce 结果保存到  /data/like/temp/torch.distributed.all_reduce.{suffix}.safetensors, safetensor key="rank_0_all_reduce".
+给出如何运行脚本的命令， 要求：把答案追加在 temp/codex_answer.md 里面
+
+###
+要求：把答案追加在 temp/codex_answer.md 里面
+sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+
+like-useful/torch_all_reduce.py 是脱离 sglang和vllm框架的，使用torchrun测试, 分别使用 sglang和vllm的conda环境测试结果，all reduce结果 bitwise一致:
+CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 like-useful/torch_all_reduce.py --suffix sglang
+CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 like-useful/torch_all_reduce.py --suffix vllm 
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+
+sglang code base 的 python/sglang/srt/layers/linear.py  的 RowParallelLinear.forward
+vllm code base的  vllm/model_executor/layers/linear.py  的  RowParallelLinear.forward
+但是，之前的修改，分别在 sglang和 vllm的 RowParallelLinear.forward里面的修改，
+                  if debug_ppl_validate_all_reduce_safetensor_dir:
+                      if layer_prefix == "model.layers.0.self_attn.o_proj" and _forward_raw_counter[0] == 0:
+                      同样是使用 torch.distributed.all_reduce 进行 all reduce, 结果却无法保证bitwise一致
+
+sglang测试命令:
+cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1 python3 /data/like/package/sglang_kernel_src/examples/runtime/engine/offline_batch_inference-debug-ppl.py --model-path /data/like/hf-models/llama3.1-70B-strip-layers/ --quantization simo --tp-size 8 --json-model-override-args='{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}' --mem-fraction-static 0.65 --disable-cuda-graph --watchdog-timeout 2592000 --skip-server-warmup --attention-backend fa3 --enable-deterministic-inference > templ/offline_batch_inference-qdqx_safetensor.online-quant.log.`nowstr.sh` 2>&1 &
+sglang日志位于templ/offline_batch_inference-qdqx_safetensor.online-quant.log.2026_05_11___16_25_44
+
+ vllm测试命令:
+ cp /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json ; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-vllm/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm  ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.vllm.1.json  python3 ../vllm-for-conda-simo/examples/offline_inference/llm_engine_example-debug-ppl.py  --model /data/like/hf-models/llama3.1-70B-strip-layers/    --quantization simo    --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}'   --gpu-memory-utilization 0.5 --enforce-eager --tensor-parallel-size 8  > temp/llm_engine_example-debug-ppl.py.log.`nowstr.sh` 2>&1 &
+
+ vllm日志位于temp/llm_engine_example-debug-ppl.py.log.2026_05_11___16_28_59
+
+sglang rank 0的 all reduce 结果safetensor位于 "/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online-compare-all-reduce-out/validate_all_reduce_rank-0.sglang.safetensors"
+vllm rank 0的all reduce 结果safetensor位于 "/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online-compare-all-reduce-out/validate_all_reduce_rank-0.vllm.safetensors"
+分析 sglang 和 vllm 在同样使用 torch.distributed.all_reduce 后， 在debug代码的if语句里面，仍旧无法保证reduce结果 bitwise一致
+
+
+###
+要求：把答案追加在 temp/codex_answer.md 里面
+sglang离线命令改成：
+ cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1 python3 /data/like/package/sglang_kernel_src/examples/runtime/engine/offline_batch_inference-debug-ppl.py --model-path /data/like/hf-models/llama3.1-70B-strip-layers/ --quantization simo --tp-size 8 --json-model-override-args='{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}' --mem-fraction-static 0.65 --disable-cuda-graph --watchdog-timeout 2592000 --skip-server-warmup --attention-backend fa3 > templ/offline_batch_inference-qdqx_safetensor.online-quant.log.`nowstr.sh` 2>&1 &
+ 日志位于/data/like/package/simo_conda_sglang/templ/offline_batch_inference-qdqx_safetensor.online-quant.log.2026_05_11___17_53_15
+
+"/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online-compare-all-reduce-out/validate_all_reduce_rank-0.sglang.safetensors" 和"/data/like/temp/qdqx_2026_05_09___16_46_17_safetensors-online-compare-all-reduce-out/validate_all_reduce_rank-0.vllm.safetensors" 里面的 safetensor 还无法保证 bitwise 一致。
+分析 sglang 和 vllm 在同样使用 torch.distributed.all_reduce 后， 在debug代码的if语句里面，仍旧无法保证reduce结果 bitwise一致
+
+##
+###
+要求：把答案追加在 temp/codex_answer.md 里面
+现在 sglang 和 vllm离线 Engine 的输出已经几乎完全一致，大多数 layer 是bitwise相等的，bitwise不相等的输出，l2 norm也很小，l2 norm最大只有0.0002824079419951886, 日志位于templ/debug_ppl_compare_qdqx.py.log.2026_05_11___23_43_04
+sglang离线测试命令:
+cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1 python3 /data/like/package/sglang_kernel_src/examples/runtime/engine/offline_batch_inference-debug-ppl.py --model-path /data/like/hf-models/llama3.1-70B --quantization simo --tp-size 8 --json-model-override-args='{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}' --mem-fraction-static 0.65 --disable-cuda-graph --watchdog-timeout 2592000 --skip-server-warmup --attention-backend fa3 > templ/offline_batch_inference-qdqx_safetensor.online-quant.log.`nowstr.sh` 2>&1 &
+日志:templ/offline_batch_inference-qdqx_safetensor.online-quant.log.2026_05_11___23_38_47
+vllm 离线测试命令:
+cp /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json ; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-vllm/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm  ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.vllm.1.json  python3 ../vllm-for-conda-simo/examples/offline_inference/llm_engine_example-debug-ppl.py  --model /data/like/hf-models/llama3.1-70B/    --quantization simo    --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}'   --gpu-memory-utilization 0.5 --enforce-eager --tensor-parallel-size 8  > temp/llm_engine_example-debug-ppl.py.log.`nowstr.sh` 2>&1 &
+日志: temp/llm_engine_example-debug-ppl.py.log.2026_05_11___23_40_44
+sglang 离线测试， 各layer保存 safetensor在   /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online 目录
+vllm  离线测试， 各layer保存 safetensor在 /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm 目录
+like-useful/debug_ppl_compare_qdqx.py 读取两个目录的 safetensor，对比 bitwise相等，cosine similariry, L2 norm。
+like-useful/debug_ppl_compare_qdqx.py 的日志位于: templ/debug_ppl_compare_qdqx.py.log.2026_05_11___23_43_04
+可以看出，sglang和vllm离线测试，dump出safetensor的layer输出基本全部bitwise一致，不一致的， L2 Norm也很小。
+
+但是, lm-eval结果区别很大。
+lm-eval所有测试的时候，debug_ppl_save_input_safetensor_dir,debug_ppl_validate_all_reduce_safetensor_dir, debug_ppl_save_input_ipc_dir, debug_log是没有设置的，其他和离线Engine一样。
+sglang lm-eval测试 wikitext命令：
+cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/llama3.1-70B", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true, "attention_backend":"fa3" }' --tasks wikitext --batch_size auto > templ/sglang.wikitext.l2norm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+日志:
+templ/sglang.wikitext.l2norm.lm-eval-mxfp4.log.2026_05_11___22_50_23
+sglang ppl:27.2849
+
+vllm lm-eval测试 wikitext命令：
+cp /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json ; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-vllm/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm  ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.vllm.1.json    lm_eval --model vllm --model_args '{"pretrained": "/data/like/hf-models/llama3.1-70B", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}, "tensor_parallel_size": 8, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size auto > templ/vllm.wikitext.l2norm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+
+日志: templ/vllm.wikitext.l2norm.lm-eval-mxfp4.log.2026_05_11___22_55_36
+vllm ppl:  10.1594
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+simo代码位于/data/like/package/simo_conda_sglang, simo的simo//extensions/sglang_simo/quantization/quantization.py 实现了 sglang的  SIMOLinearMethod的扩展，
+simo的simo/extensions/vllm_simo/quantization/quantization_method.py 实现了 vllm 的 SIMOLinearMethod 的扩展。
+为什么sglang和vllm在 离线Engine给定一条prompt测试，输出几乎bitwise相等，lm-eval结果相差这么大？有没有可能是 sglang 和 vllm 在 lm-eval 测试的时候，  lm-eval 给 sglang engine 和 vllm engine 传的sampling parameter 不一样？帮我找出根本原因.
+
+
+如果想复现 vLLM 当前默认语义，在 sglang lm-eval 的 `model_args` 里显式加：
+
+我改了:
+diff /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py.bak
+可以看出差异，
+
+cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/llama3.1-70B", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json\"}", "tp_size": 8, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true, "attention_backend":"fa3" }' --tasks wikitext --batch_size auto > templ/sglang.wikitext.l2norm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+报错。日志位于templ/sglang.wikitext.l2norm.lm-eval-mxfp4.log.2026_05_12___11_10_59
+如何解决
+要求：把答案追加在 temp/codex_answer.md 里面
+
+你前面提到 tokenizer-only 脚本验证了这个差异,把这个脚本写到  like-useful/tokenizer-only.py 里面，告诉我如何运行这个脚本。这个脚本对 sglang 有办法控制  "add_bos_token": true, 这个选项吗?
+要求：把答案追加在 temp/codex_answer.md 里面
+
+要求：把答案追加在 temp/codex_answer.md 里面
+(simo_sglang) gpu018|2026-05-12 11:59:04[like@ simo_conda_sglang] ps aux | grep 2458670
+root     2458670  185  0.2 500688300 4671796 ?   Rl   11:55   7:06 sglang::scheduler_DP8_TP8_EP8
+like     2465924  0.0  0.0   7008  2220 pts/14   S+   11:59   0:00 grep --color=auto 2458670
+(simo_sglang) gpu018|2026-05-12 11:59:10[like@ simo_conda_sglang] sudo pwdx 2458670
+[sudo] password for like:
+2458670: /sgl-workspace/sglang
+(simo_sglang) gpu018|2026-05-12 11:59:21[like@ simo_conda_sglang] sudo ls /proc/2458670/status
+/proc/2458670/status
+(simo_sglang) gpu018|2026-05-12 11:59:48[like@ simo_conda_sglang] sudo cat /proc/2458670/status
+Name:   sglang::schedul
+Umask:  0022
+State:  R (running)
+Tgid:   2458670
+Ngid:   2460093
+Pid:    2458670
+PPid:   2458501
+TracerPid:      0
+Uid:    0       0       0       0
+Gid:    0       0       0       0
+FDSize: 512
+Groups: 0
+NStgid: 2458670 60556
+NSpid:  2458670 60556
+NSpgid: 2458099 60048
+NSsid:  2458099 60048
+VmPeak: 994664896 kB
+VmSize: 500688300 kB
+VmLck:         0 kB
+VmPin:  224752160 kB
+VmHWM:  60489352 kB
+VmRSS:   4671796 kB
+RssAnon:         3196376 kB
+RssFile:          600356 kB
+RssShmem:         875064 kB
+VmData: 20398452 kB
+VmStk:       416 kB
+VmExe:      2956 kB
+VmLib:   2024040 kB
+VmPTE:     39392 kB
+VmSwap:        0 kB
+HugetlbPages:          0 kB
+CoreDumping:    0
+THP_enabled:    1
+Threads:        187
+SigQ:   12/8254251
+SigPnd: 0000000000000000
+ShdPnd: 0000000000000000
+SigBlk: 0000000000000000
+SigIgn: 0000000001001000
+SigCgt: 00000001000004eb
+CapInh: 0000000000000000
+CapPrm: 000001ffffffffff
+CapEff: 000001ffffffffff
+CapBnd: 000001ffffffffff
+CapAmb: 0000000000000000
+NoNewPrivs:     0
+Seccomp:        0
+Seccomp_filters:        0
+Speculation_Store_Bypass:       thread vulnerable
+SpeculationIndirectBranch:      conditional enabled
+Cpus_allowed:   ffffffff,ffffffff,ffffffff,ffffffff,ffffffff,ffffffff
+Cpus_allowed_list:      0-191
+Mems_allowed:   00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000003
+Mems_allowed_list:      0-1
+voluntary_ctxt_switches:        331151
+nonvoluntary_ctxt_switches:     1042
+(simo_sglang) gpu018|2026-05-12 11:59:50[like@ simo_conda_sglang] sudo ls /
+bin  boot  cdrom  data  data_gpu  dev  etc  home  lib  lib32  lib64  libx32  lost+found  media  mnt  opt  proc  root  run  sbin  share  share_data  share_data1  share_data2  snap  softhome  srv  sys  tmp  usr  var
+
+pwd显示2458670这个进程在 /sgl-workspace/sglang， 为什么 ls /显示，没有/sgl-workspace/sglang目录?
+
+如何找到2458670是在哪个docker container?
+要求：把答案追加在 temp/codex_answer.md 里面
+
+
+SIMO_SGLANG_REGISTER=1  lm-eval  --model sglang --model_args '{"pretrained": "/data/like/hf-models/llama3.1-70B-strip-layers",  "add_bos_token": true, "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json\"}", "tp_size": 1, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true, "attention_backend":"fa3" }' --tasks wikitext --batch_size auto
+如何修改这个命令，让lm-eval向 sglang发请求的时候，batch size=1,并且以固定的顺序，把 wikitext数据集向 sglang发请求，即：多多次运行lm-eval，请求的顺序是相同的
+要求：把答案追加在 temp/codex_answer.md 里面
+
+/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py
+函数 loglikelihood_rolling里面，
+            rolling_token_windows: List[Tuple[List[int], List[int]]] = list(
+                map(
+                    make_disjoint_window,
+                    get_rolling_token_windows(
+                        token_list=self.tok_encode(string),
+                        prefix_token=self.prefix_token_id,
+                        # max_seq_len - (1 for context)
+                        max_seq_len=self.max_length - 1,
+                        context_len=1,
+                    ),
+                )
+            )
+
+这是什么语法？对这段代码讲解。
+要求：把答案追加在 temp/codex_answer.md 里面
+
+对 get_rolling_token_windows 函数进行讲解，并用例子说明输入输出的形式
+要求：把答案追加在 temp/codex_answer.md 里面
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+lm-eval命令是:
+cp /share/users/like/ipc.sglang.1.json /dev/shm/like/; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-online/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online ; CUDA_VISIBLE_DEVICES=0 debug_env_file=/dev/shm/like/ipc.sglang.1.json SIMO_SGLANG_REGISTER=1  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/llama3.1-70B-strip-layers/",  "add_bos_token": true, "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json\"}", "tp_size": 1, "dtype": "auto", "mem_fraction_static": 0.5, "skip_server_warmup":true, "disable_cuda_graph":true, "attention_backend":"fa3" , "max_running_requests": 1 , "watchdog_timeout":2592000 }' --tasks wikitext --batch_size 1 > templ/sglang.wikitext.l2norm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+/data/like/temp/sglang.wikitext.l2norm.lm-eval-mxfp4.log.2026_05_13___18_15_01
+为什么在使用lm-eval的时候， sglang代码里面的 logger.info日志，无法打印出来了？
+sglang codebase的python/sglang/srt/model_executor/model_runner.py，_forward_raw函数，我加了调试代码，每个_forward_raw都对 _forward_raw_counter 进行+1操作。
+```
+                from filelock import FileLock
+                import numpy as np
+                with FileLock(ppl_ipc_counter_lock_path):
+                    if not os.path.exists(ppl_ipc_counter_npy_path):
+                        _forward_raw_counter = np.array([0], dtype=np.uint64)
+                        _forward_raw_counter.tofile(ppl_ipc_counter_npy_path)
+                    else:
+                        _forward_raw_counter = np.fromfile(ppl_ipc_counter_npy_path, dtype=np.uint64)
+                        _forward_raw_counter[0] += 1
+                        _forward_raw_counter.tofile(ppl_ipc_counter_npy_path)
+```
+运行结束，读取counter:
+```
+>>> v1=np.fromfile('/dev/shm/debug_ppl_save_input_ipc_dir-online/counter.rank-0.npy', dtype=np.uint64)
+>>> v1
+array([123], dtype=uint64)
+```
+_forward_raw 运行了124次，为什么wikitext有62 条数据，lm-eval 传的sampling parameter, max token = 1, 理论上，只跑一次forward就够了，为什么每条数据会跑2个  forward?
+为什么会多出来一次 forward,即每个请求一次 prefill，一次decode?
+要求：把答案追加在 temp/codex_answer.md 里面
+
+sglang ServerArgs默认 log_level是info，是谁把 log_level设置成erro的?
+要求：把答案追加在 temp/codex_answer.md 里面
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+vllm code base的vllm/distributed/parallel_state.py GroupCoordinator, rank_in_group和rank有什么区别？在它的注释里面，例子里面，4个进程，2个节点的例子，Rank和Rank in Group都是0,1,2,3,有什么区别呢？
+要求：把答案追加在 temp/codex_answer.md 里面
+
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+下面代码能保证 vllm使用llama模型推理的时候，一次只处理一个 wikitext数据吗？ sglang有参数  "max_running_requests": 1, vllm有类似参数吗？
+cp /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json ; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-vllm/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm  ; CUDA_VISIBLE_DEVICES=0 debug_env_file=/dev/shm/like/ipc.vllm.1.json    lm_eval --model vllm --model_args '{"pretrained": "/data/like/hf-models/llama3.1-70B-strip-layers", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions
+/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}, "tensor_parallel_size": 1, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size 1 > templ/vllm.wikitext.l2norm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+要求：把答案追加在 temp/codex_answer.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+lm_eval命令是:
+cp /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json ; rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-vllm/ /data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm  ; CUDA_VISIBLE_DEVICES=0 debug_env_file=/dev/shm/like/ipc.vllm.1.json    lm_eval --model vllm --model_args '{"pretrained": "/data/like/hf-models/llama3.1-70B-strip-layers", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a4_mxfp-copy-from-xuhaifeng.json"}, "tensor_parallel_size": 1, "dtype": "auto", "gpu_memory_utilization": 0.6, "enforce_eager":true}' --tasks wikitext --batch_size 1 > templ/vllm.wikitext.l2norm.lm-eval-mxfp4.log.`nowstr.sh` 2>&1 &
+日志位于: templ/vllm.wikitext.l2norm.lm-eval-mxfp4.log.2026_05_14___14_43_51
+
+我在 vllm code base的 vllm/v1/worker/gpu_model_runner.py  GPUModelRunner.execute_model函数 加了如下调试代码
+```
+            if env_data.get('debug_ppl_save_input_safetensor_dir', None) or env_data.get('debug_ppl_only_save_input_id_safetensor_dir', None):
+                ppl_ipc_dir = env_data.get('debug_ppl_save_input_ipc_dir', '/dev/shm/debug_ppl_save_input_ipc_dir')
+                os.makedirs(ppl_ipc_dir, exist_ok=True)
+                my_tp_rank = get_tp_group().rank
+                ppl_ipc_counter_npy_path = f"{ppl_ipc_dir}/counter.rank-{my_tp_rank}.npy"
+                ppl_ipc_counter_lock_path = f"{ppl_ipc_dir}/counter.rank-{my_tp_rank}.lock"
+                with FileLock(ppl_ipc_counter_lock_path):
+                    if not os.path.exists(ppl_ipc_counter_npy_path):
+                        _forward_raw_counter = np.array([0], dtype=np.uint64)
+                        _forward_raw_counter.tofile(ppl_ipc_counter_npy_path)
+                    else:
+                        _forward_raw_counter = np.fromfile(ppl_ipc_counter_npy_path, dtype=np.uint64)
+                        _forward_raw_counter[0] += 1
+                        _forward_raw_counter.tofile(ppl_ipc_counter_npy_path)
+
+```
+lm-eval运行结束，读取counter:
+>>> import numpy as np
+>>> v2=np.fromfile('/dev/shm/debug_ppl_save_input_ipc_dir-vllm/counter.rank-0.npy', dtype=np.uint64)
+>>> v2
+array([61], dtype=uint64)
+
+同样是wikitext的62 条数据集，lm-eval给sglang 和 vllm都传的是max new token = 1, 为什么 sglang会每条数据运行一次prefill和一次decode， vllm只有一次 prefill? sglang运行了124次forward, vllm运行了 62次 forward, sglang和vllm对于 max new token=1的解释，有什么不同？
+要求：把答案追加在 temp/codex_answer.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py 101行，会判断if self.q_lora_rank is not None，这个if 语句什么情况下是true?
+对于模型/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B// 会是true吗？
+
+要求：讲解代码的时候要使用绝对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/. vllm conda环境下， simo代码位于 /data/like/package/simo_conda_vllm/
+vllm server命令是：
+cp  /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json  ;  debug_env_file=/dev/shm/like/ipc.vllm.1.json   CUDA_VISIBLE_DEVICES=2 vllm serve --quantization simo --model //data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --gpu-memory-utilization 0.5 --attention-config '{"backend": "TRITON_MLA"}' --port 30131 --enforce-eager > temp/vllm.serve.log.`nowstr.sh` 2>&1 &
+
+日志是:/share/users/like/package/h100/package/simo_conda_sglang/temp/vllm.serve.log.2026_05_15___16_09_44
+
+simo code base的 simo/extensions/vllm_simo/v1/attention/backends/simo_mla.py  do_kv_cache_update函数，对kv cache进行量化写入，最终调用的triton kernel是什么？对triton kernel实现进行讲解。
+要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/. vllm conda环境下， simo代码位于 /data/like/package/simo_conda_vllm/
+vllm server命令是：
+cp  /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json  ;  debug_env_file=/dev/shm/like/ipc.vllm.1.json   CUDA_VISIBLE_DEVICES=2 vllm serve --quantization simo --model //data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --gpu-memory-utilization 0.5 --attention-config '{"backend": "TRITON_MLA"}' --port 30131 --enforce-eager > temp/vllm.serve.log.`nowstr.sh` 2>&1 &
+
+vllm code base的 vllm/model_executor/layers/attention/mla_attention.py unified_mla_kv_cache_update函数里面， kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]，这一行，我在pudb中调试，发现
+kv_cache.shape=torch.Size([21361, 16, 594]), 为什么会有中间的维度 16? kv_cache分配的时候，维度是在 哪个代码里面确定的？找出这条确定kv cache shape的链路.
+要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+
+
+vllm代码位于 /data//like/package/vllm-for-conda-simo/, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/. vllm conda环境下， simo代码位于 /data/like/package/simo_conda_vllm/
+vllm server命令是：
+cp  /share/users/like/ipc.vllm.1.json /dev/shm/like/ipc.vllm.1.json  ;  debug_env_file=/dev/shm/like/ipc.vllm.1.json   CUDA_VISIBLE_DEVICES=2 vllm serve --quantization simo --model //data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ --hf-overrides '{"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json"}' --gpu-memory-utilization 0.5 --attention-config '{"backend": "TRITON_MLA"}' --port 30131 --enforce-eager > temp/vllm.serve.log.`nowstr.sh` 2>&1 &
+simo/extensions/vllm_simo/v1/attention/ops/triton_concat_and_cache_mla.py concat_and_cache_mla会把kv_c和k_pe concat到一起，再送给 concat_and_cache_mla_kernel 做kv cache量化写入。
+concat_and_cache_mla_kernel在写 kv cache的时候，kv_c和k_pe部分的数据是如何排布的？
+考虑每个token内部的布局 ，mx elent和mx scale的排布是[kv_c mx element, k_pe mx element, kv_c mx scale, k_pe mx scale]
+还是按 [kv_c mx element, kv_c mx scale, k_pe mx element,  k_pe mx scale]的布局？
+要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
