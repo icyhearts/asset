@@ -3,7 +3,8 @@ import json
 import triton
 from safetensors.torch import load_file
 from sglang.srt.layers.attention.triton_ops.decode_attention import _fwd_grouped_kernel_stage1
-time_prefix=1776764594.4215453 
+time_prefix="1779268229.8098829"  # dsv2 lite
+time_prefix="1776764594.4215453"  # llama
 
 save_dir = "../sglang_kernel_src/temp/prepare_data_sgl_decode_attention_fwd/"
 
