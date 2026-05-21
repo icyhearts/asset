@@ -30,9 +30,9 @@ if True:
           "mask_indptr":mask_indptr,
           }
       time_prefix = time.time()
-      save_dir = "temp/prepare_data_simo_sglang_extend_attention_fwd/"
+      save_dir = "temp/prepare_data_sglang_extend_attention_fwd/"
       os.makedirs(save_dir, exist_ok=True)
-      safe_tensor_path = f"{save_dir}/simo_sglang_extend_attention_fwd.{time_prefix}.safetensors"
+      safe_tensor_path = f"{save_dir}/sglang_extend_attention_fwd.{time_prefix}.safetensors"
       save_file(data_dict, safe_tensor_path)
 
       args_json_path = f"{save_dir}/non_tensor_args.{time_prefix}.json"
