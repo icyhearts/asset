@@ -6,10 +6,10 @@ import json
 from safetensors.torch import load_file
 if True:
     if True:
-      time_prefix = "1776246917.2021449" # 不知道是什么格式的
-      save_dir = "temp/prepare_data_simo_sglang_extend_attention_fwd/"
+      time_prefix = "1779353757.1713867" # fp8
+      save_dir = "temp/prepare_data_sglang_extend_attention_fwd/"
 
-      safe_tensor_path = f"{save_dir}/simo_sglang_extend_attention_fwd.{time_prefix}.safetensors"
+      safe_tensor_path = f"{save_dir}/sglang_extend_attention_fwd.{time_prefix}.safetensors"
       args_json_path = f"{save_dir}/non_tensor_args.{time_prefix}.json"
 
       layer_dict_json_path = f"{save_dir}/layer_dict.{time_prefix}.json"
