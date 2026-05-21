@@ -1,6 +1,5 @@
 
-from simo.extensions.sglang_simo.layers.attention.triton_ops.extend_attention import extend_attention_fwd
-from simo.extensions.sglang_simo.quantization.quantization import parse_quantize_spec
+from   sglang.srt.layers.attention.triton_ops.extend_attention import extend_attention_fwd
 import torch
 import json
 from safetensors.torch import load_file
@@ -12,7 +11,6 @@ if True:
       safe_tensor_path = f"{save_dir}/sglang_extend_attention_fwd.{time_prefix}.safetensors"
       args_json_path = f"{save_dir}/non_tensor_args.{time_prefix}.json"
 
-      layer_dict_json_path = f"{save_dir}/layer_dict.{time_prefix}.json"
 
       data_dict = load_file(safe_tensor_path, device="cuda:0")
 
@@ -41,15 +39,7 @@ if True:
       xai_temperature_len=non_tensor_args["xai_temperature_len"]
       mask_indptr=non_tensor_args["mask_indptr"]
 
-      with open(layer_dict_json_path, 'r') as fp:
-        layer_dict = json.load(fp)
 
-      layer = torch.nn.Linear(2,3)
-      layer.qk_head_dim=layer_dict["qk_head_dim"]
-      layer.v_head_dim=layer_dict["v_head_dim"]
-      layer.packed_head_size=layer_dict["packed_head_size"]
-      layer.scale_head_size=layer_dict["scale_head_size"]
-      layer.kv_cache_quant_spec=  parse_quantize_spec(layer_dict["kv_cache_quant_spec"])
       extend_attention_fwd(
             q_extend,
             k_extend,
@@ -71,6 +61,5 @@ if True:
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=xai_temperature_len,
-            layer=layer,
             )
 
