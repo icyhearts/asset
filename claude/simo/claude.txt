@@ -1591,3 +1591,20 @@ while start_n < split_kv_end:
   start_n = start_n + BLOCK_N
 
 要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+interpreter的问题，在另外一个conda环境下不会出现，这是什么原因？
+
+工作目录都位于/data/like/package/simo_conda_sglang
+
+/data/like/miniconda3/ 环境下
+命令是
+TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=0 python3  ../sglang_kernel_src/like-useful/load_sglang_extend_attention_fwd.py  > temp/1.log.`nowstr.sh` 2>&1 &
+日志位于 temp/1.log.2026_05_21___18_11_46
+
+ /share/users/like/miniconda3 这个conda 环境下,
+TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=0 python3 ../sglang_kernel_src/like-useful/load_sglang_extend_attention_fwd.py > temp/nfs.log.`nowstr.sh` 2>&1 &
+ 日志位于 temp/nfs.log.2026_05_21___18_22_38
+
+同样的 load_sglang_extend_attention_fwd.py  为什么在/share/users/like/miniconda3环境就可以正常工作？
+两个conda环境的 triton版本是一样的
+要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
