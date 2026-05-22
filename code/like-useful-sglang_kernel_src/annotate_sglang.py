@@ -270,7 +270,10 @@ batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
 grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
 
 each program deal:
-one of bs
+one batch of bs
+one head of all head
+BLOCK_M of  max_len_extdnd
+
 
 """
     cur_seq = tl.program_id(0) # each block deal
