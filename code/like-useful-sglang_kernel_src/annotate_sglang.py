@@ -261,7 +261,19 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
-    cur_seq = tl.program_id(0)
+"""
+input has shape
+[bs*seqlen, head_num, hidden_dim ]
+
+grid design:
+batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
+grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+
+each program deal:
+one of bs
+
+"""
+    cur_seq = tl.program_id(0) # each block deal
     cur_head = tl.program_id(1)
     cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
