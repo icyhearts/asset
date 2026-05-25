@@ -4310,3 +4310,182 @@ CUDA_VISIBLE_DEVICES="" pip install -e . --no-build-isolation
 ```
 
 最稳的修复是让构建用的 CUDA toolkit/nvcc 版本和 `torch.version.cuda` 完全一致。对当前 `/data/like/miniconda3/envs/simo_sglang` 来说，就是改用 CUDA 13.0 的 `nvcc`，或者把 PyTorch 换成 CUDA 12.8 构建版本。
+
+## SGLang 启动日志 `torchvision::nms does not exist` 报错原因
+
+日志 `temp/sglang_server.30121.2026_05_25___22_36_43` 里只有一个导入期错误，服务还没有进入模型加载阶段，所以这不是 `/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B-strip-layers/` 模型目录的问题，也不是 `--kv-cache-dtype fp8_e4m3` 或 `--attention-backend triton` 的问题。
+
+直接错误是：
+
+```text
+RuntimeError: operator torchvision::nms does not exist
+```
+
+调用链是：
+
+```text
+python -m sglang.launch_server
+  -> python/sglang/__init__.py
+  -> python/sglang/srt/utils/common.py
+  -> torchvision
+  -> torchvision/_meta_registrations.py
+  -> torch.library.register_fake("torchvision::nms")
+```
+
+关键位置：
+
+`python/sglang/__init__.py:29` 导入 SGLang patch：
+
+```python
+from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
+```
+
+`python/sglang/srt/utils/common.py:91` 在模块 import 阶段直接导入 torchvision：
+
+```python
+from torchvision.io import decode_jpeg
+```
+
+然后进入当前 conda 环境的 torchvision。`/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torchvision/__init__.py:7` 到 `/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torchvision/__init__.py:8`：
+
+```python
+from . import extension  # load _C extension first
+from torchvision import _meta_registrations, datasets, io, models, ops, transforms, utils
+```
+
+`/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torchvision/_meta_registrations.py:163`：
+
+```python
+@torch.library.register_fake("torchvision::nms")
+```
+
+这里要注册 `torchvision::nms` 的 fake/meta 实现。但这个 op 应该先由 torchvision 的 C++ extension `_C.so` 注册；现在 `_C.so` 没加载成功，所以 dispatcher 里没有 `torchvision::nms` 这个 operator，最终报：
+
+```text
+RuntimeError: operator torchvision::nms does not exist
+```
+
+### 根因：torch 和 torchvision 的 CUDA build 不匹配
+
+当前 `/data/like/miniconda3/envs/simo_sglang` 里实际版本是：
+
+```text
+torch = 2.11.0+cu128
+torch.version.cuda = 12.8
+torchvision = 0.26.0+cu130
+```
+
+`/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torchvision/version.py` 显示：
+
+```python
+__version__ = '0.26.0+cu130'
+```
+
+也就是 torchvision 是 CUDA 13.0 构建；但 torch 是 CUDA 12.8 构建。
+
+进一步验证：直接加载 torchvision C++ extension 会失败：
+
+```python
+import torch
+torch.ops.load_library(
+  "/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torchvision/_C.so"
+)
+```
+
+结果是：
+
+```text
+OSError: Could not load this library: .../torchvision/_C.so
+```
+
+`ldd /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torchvision/_C.so` 也能看到它依赖：
+
+```text
+libcudart.so.13 => not found
+```
+
+虽然环境里存在一些 `nvidia/cu13` 文件，但当前 torch 运行时是 cu128，torchvision `_C.so` 作为 cu130 扩展不能和当前 torch/cu128 正常匹配加载。因此 `_C.so` 没有注册 `torchvision::nms`，后续 `_meta_registrations.py` 注册 fake nms 就失败。
+
+### 为什么会在纯文本 DeepSeek 模型启动时触发 torchvision
+
+即使你启动的是文本模型 DeepSeek-V2，`python/sglang/srt/utils/common.py:91` 也在 import 阶段全局执行：
+
+```python
+from torchvision.io import decode_jpeg
+```
+
+所以只要 `python -m sglang.launch_server` 导入 `sglang`，就会导入 torchvision。当前错误发生在这个 import 阶段，和是否真的处理图像无关。
+
+### 解决办法
+
+最稳的修复是让 torch 和 torchvision 使用同一个 CUDA build。
+
+当前 torch 是：
+
+```text
+2.11.0+cu128
+```
+
+所以应安装匹配的 torchvision：
+
+```text
+torchvision 0.26.0+cu128
+```
+
+可以先卸载当前 cu130 torchvision，再安装 cu128 版本：
+
+```bash
+conda activate /data/like/miniconda3/envs/simo_sglang
+pip uninstall -y torchvision
+pip install --no-cache-dir --force-reinstall torchvision==0.26.0+cu128 \
+  --index-url https://download.pytorch.org/whl/cu128
+```
+
+如果你使用的是内部镜像，需要确保镜像里拿到的是 `0.26.0+cu128`，而不是没有 local version 标记的 `0.26.0` 或 `0.26.0+cu130`。
+
+安装后验证：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+import torch
+import torchvision
+print("torch", torch.__version__, torch.version.cuda)
+print("torchvision", torchvision.__version__)
+from torchvision.io import decode_jpeg
+print("decode_jpeg import ok")
+PY
+```
+
+期望输出里版本类似：
+
+```text
+torch 2.11.0+cu128 12.8
+torchvision 0.26.0+cu128
+decode_jpeg import ok
+```
+
+另一个方向是把 torch 也换成 CUDA 13.0 build，让它和当前 `torchvision 0.26.0+cu130` 匹配。但你当前 SGLang 环境已经是 `torch 2.11.0+cu128`，通常改 torchvision 风险更小。
+
+### 临时绕过思路
+
+如果你只是跑纯文本模型，不想处理图像，可以考虑把 `python/sglang/srt/utils/common.py:91` 的 torchvision 导入改成 lazy import，只在真正调用 JPEG decode 时再导入。但这是代码改动，不是环境根因修复；而且 SGLang 其他多模态路径仍可能导入 torchvision。
+
+所以推荐优先修复环境：
+
+```text
+torch 2.11.0+cu128 需要匹配 torchvision 0.26.0+cu128
+```
+
+### 最终判断
+
+本次 SGLang 启动失败的根因是：
+
+```text
+当前 conda 环境里 torch 和 torchvision 的 CUDA build 不一致：
+torch 是 2.11.0+cu128，
+torchvision 是 0.26.0+cu130。
+
+torchvision/_C.so 加载失败，导致 torchvision::nms 没有注册，
+随后 torchvision/_meta_registrations.py 注册 fake nms 时报
+RuntimeError: operator torchvision::nms does not exist。
+```
