@@ -1614,4 +1614,10 @@ TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=0 python3 ../sglang_kernel_src/like-usef
 
 main分支在 c1ea7eecb06c9dd103b9100626009e2364eb2d08这个提交的时候， simo/extensions/vllm_simo/quantization/quantization_config.py里面 SIMOConfig 构造函数有 is_checkpoint_quant_serialized参数。
 main分支最新提交， simo/extensions/vllm_simo/quantization/quantization_config.py里面 SIMOConfig 构造函数 is_checkpoint_quant_serialized参数被删除掉了。这个删除是在具体commit做的?
+
 要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+conda 环境位于  /data/like/miniconda3/envs/simo_sglang 
+pip install -e . --no-build-isolation日志位于
+分析temp/ins.log.2026_05_25___17_54_18报错原因
+要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
