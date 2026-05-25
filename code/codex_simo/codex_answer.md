@@ -4145,3 +4145,168 @@ git grep -n 'is_checkpoint_quant_serialized' main -- simo/extensions/vllm_simo/q
 ```
 
 没有结果，说明这个字段在当前 main 的 `simo/extensions/vllm_simo/quantization/quantization_config.py` 里已经完全不存在。
+
+## `pip install -e . --no-build-isolation` 报错原因
+
+日志 `temp/ins.log.2026_05_25___17_54_18` 的根因是 CUDA toolkit 版本和 PyTorch 编译时 CUDA 版本不一致。
+
+关键报错在日志里：
+
+```text
+RuntimeError: ('The detected CUDA version (%s) mismatches the version that was used to compilePyTorch (%s). Please make sure to use the same CUDA versions.', '12.8', '13.0')
+```
+
+也就是：
+
+```text
+当前构建时检测到的 CUDA / nvcc 版本: 12.8
+当前 conda 环境里的 PyTorch 编译 CUDA 版本: 13.0
+```
+
+我在 `/data/like/miniconda3/envs/simo_sglang` 里确认到：
+
+```text
+torch = 2.11.0+cu130
+torch.version.cuda = 13.0
+torch.utils.cpp_extension.CUDA_HOME = /usr/local/cuda
+/usr/local/cuda -> /usr/local/cuda-12.8
+/usr/local/cuda/bin/nvcc --version = release 12.8, V12.8.93
+```
+
+所以虽然 pip 依赖里显示已经安装了 `cuda-toolkit==13.0.2`、`nvidia-cuda-runtime==13.0.*`、`nvidia-cuda-nvrtc==13.0.*` 等 Python wheel 包，但当前环境里没有可被 `torch.utils.cpp_extension` 使用的 CUDA 13.0 `nvcc`。PyTorch 扩展构建最终使用了系统 `/usr/local/cuda-12.8`，于是触发版本检查失败。
+
+### 为什么安装会走到 CUDA 编译
+
+`setup.py:7` 到 `setup.py:12` 从 PyTorch 导入 CUDA extension 构建工具：
+
+```python
+from torch.utils.cpp_extension import (
+  CUDA_HOME,
+  BuildExtension,
+  CppExtension,
+  CUDAExtension,
+)
+```
+
+`setup.py:37` 到 `setup.py:46` 决定是否启用 CUDA 扩展：
+
+```python
+if not torch.cuda.is_available():
+  print("PyTorch GPU support is not available. Skipping compilation of CUDA extensions")
+if CUDA_HOME is None and torch.cuda.is_available():
+  print("CUDA toolkit is not available. Skipping compilation of CUDA extensions")
+
+use_cuda = torch.cuda.is_available() and CUDA_HOME is not None
+extension = CUDAExtension if use_cuda else CppExtension
+```
+
+你当前机器上 GPU 可用，且 `CUDA_HOME=/usr/local/cuda` 不为空，所以 `use_cuda=True`，`setup.py` 使用 `CUDAExtension`。
+
+`setup.py:67` 到 `setup.py:72` 会把 CUDA 源文件加入编译：
+
+```python
+sources = list(glob.glob(os.path.join(extension_dir, "**/*.cpp"), recursive=True))
+cuda_sources = list(glob.glob(os.path.join(extension_dir, "**/*.cu"), recursive=True))
+
+if use_cuda:
+  sources += cuda_sources
+  extra_compile_args["nvcc"].extend(["-DUSE_CUDA", "--extended-lambda"])
+```
+
+`setup.py:89` 到 `setup.py:95` 调用 `BuildExtension`：
+
+```python
+setup(
+  ...
+  ext_modules=get_extensions(),
+  cmdclass={"build_ext": BuildExtension},
+  ...
+)
+```
+
+日志里的调用栈也对应这个过程：
+
+```text
+running build_ext
+...
+torch/utils/cpp_extension.py build_extensions
+torch/utils/cpp_extension.py _check_cuda_version
+raise RuntimeError(CUDA_MISMATCH_MESSAGE, cuda_str_version, torch.version.cuda)
+```
+
+因此这不是 pip 解析依赖失败，也不是 `--no-build-isolation` 本身的问题；失败发生在构建 `simo._C` CUDA extension 之前的 PyTorch CUDA 版本一致性检查。
+
+### 推荐解决方案 1：安装/切换到 CUDA 13.0 nvcc
+
+如果要保留当前 PyTorch `2.11.0+cu130`，构建扩展时也必须使用 CUDA 13.0 的 toolkit/nvcc。
+
+如果系统上有 CUDA 13.0，例如 `/usr/local/cuda-13.0`，可以这样跑：
+
+```bash
+conda activate /data/like/miniconda3/envs/simo_sglang
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+python - <<'PY'
+import torch
+from torch.utils.cpp_extension import CUDA_HOME
+print("torch.version.cuda =", torch.version.cuda)
+print("CUDA_HOME =", CUDA_HOME)
+PY
+
+pip install -e . --no-build-isolation
+```
+
+如果系统没有 CUDA 13.0，需要先安装 CUDA 13.0 toolkit，至少要有匹配的 `nvcc`。用 conda 的话方向是：
+
+```bash
+conda activate /data/like/miniconda3/envs/simo_sglang
+conda install -c nvidia cuda-nvcc=13.0 cuda-toolkit=13.0
+export CUDA_HOME=$CONDA_PREFIX
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+pip install -e . --no-build-isolation
+```
+
+安装后先确认：
+
+```bash
+$CUDA_HOME/bin/nvcc --version
+python -c "import torch; print(torch.version.cuda)"
+```
+
+两边都应该是 13.0。
+
+### 推荐解决方案 2：换成 CUDA 12.8 版本的 PyTorch
+
+如果你必须使用系统 `/usr/local/cuda-12.8` 编译，那么 PyTorch 也要换成 CUDA 12.8 构建版本。目标是让：
+
+```text
+torch.version.cuda == 12.8
+/usr/local/cuda/bin/nvcc --version == 12.8
+```
+
+当前环境是 `torch 2.11.0+cu130`，和系统 CUDA 12.8 不匹配。需要安装与 CUDA 12.8 匹配的 PyTorch build，或者换到已有的 CUDA 12.8 PyTorch conda 环境。
+
+### 临时绕过：只装 Python editable，不编 CUDA 扩展
+
+如果只是想让 Python 包以 editable 方式挂进去，不需要 `simo._C` CUDA 扩展，可以临时让 `torch.cuda.is_available()` 变成 false，从而走 `CppExtension`/CPU-only 路径：
+
+```bash
+CUDA_VISIBLE_DEVICES="" pip install -e . --no-build-isolation
+```
+
+但这只是临时绕过。因为 `setup.py:45` 的 `use_cuda` 会变成 false，`setup.py:70` 到 `setup.py:72` 不会加入 `.cu` 源文件。后续如果运行需要 CUDA extension 的 SIMO 功能，仍然会缺少或不能使用对应 CUDA kernel。
+
+### 最终判断
+
+这次安装失败的直接原因是：
+
+```text
+构建 simo._C 时，PyTorch 发现 nvcc/CUDA_HOME 是 CUDA 12.8，
+但当前 PyTorch 是 CUDA 13.0 编译的 torch 2.11.0+cu130，
+因此 torch.utils.cpp_extension 主动中止 build_ext。
+```
+
+最稳的修复是让构建用的 CUDA toolkit/nvcc 版本和 `torch.version.cuda` 完全一致。对当前 `/data/like/miniconda3/envs/simo_sglang` 来说，就是改用 CUDA 13.0 的 `nvcc`，或者把 PyTorch 换成 CUDA 12.8 构建版本。
