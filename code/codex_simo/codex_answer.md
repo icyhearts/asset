@@ -3995,3 +3995,153 @@ while start_n < split_kv_end:
 可以作为解决 `TRITON_INTERPRET=1` 报错的直接方案。它比尝试把 `split_kv_start/end` 转 shape=0 scalar 再给 `range()` 更靠谱。
 
 如果目标是长期保留到 SGLang 代码里，我建议只对 `TRITON_INTERPRET=1` 或本地 debug 分支启用，正常生产路径最好保留原 `range` 写法，除非你 benchmark 确认 `while` 版本没有性能/编译退化。
+
+## SIMOConfig 的 is_checkpoint_quant_serialized 参数在哪个 commit 删除
+
+结论：删除发生在这个提交：
+
+```text
+62d9622b14916b35312666bea386e4bf7ea32981
+Dehua/update vllm 0.15.0 (model-opt/simo!142)
+Author: dehua <hchu@siorigin.com>
+Date: 2026-02-02T11:24:51+00:00
+```
+
+我用下面命令确认过：
+
+```bash
+git log --oneline -S'is_checkpoint_quant_serialized' -- simo/extensions/vllm_simo/quantization/quantization_config.py
+```
+
+结果只有两个相关提交：
+
+```text
+62d9622 Dehua/update vllm 0.15.0 (model-opt/simo!142)
+0e2d30f [RENAME]update torchmo -> simo (model-opt/torchmo!104)
+```
+
+其中 `0e2d30f` 是引入/rename 后存在该字段；`62d9622` 是删除该字段。并且：
+
+```bash
+git log --oneline 62d9622..main -S'is_checkpoint_quant_serialized' -- simo/extensions/vllm_simo/quantization/quantization_config.py
+```
+
+没有输出，说明 `62d9622` 之后 main 上没有再引入/删除这个字符串。
+
+### 删除前的代码位置
+
+在你给的旧提交 `c1ea7eecb06c9dd103b9100626009e2364eb2d08`，字段还存在。
+
+`simo/extensions/vllm_simo/quantization/quantization_config.py:153 SIMOConfig.__init__` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:160 SIMOConfig.__init__`：
+
+```python
+def __init__(
+  self,
+  is_checkpoint_quant_serialized: bool = False,
+  target_to_specs: Optional[dict[str, Any]] = None,
+  excludes: Optional[list[str]] = None,
+  per_quant_opt: Optional[list[str]] = None,
+  kv_cache_quant_algo: Optional[dict[str, Any]] = None,
+  flash_comm: Optional[bool] = None,
+) -> None:
+```
+
+`simo/extensions/vllm_simo/quantization/quantization_config.py:175 SIMOConfig.__init__` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:179 SIMOConfig.__init__`：
+
+```python
+if is_checkpoint_quant_serialized:
+  self._load_from_serialized_checkpoint(
+    target_to_specs, excludes, per_quant_opt, kv_cache_quant_algo, flash_comm
+  )
+  self._loaded_from_external = True
+```
+
+旧版还在 `simo/extensions/vllm_simo/quantization/quantization_config.py:261 SIMOConfig.__repr__` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:270 SIMOConfig.__repr__` 打印：
+
+```python
+f"  is_checkpoint_quant_serialized={self.is_checkpoint_quant_serialized},\n"
+```
+
+并在 `simo/extensions/vllm_simo/quantization/quantization_config.py:273 SIMOConfig._load_from_serialized_checkpoint` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:288 SIMOConfig._load_from_serialized_checkpoint` 里设置：
+
+```python
+self.is_checkpoint_quant_serialized = True
+```
+
+`simo/extensions/vllm_simo/quantization/quantization_config.py:545 SIMOConfig.from_config` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:552 SIMOConfig.from_config` 调用构造函数时也传了：
+
+```python
+return cls(
+  is_checkpoint_quant_serialized=True,
+  target_to_specs=target_to_specs,
+  excludes=excludes,
+  per_quant_opt=per_quant_opt,
+  kv_cache_quant_algo=kv_cache_quant_algo,
+  flash_comm=flash_comm,
+)
+```
+
+### 删除 commit 前一版和后一版对比
+
+在 `62d9622^`，也就是删除提交的父提交，字段仍然存在。
+
+`simo/extensions/vllm_simo/quantization/quantization_config.py:156 SIMOConfig.__init__` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:163 SIMOConfig.__init__`：
+
+```python
+def __init__(
+  self,
+  is_checkpoint_quant_serialized: bool = False,
+  target_to_specs: Optional[dict[str, Any]] = None,
+  excludes: Optional[list[str]] = None,
+  per_quant_opt: Optional[list[str]] = None,
+  kv_cache_quant_algo: Optional[dict[str, Any]] = None,
+  flash_comm: Optional[str] = None,
+) -> None:
+```
+
+到 `62d9622` 之后，构造函数变成：
+
+`simo/extensions/vllm_simo/quantization/quantization_config.py:107 SIMOConfig.__init__` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:114 SIMOConfig.__init__`：
+
+```python
+def __init__(
+  self,
+  target_to_specs: Optional[dict[str, Any]] = None,
+  excludes: Optional[list[str]] = None,
+  per_quant_opt: Optional[list[str]] = None,
+  kv_cache_quant_algo: Optional[dict[str, Any]] = None,
+  flash_comm: Optional[str] = None,
+) -> None:
+```
+
+也就是说，`is_checkpoint_quant_serialized` 参数是在 `62d9622b14916b35312666bea386e4bf7ea32981` 这个 commit 里从 `SIMOConfig.__init__` 签名中删除的。
+
+同一个提交还删除了 `SIMOConfig._load_from_serialized_checkpoint` 这条配置加载路径，并把 `SIMOConfig.from_config` 的构造调用改成不再传 `is_checkpoint_quant_serialized=True`：
+
+`simo/extensions/vllm_simo/quantization/quantization_config.py:371 SIMOConfig.from_config` 到 `simo/extensions/vllm_simo/quantization/quantization_config.py:377 SIMOConfig.from_config`：
+
+```python
+return cls(
+  target_to_specs=target_to_specs,
+  excludes=excludes,
+  per_quant_opt=per_quant_opt,
+  kv_cache_quant_algo=kv_cache_quant_algo,
+  flash_comm=flash_comm,
+)
+```
+
+### 当前 main 状态
+
+当前 `main` 是：
+
+```text
+4913f0f [feat] sglang online real quantize (model-opt/simo!166)
+```
+
+在当前 `main` 上：
+
+```bash
+git grep -n 'is_checkpoint_quant_serialized' main -- simo/extensions/vllm_simo/quantization/quantization_config.py
+```
+
+没有结果，说明这个字段在当前 main 的 `simo/extensions/vllm_simo/quantization/quantization_config.py` 里已经完全不存在。
