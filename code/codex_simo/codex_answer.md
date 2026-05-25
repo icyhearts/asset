@@ -4489,3 +4489,204 @@ torchvision/_C.so 加载失败，导致 torchvision::nms 没有注册，
 随后 torchvision/_meta_registrations.py 注册 fake nms 时报
 RuntimeError: operator torchvision::nms does not exist。
 ```
+
+## 2026-05-25 23:03:19 SGLang 新日志分析
+
+日志文件：
+
+```text
+temp/sglang_server.30121.2026_05_25___23_03_19
+```
+
+### 结论
+
+`torchvision` 的 CUDA 版本已经修好了：
+
+```text
+torch       2.11.0+cu128, torch.version.cuda = 12.8
+torchvision 0.26.0+cu128
+```
+
+这次的新问题不是 `torchvision::nms`，而是环境里还有两个 CUDA/PyTorch 二进制扩展没有和当前 `torch 2.11.0+cu128` 对齐：
+
+1. `sgl-deep-gemm/deep_gemm` 仍然带着 CUDA 13 依赖，启动时加载 `deep_gemm/_C.so` 失败。
+2. `/data/like/package/sglang_kernel_src/sgl-kernel/python/sgl_kernel/sm90/common_ops.abi3.so` 和当前 PyTorch ABI 不匹配，加载时报 undefined symbol。
+
+### 第一处致命错误：deep_gemm 仍依赖 CUDA 13
+
+traceback 的主错误是：
+
+```text
+RuntimeError: Failed to load dynamic shared library
+/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/deep_gemm/_C.so
+libcudart.so.13: cannot open shared object file: No such file or directory
+```
+
+我检查了这个 so 的动态依赖：
+
+```bash
+ldd /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/deep_gemm/_C.so
+```
+
+关键输出是：
+
+```text
+libcudart.so.13    => not found
+libnvrtc.so.13     => not found
+libcublasLt.so.13  => not found
+libcublas.so.13    => not found
+```
+
+但当前环境和系统 CUDA 是：
+
+```text
+torch.version.cuda = 12.8
+/usr/local/cuda -> /usr/local/cuda-12.8
+nvcc release 12.8
+```
+
+所以当前 `deep_gemm/_C.so` 是 CUDA 13 版本，和现在的 cu128 环境不一致。
+
+触发链路是：
+
+```text
+python/sglang/launch_server.py:66:<module>
+  -> python/sglang/srt/server_args.py:7643:prepare_server_args
+  -> python/sglang/srt/server_args.py:6935:ServerArgs.from_cli_args
+  -> python/sglang/srt/server_args.py:902:ServerArgs.__post_init__
+  -> python/sglang/srt/server_args.py:1299:ServerArgs._handle_piecewise_cuda_graph
+  -> python/sglang/srt/server_args.py:6981:ServerArgs.get_model_config
+  -> python/sglang/srt/configs/model_config.py:27:<module>
+  -> python/sglang/srt/layers/quantization/fp8_kernel.py:31:<module>
+  -> python/sglang/srt/layers/deep_gemm_wrapper/configurer.py:32:<module>
+  -> python/sglang/srt/layers/deep_gemm_wrapper/configurer.py:17:_compute_enable_deep_gemm
+  -> python/sglang/srt/layers/deep_gemm_wrapper/configurer.py:25:import deep_gemm
+```
+
+`python/sglang/srt/layers/deep_gemm_wrapper/configurer.py:24-29:_compute_enable_deep_gemm` 现在的逻辑是：
+
+```python
+try:
+    import deep_gemm
+except ImportError:
+    return False
+
+return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
+```
+
+这里有一个坑：它只 catch `ImportError`，但这次 `deep_gemm` 不是找不到包，而是包存在、`_C.so` 加载时抛了 `RuntimeError`。所以 SGLang 不会自动禁用 DeepGEMM，而是直接启动失败。
+
+另外，`SGLANG_ENABLE_JIT_DEEPGEMM=0` 也不能绕过这个错误，因为代码是先 `import deep_gemm`，再读取 `SGLANG_ENABLE_JIT_DEEPGEMM`。我实际验证过，带这个环境变量仍然会在同一处因为 `libcudart.so.13` 报错。
+
+### 第二处问题：sgl_kernel/common_ops ABI 不匹配
+
+日志里还有这一段：
+
+```text
+[sgl_kernel] Found architecture-specific library:
+/data/like/package/sglang_kernel_src/sgl-kernel/python/sgl_kernel/sm90/common_ops.abi3.so
+
+ImportError:
+undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib
+```
+
+加载逻辑在：
+
+```text
+sgl-kernel/python/sgl_kernel/__init__.py:18-23:<module>
+sgl-kernel/python/sgl_kernel/load_utils.py:48:_load_architecture_specific_ops
+sgl-kernel/python/sgl_kernel/load_utils.py:72-99:_load_architecture_specific_ops
+```
+
+`undefined symbol: c10::cuda::c10_cuda_check_implementation...` 说明这个 `common_ops.abi3.so` 编译时使用的 PyTorch/CUDA ABI 和当前运行时的 `torch 2.11.0+cu128` 不一致。它不只是缺少 `libcudart.so`，而是 C++/PyTorch 符号对不上。
+
+所以即使先修好 `deep_gemm`，后面大概率还会继续卡在 `sgl_kernel` 的 `common_ops.abi3.so`。
+
+### 建议修复顺序
+
+优先把整个环境统一到 cu128，而不是只修 `torchvision`：
+
+1. 处理 `sgl-deep-gemm/deep_gemm`。
+
+当前包名是：
+
+```text
+sgl-deep-gemm 0.1.0
+```
+
+如果这次启动不需要 DeepGEMM，最直接的验证方式是先让 `deep_gemm` 包不可导入，使 `configurer.py:24-27:_compute_enable_deep_gemm` 走 `ImportError -> return False`。例如可以卸载：
+
+```bash
+conda activate /data/like/miniconda3/envs/simo_sglang
+pip uninstall -y sgl-deep-gemm
+```
+
+如果后续需要 DeepGEMM，则应该安装或重新构建与 `torch 2.11.0+cu128`、CUDA 12.8 匹配的 `sgl-deep-gemm`，不能继续使用当前这个依赖 `libcudart.so.13` 的 `_C.so`。
+
+2. 重新安装或重编译 `sgl_kernel`。
+
+日志实际加载的是源码树里的：
+
+```text
+/data/like/package/sglang_kernel_src/sgl-kernel/python/sgl_kernel/sm90/common_ops.abi3.so
+```
+
+这个 so 需要按当前环境重建，或者安装一个和当前 `torch 2.11.0+cu128` 兼容的 `sglang-kernel/sgl-kernel` wheel。否则会继续报：
+
+```text
+undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib
+```
+
+3. 验证当前环境的二进制一致性。
+
+可以先跑：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+import torch
+import torchvision
+print("torch", torch.__version__, torch.version.cuda)
+print("torchvision", torchvision.__version__)
+
+try:
+    import deep_gemm
+    print("deep_gemm import ok")
+except Exception as e:
+    print("deep_gemm import failed:", repr(e))
+
+try:
+    import sgl_kernel
+    print("sgl_kernel import ok")
+except Exception as e:
+    print("sgl_kernel import failed:", repr(e))
+PY
+```
+
+期望至少达到：
+
+```text
+torch 2.11.0+cu128 12.8
+torchvision 0.26.0+cu128
+deep_gemm 要么 import ok，要么因为包不存在而由 SGLang 禁用
+sgl_kernel import ok
+```
+
+### 最终判断
+
+`temp/sglang_server.30121.2026_05_25___23_03_19` 的根因是：换成 cu128 的 `torch/torchvision` 后，环境里仍残留了不匹配的二进制扩展。
+
+当前第一个 fatal error 是：
+
+```text
+deep_gemm/_C.so 依赖 CUDA 13 的 libcudart.so.13/libnvrtc.so.13/libcublas*.so.13，
+但当前环境是 CUDA 12.8 / torch 2.11.0+cu128。
+```
+
+后续还需要修：
+
+```text
+sgl-kernel/python/sgl_kernel/sm90/common_ops.abi3.so
+和当前 PyTorch 2.11.0+cu128 ABI 不匹配。
+```
+
+所以这次不是单点的 `torchvision` 问题，而是 CUDA 13 -> CUDA 12.8 切换后，`deep_gemm` 和 `sgl_kernel` 也必须同步重装或重编译。
