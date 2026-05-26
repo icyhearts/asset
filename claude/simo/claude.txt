@@ -1641,3 +1641,8 @@ sglang代码位于 /data//like/package/sglang_kernel_src/，我从github拉取�
 对比 main-2026_05_25___14_36_25 和main分支的 python/sglang/srt/layers/attention/triton_ops/extend_attention.py,
 _fwd_kernel 这个函数签名增加了两个参数: k_scale, v_scale,分析这个改动是为什么？两个参数有什么作用？
 要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+sglang代码位于 /data//like/package/sglang_kernel_src/，
+python/sglang/srt/layers/attention/triton_backend.py, 在某些条件下，会调用 attn_logits = self.forward_metadata.swa_attn_logits
+这行代码什么情况会触发？比如需要什么模型结构或者给sglang传什么参数？
+要求：把答案追加在 temp/codex_answer.md 里面
