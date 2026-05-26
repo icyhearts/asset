@@ -5085,3 +5085,113 @@ output = softmax(logits) @ (V_cache * v_scale)
 ```
 
 旧分支缺少这两个乘法，所以一旦 Triton extend attention 读的是 FP8 KV cache，prefix 部分的 attention 会按被压缩后的 K/V 数值计算，结果偏小或错误。新分支通过 `k_scale/v_scale` 把 FP8 cache 的反量化补回来了。
+
+---
+
+## Q: sglang 的 triton_backend.py 中，`attn_logits = self.forward_metadata.swa_attn_logits` 什么时候触发？
+
+### 代码位置
+
+`python/sglang/srt/layers/attention/triton_backend.py:1247-1252`，在 `forward_decode` 方法中：
+
+```python
+attn_logits = self.forward_metadata.attn_logits
+if (
+    self.forward_metadata.swa_attn_logits is not None
+    and layer.v_head_dim == self.swa_v_head_dim
+):
+    attn_logits = self.forward_metadata.swa_attn_logits
+```
+
+### 触发条件
+
+这行代码的触发需要**两个条件同时满足**：
+
+#### 条件 1：`sliding_window_size` 不为 None 且 SWA 与 full-attention 的 v_head_dim 不同
+
+在 `TritonAttnBackend.__init__` 中（`triton_backend.py:135-137`）：
+
+```python
+full_v_head_dim = model_runner.model_config.v_head_dim
+swa_v_head_dim = model_runner.model_config.swa_v_head_dim
+if self.sliding_window_size is not None and swa_v_head_dim != full_v_head_dim:
+    self.v_head_dim = full_v_head_dim
+    self.swa_v_head_dim = swa_v_head_dim
+```
+
+`self.swa_v_head_dim` 只有在**模型同时存在 sliding window 层和 full-attention 层，且它们的 v_head_dim 不同**时才会被设为非 None 值。
+
+当 `self.swa_v_head_dim is not None` 时，在 `init_forward_metadata` 的 decode 路径（`triton_backend.py:348-355`）会额外分配一个 `swa_attn_logits` buffer：
+
+```python
+if self.swa_v_head_dim is not None:
+    swa_attn_logits = torch.empty(
+        (bs, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
+        dtype=torch.float32, device=self.device,
+    )
+else:
+    swa_attn_logits = None
+```
+
+#### 条件 2：当前 layer 恰好是 SWA 层（`layer.v_head_dim == self.swa_v_head_dim`）
+
+在 `forward_decode` 中，每一层都会根据自身的 `v_head_dim` 决定使用哪个 buffer：
+- 如果当前层是 **full-attention 层**（`v_head_dim == self.v_head_dim`），使用 `self.forward_metadata.attn_logits`
+- 如果当前层是 **SWA 层**（`v_head_dim == self.swa_v_head_dim`），使用 `self.forward_metadata.swa_attn_logits`
+
+### 为什么需要两个 buffer？
+
+代码注释（`triton_backend.py:127-132`）解释：
+
+```python
+# The decode triton kernel derives attn_lse offsets from attn_logits
+# strides via integer division by v_head_dim (the "// Lv" trick in
+# _fwd_kernel_stage1/stage2), so attn_logits.shape[-1] must exactly
+# match the layer's v_head_dim. For hybrid SWA models where SWA and
+# full-attention layers use different v_head_dim (e.g. Gemma 4:
+# swa=256, full=512), we allocate a second buffer for SWA layers.
+```
+
+Triton decode kernel 内部通过 `attn_logits` 的 stride 除以 `v_head_dim` 来计算 `attn_lse` 的偏移量（`// Lv` trick）。因此 `attn_logits.shape[-1]` 必须**精确匹配**该层实际的 `v_head_dim`，否则计算出的 offset 会出错。对于 SWA 和 full-attention 层共用同一 batch 但 v_head_dim 不同的模型，就需要两个不同 shape 的 buffer。
+
+### 哪些模型满足条件？
+
+核心场景是 **Gemma 4** 系列（如 `google/gemma-4-27b`）。
+
+在 `python/sglang/srt/utils/hf_transformers/config.py:136-159` 中，对 Gemma 4 做了特殊处理：
+
+```python
+if config.model_type in ("gemma4", "gemma4_assistant"):
+    text_config = config.text_config
+    # SWA 层: head_dim = 256
+    swa_head_dim = text_config.head_dim       # ← 例如 256
+    text_config.swa_v_head_dim = swa_head_dim  # ← 256
+
+    # Full-attention 层: head_dim = 512
+    if global_head_dim is not None:
+        text_config.head_dim = global_head_dim  # ← 例如 512，覆盖了原始值
+```
+
+Gemma 4 的 HuggingFace config 中，基础属性（`head_dim`、`num_key_value_heads`）描述的是 **SWA 层**，全局属性（`global_head_dim`、`num_global_key_value_heads`）描述的是 **full-attention 层**。SGLang 的约定相反：基础属性代表 full-attention 层，`swa_*` 代表 SWA 层。因此 config.py 做了这个 swap 操作，最终形成：
+
+| 属性 | 值 | 含义 |
+|------|-----|------|
+| `v_head_dim` (= `head_dim`) | 512 | Full-attention 层的 v_head_dim |
+| `swa_v_head_dim` | 256 | SWA 层的 v_head_dim |
+
+模型结构为 **交替排列**：SWA 层和 full-attention 层交叉出现（pattern: full, swa, full, swa, ...）。
+
+### 是否需要传额外参数？
+
+**不需要**。SGLang 会自动从模型 `config.json` 中读取 `head_dim`、`global_head_dim` 等字段，在 `ModelConfig` 初始化时（`model_config.py:587-601`）自动推导出 `swa_v_head_dim`，并在 `TritonAttnBackend` 构造时自动判断是否需要分配两份 buffer。
+
+只需正常启动 SGLang 服务即可，例如：
+
+```bash
+python -m sglang.launch_server \
+    --model google/gemma-4-27b \
+    --trust-remote-code
+```
+
+SGLang 会在内部自动检测 hybrid SWA 结构并启用双 buffer 机制。
+
