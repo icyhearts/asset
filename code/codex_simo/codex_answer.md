@@ -4690,3 +4690,398 @@ sgl-kernel/python/sgl_kernel/sm90/common_ops.abi3.so
 ```
 
 所以这次不是单点的 `torchvision` 问题，而是 CUDA 13 -> CUDA 12.8 切换后，`deep_gemm` 和 `sgl_kernel` 也必须同步重装或重编译。
+
+## main 分支 extend_attention.py 新增 k_scale/v_scale 参数分析
+
+对比对象：
+
+```text
+old: main-2026_05_25___14_36_25
+new: main
+file: python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+```
+
+### 结论
+
+`_fwd_kernel` 新增 `k_scale`、`v_scale` 是为了让 Triton attention backend 支持 FP8 KV cache。
+
+这个改动来自 commit：
+
+```text
+07b8d763e feat: Add FP8 KV cache support for Triton attention backend (#18882)
+```
+
+核心原因是：KV cache 如果用 FP8 保存，写入 cache 前会把原始 K/V 除以 scale 再转成 FP8；attention 从 cache 读 K/V 时，必须把 scale 乘回来，否则 prefix KV 的 QK logits 和 PV 输出都会少一个反量化因子。
+
+所以：
+
+```text
+k_scale: 读 FP8 K cache 后用于恢复 K 的反量化 scale，影响 QK logits。
+v_scale: 读 FP8 V cache 后用于恢复 V 的反量化 scale，影响 attention output。
+```
+
+非 FP8 KV cache 路径下，这两个值传 `1.0`，行为和旧版本一致。
+
+### 旧版本的问题
+
+旧分支 `main-2026_05_25___14_36_25` 的 `python/sglang/srt/layers/attention/triton_ops/extend_attention.py:220:_fwd_kernel` 只有 `sm_scale`，没有 `k_scale/v_scale`。
+
+旧逻辑里 prefix 阶段从 KV cache 读 K/V：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:327:_fwd_kernel
+```
+
+旧分支对应逻辑是：
+
+```text
+qk = dot(q, k)
+qk *= sm_scale
+acc += dot(p, v)
+```
+
+也就是默认 `K_Buffer`、`V_Buffer` 里读出来的值已经是原始数值。这个假设在 bf16/fp16 KV cache 下成立，但在 FP8 KV cache 下不成立。
+
+### 新版本的具体改动
+
+新分支 `main` 中，`python/sglang/srt/layers/attention/triton_ops/extend_attention.py:228:_fwd_kernel` 的函数签名新增：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:242:_fwd_kernel  sm_scale
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:243:_fwd_kernel  k_scale
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:244:_fwd_kernel  v_scale
+```
+
+在 prefix KV 阶段，K 从 cache 读出后参与 QK：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:374:_fwd_kernel
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:380:_fwd_kernel
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:385:_fwd_kernel
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:398:_fwd_kernel
+```
+
+新逻辑是：
+
+```python
+qk = tl.dot(q.to(k.dtype), k)
+qk *= sm_scale * k_scale
+```
+
+含义是：
+
+```text
+真实 K = FP8_cache_K * k_scale
+所以 QK logits = Q @ (FP8_cache_K * k_scale)^T * sm_scale
+            = (Q @ FP8_cache_K^T) * sm_scale * k_scale
+```
+
+V 从 cache 读出后参与 PV：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:416:_fwd_kernel
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:421:_fwd_kernel
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:427:_fwd_kernel
+```
+
+新逻辑是：
+
+```python
+acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+```
+
+含义是：
+
+```text
+真实 V = FP8_cache_V * v_scale
+所以 PV = P @ (FP8_cache_V * v_scale)
+      = (P @ FP8_cache_V) * v_scale
+```
+
+### 为什么只在 stage 1 prefix 部分乘 scale
+
+`python/sglang/srt/layers/attention/triton_ops/extend_attention.py:330:_fwd_kernel` 注释写的是：
+
+```text
+stage 1: compute scores with prefix
+```
+
+这一段读的是历史 prefix KV cache：
+
+```text
+K_Buffer / V_Buffer
+```
+
+这些 buffer 可能是 FP8 cache，所以必须乘 `k_scale/v_scale`。
+
+但是 `python/sglang/srt/layers/attention/triton_ops/extend_attention.py:431:_fwd_kernel` 开始的 stage 2 处理的是当前 extend chunk 内部的三角注意力，读的是：
+
+```text
+K_Extend / V_Extend
+```
+
+这些是当前 forward 刚算出来的 K/V，本身还是计算 dtype，不是从 FP8 KV cache 读出的历史值。因此 stage 2 仍然保持：
+
+```text
+qk *= sm_scale
+acc += dot(p, v)
+```
+
+不额外乘 `k_scale/v_scale`。
+
+换句话说，这个 kernel 里有两类 K/V：
+
+```text
+prefix K/V: 来自 KV cache，可能被 FP8 量化，需要 descale。
+extend K/V: 当前 forward 的原始 K/V，不需要 descale。
+```
+
+### 调用方如何传入 k_scale/v_scale
+
+`python/sglang/srt/layers/attention/triton_ops/extend_attention.py:559:extend_attention_fwd` 的 Python wrapper 也新增了两个参数：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:573:extend_attention_fwd  k_scale
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:574:extend_attention_fwd  v_scale
+```
+
+并在 launch `_fwd_kernel` 时传进去：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:630:extend_attention_fwd  sm_scale
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:631:extend_attention_fwd  k_scale
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:632:extend_attention_fwd  v_scale
+```
+
+上层调用在：
+
+```text
+python/sglang/srt/layers/attention/triton_backend.py:900:TritonAttnBackend.forward_extend
+```
+
+这里先决定是否有 layer 级别的 scale：
+
+```text
+python/sglang/srt/layers/attention/triton_backend.py:1002:TritonAttnBackend.forward_extend
+python/sglang/srt/layers/attention/triton_backend.py:1003:TritonAttnBackend.forward_extend
+python/sglang/srt/layers/attention/triton_backend.py:1004:TritonAttnBackend.forward_extend
+python/sglang/srt/layers/attention/triton_backend.py:1006:TritonAttnBackend.forward_extend
+python/sglang/srt/layers/attention/triton_backend.py:1007:TritonAttnBackend.forward_extend
+```
+
+逻辑是：
+
+```python
+if layer.k_scale is not None and layer.v_scale is not None:
+    k_descale = layer.k_scale_float
+    v_descale = layer.v_scale_float
+else:
+    k_descale = 1.0
+    v_descale = 1.0
+```
+
+然后传给 `extend_attention_fwd`：
+
+```text
+python/sglang/srt/layers/attention/triton_backend.py:1009:TritonAttnBackend.forward_extend
+python/sglang/srt/layers/attention/triton_backend.py:1023:TritonAttnBackend.forward_extend
+python/sglang/srt/layers/attention/triton_backend.py:1024:TritonAttnBackend.forward_extend
+```
+
+### k_scale/v_scale 从哪里来
+
+`RadixAttention` 初始化时默认没有 scale：
+
+```text
+python/sglang/srt/layers/radix_attention.py:54:RadixAttention
+python/sglang/srt/layers/radix_attention.py:90:RadixAttention.__init__
+python/sglang/srt/layers/radix_attention.py:91:RadixAttention.__init__
+python/sglang/srt/layers/radix_attention.py:92:RadixAttention.__init__
+python/sglang/srt/layers/radix_attention.py:93:RadixAttention.__init__
+```
+
+默认值是：
+
+```python
+self.k_scale = None
+self.v_scale = None
+self.k_scale_float = None
+self.v_scale_float = None
+```
+
+如果启用了 KV cache quantization，量化方法会创建这两个参数：
+
+```text
+python/sglang/srt/layers/quantization/kv_cache.py:18:BaseKVCacheMethod
+python/sglang/srt/layers/quantization/kv_cache.py:32:BaseKVCacheMethod.create_weights
+python/sglang/srt/layers/quantization/kv_cache.py:39:BaseKVCacheMethod.create_weights
+python/sglang/srt/layers/quantization/kv_cache.py:42:BaseKVCacheMethod.create_weights
+```
+
+加载权重后，`process_weights_after_loading` 会把 checkpoint 里的 scale 或默认 scale 写回 layer：
+
+```text
+python/sglang/srt/layers/quantization/kv_cache.py:51:BaseKVCacheMethod.process_weights_after_loading
+python/sglang/srt/layers/quantization/kv_cache.py:52:BaseKVCacheMethod.process_weights_after_loading
+python/sglang/srt/layers/quantization/kv_cache.py:59:BaseKVCacheMethod.process_weights_after_loading
+python/sglang/srt/layers/quantization/kv_cache.py:82:BaseKVCacheMethod.process_weights_after_loading
+python/sglang/srt/layers/quantization/kv_cache.py:83:BaseKVCacheMethod.process_weights_after_loading
+python/sglang/srt/layers/quantization/kv_cache.py:84:BaseKVCacheMethod.process_weights_after_loading
+python/sglang/srt/layers/quantization/kv_cache.py:85:BaseKVCacheMethod.process_weights_after_loading
+```
+
+关键语义在这个文件注释里已经说明：
+
+```text
+python/sglang/srt/layers/quantization/kv_cache.py:20:BaseKVCacheMethod
+python/sglang/srt/layers/quantization/kv_cache.py:22:BaseKVCacheMethod
+python/sglang/srt/layers/quantization/kv_cache.py:23:BaseKVCacheMethod
+python/sglang/srt/layers/quantization/kv_cache.py:24:BaseKVCacheMethod
+```
+
+即 `k_scale/v_scale` 用于：
+
+```text
+1. 写 KV cache 前量化 K/V。
+2. 从 KV cache 取出 K/V 后反量化 K/V。
+```
+
+KV cache 写入处在：
+
+```text
+python/sglang/srt/mem_cache/memory_pool.py:1087:MHATokenToKVPool.set_kv_buffer
+python/sglang/srt/mem_cache/memory_pool.py:1131:MHATokenToKVPool.set_kv_buffer
+python/sglang/srt/mem_cache/memory_pool.py:1132:MHATokenToKVPool.set_kv_buffer
+python/sglang/srt/mem_cache/memory_pool.py:1133:MHATokenToKVPool.set_kv_buffer
+python/sglang/srt/mem_cache/memory_pool.py:1134:MHATokenToKVPool.set_kv_buffer
+python/sglang/srt/mem_cache/memory_pool.py:1135:MHATokenToKVPool.set_kv_buffer
+python/sglang/srt/mem_cache/memory_pool.py:1136:MHATokenToKVPool.set_kv_buffer
+python/sglang/srt/mem_cache/memory_pool.py:1137:MHATokenToKVPool.set_kv_buffer
+```
+
+逻辑是：
+
+```python
+if cache_k.dtype != self.dtype:
+    if k_scale is not None:
+        cache_k.div_(k_scale)
+    if v_scale is not None:
+        cache_v.div_(v_scale)
+    cache_k = cache_k.to(self.dtype)
+    cache_v = cache_v.to(self.dtype)
+```
+
+如果 `self.dtype` 是 FP8，写入 cache 的就是：
+
+```text
+K_cache_fp8 = cast_fp8(K_original / k_scale)
+V_cache_fp8 = cast_fp8(V_original / v_scale)
+```
+
+因此 attention 读取 cache 后要恢复：
+
+```text
+K_original ≈ K_cache_fp8 * k_scale
+V_original ≈ V_cache_fp8 * v_scale
+```
+
+这正是 `extend_attention.py` 新增参数的用途。
+
+### 和 decode attention 的一致性
+
+这次改动也让 extend 路径和 decode 路径一致。
+
+decode 路径在：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:745:decode_attention_fwd
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:756:decode_attention_fwd
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:757:decode_attention_fwd
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:758:decode_attention_fwd
+```
+
+decode 已经把 `k_scale` 合入 QK scale：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:784:decode_attention_fwd
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:803:decode_attention_fwd
+```
+
+并在 reduce V 阶段乘回 `v_scale`：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:522:_fwd_kernel_stage2
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:527:_fwd_kernel_stage2
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:590:_fwd_kernel_stage2
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py:592:_fwd_kernel_stage2
+```
+
+新版本的 extend attention 相当于把这套逻辑补到了 prefill/extend 访问 prefix KV cache 的路径上。
+
+### unified deterministic kernel 也同步改了
+
+新分支里 `python/sglang/srt/layers/attention/triton_ops/extend_attention.py:705:_fwd_kernel_unified` 也增加了等价逻辑。
+
+wrapper 在：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:956:extend_attention_fwd_unified
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:961:extend_attention_fwd_unified
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:962:extend_attention_fwd_unified
+```
+
+launch 时把 `sm_scale * k_scale` 传进 kernel：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:1042:extend_attention_fwd_unified
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:1043:extend_attention_fwd_unified
+```
+
+kernel 内部：
+
+```text
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:903:_fwd_kernel_unified
+python/sglang/srt/layers/attention/triton_ops/extend_attention.py:951:_fwd_kernel_unified
+```
+
+即：
+
+```python
+qk *= sm_scale_withk
+tl.store(O + offs_o, acc / deno[:, None] * v_scale, ...)
+```
+
+`TritonAttnBackend._forward_extend_unified` 里同样取 `layer.k_scale_float/layer.v_scale_float`：
+
+```text
+python/sglang/srt/layers/attention/triton_backend.py:1034:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1138:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1139:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1140:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1142:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1143:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1146:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1151:TritonAttnBackend._forward_extend_unified
+python/sglang/srt/layers/attention/triton_backend.py:1152:TritonAttnBackend._forward_extend_unified
+```
+
+### 最终理解
+
+这个改动不是为了改变普通 bf16/fp16 attention 的数学，而是为了修正 FP8 KV cache 下 Triton extend attention 的数值。
+
+等价公式是：
+
+```text
+FP8 cache 写入：
+K_cache = quantize(K / k_scale)
+V_cache = quantize(V / v_scale)
+
+attention 读取 prefix cache：
+logits = Q @ (K_cache * k_scale)^T * sm_scale
+       = (Q @ K_cache^T) * sm_scale * k_scale
+
+output = softmax(logits) @ (V_cache * v_scale)
+       = (softmax(logits) @ V_cache) * v_scale
+```
+
+旧分支缺少这两个乘法，所以一旦 Triton extend attention 读的是 FP8 KV cache，prefix 部分的 attention 会按被压缩后的 K/V 数值计算，结果偏小或错误。新分支通过 `k_scale/v_scale` 把 FP8 cache 的反量化补回来了。
