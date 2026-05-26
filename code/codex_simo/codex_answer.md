@@ -5195,3 +5195,50 @@ python -m sglang.launch_server \
 
 SGLang 会在内部自动检测 hybrid SWA 结构并启用双 buffer 机制。
 
+---
+
+## Q: 分析日志 `Llama3.1-8B-Instruct_tp1_quant-simo_w4a4_mxfp.log` 报错原因及修复
+
+### 报错分析
+
+**报错类型**：`httpx.ConnectError: [Errno 101] Network is unreachable`
+
+**发生时机**：模型加载和 CUDA graph 捕获均已成功完成（`Capturing batches: 100%`），进入 MMLU benchmark 评测阶段，在加载 dataset 时崩溃。
+
+**关键日志**：
+```
+httpcore.ConnectError: [Errno 101] Network is unreachable
+```
+
+**调用栈分析**：
+
+```
+lm_eval → simple_evaluate → task_manager.load → _factory.build
+→ ConfigurableTask.__init__ → download → datasets.load_dataset
+→ load_dataset_builder → _create_builder_config → _resolve_data_files
+→ HfFileSystem.glob → _ls_tree → list_repo_tree
+→ httpx GET → ConnectError
+```
+
+`datasets` 库在构建每个 MMLU 子任务（sub-config）时，会调用 `HfFileSystem.glob()` 来解析数据文件路径。这个方法内部会通过 `huggingface_hub` 的 API 列出远程仓库的目录结构（`list_repo_tree`），**即使数据集已经缓存在本地**也需要网络来验证/刷新元数据。
+
+日志中可以看到 33+ 个 MMLU 子任务通过 `"Using the latest cached version of the dataset since cais/mmlu couldn't be found on the Hugging Face Hub"` 成功降级到本地缓存。但在构建下一个子任务（`high_school_geography` 之后的某个子任务）时，`_resolve_data_files` → `HfFileSystem.glob()` 的网络调用彻底失败，无法降级到本地缓存，导致崩溃。
+
+**注意**：这**不是 SIMO 量化的问题**，也与模型加载无关。模型已正常加载完成，CUDA graph 已成功捕获（36/36）。这是运行环境的网络限制导致的 `datasets` 库功能性问题。
+
+### 修复方法
+
+在 lm-eval 命令前添加 `HF_DATASETS_OFFLINE=1` 环境变量，强制 `datasets` 和 `huggingface_hub` 使用离线模式：
+
+```bash
+export SIMO_SGLANG_REGISTER=1
+export HF_DATASETS_CACHE=/share_data/users/like/huggingface_cache
+export HF_DATASETS_OFFLINE=1   # ← 添加这一行
+
+lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_mxfp.json\"}", "tp_size": 1, "dtype": "auto", "mem_fraction_static": 0.5}' --tasks mmlu --batch_size auto
+```
+
+`HF_DATASETS_OFFLINE=1` 会告诉 `huggingface_hub` 和 `datasets` 完全跳过网络请求，仅使用本地缓存的 `cais/mmlu` 数据集。由于日志中已经显示大部分 MMLU 子任务的数据都能从缓存加载，加上此变量后剩余的也能正常工作。
+
+如果还需要更严格的离线约束，可以再加 `HF_HUB_OFFLINE=1`，但对 `datasets` 而言 `HF_DATASETS_OFFLINE=1` 已经足够。
+

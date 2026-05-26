@@ -1646,3 +1646,14 @@ sglang代码位于 /data//like/package/sglang_kernel_src/，
 python/sglang/srt/layers/attention/triton_backend.py, 在某些条件下，会调用 attn_logits = self.forward_metadata.swa_attn_logits
 这行代码什么情况会触发？比如需要什么模型结构或者给sglang传什么参数？
 要求：把答案追加在 temp/codex_answer.md 里面
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo代码位于 /data/like/package/simo_conda_sglang
+lm-eval测试simo量化的命令是:
+export SIMO_SGLANG_REGISTER=1
+export HF_DATASETS_CACHE=/share_data/users/like/huggingface_cache
+lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/online_quantization/quant_config_w4a4_mxfp.json\"}", "tp_size": 1, "dtype": "auto", "mem_fraction_static": 0.5}' --tasks mmlu --batch_size auto
+
+日志位于 logs/Llama3.1-8B-Instruct_tp1_quant-simo_w4a4_mxfp.log
+分析日志报错原因，如何修复
+要求：把答案追加在 temp/codex_answer.md 里面
