@@ -1657,3 +1657,6 @@ lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data
 日志位于 logs/Llama3.1-8B-Instruct_tp1_quant-simo_w4a4_mxfp.log
 分析日志报错原因，如何修复
 要求：把答案追加在 temp/codex_answer.md 里面
+
+vllm源码在 /data/like/package/vllm-for-conda-simo，在源码目录执行bash like-useful/install-vllm.sh命令进行vllm源码构建，日志位于/share_data/users/like/package/h100/package/other/vllm/temp/pip-vllm-src.log.txt.2026_05_26___22_20_35，分析构建失败的原因
+要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面

@@ -5242,3 +5242,105 @@ lm-eval --model sglang --model_args '{"pretrained": "/data_gpu/models/share_data
 
 如果还需要更严格的离线约束，可以再加 `HF_HUB_OFFLINE=1`，但对 `datasets` 而言 `HF_DATASETS_OFFLINE=1` 已经足够。
 
+---
+
+## Q: 分析 vllm 源码构建失败原因
+
+### 错误摘要
+
+CMake 在 `FetchContent_MakeAvailable` 阶段失败，无法完成 vllm-flash-attn 外部依赖的 git 子模块初始化。
+
+### 关键错误日志
+
+```
+fatal: git upload-pack: not our ref 574c1c121a0f3c0b44155b2b1987d89d16159b58
+fatal: remote error: upload-pack: not our ref 574c1c121a0f3c0b44155b2b1987d89d16159b58
+Errors during submodule fetch:
+    csrc/composable_kernel
+```
+
+```
+CMake Error at cmake/external_projects/vllm_flash_attn.cmake:58 (FetchContent_MakeAvailable):
+  Build step for vllm-flash-attn failed: 1
+```
+
+### 调用链分析
+
+构建入口 `like-useful/install-vllm.sh:4` 执行 `pip install -e .` 触发 CMake 编译。CMake 配置 `CMakeLists.txt:1254` 包含了 vllm-flash-attn 外部依赖，其定义在 `cmake/external_projects/vllm_flash_attn.cmake:40-47`：
+
+```cmake
+FetchContent_Declare(
+    vllm-flash-attn
+    GIT_REPOSITORY git@gitlabsoft.siorigin.com:xtubk/vllm-project-flash-attention.git
+    GIT_TAG cmt-f5bc33cfc02c744d24a2e9d50e6db656de40611c
+    GIT_PROGRESS TRUE
+    BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
+)
+```
+
+`cmake/external_projects/vllm_flash_attn.cmake:58` 调用 `FetchContent_MakeAvailable(vllm-flash-attn)`，CMake 执行 git clone + git submodule update --init。
+
+### 根因分析
+
+vllm-flash-attention 仓库本身被成功 fetch（日志 line 376-377），但它含有一个 git 子模块 `csrc/composable_kernel`。子模块引用了一个 git commit `574c1c121a0f3c0b44155b2b1987d89d16159b58`，该 commit **在远程服务器上已不存在**（可能被 force push 覆盖或分支被删除了）。
+
+日志 line 381-382：
+```
+fatal: git upload-pack: not our ref 574c1c121a0f3c0b44155b2b1987d89d16159b58
+fatal: remote error: upload-pack: not our ref 574c1c121a0f3c0b44155b2b1987d89d16159b58
+```
+
+这是典型的 **git 子模块引用断裂**：父仓库的 `.gitmodules` 指向的子模块 commit hash 在子模块远程仓库中不再可用。
+
+### 修复方案
+
+有两种方式：
+
+**方案一：使用本地源码绕过网络 clone（推荐）**
+
+`cmake/external_projects/vllm_flash_attn.cmake:28-30` 支持通过环境变量 `VLLM_FLASH_ATTN_SRC_DIR` 指向本地已有副本：
+
+```cmake
+if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
+  set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
+endif()
+```
+
+操作步骤：
+1. 手动克隆 vllm-flash-attention 仓库并修复子模块问题：
+   ```bash
+   VLLM_FA_DIR=/data/like/package/vllm-for-conda-simo/.deps/vllm-flash-attn-local
+   git clone git@gitlabsoft.siorigin.com:xtubk/vllm-project-flash-attention.git $VLLM_FA_DIR
+   cd $VLLM_FA_DIR
+   git checkout cmt-f5bc33cfc02c744d24a2e9d50e6db656de40611c
+   # 尝试修复子模块（如果主仓库已更新子模块引用）
+   git submodule update --init --recursive
+   ```
+
+2. 如果可以自行处理子模块引用，用当前远程最新 commit 替换：
+   ```bash
+   cd $VLLM_FA_DIR/csrc/composable_kernel
+   git fetch origin
+   # 找到子模块应指向的新 commit，或使用 HEAD
+   git checkout <valid-commit>
+   cd $VLLM_FA_DIR
+   git add csrc/composable_kernel
+   ```
+
+3. 设置环境变量后构建：
+   ```bash
+   export VLLM_FLASH_ATTN_SRC_DIR=$VLLM_FA_DIR
+   pip install -e . --no-build-isolation ...
+   ```
+
+**方案二：联系 vllm-flash-attention 仓库维护者更新子模块引用**
+
+子模块 commit `574c1c121a0f3c0b44155b2b1987d89d16159b58` 在 `csrc/composable_kernel` 远程仓库不存在了。需要仓库维护者：
+1. 确认 `csrc/composable_kernel` 的正确 commit hash
+2. 更新父仓库中的子模块引用（`git submodule update --remote`）
+3. 推送到 `cmt-f5bc33cfc02c744d24a2e9d50e6db656de40611c` 分支（或创建新分支/tag）
+
+### 补充说明
+
+这**不是 vLLM 代码本身的问题**，也不是本地环境配置问题。这是一个外部依赖仓库的子模块引用失效问题。CMake 配置和编译环境本身都正常（PyTorch 12.8、nvcc 路径、CUDA arch 9.0 检测均正确）。
+
