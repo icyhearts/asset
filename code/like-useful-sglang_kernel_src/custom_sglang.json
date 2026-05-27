@@ -3,6 +3,7 @@
     "disable_existing_loggers": false,
     "formatters": {
         "detailed": {
+            "()": "sglang.srt.utils.log_utils.USFormatter",
             "format": "[%(asctime)s] %(process)d %(filename)s:%(lineno)d %(funcName)s %(levelname)s %(message)s",
             "datefmt": "%Y-%m-%d %H:%M:%S"
         }
