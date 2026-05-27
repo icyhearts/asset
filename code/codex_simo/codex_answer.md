@@ -5344,3 +5344,132 @@ endif()
 
 这**不是 vLLM 代码本身的问题**，也不是本地环境配置问题。这是一个外部依赖仓库的子模块引用失效问题。CMake 配置和编译环境本身都正常（PyTorch 12.8、nvcc 路径、CUDA arch 9.0 检测均正确）。
 
+---
+
+## Q: sglang 日志时间戳精度从秒提高到 us（微秒）
+
+### 现状分析
+
+当前 `custom_sglang.json` 的配置：
+
+```json
+"formatters": {
+    "detailed": {
+        "format": "[%(asctime)s] %(process)d %(filename)s:%(lineno)d %(funcName)s %(levelname)s %(message)s",
+        "datefmt": "%Y-%m-%d %H:%M:%S"
+    }
+}
+```
+
+日志输出如：`[2026-05-27 17:10:13]`，精度只到**秒**。
+
+### 无法仅靠修改 JSON 达到微秒精度
+
+Python 的 `logging.Formatter` 中 `datefmt` 参数会被传递给 `time.strftime()`，而 `strftime()` **不支持**表示毫秒或微秒的格式符（`%f` 仅在 `datetime.strftime()` 中可用，不在 `time.strftime()` 中）。相关代码在 Python 标准库 `logging/__init__.py` 的 `Formatter.formatTime()` 方法中。
+
+sglang 本身通过 `SGLANG_LOG_MS` 环境变量在 format 中追加 `%(msecs)03d` 实现毫秒精度，参见 `python/sglang/srt/utils/common.py:1323` 的 `configure_logger()`：
+
+```python
+maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
+format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+```
+
+但 `SGLANG_LOG_MS` 只在**不使用** `SGLANG_LOGGING_CONFIG_PATH` 时生效（因为 `configure_logger()` 中若检测到 `SGLANG_LOGGING_CONFIG_PATH` 会直接 `return`，跳过后续所有内置格式逻辑，见 `python/sglang/srt/utils/common.py:1313-1322`）。
+
+而 `%(msecs)03d` 本身就是毫秒，不是微秒。
+
+### 方案一：JSON 修改 → 达到毫秒精度（最简单，改配置就行）
+
+修改 `custom_sglang.json` 的 `format` 字段，在 `%(asctime)s` 后追加 `%(msecs)03d`：
+
+```json
+{
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {
+        "detailed": {
+            "format": "[%(asctime)s.%(msecs)03d] %(process)d %(filename)s:%(lineno)d %(funcName)s %(levelname)s %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S"
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "detailed",
+            "stream": "ext://sys.stdout"
+        }
+    },
+    "root": {
+        "level": "INFO",
+        "handlers": ["console"]
+    }
+}
+```
+
+输出变为：`[2026-05-27 17:10:13.123]`（毫秒精度）
+
+只改了 `format` 字段，无需改任何代码。`%(msecs)03d` 是 `LogRecord` 的内置属性，dictConfig 可以直接使用。
+
+### 方案二：自定义 Formatter 类 → 达到真微秒精度（需要加一段小代码）
+
+Python `dictConfig` 支持 `()` 键指定 formatter 工厂。可以创建一个微秒级的 Formatter 并引用。
+
+**Step 1**：创建 formatter 模块 `python/sglang/srt/utils/log_formatter_us.py`（放在 sglang 源码中，确保可 import）：
+
+```python
+import logging
+import time
+
+
+class USFormatter(logging.Formatter):
+    """Formatter with microsecond precision timestamps."""
+
+    def formatTime(self, record, datefmt=None):
+        ct = self.converter(record.created)
+        if datefmt:
+            s = time.strftime(datefmt, ct)
+        else:
+            s = time.strftime(self.default_time_format, ct)
+        us = int((record.created - int(record.created)) * 1_000_000)
+        return f"{s}.{us:06d}"
+```
+
+**Step 2**：修改 `custom_sglang.json`，用 `()` 指定自定义 formatter：
+
+```json
+{
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {
+        "detailed": {
+            "()": "sglang.srt.utils.log_formatter_us.USFormatter",
+            "format": "[%(asctime)s] %(process)d %(filename)s:%(lineno)d %(funcName)s %(levelname)s %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S"
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "detailed",
+            "stream": "ext://sys.stdout"
+        }
+    },
+    "root": {
+        "level": "INFO",
+        "handlers": ["console"]
+    }
+}
+```
+
+输出变为：`[2026-05-27 17:10:13.123456]`（微秒精度）
+
+`dictConfig` 看到 `()` 键会调用该类的构造函数，传入其余参数（`format`, `datefmt`）。核心原理是覆写 `formatTime()` 方法，从 `record.created`（float，天然包含微秒精度）手动提取微秒部分并拼接到 `strftime` 的结果后。
+
+### 总结对比
+
+| 方案 | 精度 | 需要改代码？ | 需要改 JSON？ |
+|------|------|-------------|--------------|
+| 方案一 | 毫秒 (ms) | 否 | 是（改 `format` 字段） |
+| 方案二 | 微秒 (us) | 是（新增 ~12 行 fomatter） | 是（改 `()` 键引用自定义类） |
+
+
