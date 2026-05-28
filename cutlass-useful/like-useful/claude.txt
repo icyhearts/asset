@@ -1,0 +1,299 @@
+
+
+examples/cute/tutorial/sgemm_1.cu
+418~420行，写了:
+```
+  thrust::device_vector<TA> d_A = h_A;
+  thrust::device_vector<TB> d_B = h_B;
+  thrust::device_vector<TC> d_C = h_C;
+```
+，这里device_vector的构造函数，会发生host memory到device memory的copy吗？
+device_vector的定义在 /share/users/like/opt/cuda-12.8/targets/x86_64-linux/include/thrust/device_vector.h。
+要求：答案追加到temp/answer.md里面
+
+examples/cute/tutorial/sgemm_1.cu
+如下代码：
+```
+  if (transA == 'N') {
+    ldA = m;
+  } else if (transA == 'T') {
+    ldA = k;
+  } else {
+    assert(false);
+  }
+
+  if (transB == 'N') {
+    ldB = k;
+  } else if (transB == 'T') {
+    ldB = n;
+  } else {
+    assert(false);
+  }
+```
+为什么m x k的A矩阵，lda在no transpose的时候是m?这是假设A矩阵是column major的数据吗？
+为什么k x n的B矩阵，ldb在no transpose的时候是k?这是假设B矩阵是column major的数据吗？
+要求：答案追加到temp/answer.md里面
+ 解释这行代码 ：
+Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{})
+要求：答案追加到temp/answer.md里面
+
+
+examples/cute/tutorial/sgemm_1.cu的main函数里面:
+  auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
+prob_shape是什么类型的？
+为什么在gemm_device用cuda-gdb看到的
+ProblemShape shape_MNK参数的类型是:
+(cuda-gdb) p shape_MNK
+$3 = {__b_N4cute3eso3ESOILb0ELb0EJiiiEEE = {first_ = 512, rest_ = {first_ = 1024, rest_ = {first_ = 2048}}}} ?
+
+我用c++filt解析出来的类型是:
+ echo "_ZN4cute3eso3ESOILb0ELb0EJiiiEEE" |  c++filt
+cute::eso::ESO<false, false, int, int, int>
+cute::eso::ESO是make_shape的返回类型吗？
+要求：答案追加到temp/answer.md里面
+
+include/cute/container/tuple.hpp 81行:
+template <class First, class... Rest>
+static constexpr bool is_first_empty_v = cute::is_empty<First>::value;
+template <class First, class... Rest>
+static constexpr bool is_rest_empty_v  = (cute::is_empty<Rest>::value && ...);
+
+is_empty的实现在哪里？is_empty的工作原理是怎么样的?
+
+要求：答案追加到temp/answer.md里面
+
+
+ `is_rest_empty_v` 使用了 C++17 **fold expression**（`&& ...`）
+ 对这个fold expression进行解释，并给出一个解释c++ 17 fold expression的例子
+要求：答案追加到temp/answer.md里面
+
+
+
+把 examples/cute/tutorial/sgemm_1.cu copy成 examples/cute/tutorial/sgemm_1_ref_np.cu,
+再写一个python代码 like-useful/generate_ref_np.py, 接受m, n, k, transA, transB 参数，命令行参数顺序和 examples/cute/tutorial/sgemm_1_ref_np.cu顺序保持一致。，用numpy生成和examples/cute/tutorial/sgemm_1_ref_np.cu形状匹配的A, B, C，类型为 np.array，用numpy进行matmul运算。
+把A, B, C用numpy.ndarray.tofile保存到3个文件中，以二进制文件A.npy, B.npy, C.npy保存。
+python代码
+修改examples/cute/tutorial/sgemm_1_ref_np.cu, 不再使用随机数据，而是读取python代码保存的二进制A.npy, B.npy, C.npy.
+examples/cute/tutorial/sgemm_1_ref_np.cu 使用cute执行完gemm后，把gpu计算的结果和读取的C.npy参考结果进行比较，打印出误差的最大值。
+注意numpy内存排布和cute对内存排布的要求可能有区别，比如numpy是row major的数据，cute可能要求不一样，你要仔细处理这种numpy和cute内存布局的不同。
+修改examples/cute/tutorial/CMakeLists.txt, 把examples/cute/tutorial/sgemm_1_ref_np.cu也参与编译。
+要求：另外，解释一下numpy和cute对A矩阵和B矩阵内存布局不同的要求，把答案追加到 like-useful/answer.md里面
+
+
+like-useful/generate_ref_np.py，matmul计算的时候，为什么是要对B_logical进行转置再和A_logical运算：A_logical @ B_logical.T? 
+要求：把答案追加到 like-useful/answer.md里面
+
+
+examples/cute/tutorial/sgemm_1_ref_np.cu里面， 以命令行参数:512 1024 2048 N T为例, 每个线程需要负责几个C矩阵中元素的计算?每个线程计算的C矩阵的形状是怎样的？是一块连续的子矩阵还是分散开的几个元素？
+要求：把答案追加到 like-useful/answer.md里面
+
+
+examples/cute/tutorial/sgemm_1_ref_np.cu里面, Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
+local_tile函数完成什么功能？
+4个参数版本的local_tile, 会调用dice函数， 它调的dice实现在哪里？
+dice又完成了什么功能？
+
+要求：把答案追加到 like-useful/answer.md里面
+
+
+examples/cute/tutorial/sgemm_1_ref_np.cu里面,gemm_device函数有如下3条同步语句：
+```
+    cp_async_fence();        // Label the end of (potential) cp.async instructions
+    cp_async_wait<0>();      // Sync on all (potential) cp.async instructions
+    __syncthreads();         // Wait for all threads to write to smem
+```
+，分别有什么作用？3个同步语句的实现分别在哪里？
+要求：把答案追加到 like-useful/answer.md里面
+
+
+examples/cute/tutorial/sgemm_1_ref_np.cu的命令行参数是 512 1024 2048 N T的情况下，
+include/cute/algorithm/gemm.hpp的474行的gemm定义，里面有
+485行有代码
+```
+  auto rA = MMA_Atom<MMA>::make_fragment_A(A);
+  auto rB = MMA_Atom<MMA>::make_fragment_B(B);
+```
+MMA_Atom<MMA>::make_fragment_A(A)和MMA_Atom<MMA>::make_fragment_B(B)的功能是什么 ？
+rA和rB的数据是在shared memory还是register?
+要求：把答案追加到 like-useful/answer.md里面
+
+继续上面的讨论，MMA_Atom<MMA>::make_fragment_A(A)的时候，include/cute/atom/mma_atom.hpp make_fragment_A里面有一个
+
+```
+if constexpr (has_dereference<FrgTypeA>::value)
+```
+在上面的讨论条件下，这个if是true还是false?
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+include/cute/atom/mma_atom.hpp有3个 struct MMA_Atom,这3个struct MMA_Atom是什么关系？用了什么c++语法特性 ？
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+在上面的讨论条件下，
+include/cute/atom/mma_atom.hpp 里面, 第 3个 struct MMA_Atom里面，下面的using语句分别推导出什么类型 ？
+
+```
+  using MMA_Op = MMAOperation;
+  using Traits = MMA_Traits<MMAOperation, Args...>;
+
+  // Element value types from the MMA_Traits
+  using ValTypeD = typename Traits::ValTypeD;
+  using ValTypeA = typename Traits::ValTypeA;
+  using ValTypeB = typename Traits::ValTypeB;
+  using ValTypeC = typename Traits::ValTypeC;
+
+  // Thr-Val layouts from the MMA_Traits
+  using Shape_MNK  = typename Traits::Shape_MNK;
+  using ThrID      = typename Traits::ThrID;
+  using LayoutC_TV = typename Traits::CLayout;
+  using LayoutA_TV = typename Traits::ALayout;
+  using LayoutB_TV = typename Traits::BLayout;
+
+  // Fragment value types from the MMA_Traits (optional, defaults to Val type)
+  using FrgTypeD = typename detail::FrgTypeC_or_Default<Traits>::type;
+  using FrgTypeA = typename detail::FrgTypeA_or_Default<Traits>::type;
+  using FrgTypeB = typename detail::FrgTypeB_or_Default<Traits>::type;
+  using FrgTypeC = typename detail::FrgTypeC_or_Default<Traits>::type;
+```
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+include/cute/atom/mma_traits.hpp，下面的定义，使用了什么c++语法特性?
+```
+template <class X, class = void>
+struct FrgTypeC_or_Default { using type = typename X::ValTypeC; };
+template <class X>
+struct FrgTypeC_or_Default<X,void_t<typename X::FrgTypeC>> { using type = typename X::FrgTypeC; };
+
+```
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+
+examples/cute/tutorial/sgemm_1_ref_np.cu的命令行参数是 512 1024 2048 N T的情况下，
+gemm_device函数会进入 include/cute/algorithm/gemm.hpp 314行
+下面这个双层循环为什么么要这样设计？m为什么要一次+=2?
+```
+  // 32-bit traversal specialization -- kinked serpentine path
+  if constexpr (decltype(size<0>(A))::value * sizeof(typename TA::value_type) == 4 &&
+                decltype(size<0>(B))::value * sizeof(typename TB::value_type) == 4)
+  {
+#if 1  // NOTE: Row- vs Col- major could depend on the C-matrix order... (which we can test)
+    // Row-major kinked serpentine iteration
+    CUTE_UNROLL
+    for (int m = 0; m < M; m += 2) {
+      CUTE_UNROLL
+      for (int n = 0; n < N; ++n) {
+        int ns = (m & 2) ? N-1-n : n;
+        gemm(mma, D(_,m+0,ns), A(_,m+0), B(_,ns), C(_,m+0,ns));
+
+        if (m+1 < M) {
+          gemm(mma, D(_,m+1,ns), A(_,m+1), B(_,ns), C(_,m+1,ns));
+        }
+      }
+    }
+```
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer_cld.md里面
+
+314行的gemm重载 ，已经有要求
+```
+ALayout::rank == 2 && is_rmem<TA>::value &&
+                          BLayout::rank == 2 && is_rmem<TB>::value &&
+```
+is_rmem已经保证A和B的数据在寄存器了，还会存在把A/B从别的存储加载到寄存器吗？
+如果A/B已经由is_rmem保证了,
+```
+   - B 矩阵的寄存器加载次数减半
+``` 这个说法又是如何成立呢？
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer_cld.md里面
+
+include/cute/arch/util.hpp 209行的explode函数:
+```
+template <class Fn,
+          class PtrD, int... Id,
+          class PtrA, int... Ia,
+          class PtrB, int... Ib,
+          class PtrC, int... Ic>
+CUTE_HOST_DEVICE constexpr
+void
+explode(Fn fn,
+        PtrD&& d, int_sequence<Id...>,
+        PtrA&& a, int_sequence<Ia...>,
+        PtrB&& b, int_sequence<Ib...>,
+        PtrC&& c, int_sequence<Ic...>)
+{
+  return fn(d[Id]..., a[Ia]..., b[Ib]..., c[Ic]...);
+}
+```
+使用了什么c++语法？对这个函数进行讲解
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+include/cute/layout.hpp有 raked_product 函数，解释它的功能。
+如果它的参数如下:
+block=Layout<Shape<_32,_8>>{},
+tiler=Layout<Shape< _4,_1>>{}
+结果是怎样的？ 要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+在
+block=Layout<Shape<_32,_8>>{},
+tiler=Layout<Shape< _4,_1>>{}
+的情况下.
+logical_product(block, tiler)
+= ((_32,_8),(_4,_1)):((_1,_32),(_256,_0))
+再经过 zip(get<1>(result), get<0>(result)) 后，是如何变成
+```
+((_4,_32),(_1,_8)):((_256,_1),(_0,_32))
+```
+的？
+get<1>(result)和get<0>(result)分别是多少？
+对两个layout进行zip()操作的语义是怎样的？
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+使用如下命令编译出.o文件：
+/share_data/users/like/opt/cuda-13.0/bin//nvcc -forward-unknown-to-host-compiler --options-file CMakeFiles/cute_tutorial_sgemm_2_ref_np.dir/includes_CUDA.rsp -DCUTLASS_VERSIONS_GENERATED -Xcudafe=--diag_suppress=550 --fmad=false -O0 -G -g -std=c++17 '--generate-code=arch=compute_120a,code=[sm_120a]' '--generate-code=arch=compute_120a,code=[compute_120a]' -Xcompiler=-fPIE -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 -DCUTLASS_ENABLE_GDC_FOR_SM100=1 --expt-relaxed-constexpr -ftemplate-backtrace-limit=0 -DCUTLASS_TEST_LEVEL=0 -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1 -DCUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED=1 -DCUTLASS_DEBUG_TRACE_LEVEL=0 -Xcompiler=-Wconversion -Xcompiler=-fno-strict-aliasing -MD -MT examples/cute/tutorial/CMakeFiles/cute_tutorial_sgemm_2_ref_np.dir/sgemm_2_ref_np.cu.o -MF CMakeFiles/cute_tutorial_sgemm_2_ref_np.dir/sgemm_2_ref_np.cu.o.d -x cu -c /softhome/like/package/h100/package/cutlass/examples/cute/tutorial/sgemm_2_ref_np.cu -o CMakeFiles/cute_tutorial_sgemm_2_ref_np.dir/sgemm_2_ref_np.cu.o
+
+再链接出可执行文件，再用gdb 调试 examples/cute/tutorial/sgemm_2_ref_np.cu, gdb能走到266行, 
+```
+auto dC = make_stride(Int<1>{}, ldC);
+```
+269-289行代码被gdb跳过，包括make_tiled_copy 的调用也被gdb跳过，为什么会这样？
+```
+  auto bM = Int<128>{};
+  auto bN = Int<128>{};
+  auto bK = Int<  8>{};
+  auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
+  ...
+  TiledCopy copyA = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TA>{},
+                                    Layout<Shape<_32,_8>>{},  // Thr layout 32x8 m-major
+                                    Layout<Shape< _4,_1>>{}); // Val layout  4x1 m-major
+  TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TB>{},
+                                    Layout<Shape<_32,_8>>{},  // Thr layout 32x8 n-major
+                                    Layout<Shape< _4,_1>>{}); // Val layout  4x1 n-major
+```
+如何让gdb 严格执行每一行代码？
+要求：1:文件路径要用相对于代码仓库的完整路径，2:把答案追加到 like-useful/answer.md里面
+
+分析一个gentoo emerge的错误日志 ：
+/softhome/like/temp/emerge.log.2026_04_18___11_16_26
+这个日志来自另外一台机器，不是本机。
+要求：把答案追加到 like-useful/answer.gentoo.md里面
+
+examples/cute/tutorial/sgemm_1_ref_np.cu 有如下代码
+```
+  Tensor cA = make_identity_tensor(shape(mA));   // (m,k) -> (m,k)
+  Tensor cB = make_identity_tensor(shape(mB));   // (n,k) -> (n,k)
+  printf("global full cA:"); print(cA); printf("\n");
+  printf("global full cA Layout:"); print(cA.layout()); printf("\n");
+  printf("global full cB:"); print(cB); printf("\n");
+  printf("global full cB Layout:"); print(cB.layout()); printf("\n");
+```
+make_identity_tensor 的功能是什么?
+运行命令是:
+./build-rtx5060/examples/cute/tutorial/cute_tutorial_sgemm_1_ref_np 512 1024 2048 N T > temp/run.cute_tutorial_sgemm_1_ref_np.log 2>&1 &
+日志位于 temp/run.cute_tutorial_sgemm_1_ref_np.log
+对应的打印结果
+```
+global full cA:ArithTuple(_0,_0) o (512,2048):(_1@0,_1@1)
+global full cA Layout:(512,2048):(_1@0,_1@1)
+global full cB:ArithTuple(_0,_0) o (1024,2048):(_1@0,_1@1)
+global full cB Layout:(1024,2048):(_1@0,_1@1)
+```
+ArithTuple 是什么意思? 为什么打印出来的 Layout, stride 是_1@0这种奇怪的符号
+要求：把答案追加到 like-useful/answer.md里面

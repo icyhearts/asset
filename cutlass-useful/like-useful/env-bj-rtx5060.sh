@@ -1,0 +1,8 @@
+export NCCL_NVLS_ENABLE=0
+export CUDA_ROOT_DIR=/share_data/users/like/opt/cuda-13.0/
+export CUDA_HOME=$CUDA_ROOT_DIR
+export LD_LIBRARY_PATH=${CUDA_HOME}/lib64/:${LD_LIBRARY_PATH}
+export PATH=${CUDA_HOME}/bin/:$PATH
+export NVCC_VERBOSE=1
+export CUDA_VERBOSE_BUILD=1
+export CMAKE_VERBOSE_MAKEFILE=ON
