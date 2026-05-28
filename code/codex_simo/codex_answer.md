@@ -5472,4 +5472,74 @@ class USFormatter(logging.Formatter):
 | 方案一 | 毫秒 (ms) | 否 | 是（改 `format` 字段） |
 | 方案二 | 微秒 (us) | 是（新增 ~12 行 fomatter） | 是（改 `()` 键引用自定义类） |
 
+---
+
+## Q: `MLATokenToKVPool.get_value_buffer` 中的 `self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]` 发生 memory copy 吗？返回的是 view 还是 copy？
+
+### 代码位置
+
+`python/sglang/srt/mem_cache/memory_pool.py:1840-1856`，`MLATokenToKVPool.get_value_buffer()` 方法：
+
+```python
+def get_value_buffer(self, layer_id: int):
+    if self.layer_transfer_counter is not None:
+        self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+    if self.store_dtype != self.dtype:
+        return self.kv_buffer[layer_id - self.start_layer][
+            ..., : self.kv_lora_rank
+        ].view(self.dtype)
+    return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
+```
+
+### `kv_buffer` 的 tensor shape
+
+`_create_buffers()`（`memory_pool.py:1754-1777`）中分配：
+
+```python
+self.kv_buffer = [
+    torch.zeros(
+        (self.size + self.page_size, 1, self.kv_cache_dim),
+        dtype=self.store_dtype,
+        device=self.device,
+    )
+    for _ in range(self.layer_num)
+]
+```
+
+其中 `self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim`（`memory_pool.py:1737-1741`）。每个 buffer 的 shape 是 `(size + page_size, 1, kv_lora_rank + qk_rope_head_dim)`。
+
+### 结论：返回的是 **view**，不会发生 memory copy
+
+核心表达式分为两步：
+
+1. **`self.kv_buffer[layer_id - self.start_layer]`** — Python list 索引，取出对应的 `torch.Tensor`（shape `[size+page_size, 1, kv_lora_rank + qk_rope_head_dim]`）
+
+2. **`[..., : self.kv_lora_rank]`** — PyTorch **basic slicing**（冒号切片），取最后一维的前 `kv_lora_rank` 个元素
+
+PyTorch 中 **basic slicing 始终返回 view**（共享同一个 storage），只有 advanced indexing（用 tensor/list 做索引）才会触发 copy。这里用的是最基础的 `:N` 切片，没有 fancy indexing，所以是 view。
+
+**store_dtype != dtype 的分支**（line 1852-1855）：
+
+```python
+return self.kv_buffer[layer_id - self.start_layer][
+    ..., : self.kv_lora_rank
+].view(self.dtype)
+```
+
+`.view()` 同样返回 view。由于 `[..., :N]` 对最后一维做切片，产生的 tensor 在最后一维是连续的，所以 `.view()` 可以直接 reshape 而不需要 `.contiguous()` 调用，**也不会触发 copy**。
+
+### 验证逻辑
+
+```python
+# 假设 buffer shape = (100, 1, 192), kv_lora_rank = 128
+buf = torch.zeros(100, 1, 192)
+v = buf[..., :128]
+print(v.data_ptr() == buf.data_ptr())  # True — 共享首地址，是 view
+print(v.is_contiguous())               # True — 最后一维切片保持连续性
+print(v.view(torch.float16).is_contiguous())  # True — .view() 也不会拷贝
+```
+
+两条 return 路径都不会触发 memory copy，返回的 tensor 与 `self.kv_buffer[layer_id]` 共享底层 storage。
+
 

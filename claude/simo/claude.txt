@@ -1669,3 +1669,9 @@ cp /share/users/like/ipc.sglang.1.json  /dev/shm/like/ipc.sglang.1.json  ; SGLAN
 现在的日志时间戳精度到秒，如何提高到 us? 是需要改代码，还是改custom_sglang.json?
 
 要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+sglang code base的 python/sglang/srt/mem_cache/memory_pool.py
+MLATokenToKVPool.get_value_buffer 函数中写的 self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank], 它会发生 memory copy吗？返回的是view还是copy?
+要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
