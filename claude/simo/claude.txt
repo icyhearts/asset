@@ -1679,9 +1679,19 @@ MLATokenToKVPool.get_value_buffer 函数中写的 self.kv_buffer[layer_id - self
 
 
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于/data//like/package/vllm-for-conda-simo, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+
 simo 代码位于 /data/like/package/simo_conda_sglang
 
 simo code base的simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py 实现了 concat_and_cache_mla_kernel 函数.
+sglang_simo 的 concat_and_cache_mla_kernel 基本上 是copy 的 simo/extensions/vllm_simo/v1/attention/ops/triton_concat_and_cache_mla.py 的 concat_and_cache_mla_kernel
+区别是， sglan_simo接受的bf16 kv, nope部分和rope部分是分开的，没有提前concat.
+vllm_simo接受的 bf16 kv, nope部分和rope部分是提前concat了.
+
+sglang_simo 的 kv cache, 不同token 在 kv cache里面是  线性排列， vllm_simo的 kv cache， token维度之外，有2个维度。计算某个 token 在kv cache buffer的基地址的方法不一样。
+
+后续的kv cache量化基本一样。
+
 simo/extensions/sglang_simo/mem_cache/memory_pool.py 实现了 SIMOMLATokenToKVPool.set_mla_kv_buffer，它会调用concat_and_cache_mla_kernel.
 SIMOMLATokenToKVPool.set_kv_buffer 通过 self.set_mla_kv_buffer(layer, loc, cache_k[..., :self.kv_lora_rank], cache_k[..., self.kv_lora_rank:])， 把 cache_k拆分，调用self.set_mla_kv_buffer
 

@@ -5542,4 +5542,162 @@ print(v.view(torch.float16).is_contiguous())  # True — .view() 也不会拷贝
 
 两条 return 路径都不会触发 memory copy，返回的 tensor 与 `self.kv_buffer[layer_id]` 共享底层 storage。
 
+---
+
+## Q: Code Review — `concat_and_cache_mla_kernel`, `SIMOMLATokenToKVPool.set_mla_kv_buffer`, `set_kv_buffer`, `_temporarily_replace_simo_kv_pool_cls`
+
+### 总览
+
+共发现 **4 个 critical bug**（会导致 SyntaxError/NameError 直接崩溃）和 **3 个 medium bug**（缺少 import 导致运行时 NameError）。
+
+---
+
+### Critical Bug 1: `page_size: int` 语法错误
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:256-269`
+**函数**: `SIMOMLATokenToKVPool.__init__`
+
+```python
+    super().__init__(
+      size,
+      page_size: int,    # BUG: type annotation 非法出现在函数调用实参位置
+      dtype,
+```
+
+`page_size: int` 是 Python 类型标注语法，只能用于函数签名、变量标注等，**不能出现在函数调用的参数列表里**。这里意图显然是 `page_size=page_size`（关键字参数传递），属于写错成类型标注的 typo。会导致 `SyntaxError`，代码根本无法加载。
+
+**修复**：改为 `page_size=page_size`。
+
+---
+
+### Critical Bug 2: 缺少逗号导致语法错误
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:363-366`
+**函数**: `SIMOMLATokenToKVPool.set_mla_kv_buffer`
+
+```python
+    concat_and_cache_mla_kernel[grid](
+      knope_ptr=cache_k_nope,
+      kpe_ptr=cache_k_rope      # BUG: 缺少逗号
+      kv_cache_ptr=kv_cache,
+```
+
+第 365 行 `kpe_ptr=cache_k_rope` 末尾缺少逗号，下一行 `kv_cache_ptr=kv_cache` 会被解析为独立语句而非函数参数。导致 `SyntaxError`。
+
+**修复**：在 `kpe_ptr=cache_k_rope` 后加逗号。
+
+---
+
+### Critical Bug 3: `concat_dim` 未定义
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:356`
+**函数**: `SIMOMLATokenToKVPool.set_mla_kv_buffer`
+
+```python
+    total_tiles = triton.cdiv(concat_dim, tile_size)
+```
+
+`concat_dim` 变量在 `set_mla_kv_buffer` 中从未被定义过。对比 vllm_simo 参照代码 `simo/extensions/vllm_simo/v1/attention/ops/triton_concat_and_cache_mla.py:236`：
+
+```python
+    concat_dim = kv_lora_rank + pe_dim          # ← vllm_simo 在调用前定义
+    total_tiles = triton.cdiv(concat_dim, tile_size)
+```
+
+sglang_simo 版漏掉了这行定义，会导致运行时 `NameError`。
+
+**修复**：在 line 356 前添加 `concat_dim = kv_lora_rank + pe_dim`。
+
+---
+
+### Critical Bug 4: `pe_dim` 使用错误维度索引
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:325`
+**函数**: `SIMOMLATokenToKVPool.set_mla_kv_buffer`
+
+```python
+    kv_lora_rank = cache_k_nope.shape[-1]   # ← 取最后一维，正确
+    pe_dim = cache_k_rope.shape[1]           # ← BUG: 应取最后一维
+```
+
+对比同一行获取 `kv_lora_rank` 用 `shape[-1]`，获取 `pe_dim` 却用了 `shape[1]`，不一致。
+
+`set_kv_buffer`（line 308）传入的 `cache_k` 形状为 `[num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]`，拆分后 `cache_k_rope = cache_k[..., self.kv_lora_rank:]` 形状为 `[num_tokens, num_heads, qk_rope_head_dim]`。当 `num_heads > 1` 时 `shape[1]` 取到的是 `num_heads` 而非 `pe_dim`，导致 `pe_dim` 值错误，kernel 的 tile 划分和 load mask 全部出错，写出的 kv cache 数据损坏。
+
+**注意**：对于 DeepSeek-V2 等 MLA 模型，`num_heads=1`（kv 被压缩到 1 个 head），这时 `shape[1]` 恰好等于 `pe_dim`，所以不会触发。但如果 `num_heads > 1`（例如某些 MLA 变体），就会出问题。
+
+**修复**：改为 `pe_dim = cache_k_rope.shape[-1]`。
+
+---
+
+### Medium Bug 5: 缺少 `import os`、`import json`
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:270-294`
+**函数**: `SIMOMLATokenToKVPool._create_buffers`
+
+```python
+  def _create_buffers(self):
+    _in_capture = torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+    if not _in_capture:
+        env_file = os.getenv("debug_env_file", "/dev/ipc.json")     # BUG: os 未 import
+        env_data = json.load(open(env_file)) if os.path.exists(...)  # BUG: json 未 import
+```
+
+模块顶层 imports（`memory_pool.py:11-29`）中既无 `import os` 也无 `import json`。该方法在 `__init__` → `_create_buffers` 调用链上总是以 non-capture 状态执行，因此 `os.getenv` 和 `json.load` 会被实际执行，触发 `NameError`。
+
+sglang 原始 `memory_pool.py` 模块顶层有 `import os`、`import json`，但 SIMO 版本遗漏了。
+
+**修复**：在模块顶层添加 `import os`、`import json`。
+
+---
+
+### Medium Bug 6: 缺少 `import triton`
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:356, 363`
+**函数**: `SIMOMLATokenToKVPool.set_mla_kv_buffer`
+
+```python
+    total_tiles = triton.cdiv(concat_dim, tile_size)   # BUG: triton 未 import
+    ...
+    concat_and_cache_mla_kernel[grid](...)              # BUG: triton 未 import
+```
+
+`triton` 模块没有在 `memory_pool.py` 中 import。尽管 `concat_and_cache_mla_kernel` 本身已在 line 29 import 进来看似可用，但 `[grid]` 调用方式需要 Triton 的 autotuner/JITFunction 机制，且 `triton.cdiv` 直接引用了 `triton` 命名空间。运行时触发 `NameError`。
+
+**修复**：在模块顶层添加 `import triton`，或在函数内局部 import。
+
+---
+
+### Medium Bug 7: 缺少 `import RadixAttention`
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:279, 283`
+**函数**: `SIMOMLATokenToKVPool.set_kv_buffer`、`set_mla_kv_buffer`
+
+```python
+    def set_kv_buffer(self, layer: RadixAttention, ...):           # BUG: RadixAttention 未 import
+    def set_mla_kv_buffer(self, layer: RadixAttention, ...):       # BUG: RadixAttention 未 import
+```
+
+函数参数的类型标注使用了 `RadixAttention`，但该类型没有在模块中 import。在 Python 3.12 中，类型标注默认在函数定义时求值，会导致 `NameError`（除非模块有 `from __future__ import annotations`，此时标注转为字符串，不立即求值）。
+
+sglang 原始 `memory_pool.py` 第 219 行有 `from sglang.srt.layers.radix_attention import RadixAttention`，SIMO 版本遗漏。
+
+**修复**：在模块顶层添加 `from sglang.srt.layers.radix_attention import RadixAttention`，或添加 `from __future__ import annotations`。
+
+---
+
+### 对照表
+
+| Bug | 严重程度 | 文件 (相对 simo/) | 行号 | 函数 |
+|-----|---------|-------------------|------|------|
+| `page_size: int` | Critical (SyntaxError) | `extensions/sglang_simo/mem_cache/memory_pool.py` | 258 | `SIMOMLATokenToKVPool.__init__` |
+| 缺逗号 | Critical (SyntaxError) | `extensions/sglang_simo/mem_cache/memory_pool.py` | 365 | `SIMOMLATokenToKVPool.set_mla_kv_buffer` |
+| `concat_dim` 未定义 | Critical (NameError) | `extensions/sglang_simo/mem_cache/memory_pool.py` | 356 | `SIMOMLATokenToKVPool.set_mla_kv_buffer` |
+| `pe_dim = shape[1]` | Critical (错误值, 数据损坏) | `extensions/sglang_simo/mem_cache/memory_pool.py` | 325 | `SIMOMLATokenToKVPool.set_mla_kv_buffer` |
+| 缺 `import os, json` | Medium (NameError) | `extensions/sglang_simo/mem_cache/memory_pool.py` | 273-276 | `SIMOMLATokenToKVPool._create_buffers` |
+| 缺 `import triton` | Medium (NameError) | `extensions/sglang_simo/mem_cache/memory_pool.py` | 356, 363 | `SIMOMLATokenToKVPool.set_mla_kv_buffer` |
+| 缺 `import RadixAttention` | Medium (NameError) | `extensions/sglang_simo/mem_cache/memory_pool.py` | 301, 312 | `set_kv_buffer`, `set_mla_kv_buffer` |
+
+**附加说明**：`triton_backend.py` 中的 `concat_and_cache_mla_kernel` 本身没有发现 bug。KV cache 的 1D 线性地址计算（`slot_base = slot_idx * stride_cache`）和 nope/rope 分别从两个指针加载的逻辑是正确的。`_temporarily_replace_simo_kv_pool_cls` 的 class 替换/恢复逻辑（try/finally restore）也是正确的，无并发安全问题。
+
 
