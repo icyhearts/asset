@@ -1676,12 +1676,18 @@ sglang code base的 python/sglang/srt/mem_cache/memory_pool.py
 MLATokenToKVPool.get_value_buffer 函数中写的 self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank], 它会发生 memory copy吗？返回的是view还是copy?
 要求：讲解代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
 
-simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py 实现了 concat_and_cache_mla_kernel 函数.
 
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo 代码位于 /data/like/package/simo_conda_sglang
+
+simo code base的simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py 实现了 concat_and_cache_mla_kernel 函数.
 simo/extensions/sglang_simo/mem_cache/memory_pool.py 实现了 SIMOMLATokenToKVPool.set_mla_kv_buffer，它会调用concat_and_cache_mla_kernel.
 SIMOMLATokenToKVPool.set_kv_buffer 通过 self.set_mla_kv_buffer(layer, loc, cache_k[..., :self.kv_lora_rank], cache_k[..., self.kv_lora_rank:])， 把 cache_k拆分，调用self.set_mla_kv_buffer
 
-simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py
+simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py 实现的 _temporarily_replace_simo_kv_pool_cls, 临时替换  sglang 的 MLATokenToKVPool,  sglang 调用init_memory_pool 后，再把sglang 的 MLATokenToKVPool恢复成原来的class. 
 
 对以下代码进行review:
-concat_and_cache_mla_kernel, SIMOMLATokenToKVPool.set_mla_kv_buffer， SIMOMLATokenToKVPool.set_kv_buffer
+concat_and_cache_mla_kernel, SIMOMLATokenToKVPool.set_mla_kv_buffer， SIMOMLATokenToKVPool.set_kv_buffer, _temporarily_replace_simo_kv_pool_cls
+检查代码是否有bug.
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
