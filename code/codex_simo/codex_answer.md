@@ -5700,4 +5700,123 @@ sglang 原始 `memory_pool.py` 第 219 行有 `from sglang.srt.layers.radix_atte
 
 **附加说明**：`triton_backend.py` 中的 `concat_and_cache_mla_kernel` 本身没有发现 bug。KV cache 的 1D 线性地址计算（`slot_base = slot_idx * stride_cache`）和 nope/rope 分别从两个指针加载的逻辑是正确的。`_temporarily_replace_simo_kv_pool_cls` 的 class 替换/恢复逻辑（try/finally restore）也是正确的，无并发安全问题。
 
+---
+
+## Q: 修复后复查
+
+### 已修复项（7/7 确认）
+
+| # | 原 bug（memory_pool.py） | 状态 | 备注 |
+|---|-------------------------|------|------|
+| 1 | `page_size: int` (line 258) | 修复 | 改为 positional `page_size` (line 262) |
+| 2 | 缺逗号 `kpe_ptr=cache_k_rope` (line 365) | 修复 | line 372 已加逗号 |
+| 3 | `concat_dim` 未定义 (line 356) | 修复 | line 362: `concat_dim = kv_lora_rank + pe_dim` |
+| 4 | `pe_dim = shape[1]` (line 325) | 修复 | line 329: `cache_k_rope.shape[-1]` |
+| 5 | 缺 `import os, json` | 修复 | line 33-35 |
+| 6 | 缺 `import triton` | 修复 | line 27 |
+| 7 | 缺 `import RadixAttention` | 修复 | 移除了 `RadixAttention` 类型标注 |
+
+---
+
+### 新引入的 Critical Bug 1: `assert` 用 `=` 赋值而非 `==` 比较
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:330-331`
+**函数**: `SIMOMLATokenToKVPool.set_mla_kv_buffer`
+
+```python
+    assert self.kv_lora_rank = kv_lora_rank       # BUG: = → SyntaxError
+    assert self.qk_rope_head_dim = pe_dim          # BUG: = → SyntaxError
+```
+
+`assert` 语句中必须使用 `==`（相等比较），不能使用 `=`（赋值）。`assert x = y` 在 Python 中是 `SyntaxError`。
+
+意图显然是对 kv_lora_rank 和 pe_dim 做一致性校验。**修复**：改为 `==`。
+
+---
+
+### 新引入的 Critical Bug 2: `kv_cache` 变量在定义前被引用
+
+**文件**: `simo/extensions/sglang_simo/mem_cache/memory_pool.py:364-366`
+**函数**: `SIMOMLATokenToKVPool.set_mla_kv_buffer`
+
+```python
+    concat_dim = kv_lora_rank + pe_dim                    # line 362
+    total_tiles = triton.cdiv(concat_dim, tile_size)      # line 363
+    assert kv_cache.dtype == torch.uint8, ...             # line 364  ← BUG! kv_cache 未定义
+    grid = (num_tokens, total_tiles)                      # line 365
+    kv_cache = self.kv_buffer[layer.layer_id - self.start_layer]  # line 366  ← 定义在这之后
+```
+
+`kv_cache` 在 line 364 被引用，但在 line 366 才被赋值定义。会导致运行时 `NameError`。
+
+对比 vllm_simo 版 `triton_concat_and_cache_mla.py:239`，那里 `kv_cache` 是函数参数，所以在 assert 时已存在。sglang_simo 版需要在 assert 之前先定义 `kv_cache`。
+
+**修复**：将 line 366 移到 line 364 之前：
+
+```python
+    kv_cache = self.kv_buffer[layer.layer_id - self.start_layer]
+    assert kv_cache.dtype == torch.uint8, "Quantized KV cache must be uint8"
+    concat_dim = kv_lora_rank + pe_dim
+    total_tiles = triton.cdiv(concat_dim, tile_size)
+    grid = (num_tokens, total_tiles)
+```
+
+---
+
+### 其他检查（无问题）
+
+- `concat_and_cache_mla_kernel`（triton kernel）未修改，正确
+- `_temporarily_replace_simo_kv_pool_cls` 未修改，正确
+- `set_kv_buffer` 未修改，正确
+- `_create_buffers` 中 `os`/`json` 的 `import` 位置（line 33-35）在 `# like_debug {` 注释块内，运行时能正常工作
+- `import triton`（line 27）已添加到模块顶层
+
+---
+
+## Q: 第二次修复后复查
+
+### 上次待修复项（2/2 确认）
+
+| # | 上次 bug（memory_pool.py） | 状态 | 备注 |
+|---|---------------------------|------|------|
+| 1 | `assert self.kv_lora_rank = kv_lora_rank` (line 330-331) | 修复 | 改为 `==` |
+| 2 | `kv_cache` 在定义前被引用 | 修复 | line 364 定义，line 365 assert，顺序正确 |
+
+### 完整终审 — 全部 4 个审查目标
+
+**`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:306-460` — `concat_and_cache_mla_kernel`**
+
+无 bug。Tile 分配逻辑正确：
+- `is_kv_c = (tile_idx * TILE_SIZE) < kv_lora_rank` — 按 tile 起始位置判断归属区域
+- nope/rope 分别从 `knope_ptr` / `kpe_ptr` 加载，mask 正确处理 tail tile
+- 写入 offset 布局正确：
+  ```
+  [KV_C packed | KV_C scales | K_PE packed | K_PE scales]
+  ```
+  与 vllm_simo 版一致，与 `__init__` 中 `kv_cache_dim_in_bytes` 的计算对齐
+
+**`simo/extensions/sglang_simo/mem_cache/memory_pool.py:232-298` — `SIMOMLATokenToKVPool.__init__` + `_create_buffers`**
+
+无 bug。初始化顺序正确：
+1. `self.kv_cache_dim_in_bytes` 先计算（依赖 `kv_cache_downcast_kernel`）
+2. 调用 `super().__init__()` → `MLATokenToKVPool.__init__()` → `self._create_buffers()`（已被子类 override）
+3. 子类 `_create_buffers` 使用步骤 1 已赋值的 `self.kv_cache_dim_in_bytes`
+
+buffer shape 为 `(size + page_size, 1, kv_cache_dim_in_bytes)`，与 1D 线性寻址 kernel 的 `slot_base = slot_idx * stride_cache` 一致。
+
+**`simo/extensions/sglang_simo/mem_cache/memory_pool.py:303-395` — `set_kv_buffer` + `set_mla_kv_buffer`**
+
+无 bug。
+- `set_kv_buffer`：basic slicing `cache_k[..., :self.kv_lora_rank]` 拆分 nope/rope，返回 view，无 copy
+- `set_mla_kv_buffer`：format params → tile bytes → grid → kernel call，逻辑正确
+- `kv_cache_dim_in_bytes`（`__init__` 用 128 批量计算）与 `set_mla_kv_buffer` 用单 tile 计算再合并的每 token bytes 一致
+
+**`simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:34-178` — `_temporarily_replace_simo_kv_pool_cls` + `_patched_init_memory_pool`**
+
+无 bug。class 替换/恢复在 try/finally 中保证原子性，并发安全。SWA 路径通过 `is_hybrid_swa` 正确跳过。
+
+### 结论
+
+**无遗漏，无新 bug。** 所有 4 个目标代码段已通过 review。
+
 

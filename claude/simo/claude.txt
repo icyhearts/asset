@@ -1700,4 +1700,6 @@ simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py 实现的 _tempo
 对以下代码进行review:
 concat_and_cache_mla_kernel, SIMOMLATokenToKVPool.set_mla_kv_buffer， SIMOMLATokenToKVPool.set_kv_buffer, _temporarily_replace_simo_kv_pool_cls
 检查代码是否有bug.
+
+ 我做了修复，检查有没有遗漏或者新的 bug
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
