@@ -1680,3 +1680,8 @@ simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py 实现�
 
 simo/extensions/sglang_simo/mem_cache/memory_pool.py 实现了 SIMOMLATokenToKVPool.set_mla_kv_buffer，它会调用concat_and_cache_mla_kernel.
 SIMOMLATokenToKVPool.set_kv_buffer 通过 self.set_mla_kv_buffer(layer, loc, cache_k[..., :self.kv_lora_rank], cache_k[..., self.kv_lora_rank:])， 把 cache_k拆分，调用self.set_mla_kv_buffer
+
+simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py
+
+对以下代码进行review:
+concat_and_cache_mla_kernel, SIMOMLATokenToKVPool.set_mla_kv_buffer， SIMOMLATokenToKVPool.set_kv_buffer
