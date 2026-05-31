@@ -297,3 +297,14 @@ global full cB Layout:(1024,2048):(_1@0,_1@1)
 ```
 ArithTuple 是什么意思? 为什么打印出来的 Layout, stride 是_1@0这种奇怪的符号
 要求：把答案追加到 like-useful/answer.md里面
+
+
+
+examples/cute/tutorial/tma_tensor.cu运行的 日志位于run.tma_tensor.log
+1) 对 代码的Tensor A = make_tensor(counting_iterator<int>(42), make_shape(4,5)); 中的counting_iterator<int>(42)  进行讲解.
+2) 为什么打印日志中的第1个元素是42, 和counting_iterator<int>(42)有关系吗？
+要求：要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到 like-useful/answer.md里面
+
+examples/cute/tutorial/tma_tensor.cu编译报错，日志位于 make.log
+如何解决错误
+要求：要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到 like-useful/answer.md里面
