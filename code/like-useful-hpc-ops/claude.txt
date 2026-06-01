@@ -1,0 +1,16 @@
+hpc-ops代码位于/data/like/package/hpc-ops
+conda环境位于 /data/like/miniconda3/envs/simo_sglang/
+tests/test_group_gemm_pertensor_like.py会调用 hpc.group_gemm_pertensor_fp8
+hpc.group_gemm_pertensor_fp8的cuda实现在哪里？
+它是如何注册成为pytorch算子的?
+从 hpc.group_gemm_pertensor_fp8 入口到cuda代码实现，之间的调用链是怎么样的
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
+
+
+
+hpc-ops代码位于/data/like/package/hpc-ops
+conda环境位于 /data/like/miniconda3/envs/simo_sglang/
+src/group_gemm/entry.cc调用 TORCH_LIBRARY_FRAGMENT(hpc, m)宏，TORCH_LIBRARY_FRAGMENT的功能是怎么样的? 宏的实现在哪里?
+hpc和m分别是什么参数? 为什么有的函数参数带问号: Tensor? output, Tensor? tma_desc
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
