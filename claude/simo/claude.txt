@@ -1713,3 +1713,9 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 
 循环结束，打印上述所有操作的总体耗时, 时间单位是s. 打印sum.
 代码写在 /softhome/like/asset/code/bench_disk_io.py
+
+
+#### v2
+simo/extensions/sglang_simo/models/deepseek_v2.py 用 class SIMODeepseekV2AttentionMLA 替换掉sglang的deepseek_v2.DeepseekV2AttentionMLA, 它的 attn_mqa and attn_mha 拥有kv_lora_rank, qk_rope_head_dim 属性
+kv_lora_rank, qk_rope_head_dim 属性的用途:
+##
