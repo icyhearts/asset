@@ -1718,4 +1718,4 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 #### v2
 simo/extensions/sglang_simo/models/deepseek_v2.py 用 class SIMODeepseekV2AttentionMLA 替换掉sglang的deepseek_v2.DeepseekV2AttentionMLA, 它的 attn_mqa and attn_mha 拥有kv_lora_rank, qk_rope_head_dim 属性
 kv_lora_rank, qk_rope_head_dim 属性的用途:
-##
+SIMOKVCacheMethod.create_weights 函数里面，用来计算: layer.packed_head_size layer.scale_head_size layer.packed_head_size_rope layer.scale_head_size_rope
