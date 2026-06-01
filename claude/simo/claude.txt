@@ -1703,3 +1703,13 @@ concat_and_cache_mla_kernel, SIMOMLATokenToKVPool.set_mla_kv_buffer， SIMOMLATo
 
  我做了修复，检查有没有遗漏或者新的 bug
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+
+conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+写一个实现如下功能的python代码:
+定义一个sum全局变量, 初始化0。
+从命令行读取一个目录名, 
+递归遍历目录的所有文件，如果文件大小大于0, 以二进制方式打开文件，读取第1字节，转换成int,累加到sum
+
+循环结束，打印上述所有操作的总体耗时, 时间单位是s. 打印sum.
+代码写在 /softhome/like/asset/code/bench_disk_io.py
