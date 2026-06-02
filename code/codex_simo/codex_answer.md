@@ -5819,4 +5819,164 @@ buffer shape 为 `(size + page_size, 1, kv_cache_dim_in_bytes)`，与 1D 线性�
 
 **无遗漏，无新 bug。** 所有 4 个目标代码段已通过 review。
 
+---
+
+## Q: Code Review — commit `8c9611c29` (decode_attention support rope part)
+
+### 变更概览
+
+| 文件 | 变更 |
+|------|------|
+| `simo/extensions/sglang_simo/models/deepseek_v2.py` | 新建 — 替换 `DeepseekV2AttentionMLA`，给 `attn_mqa/attn_mha` 设置 `kv_lora_rank`/`qk_rope_head_dim` |
+| `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py` | `_fwd_grouped_kernel_stage1` 新增 PE 部分量化 K 的加载与 attention；`_decode_grouped_att_m_fwd` 传入 rope 参数 |
+| `simo/extensions/sglang_simo/quantization/quantization.py` | `create_weights` 区分 MHA/MLA 分别计算 `packed_head_size`/`scale_head_size` |
+| `simo/extensions/sglang_simo/__init__.py` | 新增 import deepseek_v2 |
+
+---
+
+### Critical Bug 1: `super().__init__()` 未传参 — 父类未初始化
+
+**文件**: `simo/extensions/sglang_simo/models/deepseek_v2.py:17-30`
+**类**: `SIMODeepseekV2AttentionMLA.__init__`
+
+```python
+    def __init__(
+        self,
+        config,
+        hidden_size: int,
+        ...
+        mla_enable_prefill_cp: bool = False,
+    ) -> None:
+        super().__init__()          # BUG: 没有传任何参数给父类
+        # set kv_lora_rank and qk_rope_head_dim
+        self.attn_mqa.kv_lora_rank = kv_lora_rank   # BUG: self.attn_mqa 未定义!
+```
+
+父类 `DeepseekV2AttentionMLA.__init__` 的签名 (`sglang_kernel_src/python/sglang/srt/models/deepseek_v2.py:1379-1401`)：
+
+```python
+    def __init__(
+        self,
+        config: PretrainedConfig,   # ← 没有默认值, 必须传!
+        hidden_size: int,           # ← 没有默认值, 必须传!
+        num_heads: int,
+        ...
+```
+
+`super().__init__()` 不带任何参数调用 `DeepseekV2AttentionMLA.__init__`，而该函数前两个参数 `config` 和 `hidden_size` 是**必传**的（无默认值），会直接抛出 `TypeError`。
+
+此外，即使修复 `super().__init__()` 传参，`self.attn_mqa` 和 `self.attn_mha` 是由父类 `__init__` 创建的，`super().__init__()` 不传参意味着这两个属性根本不会被创建，后续 setattr 也会报 `AttributeError`。
+
+**修复**：将 SIMO `__init__` 收到的所有参数转发给父类：
+
+```python
+super().__init__(
+    config=config, hidden_size=hidden_size, num_heads=num_heads,
+    qk_nope_head_dim=qk_nope_head_dim, qk_rope_head_dim=qk_rope_head_dim,
+    v_head_dim=v_head_dim, q_lora_rank=q_lora_rank, kv_lora_rank=kv_lora_rank,
+    rope_theta=rope_theta, rope_scaling=rope_scaling,
+    max_position_embeddings=max_position_embeddings, quant_config=quant_config,
+    reduce_results=reduce_results, layer_id=layer_id, prefix=prefix,
+    alt_stream=alt_stream, skip_rope=skip_rope, is_nextn=is_nextn,
+    dsa_enable_prefill_cp=dsa_enable_prefill_cp,
+    mla_enable_prefill_cp=mla_enable_prefill_cp,
+)
+```
+
+---
+
+### Critical Bug 2: PE attention 的 dot 操作使用 `q` 而非 `qpe` — 维度不匹配
+
+**文件**: `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:138-155`
+**函数**: `_fwd_grouped_kernel_stage1`
+
+`q` 的加载（line 138, 154）：
+
+```python
+offs_d = tl.arange(0, BLOCK_DMODEL)               # line 115
+offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+q = tl.load(Q + offs_q, ...)                      # q shape: [BLOCK_H, BLOCK_DMODEL]
+```
+
+对 MLA 模型：`BLOCK_DMODEL = Lk = kv_lora_rank + qk_rope_head_dim`。`q` 包含 nope **和** PE 两部分的 query，共 `kv_lora_rank + pe_dim` 个元素。
+
+但在所有三个 PE attention 计算路径中，**全部使用了 `q` 而不是 `qpe`**：
+
+| 路径 (line) | 代码 | 问题 |
+|------------|------|------|
+| Per-group (296) | `tl.dot(q, K_dequant)` | PE key 只有 `pe_dim` 行，q 有 `kv_lora_rank + pe_dim` 行 → 维度不匹配 |
+| MX SW dequant (335) | `tl.dot(q, K_dequant)` | 同上 |
+| MXFP8 (347) | `tl.dot_scaled(q, ..., k, ...)` | `k` 用 `offs_dpe` 加载，只有 `pe_dim` 行，q 维度不匹配 |
+
+**同时**，`qpe` 虽然在 line 155-156 被加载了：
+
+```python
+if BLOCK_DPE > 0:
+    qpe = tl.load(Q + off_qpe, mask=(...), other=0.0)
+```
+
+但它 `offs_dpe` 的计算（line 141）也有历史 bug：
+
+```python
+offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)   # line 141
+mask_dpe = offs_dpe < Lk                             # BLOCK_DMODEL == Lk → mask 永远为 False
+```
+
+`offs_dpe` 起始于 `BLOCK_DMODEL`（等于 `Lk`），mask `offs_dpe < Lk` 永远为 False，`qpe` 永远是全零 tensor。正确的 offset 应该是 `kv_lora_rank + tl.arange(0, BLOCK_DPE)`。
+
+**修复**（两个问题一起修）：
+
+```python
+# 修正 offs_dpe (line 141)
+offs_dpe = kv_lora_rank + tl.arange(0, BLOCK_DPE)   # 原: BLOCK_DMODEL + ...
+
+# PE attention 统一改用 qpe（替换所有 3 处 tl.dot(q, ...) 为 tl.dot(qpe, ...)）
+qk_pe = tl.dot(qpe, K_dequant)                                        # PG path
+qk_pe = tl.dot(qpe, K_dequant)                                        # MX SW path
+qk_pe = tl.dot_scaled(qpe, None, "bf16", k, k_scale, "e4m3")        # MXFP8 path
+```
+
+**说明**：MHA 模型 `BLOCK_DPE = 0`，PE 分支完全跳过，使用 `q` 或 `qpe` 无影响。但 MLA 模型 `BLOCK_DPE > 0`，此 bug 会导致 Triton JIT 编译失败（维度不匹配）。
+
+---
+
+### NIT 1: `_decode_grouped_att_m_fwd` 传参 — MLA 模式下不应传 `-1`
+
+**文件**: `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:558-565`
+**函数**: `_decode_grouped_att_m_fwd`
+
+```python
+    packed_head_size_rope = getattr(layer, "packed_head_size_rope", -1)
+    scale_head_size_rope = getattr(layer, "scale_head_size_rope", -1)
+```
+
+非 MLA 模型（MHA）中 `BLOCK_DPE = 0`，kernel 的 PE 分支被完全跳过，`-1` 不会被执行到，所以不造成功能 bug。但 `PACKED_HEAD_SIZE_ROPE = -1` 作为 `tl.constexpr` 传入 kernel 是 dirty 的默认值。
+
+---
+
+### NIT 2: 注释掉的旧代码和 FP6 mask 冗余问题
+
+- `decode_attention.py:352-360` — 旧 K-PE 加载代码被注释而非删除，保留为死代码。
+- `decode_attention.py:287` — FP6 mask 中 `(group_offs[None, :] < FP6_NUM_GROUPS)` 永远 True（开发者自己在注释里问了），冗余但无害。
+
+---
+
+### 验证点：`_decode_grouped_att_m_fwd` 参数计算
+
+调用路径：`SIMOKVCacheMethod.create_weights` → `layer.packed_head_size_rope` / `layer.scale_head_size_rope` → `_decode_grouped_att_m_fwd`
+
+- `packed_head_size_rope` 和 `scale_head_size_rope` 在 `simo/extensions/sglang_simo/quantization/quantization.py:1399-1402` 通过 `getattr(layer, "kv_lora_rank")` 区分 MHA/MLA 后分别计算，逻辑正确。
+- `PACKED_HEAD_SIZE_PADDED_ROPE`（line 564）对 `> 0` 才做 `next_power_of_2`，否则为 `-1`，防御性正确。
+- `rope_offset_in_token = num_kv_heads * (PACKED_HEAD_SIZE + SCALE_HEAD_SIZE)` 计算从 buffer 中跳过 nope 部分的偏移量。buffer 布局为 `[nope_packed | nope_scales | pe_packed | pe_scales]`，其中 nope 部分每个 head 占 `PACKED_HEAD_SIZE + SCALE_HEAD_SIZE` bytes，`num_kv_heads * (...)` 正确跳过了所有 head 的 nope 数据。
+
+### 总结
+
+| # | Bug | 严重程度 | 位置 |
+|---|-----|---------|------|
+| 1 | `super().__init__()` 未传参 → TypeError | Critical | `deepseek_v2.py:29` |
+| 2 | PE dot 用 `q` 而非 `qpe` → 维度不匹配 | Critical | `decode_attention.py:296, 335, 347` |
+| - | `qpe` offs_dpe 计算错误 → qpe 全零 | 历史 bug | `decode_attention.py:141` |
+| 3 | 非 MLA 传 `-1` | Nit | `decode_attention.py:563-565` |
+| 4 | 旧代码未删除 + FP6 mask 冗余 | Nit | `decode_attention.py:287, 352` |
+
 

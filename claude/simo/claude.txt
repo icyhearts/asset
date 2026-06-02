@@ -1716,6 +1716,10 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 
 
 #### v2
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于/data//like/package/vllm-for-conda-simo, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+simo 代码位于 /data/like/package/simo_conda_sglang
 对提交 8c9611c29c3806e92f1b154f8c826ddee40a93b5  进行code review.
 simo/extensions/sglang_simo/models/deepseek_v2.py 用 class SIMODeepseekV2AttentionMLA 替换掉sglang的deepseek_v2.DeepseekV2AttentionMLA, 它的 attn_mqa and attn_mha 拥有kv_lora_rank, qk_rope_head_dim 属性
 kv_lora_rank, qk_rope_head_dim 属性的用途:
@@ -1728,9 +1732,11 @@ simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 的�
   PACKED_HEAD_SIZE_PADDED_ROPE: tl.constexpr,
   BLOCK_DMODEL_SCALE_ROPE: tl.constexpr,
 ``
-这些增加的参数主要用来进行支持 MX format kv cache量化和 per group quant的 kv cache量化的读取，以及attention计算。
-_fwd_grouped_kernel_stage1的修改有bug吗？
-参数的计算过程在: simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py, _decode_grouped_att_m_fwd 函数里面。
+这些增加的参数主要用来进行支持 MLA模型的 rope部分的 cache读取，可以支持 MX format kv cache和 per group quant的 kv cache的读取，以及attention计算。
+kv cache量化和写入的实现位于 simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py 的 concat_and_cache_mla_kernel.
+_fwd_grouped_kernel_stage1 的修改有bug吗？_fwd_grouped_kernel_stage1 读取 MLA 的 kv cache 和 sglang_simo concat_and_cache_mla_kernel  的写入是匹配的吗？
+
+stage1 kernel PACKED_HEAD_SIZE_ROPE SCALE_HEAD_SIZE_ROPE PACKED_HEAD_SIZE_PADDED_ROPE BLOCK_DMODEL_SCALE_ROPE 参数的计算过程在: simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py, _decode_grouped_att_m_fwd 函数里面。
 _decode_grouped_att_m_fwd 函数用到了上面的 layer.packed_head_size_rope layer.scale_head_size_rope.
 _decode_grouped_att_m_fwd  计算stage1 kernel参数过程是否正确 ？
 
