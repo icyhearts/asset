@@ -581,14 +581,288 @@ inline at::Tensor empty(at::IntArrayRef size, at::TensorOptions options = {}, ..
 3. **包装为 Variable**：`autograd::make_variable(..., options.requires_grad())` — 根据原始 options 的 `requires_grad` 设置来包装
 4. 由于步骤 1 设置了 `requires_grad(std::nullopt)`，`at::empty()` 返回的是不追踪梯度的 tensor；步骤 3 再根据原始设置决定是否启用梯度追踪
 
+## 9. y_scale 与 torch._scaled_mm 的 scale_a/scale_b 的数学关系
 
-`src/group_gemm/config.h:63-107` `struct GroupGEMMFp8Config`
+### 9.1 两种接口的差异
 
-| 配置项 | 说明 |
-|--------|------|
-| `SLayoutXAtom` | X 的 shared memory swizzle 布局 (kSwizzleX=128, K-major) |
-| `SLayoutWAtom` | W 的 shared memory swizzle 布局 (kSwizzleW=128, K-major) |
-| `SLayoutYAtom` | Y 的 shared memory swizzle 布局 (kSwizzleY=64, MN-major) |
-| `TiledMma` | `SM90_64x<kTileM>x32_F32E4M3E4M3_SS_TN` + warpgroup layout |
-| `get_tma()` | 创建 SM90_TMA_LOAD / SM90_TMA_STORE copy atoms |
-| `get_shm_size()` | 计算动态共享内存总大小 |
+在测试文件 `tests/test_group_gemm_pertensor_like.py:39-41`，naive 实现使用 `torch._scaled_mm`：
+
+```python
+y_group = torch._scaled_mm(
+    x_group, w_group.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
+)
+```
+
+而在 `hpc/group_gemm.py:94`，自定义算子只接收一个 `y_scale` 参数，传入 `src/group_gemm/entry.cc:15-21` 的 `y_scale`（per-group tensor），最终在 CUDA kernel 中应用。
+
+### 9.2 torch._scaled_mm 的数学定义
+
+`torch._scaled_mm(A, B, scale_a, scale_b, out_dtype=torch.bfloat16)` 的计算逻辑等价于：
+
+```
+C = (A * scale_a) @ B
+```
+
+由于 FP8 量化的惯例，`scale_a` 和 `scale_b` 是**逆量化因子**（inverse scale），即存储的 `A_fp8` 代表的真实浮点值是 `A_fp8 * scale_a`。因此：
+
+```
+C = (A_fp8 * scale_a) @ B_fp8  → 累积后再乘以 scale_b → C * scale_b
+```
+
+更准确的公式（对应 NVIDIA cuBLASLt 和 Hopper MMA 的语义）：
+
+```
+C = scale_a * scale_b * (A_fp8 @ B_fp8)
+```
+
+### 9.3 自定义 CUDA kernel 的数学定义
+
+在 `src/group_gemm/kernels.cuh:347-374`，CUDA kernel 的计算为：
+
+```cpp
+float scale = yscale_ptr[igroup];   // line 347: 取当前 group 的 y_scale
+
+// ... cute::gemm 计算 FP8 MMA，结果为 tCr = A_fp8 @ B_fp8
+
+#pragma unroll
+for (int i = 0; i < size(tCr); ++i) {
+    tDr(i) = tCr(i) * scale + tDr(i);  // line 374: result = mma_result * y_scale
+}
+```
+
+所以 kernel 的计算为：
+
+```
+C = y_scale * (A_fp8 @ B_fp8)
+```
+
+### 9.4 等价关系推导
+
+令两种实现的结果相等：
+
+```
+scale_a * scale_b * (A_fp8 @ B_fp8) = y_scale * (A_fp8 @ B_fp8)
+```
+
+消去公共因子 `(A_fp8 @ B_fp8)`：
+
+```
+y_scale = scale_a * scale_b
+```
+
+### 9.5 测试代码中的验证
+
+在 `tests/test_group_gemm_pertensor_like.py:57-58`：
+
+```python
+scale = torch.tensor(1.0, dtype=torch.float, device="cuda")
+scale_hpc = torch.full((num_group,), 1.0, dtype=torch.float, device="cuda")
+```
+
+- `scale_a = 1.0`, `scale_b = 1.0` → `scale_a * scale_b = 1.0`
+- `y_scale[i] = 1.0` for all groups
+
+满足 `y_scale = scale_a * scale_b = 1.0`，所以两种实现的计算结果等价。
+
+### 9.6 补充说明：per-tensor vs per-group
+
+`torch._scaled_mm` 的 `scale_a` / `scale_b` 可以是标量（所有 token 共享），也可以是 1D tensor（per-token scale）。
+
+`group_gemm_pertensor_fp8` 的 `y_scale` 是一个形状为 `[num_group]` 的 1D tensor（`tests/test_group_gemm_pertensor_like.py:58`），每个 group 可以有不同的 scale。尽管算子名称中包含 "pertensor"，但这里的 "tensor" 实际指的是对每个 group 内使用**单一 scale**（而非逐元素的 block-wise scale），与 `group_gemm_blockwise_fp8` 的 block-wise 量化形成对比。
+
+## 10. tmas 形状 `{num_group * 2, 128}` 的设计原因
+
+`src/group_gemm/entry.cc:52`：
+
+```cpp
+tmas = torch::empty({num_group * 2, 128}, options);
+```
+
+### 10.1 总体布局
+
+`tmas` 是一个存储 TMA 描述符的 tensor，按 **每 group 2 个描述符** 布局：
+
+| 索引 | 内容 | 用途 |
+|------|------|------|
+| `igroup * 2 + 0` | X 的 TMA descriptor | 当前 group 的输入激活子 tensor 的加载描述符 |
+| `igroup * 2 + 1` | Y 的 TMA descriptor | 当前 group 的输出子 tensor 的存储描述符 |
+
+### 10.2 逐层代码证据
+
+**入口层** — `src/group_gemm/entry.cc:39`：
+
+```cpp
+auto *tma_xy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
+```
+
+将 `tmas` 的裸指针强转为 `cute::TmaDescriptor *` 指针，后续按 group-offset 索引。
+
+**TMA 更新 kernel** — `src/group_gemm/kernels.cuh:138`：
+
+```cpp
+tma_descriptor_cp_fence_release(tma_xy + igroup * 2 + i, smem_tma_desc[i]);
+```
+
+其中 `i ∈ {0, 1}`：`0` 代表 X descriptor，`1` 代表 Y descriptor。每个 group 写入两个相邻的 TMA descriptor。
+
+**主 kernel 加载侧 (Load Warpgroup)** — `src/group_gemm/kernels.cuh:277`：
+
+```cpp
+auto *td_x = td_xy + igroup * 2;  // X descriptor for group igroup
+```
+
+使用 `igroup * 2 + 0` 处的 descriptor 进行 X 的 TMA 加载。
+
+**主 kernel 写回侧 (Epilogue)** — `src/group_gemm/kernels.cuh:417`：
+
+```cpp
+auto *td_y = td_xy + igroup * 2 + 1;  // Y descriptor for group igroup
+```
+
+使用 `igroup * 2 + 1` 处的 descriptor 进行 Y 的 TMA 存储。
+
+### 10.3 为什么需要 per-group TMA 描述符
+
+每个 group 的 X 子 tensor 和 Y 子 tensor **起始地址和形状都不同**：
+
+- X 子 tensor：`(cu_seqlens[igroup], k)` 处的 `seqlens[igroup] × k` 子矩阵
+- Y 子 tensor：输出 `(cu_seqlens[igroup], n)` 处的 `seqlens[igroup] × n` 子矩阵
+
+TMA 描述符包含硬件加速拷贝所需的目标地址和 tensor shape/stride 信息。因为每个 group 的这些参数不同，必须为每个 group 独立准备描述符。
+
+在 `src/group_gemm/group_gemm_pertensor_fp8.cu:42-46`，先用 W 的全局 descriptor 和 Y 的全局 descriptor 作为**模板**：
+
+```cpp
+vec_t<cute::TmaDescriptor, 2> td_xy{
+    *tma_x.get_tma_descriptor(),
+    *tma_y.get_tma_descriptor(),
+};
+```
+
+然后 `update_grouped_tma` kernel 对每个 group 拷贝模板，并调用 `update_tma_gtensor()` 替换描述符中的地址和形状字段（`src/utils/tma.cuh:37-57`），生成每 group 专属的 TMA descriptor。
+
+### 10.4 为什么每个 descriptor 128 字节
+
+每个 `cute::TmaDescriptor` 的大小是 **128 字节**。这是 NVIDIA Hopper (SM90) GPU 硬件定义的 TMA (Tensor Memory Access) 描述符固定大小。SM90 架构规格中，TMA descriptor 固定为 1024 bits = 128 bytes。
+
+因此 tensor 的第二维度 `128` 正好容纳一个 `cute::TmaDescriptor`，加上第一维 `num_group * 2` 个条目，总字节数 = `num_group * 2 * 128`，即 `tmas.nbytes()`。
+
+### 10.5 复用场景（跳过 TMA 更新）
+
+当调用者传入预缓存的 `tma_desc` 时（`src/group_gemm/entry.cc:48-50`）：
+
+```cpp
+if (tma_desc.has_value()) {
+    tmas = tma_desc.value();
+    update_tma = false;  // 跳过 TMA 更新 kernel
+}
+```
+
+`update_tma = false` 使得 `launch_group_gemm_fp8`（`src/group_gemm/group_gemm_pertensor_fp8.cu:42`）跳过 `update_grouped_tma` kernel launch，直接使用上一次写入的 per-group TMA descriptor。这在同一个 x/w 形状被反复调用时可以省去 TMA 更新开销。
+
+## 11. 为什么 W 不需要 per-group TMA descriptor
+
+### 11.1 三种 tensor 的数据布局差异
+
+三种 tensor 在全局内存中的布局由 `src/group_gemm/group_gemm_pertensor_fp8.cu:27-32` 定义：
+
+```cpp
+auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)),
+                     make_shape(m, k),                          // 2D: (total_seq, k)
+                     make_stride(k, Int<1>{}));
+
+auto W = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_ptr)),
+                     make_shape(n, k, num_group),                // 3D: (n, k, num_group)
+                     make_stride(k, Int<1>{}, n * k));
+
+auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)),
+                     make_shape(n, m),                           // 2D: (n, total_seq)
+                     make_stride(Int<1>{}, n));
+```
+
+关键区别：
+
+| Tensor | 维度 | Group 如何影响访问 | 是否需要 per-group descriptor |
+|--------|------|--------------------|:--:|
+| **X** | 2D `(m, k)`, 所有 groups 拼接在 M 维上 | 不同 group 的 sub-tensor 起始地址和 M 长度不同 | 是 |
+| **W** | 3D `(n, k, num_group)`，group 是第 3 维 | 通过坐标索引，W 是一个整体连续的大 tensor | **否** |
+| **Y** | 2D `(n, m)`，所有 groups 拼接在 M 维上 | 不同 group 的 sub-tensor 起始地址和 M 长度不同 | 是 |
+
+### 11.2 W 如何通过单一 TMA 描述符访问不同 group
+
+W 的 TMA 描述符 `tma_w` 在 `launch_group_gemm_fp8` 中创建（`src/group_gemm/group_gemm_pertensor_fp8.cu:34-37`），作为**模板参数**和**kernel 参数**传递，不存储在 `td_xy` 表中：
+
+```cpp
+auto [tma_x, tma_w, tma_y] = config.get_tma(X, W, Y);
+
+// W 的 TMA descriptor 作为 __grid_constant__ 参数传递
+kernel<<<...>>>(tma_w, tma_xy, ...);   // line 76-78: tma_w 是第一个 kernel 参数
+```
+
+在 kernel 内部（`src/group_gemm/kernels.cuh:145`）：
+
+```cpp
+__global__ void group_gemm_pertensor_fp8_kernel(
+    const __grid_constant__ TmaB tma_b,   // ← W 的 TMA descriptor，__grid_constant__
+    cute::TmaDescriptor *td_xy,           // ← X 和 Y 的 per-group descriptor 表
+    ...
+)
+```
+
+`__grid_constant__` 是 CUDA SM90 的特性：将 kernel 参数标记为对整个 grid 所有 block 都相同的常量，由硬件 load 一次后缓存在 constant memory 中，所有 block 共享。
+
+TMA 加载 W 时（`src/group_gemm/kernels.cuh:287`）：
+
+```cpp
+cute::copy(tma_b.with(readable[ismem_write]),
+           tBg(_, itile_n, itile_k, igroup),   // ← igroup 是坐标索引
+           tBs(_, 0, 0, ismem_write));
+```
+
+`tBg` 的 partitioned source tensor 是 `btma_b.partition_S(gB)`，其中 `gB = tma_b.get_tma_tensor(make_shape(n, k, num_group))`（`kernels.cuh:191`）。这产生一个 4D view：
+
+```
+tBg = (TMA, TMA_N, TMA_K, num_group)     // kernels.cuh:202
+```
+
+**`igroup` 是 tBg 的第 4 个坐标索引**，不是 descriptor 索引。TMA 硬件根据（固定）descriptor 中的基地址 + 坐标 `(*, *, *, igroup)` 自动计算目标地址。由于 W 是 3D contiguous tensor（stride: `(k, 1, n*k)`），`igroup` 维度的步长为 `n*k`，硬件自动加上 `igroup * n * k * sizeof(element)` 的偏移。
+
+### 11.3 为什么 X 和 Y 不能用同样的坐标方式
+
+X 和 Y 的 group 划分方式与 W 根本不同：
+
+**W 的 group 划分**（规则，3D tensor）：
+```
+W 是一个规则的 3D tensor，所有 groups 的矩阵有相同的 shape (n, k)
+W[igroup] 位于内存 offset = igroup * n * k 处
+```
+
+**X 的 group 划分**（不规则，2D tensor 切分）：
+```
+X 是所有 groups 的激活拼接在一起的 2D tensor
+X[igroup] 起始于 cu_seqlens[igroup]，长度为 seqlens[igroup]
+每个 group 的 M 维长度不同（各组 seqlen 不同）
+```
+
+TMA descriptor **必须在创建时指定完整的边界形状（bounding box shape）**。由于 X 的 group 边界和非均匀大小无法表示为坐标索引，必须为每个 group 创建独立 descriptor，用 `update_tma_gtensor`（`src/utils/tma.cuh:36-57`）替换 descriptor 中的地址指针和边界形状。
+
+Y 同理：output tensor 按 `cu_seqlens` 拼接，各 group 的子区域非均匀，需要独立 descriptor。
+
+### 11.4 总结对比
+
+```
+                    ┌─────────┬──────────────┬─────────────────────┐
+                    │    W    │      X       │          Y          │
+├───────────────────┼─────────│──────────────│─────────────────────┤
+│ 全局内存布局      │ 3D tensor│ 2D, 按seqlen│ 2D, 按seqlen 拼接    │
+│                   │ (n,k,g) │    拼接       │                      │
+├───────────────────┼─────────│──────────────│─────────────────────┤
+│ group 如何访问    │ 坐标    │ per-group    │ per-group            │
+│                   │ igroup  │ descriptor   │ descriptor           │
+├───────────────────┼─────────│──────────────│─────────────────────┤
+│ descriptor 数量   │ 1个     │ num_group个  │  num_group个          │
+├───────────────────┼─────────│──────────────│─────────────────────┤
+│ 传递方式          │__grid_  │ td_xy 表中   │  td_xy 表中           │
+│                   │constant_│              │                      │
+└───────────────────┴─────────│──────────────│─────────────────────┘
+```
