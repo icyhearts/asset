@@ -23,4 +23,7 @@ src/group_gemm/entry.cc group_gemm_pertensor_fp8_entry 函数，下面代码:y =
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//codex_answer.md 里面
 
 src/group_gemm/entry.cc使用的 torch::kBFloat16, 它是C++ Enum类型吗？定义在哪里?
-要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//codex_answer.md 里面
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
+
+
+src/group_gemm/entry.cc 里面有一行代码 tmas = torch::empty({num_group * 2, 128}, options);, tmas的形状为什么要这样设置?
