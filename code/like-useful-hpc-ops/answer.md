@@ -443,6 +443,145 @@ if (tma_desc.has_value()) {
 
 在 Python 调用侧 (`hpc/group_gemm.py:49-96`)，`output` 和 `tma_desc` 的默认值均为 `None`，对应 schema 中的 `Tensor?`：调用者不传这些参数时，它们等价于 `None`，在 C++ 端对应 `std::nullopt`。
 
+## 8. `torch::empty` 的 device 推断、`options.dtype()` 定义与副作用分析
+
+本节分析 `src/group_gemm/entry.cc:38-43` 这段代码：
+
+```cpp
+auto options = x.options();
+torch::Tensor y;
+if (output.has_value()) {
+    y = output.value();
+} else {
+    y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
+}
+```
+
+### 8.1 y 的 device 如何确定
+
+y 的 device **继承自输入 tensor `x` 的 device**，通过 `x.options()` 获得：
+
+**第 1 步** — `x.options()` 返回携带 x 属性的 `TensorOptions`：
+
+`{conda_env}/lib/python3.12/site-packages/torch/include/ATen/core/TensorBase.h:610-614`
+
+```cpp
+TensorOptions options() const {
+    return TensorOptions().dtype(dtype())
+                          .device(device())
+                          .layout(layout());
+}
+```
+
+`TensorBase::options()` 创建一个全新的 `TensorOptions`，并从当前 tensor 上取出 `dtype`、`device`、`layout` 三个属性设置上去。由于 `x` 是 CUDA tensor，`device()` 返回 GPU 设备，因此 `options` 携带的是 x 所在的 GPU device。
+
+注意：`options()` 不保留 `requires_grad`、`pinned_memory`、`memory_format` 属性（参见 `TensorOptions.h:536-541` 处的注释警告）。
+
+**第 2 步** — `options.dtype(torch::kBFloat16)` 返回**新副本**，只改了 dtype：
+
+`{conda_env}/lib/python3.12/site-packages/torch/include/c10/core/TensorOptions.h:228-233`
+
+```cpp
+[[nodiscard]] TensorOptions dtype(
+    std::optional<ScalarType> dtype) const noexcept {
+  TensorOptions r = *this;
+  r.set_dtype(dtype);
+  return r;
+}
+```
+
+关键点：
+- 方法是 `const noexcept`（不修改 `*this`）
+- 先拷贝 `*this`：`TensorOptions r = *this;`
+- 在拷贝上调用 `r.set_dtype(dtype)` 修改 dtype
+- **device 属性原封不动地保留了** — 来自第 1 步的 x.device()
+- 返回值类型是 `TensorOptions`（值语义，新对象）
+- `[[nodiscard]]` 表示返回值不应被丢弃
+
+**第 3 步** — `torch::empty()` 用新 options 分配 tensor：
+
+`{conda_env}/lib/python3.12/site-packages/torch/include/ATen/ops/empty.h:37-38`
+
+```cpp
+inline at::Tensor empty(at::IntArrayRef size, at::TensorOptions options={}, ...) {
+    return at::_ops::empty_memory_format::call(
+        c10::fromIntArrayRefSlow(size),
+        c10::optTypeMetaToScalarType(options.dtype_opt()),
+        options.layout_opt(),
+        options.device_opt(),    // ← 这里提取 device，来自 x 的 device
+        options.pinned_memory_opt(),
+        ...);
+}
+```
+
+`options.device_opt()` 返回的就是 x 所在 GPU 设备，因此分配的 `y` tensor 与 `x` 在同一 GPU 上。
+
+**完整device流转链**：
+
+```
+x (CUDA tensor on device 0)
+  → x.device()          → c10::Device(kCUDA, 0)
+  → x.options()         → TensorOptions{ .device_ = c10::Device(kCUDA, 0), ... }
+  → .dtype(kBFloat16)   → TensorOptions{ .device_ = c10::Device(kCUDA, 0),
+                                          .dtype_ = ScalarType::BFloat16, ... }
+  → torch::empty(...)   → 在 device 0 上分配 bfloat16 tensor y
+```
+
+### 8.2 `options` 本身是否被 `dtype()` 修改
+
+**不会。** `options` 的原始值保持不变。
+
+`options.dtype(torch::kBFloat16)` 调用的 `dtype(std::optional<ScalarType>)` 重载是 `const noexcept` 方法（`TensorOptions.h:228-233`），它：
+
+1. 拷贝 `*this` 到局部变量 `r`
+2. 修改 `r` 的 dtype
+3. 返回 `r`（新对象）
+4. `options` 自身没有任何变化
+
+因此下面这段代码是安全的，`options` 在调用前后完全一致：
+
+```cpp
+auto options = x.options();                        // dtype=FP8, device=GPU0
+y = torch::empty({m, n}, options.dtype(kBFloat16)); // 传入新 TensorOptions(dtype=BF16, device=GPU0)
+                                                    // options 依然 = {dtype=FP8, device=GPU0}
+tmas = torch::empty({num_group * 2, 128}, options); // 复用 options，分配 FP8 类型 tensor
+```
+
+这正是 `src/group_gemm/entry.cc:38-52` 中实际发生的模式 — `options`（FP8 dtype）在 line 43 被 `.dtype()` 临时改为 BF16 用于分配输出 tensor，随后 line 52 再次使用原始 `options`（FP8）分配 TMA descriptor tensor。
+
+### 8.3 `TensorOptions` setter 方法的三类重载对比
+
+`{conda_env}/lib/python3.12/site-packages/torch/include/c10/core/TensorOptions.h:220-241`
+
+| 重载 | 签名 | 是否修改 `*this` | 返回值 | 对应调用方式 |
+|------|------|:---:|------|------|
+| TypeMeta setter | `[[nodiscard]] TensorOptions dtype(std::optional<TypeMeta>) const noexcept` | 否 | 副本（值） | 传入 `TypeMeta` 对象 |
+| ScalarType setter | `[[nodiscard]] TensorOptions dtype(std::optional<ScalarType>) const noexcept` | 否 | 副本（值） | `options.dtype(torch::kBFloat16)` |
+| Template setter | `TensorOptions& dtype<ScalarType>()` | **是** | 引用 | `options.dtype<float>()` |
+
+在实际代码中，`options.dtype(torch::kBFloat16)` 匹配的是 ScalarType 重载（第 2 种），因此**不修改原对象**。
+
+### 8.4 `torch::empty` 的完整调用路径
+
+`{conda_env}/lib/python3.12/site-packages/torch/include/torch/csrc/autograd/generated/variable_factories.h:275-277`
+
+```cpp
+inline at::Tensor empty(at::IntArrayRef size, at::TensorOptions options = {}, ...) {
+  at::AutoDispatchBelowADInplaceOrView guard;
+  return autograd::make_variable(
+      at::empty(size, at::TensorOptions(options).requires_grad(std::nullopt), memory_format),
+      options.requires_grad());
+}
+```
+
+`torch::empty()` 的流程：
+
+1. **剥离 requires_grad**：`at::TensorOptions(options).requires_grad(std::nullopt)` — 拷贝 options 后清除 `requires_grad` 标志（ATen 层总返回不带 autograd 的 tensor）
+2. **调用 ATen 的 `at::empty()`**：实际分配 tensor
+3. **包装为 Variable**：`autograd::make_variable(..., options.requires_grad())` — 根据原始 options 的 `requires_grad` 设置来包装
+4. 由于步骤 1 设置了 `requires_grad(std::nullopt)`，`at::empty()` 返回的是不追踪梯度的 tensor；步骤 3 再根据原始设置决定是否启用梯度追踪
+
+
 `src/group_gemm/config.h:63-107` `struct GroupGEMMFp8Config`
 
 | 配置项 | 说明 |
