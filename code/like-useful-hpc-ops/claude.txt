@@ -21,3 +21,6 @@ conda环境位于 /data/like/miniconda3/envs/simo_sglang/
 src/group_gemm/entry.cc group_gemm_pertensor_fp8_entry 函数，下面代码:y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
 分配的tensor， 如何确定y 的 device是什么？ options.dtype(torch::kBFloat16) 的函数定义是在哪里？它会改变 options本身的成员变量吗？
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//codex_answer.md 里面
+
+src/group_gemm/entry.cc使用的 torch::kBFloat16, 它是C++ Enum类型吗？定义在哪里?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//codex_answer.md 里面
