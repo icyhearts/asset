@@ -6388,3 +6388,125 @@ else:
 | `qpe` 加载正确性 | ✅ （无 bug） |
 | MHA 路径量化 buffer 兼容性 | 🔴 已存在 bug |
 
+
+---
+
+## `extend_attention.py` MLA PE 量化支持修改
+
+### 修改内容
+
+#### 1. 新增 4 个 `tl.constexpr` 参数
+
+**`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:162-166` — `_fwd_kernel`**
+
+```python
+  # MLA part
+  PACKED_HEAD_SIZE_ROPE: tl.constexpr,
+  SCALE_HEAD_SIZE_ROPE: tl.constexpr,
+  PACKED_HEAD_SIZE_PADDED_ROPE: tl.constexpr,
+  BLOCK_DMODEL_SCALE_ROPE: tl.constexpr,
+```
+
+这四个参数已由 `extend_attention_fwd:728-731` 的 `simo_extra_kargs` 字典提供（`packed_head_size_rope` / `scale_head_size_rope` 来自 `layer` 属性），无需修改调用侧。
+
+#### 2. 新增派生常量和 offset/mask 数组
+
+**`:169` — `SCALE_PLANE_OFFSET_ROPE`**
+```python
+SCALE_PLANE_OFFSET_ROPE = num_kv_heads * PACKED_HEAD_SIZE_ROPE
+```
+用于 PE scale 数据在 buffer 内的偏移。
+
+**`:198` — `offs_d_scale_rope`**
+```python
+offs_d_scale_rope = tl.arange(0, BLOCK_DMODEL_SCALE_ROPE)
+```
+
+**`:206` — `mask_d_scale_rope`**
+```python
+mask_d_scale_rope = offs_d_scale_rope < SCALE_HEAD_SIZE_ROPE
+```
+
+#### 3. Stage 1 PE 块替换为量化版本
+
+**修改前 (`:372-382`，旧代码)：**
+```python
+if BLOCK_DPE > 0:
+    offs_kpe = (
+      offs_kv_loc[None, :] * stride_buf_kbs + cur_kv_head * stride_buf_kh + offs_dpe[:, None]
+    )
+    kpe = tl.load(K_Buffer + offs_kpe, mask=mask_n[None, :], other=0.0)
+    qk += tl.dot(qpe.to(kpe.dtype), kpe)
+```
+问题：使用 `stride_buf_kh`（bf16 head stride）和 `offs_dpe`（从 BLOCK_DMODEL 开始的偏移）直接加载 —— 对量化 buffer 不正确。
+
+**修改后 (`:372-469`)：** 三种量化路径：
+
+| 路径 | 行号 | 关键点 |
+|------|------|--------|
+| PG | `:376-405` | `packed_offs_d_rope`, `NUM_GROUPS_ROPE`, `_dequant_pg_fused` → `tl.dot(qpe, K_dequant)` |
+| SW dequant | `:406-440` | FP6 via `_load_fp6_packed`；4-bit/INT8 via `_unpack_and_dequant_mxfmt` → `tl.dot(qpe, ...)` |
+| MXFP8 | `:441-468` | 转置加载，`tl.dot_scaled(qpe, ...)` |
+
+所有路径使用：
+- `qpe`（而非 `q`）进行 dot product —— 维度正确（`qpe` = `[BLOCK_M, BLOCK_DPE]`, PE key = `[BLOCK_N, BLOCK_DPE]`）
+- `_rope` 后缀变量名避免 shadow nope 版本的 `packed_offs_d`, `packed_mask`, `group_offs`, `fp6_mask`, `NUM_GROUPS`
+
+#### 4. PE 偏移计算
+
+```python
+rope_offset_in_token = num_kv_heads * (PACKED_HEAD_SIZE + SCALE_HEAD_SIZE)
+```
+对于 MLA（num_kv_heads=1）：`rope_offset_in_token = KV_C_TOTAL_BYTES`。与 `concat_and_cache_mla_kernel` 写入布局匹配。
+
+PE packed 偏移：`rope_offset_in_token + cur_kv_head * PACKED_HEAD_SIZE_ROPE + packed_offs_d_rope[...]`
+
+PE scale 偏移：`rope_offset_in_token + SCALE_PLANE_OFFSET_ROPE + cur_kv_head * SCALE_HEAD_SIZE_ROPE + offs_d_scale_rope[...]`
+
+---
+
+### Stage 2 是否需要修改？—— **不需要**
+
+**`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:609-635` — `_fwd_kernel`（stage 2: triangle part）**
+
+Stage 2 读取的是 `K_Extend` 和 `V_Extend`（新 token 的 bf16 张量），而非量化 KV cache buffer。这些是当前层的输出，未经量化存储：
+
+```python
+offs_k = (
+    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+    + cur_kv_head * stride_kh
+    + offs_d[:, None]
+)
+k = tl.load(K_Extend + offs_k, ...)
+```
+
+PE 部分 (`:619-630`) 同样从 `K_Extend` 加载 bf16：
+```python
+offs_kpe = (
+    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+    + cur_kv_head * stride_kh
+    + offs_dpe[:, None]
+)
+kpe = tl.load(K_Extend + offs_kpe, ...)
+qk += tl.dot(qpe, kpe)
+```
+
+已有的 bf16 PE 加载路径完全正确，无需修改。
+
+---
+
+### 验证清单
+
+| 检查项 | 状态 |
+|--------|------|
+| 4 个新 `tl.constexpr` 参数添加到函数签名 | ✅ |
+| `SCALE_PLANE_OFFSET_ROPE` 常量 | ✅ |
+| `offs_d_scale_rope` / `mask_d_scale_rope` | ✅ |
+| Stage 1 PE-PG 路径（`packed_offs_d_rope`, `NUM_GROUPS_ROPE`, `qpe`） | ✅ |
+| Stage 1 PE-SW 路径（FP6 / 4-bit / MXINT8, `_rope` 变量） | ✅ |
+| Stage 1 PE-MXFP8 路径（`packed_offs_d_rope[:, None]`, `tl.dot_scaled(qpe, ...)`） | ✅ |
+| PE 偏移匹配写布局（`rope_offset_in_token`） | ✅ |
+| Nope V 加载变量不受 PE 块覆盖（`_rope` 后缀） | ✅ |
+| Stage 2 无需修改（读取 bf16 `K_Extend`） | ✅ |
+| Stale `TODO: BLOCK_DPE` 注释已移除 | ✅ |
+
