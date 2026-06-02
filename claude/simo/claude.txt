@@ -1716,6 +1716,22 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 
 
 #### v2
+对提交 8c9611c29c3806e92f1b154f8c826ddee40a93b5  进行code review.
 simo/extensions/sglang_simo/models/deepseek_v2.py 用 class SIMODeepseekV2AttentionMLA 替换掉sglang的deepseek_v2.DeepseekV2AttentionMLA, 它的 attn_mqa and attn_mha 拥有kv_lora_rank, qk_rope_head_dim 属性
 kv_lora_rank, qk_rope_head_dim 属性的用途:
 SIMOKVCacheMethod.create_weights 函数里面，用来计算: layer.packed_head_size layer.scale_head_size layer.packed_head_size_rope layer.scale_head_size_rope
+
+simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 的修改, _fwd_grouped_kernel_stage1 里面增加了参数：
+```
+  PACKED_HEAD_SIZE_ROPE: tl.constexpr,
+  SCALE_HEAD_SIZE_ROPE: tl.constexpr,
+  PACKED_HEAD_SIZE_PADDED_ROPE: tl.constexpr,
+  BLOCK_DMODEL_SCALE_ROPE: tl.constexpr,
+``
+这些增加的参数主要用来进行支持 MX format kv cache量化和 per group quant的 kv cache量化的读取，以及attention计算。
+_fwd_grouped_kernel_stage1的修改有bug吗？
+参数的计算过程在: simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py, _decode_grouped_att_m_fwd 函数里面。
+_decode_grouped_att_m_fwd 函数用到了上面的 layer.packed_head_size_rope layer.scale_head_size_rope.
+_decode_grouped_att_m_fwd  计算stage1 kernel参数过程是否正确 ？
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
