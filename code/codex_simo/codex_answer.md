@@ -6164,3 +6164,227 @@ However, note that `Q` here refers to the original **bf16 Q tensor** (not the qu
 Line 362: `qk += qk_pe` — once BUG 2 is fixed (using `qpe` for the dot product), this line correctly accumulates the PE attention score onto the nope score. The resulting `qk` has the right shape `[BLOCK_H, BLOCK_N]`.
 
 ---
+
+---
+
+## 修复后的代码检查
+
+### Bug 1: `super().__init__()` 参数转发 — ✅ 已修复
+
+**`simo/extensions/sglang_simo/models/deepseek_v2.py:29-50` — `SIMODeepseekV2AttentionMLA.__init__`**
+
+```python
+super().__init__(
+    config, hidden_size, num_heads,
+    qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
+    q_lora_rank, kv_lora_rank,
+    rope_theta=rope_theta, rope_scaling=rope_scaling,
+    max_position_embeddings=max_position_embeddings,
+    quant_config=quant_config, reduce_results=reduce_results,
+    layer_id=layer_id, prefix=prefix, alt_stream=alt_stream,
+    skip_rope=skip_rope, is_nextn=is_nextn,
+    dsa_enable_prefill_cp=dsa_enable_prefill_cp,
+    mla_enable_prefill_cp=mla_enable_prefill_cp,
+)
+```
+
+所有 19 个参数正确转发给父类 `DeepseekV2AttentionMLA.__init__()`。父类会初始化 `self.attn_mqa` 和 `self.attn_mha`，后续第 53-56 行设置 `kv_lora_rank` 和 `qk_rope_head_dim` 可以正常执行。✅
+
+---
+
+### Bug 2: PE dot product 使用 `qpe` 代替 `q` — ✅ 全部修复
+
+| 行号 | 路径 | 当前代码 | 状态 |
+|------|------|----------|------|
+| `decode_attention.py:292` | Per-group | `qk_pe = tl.dot(qpe, K_dequant)` | ✅ |
+| `decode_attention.py:331` | MXFP4 SW | `qk_pe = tl.dot_scaled(qpe, None, "bf16", ...)` | ✅ |
+| `decode_attention.py:334` | SW dequant | `qk_pe = tl.dot(qpe, K_dequant)` | ✅ |
+| `decode_attention.py:363` | MXFP8 E4M3 | `qk_pe = tl.dot_scaled(qpe, None, "bf16", ...)` | ✅ |
+| `decode_attention.py:365` | MXFP8 E5M2 | `qk_pe = tl.dot_scaled(qpe, None, "bf16", ...)` | ✅ |
+
+5 处全部正确使用 `qpe`（shape `[BLOCK_H, BLOCK_DPE]`）。✅
+
+---
+
+### Bug 3: MXFP8 PE 转置加载使用正确的从 0 开始的偏移 — ✅ 已修复
+
+**`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:337-348` — `_fwd_grouped_kernel_stage1`**
+
+之前使用 `offs_dpe` (起始于 `BLOCK_DMODEL=512`)，现在改为：
+
+```python
+packed_offs_d = tl.arange(0, PACKED_HEAD_SIZE_PADDED_ROPE)         # :337 -- 从 0 开始
+packed_mask = (offs_n[None, :] < split_kv_end) & (packed_offs_d[:, None] < PACKED_HEAD_SIZE_ROPE)  # :338
+offs_buf_k = (
+    kv_loc[None, :] * stride_buf_kbs + rope_offset_in_token
+    + cur_kv_head * PACKED_HEAD_SIZE_ROPE
+    + packed_offs_d[:, None]                                        # :342 -- 使用 packed_offs_d
+)
+```
+
+对于 MXFP8，`PACKED_HEAD_SIZE_ROPE == pe_dim`（1 byte per element），所以 `packed_offs_d` 的维度 = `BLOCK_DPE = pe_dim`。`qpe @ k` 维度匹配 ✅。
+
+---
+
+### 新发现的 Bug: Nope V 加载使用了 PE 块中重定义的变量
+
+**`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:167, 266, 391-393` — `_fwd_grouped_kernel_stage1`**
+
+在 `for start_n` 循环内，代码结构如下：
+
+```
+1. Nope K 加载: 定义 packed_offs_d, packed_mask, group_offs, fp6_mask (nope 版本)
+2. PE K 加载:   重定义 packed_offs_d, packed_mask, group_offs, fp6_mask (PE 版本)
+3. V 加载:      使用上述变量 ← 此时使用的是 PE 版本，而非 nope 版本
+```
+
+**具体影响路径：**
+
+| 量化路径 | 被重定义的变量 | 代码行 (nope定义 → PE重定义) | 影响的 V 加载行 |
+|----------|----------------|------------------------------|-----------------|
+| Per-group | `packed_offs_d` | `:167` → `:266` | `:391` |
+| Per-group | `packed_mask` | `:168` → `:267` | `:393` |
+| SW-FP6 | `group_offs` | `:198` → `:297` | `:412` |
+| SW-FP6 | `fp6_mask` | `:199` → `:298` | `:413` |
+| SW-4bit/INT8 | `packed_offs_d` | `:203` → `:302` | `:416` |
+| SW-4bit/INT8 | `packed_mask` | `:204-206` → `:303-305` | `:420` |
+
+**举例（Per-group 路径）：**
+
+Nope K 加载时（`:167`）：
+```python
+packed_offs_d = tl.arange(0, PACKED_HEAD_SIZE_PADDED)  # nope packed size
+packed_mask = (offs_n[:, None] < split_kv_end) & (packed_offs_d[None, :] < PACKED_HEAD_SIZE)
+```
+
+PE K 加载时（`:266-267`）：
+```python
+packed_offs_d = tl.arange(0, PACKED_HEAD_SIZE_PADDED_ROPE)  # ← 变量被 PE 版本覆盖!
+packed_mask = (offs_n[:, None] < split_kv_end) & (packed_offs_d[None, :] < PACKED_HEAD_SIZE_ROPE)
+```
+
+V 加载时（`:391-393`）：
+```python
+offs_buf_v_packed = (
+    kv_loc[:, None] * stride_buf_vbs + cur_kv_head * PACKED_HEAD_SIZE + packed_offs_d[None, :]
+)  # ← 这里 packed_offs_d 是 PE 版本 (PACKED_HEAD_SIZE_ROPE)，而非 nope 版本!
+v_packed = tl.load(V_Buffer + offs_buf_v_packed, mask=packed_mask, other=0)
+```
+
+**后果：** V buffer 的 nope 部分使用 PE packed_size 作为数据访问偏移，会导致 V 加载出界或加载错误数据。对于 FP6 路径，`group_offs` 和 `fp6_mask` 使用 PE 的 tile 计数而非 nope 的，`_load_fp6_packed` 会读取错误位置的 FP6 字节。
+
+**仅影响 MLA 模型** (`BLOCK_DPE > 0`)。非 MLA 模型中 `BLOCK_DPE = 0`，PE 块整体被编译器移除，变量不会被重定义。
+
+**修复建议：** PE 块中使用独立的变量名，例如 `packed_offs_d_rope`, `packed_mask_rope`, `group_offs_rope`, `fp6_mask_rope`，避免覆盖 nope 版本。
+
+---
+
+### 已验证无问题的部分
+
+1. **读/写布局一致性：** 已验证 `concat_and_cache_mla_kernel` 和 `_fwd_grouped_kernel_stage1` 的 PE 数据段偏移完全匹配（`rope_offset_in_token = KV_C_TOTAL_BYTES`, `SCALE_PLANE_OFFSET_ROPE = K_PE_PACKED_BYTES`）。
+
+2. **`_decode_grouped_att_m_fwd` 参数计算：** `packed_head_size_rope`/`scale_head_size_rope` 从 `create_weights` 正确计算，fallback `-1` 安全。
+
+3. **MXFP8 V 加载：** `decode_attention.py:434-457` 的 MXFP8 V 路径不使用 `packed_offs_d`/`packed_mask`，不受 PE 块变量覆盖影响。✅
+
+4. **PE 块内 MXFP8 转置路径的 `qpe` 维度：** 对于 MXFP8，`PACKED_HEAD_SIZE_ROPE == pe_dim == BLOCK_DPE`（1 byte per element），`qpe @ k` 维度正确匹配。✅
+
+### 总结
+
+| # | 问题 | 严重程度 | 文件:行 | 状态 |
+|---|------|----------|---------|------|
+| 1 | `super().__init__()` 参数转发 | 严重 | `deepseek_v2.py:29` | ✅ 已修复 |
+| 2 | PE dot product 使用 `q` → `qpe` | 严重 | `decode_attention.py:292,331,334,363,365` | ✅ 已修复 |
+| 3 | MXFP8 PE packed 偏移使用 `offs_dpe` → `packed_offs_d` | 严重 | `decode_attention.py:337-342` | ✅ 已修复 |
+| **4** | **Nope V 加载使用了 PE 块中重定义的变量** | **严重** | `decode_attention.py:167,266,391-393 等` | **🔴 未修复** |
+
+
+---
+
+## Bug 4 修复验证 + 继续 Code Review
+
+### Bug 4 修复: PE 块变量重命名 — ✅ 已修复
+
+在 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py` — `_fwd_grouped_kernel_stage1` 中，PE 块内的运行时变量重命名为带 `_rope` 后缀的独立名称：
+
+| PE 块路径 | 旧名称 → 新名称 | 行号 |
+|-----------|-----------------|------|
+| PE-PG | `packed_offs_d` → `packed_offs_d_rope` | `:266, 269, 285` |
+| PE-PG | `packed_mask` → `packed_mask_rope` | `:267, 271` |
+| PE-PG | `NUM_GROUPS` → `NUM_GROUPS_ROPE` | `:279, 287` |
+| PE-SW-FP6 | `group_offs` → `group_offs_rope` | `:297, 300` |
+| PE-SW-FP6 | `fp6_mask` → `fp6_mask_rope` | `:298, 300` |
+| PE-SW-nonFP6 | `packed_offs_d` → `packed_offs_d_rope` | `:302, 304, 309` |
+| PE-SW-nonFP6 | `packed_mask` → `packed_mask_rope` | `:303, 311` |
+| PE-MXFP8 | `packed_offs_d` → `packed_offs_d_rope` | `:337, 338, 342` |
+| PE-MXFP8 | `packed_mask` → `packed_mask_rope` | `:338, 346` |
+
+**修复后验证（grep 确认）：**
+
+- `packed_offs_d`（无后缀）：仅出现在 nope PG K 加载（`:167, 170, 186`）、nope SW K 加载（`:203, 205, 210`）、V 加载（`:391, 403, 418`）— 全部正确使用 nope 版本 ✅
+- `packed_mask`（无后缀）：仅出现在 nope PG/SW K 加载（`:168, 172, 204, 212`）、V 加载（`:393, 420`）— 全部正确使用 nope 版本 ✅
+- `group_offs`（无后缀）：仅出现在 nope SW-FP6 K 加载（`:198, 199, 201`）、V 加载（`:413`）— 行 `:298` 出现在注释中，不影响运行时 ✅
+- `fp6_mask`（无后缀）：仅出现在 nope SW-FP6 K 加载（`:199, 201`）、V 加载（`:413`）— 全部正确 ✅
+- `NUM_GROUPS`（无后缀）：仅出现在 nope PG K 加载（`:180, 188`）、V 加载（`:405`）— 全部正确使用 nope 版本 ✅
+
+所有 V 加载路径现在正确引用原始 nope 版本的变量，不再受 PE 块变量覆盖影响。
+
+---
+
+### 继续 Code Review: 发现的其他问题
+
+#### 潜在 Bug: PE-FP6 注释引用了已重命名的变量（Nit）
+
+**`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:298` — `_fwd_grouped_kernel_stage1`**
+
+```python
+fp6_mask_rope = (offs_n[:, None] < split_kv_end) # & (group_offs[None, :] < FP6_NUM_GROUPS)
+```
+
+注释中引用了 nope 的 `group_offs`，但实际上应该引用 PE 的 `group_offs_rope`。不过这只是注释，不影响运行时行为。原注释本身就是在说明该检查恒为 True，因此被注释掉。**无功能影响。**
+
+---
+
+#### 潜在 Bug: MHA 路径将 uint8 量化 buffer 传给原始 sglang bf16 kernel（已存在，非本次引入）
+
+**`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:871-890` — `decode_attention_fwd`**
+
+```python
+kv_group_num = q.shape[1] // v_buffer.shape[1]       # :869
+
+if kv_group_num == 1:                                  # :871
+    # MHA
+    v_scale = 1.0
+    decode_attention_fwd_normal(                       # :874 -- 原始 sglang 函数！
+        q, k_buffer, v_buffer, o, ...
+    )
+else:
+    # GQA/MQA/MLA
+    decode_attention_fwd_grouped(...)                  # :893 -- SIMO 量化版本
+```
+
+`decode_attention_fwd_normal` 是从 sglang 原始代码导入的（`:7-9`），**不具备任何量化/KV cache dequant 支持**。它期望 `k_buffer`/`v_buffer` 是 bf16 格式，shape 为 `[num_tokens, num_kv_heads, head_dim]`。
+
+当 MHA 模型使用 SIMO KV cache 量化时，`k_buffer`/`v_buffer` 来自 `SIMOMHATokenToKVPool`（`memory_pool.py:149-174`），是 **uint8** 类型，shape 为 `[size, head_num, packed_head_size + scale_head_size]`。原始 kernel 会将这些 uint8 字节当作 bf16 浮点数解释，产生完全错误的 attention 计算结果。
+
+**影响范围：** 仅影响 MHA 模型（`kv_group_num == 1`）使用 SIMO KV cache 量化时。GQA/MLA 模型不受影响（走 `decode_attention_fwd_grouped` 路径）。
+
+**注意：此 Bug 在 commit 8c9611c29 之前就已存在**（`decode_attention_fwd` 函数的 MHA/GQA 分支结构早于 MLA 相关修改）。不属于本次修改引入的新 bug，但在当前 review 范围内值得记录。
+
+---
+
+### 检查清单总结
+
+| 检查项 | 状态 |
+|--------|------|
+| Bug 1 `super().__init__()` 参数转发 | ✅ |
+| Bug 2 PE dot product `q` → `qpe` | ✅ |
+| Bug 3 MXFP8 PE `offs_dpe` → `packed_offs_d` | ✅ |
+| Bug 4 PE 块变量覆盖 → `_rope` 重命名 | ✅ |
+| 读/写布局一致性 | ✅ |
+| `_decode_grouped_att_m_fwd` 参数计算 | ✅ |
+| V 加载路径变量引用正确性 | ✅ |
+| PE 块内变量引用一致性 | ✅ |
+| `qpe` 加载正确性 | ✅ （无 bug） |
+| MHA 路径量化 buffer 兼容性 | 🔴 已存在 bug |
+
