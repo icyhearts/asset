@@ -5980,3 +5980,187 @@ qk_pe = tl.dot_scaled(qpe, None, "bf16", k, k_scale, "e4m3")        # MXFP8 path
 | 4 | 旧代码未删除 + FP6 mask 冗余 | Nit | `decode_attention.py:287, 352` |
 
 
+
+---
+
+## Code Review: Commit 8c9611c29 — MLA KV Cache read/write matching & parameter computation
+
+### Review Scope
+
+1. `_fwd_grouped_kernel_stage1` PE reading correctness
+2. Read/write layout consistency with `concat_and_cache_mla_kernel`
+3. `_decode_grouped_att_m_fwd` parameter computation
+4. `SIMODeepseekV2AttentionMLA` class
+
+---
+
+### 1. Read/Write Layout Matching: VERIFIED CORRECT
+
+**Write layout** (`concat_and_cache_mla_kernel` in `set_kv_buffer.py`):
+
+Per token slot (1D linear buffer), the 4 regions are:
+
+```
+[0 .. KV_C_PACKED_BYTES-1]                              : nope packed data
+[KV_C_PACKED_BYTES .. KV_C_TOTAL_BYTES-1]               : nope scale data
+[KV_C_TOTAL_BYTES .. KV_C_TOTAL_BYTES+K_PE_PACKED_BYTES-1] : pe packed data
+[KV_C_TOTAL_BYTES+K_PE_PACKED_BYTES .. END]             : pe scale data
+```
+
+Where:
+- `KV_C_TOTAL_BYTES = KV_C_PACKED_BYTES + KV_C_SCALE_BYTES`
+- `kv_c_num_tiles * packed_tile_bytes = KV_C_PACKED_BYTES`
+- `k_pe_num_tiles * packed_tile_bytes = K_PE_PACKED_BYTES`
+
+PE packed write uses `local_tile_idx = tile_idx - kv_c_num_tiles`:
+```python
+packed_write_offset = KV_C_TOTAL_BYTES + local_tile_idx * PACKED_TILE_BYTES   # set_kv_buffer.py:372
+scale_write_offset  = KV_C_TOTAL_BYTES + K_PE_PACKED_BYTES + local_tile_idx * SCALE_TILE_BYTES  # :373
+```
+
+**Read layout** (`_fwd_grouped_kernel_stage1` in `decode_attention.py`):
+
+PE start offset per token:
+```python
+rope_offset_in_token = num_kv_heads * (PACKED_HEAD_SIZE + SCALE_HEAD_SIZE)    # :263
+```
+
+For MLA, `num_kv_heads = 1`, so:
+- `rope_offset_in_token = PACKED_HEAD_SIZE + SCALE_HEAD_SIZE = KV_C_TOTAL_BYTES` ✓
+
+PE packed data offset (PG/SW paths):
+```python
+rope_offset_in_token + cur_kv_head * PACKED_HEAD_SIZE_ROPE + packed_offs_d[...]
+```
+= `KV_C_TOTAL_BYTES + 0 + [0, 1, ...]` ✓
+
+PE scale offset:
+```python
+rope_offset_in_token + SCALE_PLANE_OFFSET_ROPE + cur_kv_head * SCALE_HEAD_SIZE_ROPE + ...
+```
+= `KV_C_TOTAL_BYTES + K_PE_PACKED_BYTES + 0 + ...` ✓
+
+**The read layout matches the write layout for PG and SW dequant paths.**
+
+---
+
+### 2. `_decode_grouped_att_m_fwd` Parameter Computation: CORRECT
+
+```python
+packed_head_size_rope = getattr(layer, "packed_head_size_rope", -1)    # :550
+scale_head_size_rope  = getattr(layer, "scale_head_size_rope", -1)     # :551
+
+PACKED_HEAD_SIZE_PADDED_ROPE = triton.next_power_of_2(packed_head_size_rope) if packed_head_size_rope > 0 else -1   # :564
+BLOCK_DMODEL_SCALE_ROPE      = triton.next_power_of_2(scale_head_size_rope)  if scale_head_size_rope > 0 else -1    # :565
+```
+
+These values come from `SIMOKVCacheMethod.create_weights` (`quantization.py:1401-1407`), which correctly computes packing sizes for the rope part via meta tensors.
+
+Fallback `-1` is safe: when `packed_head_size_rope == -1` (non-MLA), `BLOCK_DPE` will be 0 (since Lk < 288 won't trigger the pe_dim split), so the MLA PE code block is never entered.
+
+**Parameter computation is correct.**
+
+---
+
+### 3. BUGS FOUND
+
+#### BUG 1 (CRITICAL): `super().__init__()` without arguments
+
+**File:** `simo/extensions/sglang_simo/models/deepseek_v2.py:29`
+
+```python
+def __init__(self, config, hidden_size, ..., mla_enable_prefill_cp=False) -> None:
+    super().__init__()   # ← BUG: parent __init__() called without any arguments
+```
+
+The parent class `deepseek_v2.DeepseekV2AttentionMLA.__init__()` requires ALL the constructor parameters (`config`, `hidden_size`, `num_heads`, `qk_nope_head_dim`, ...) to properly initialize `self.attn_mqa`, `self.attn_mha`, and all the attention projection layers.
+
+Calling `super().__init__()` with no arguments will raise a TypeError at runtime.
+
+Lines 32-35 then attempt to set attributes on `self.attn_mqa` and `self.attn_mha`, which don't exist since the parent was never properly initialized.
+
+**Fix:**
+```python
+super().__init__(
+    config, hidden_size, num_heads, qk_nope_head_dim, qk_rope_head_dim,
+    v_head_dim, q_lora_rank, kv_lora_rank, rope_theta, rope_scaling,
+    max_position_embeddings, quant_config, reduce_results, layer_id,
+    prefix, alt_stream, skip_rope, is_nextn, dsa_enable_prefill_cp,
+    mla_enable_prefill_cp,
+)
+```
+
+---
+
+#### BUG 2 (CRITICAL): PE dot products use `q` instead of `qpe`
+
+**File:** `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py`
+
+All 5 PE dot product paths use the **nope query vector `q`** instead of the **rope query vector `qpe`**. This is a dimension mismatch that will cause incorrect results or kernel failure.
+
+For DeepSeek-V2 MLA: `q` has shape `[BLOCK_H, kv_lora_rank]` = `[16, 512]`, while the PE key has shape `[BLOCK_N, pe_dim]` = `[32, 64]`. The dot product `q @ K_pe.T` has shape `[16, 512] @ [32, 64]` — dimension mismatch (512 ≠ 64).
+
+`qpe` has shape `[BLOCK_H, BLOCK_DPE]` = `[16, 64]`, so `qpe @ K_pe.T` = `[16, 64] @ [32, 64]` — correct.
+
+**Affected lines (all use `q` instead of `qpe`):**
+
+| Line | Path | Current (wrong) | Correct |
+|------|------|-----------------|---------|
+| 292 | Per-group | `tl.dot(q, K_dequant)` | `tl.dot(qpe, K_dequant)` |
+| 331 | MXFP4 SW | `tl.dot_scaled(q, None, "bf16", ...)` | `tl.dot_scaled(qpe, None, "bf16", ...)` |
+| 334 | SW dequant | `tl.dot(q, K_dequant)` | `tl.dot(qpe, K_dequant)` |
+| 359 | MXFP8 E4M3 | `tl.dot_scaled(q, None, "bf16", ...)` | `tl.dot_scaled(qpe, None, "bf16", ...)` |
+| 361 | MXFP8 E5M2 | `tl.dot_scaled(q, None, "bf16", ...)` | `tl.dot_scaled(qpe, None, "bf16", ...)` |
+
+---
+
+#### BUG 3 (CRITICAL): Transposed MXFP8 PE loading uses wrong offset
+
+**File:** `decode_attention.py:337-338`
+
+```python
+# Transposed K loading for MXFP8 PE
+offs_buf_k = (
+    kv_loc[None, :] * stride_buf_kbs
+    + rope_offset_in_token
+    + cur_kv_head * PACKED_HEAD_SIZE_ROPE
+    + offs_dpe[:, None]          # ← BUG: offs_dpe starts at BLOCK_DMODEL=512
+)
+```
+
+`offs_dpe` is defined on line 141 as `BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)`, which for DeepSeek-V2 is `[512, 513, ..., 575]`.
+
+The PE packed data for one token starts at `rope_offset_in_token` and has only `PACKED_HEAD_SIZE_ROPE` bytes (e.g., 64 bytes for MXFP8_E4M3, pe_dim=64). Using offsets `[512, ..., 575]` will read far beyond the PE data segment — out of the token's buffer region entirely.
+
+This affects only the transposed MXFP8 path (fast path with `tl.dot_scaled`).
+
+**Fix:** Define a separate offset variable that starts at 0:
+```python
+offs_d_pe_local = tl.arange(0, BLOCK_DPE)  # or tl.arange(0, PACKED_HEAD_SIZE_PADDED_ROPE)
+```
+And use it in the transposed PE loading path instead of `offs_dpe`.
+
+Note: the PG and SW dequant paths (lines 266-334) correctly start their offsets at 0 using `tl.arange(0, PACKED_HEAD_SIZE_PADDED_ROPE)`. Only the transposed MXFP8 path has this bug.
+
+---
+
+### 4. ADDITIONAL OBSERVATIONS
+
+#### `qpe` loading offset — actually NOT a historical bug
+
+The earlier analysis suggested `qpe` loading at line 141 was buggy because `offs_dpe < Lk` would always be False. This is incorrect:
+
+```python
+offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)  # = [512, 513, ..., 575]
+mask_dpe = offs_dpe < Lk                              # Lk = kv_lora_rank + pe_dim = 576
+```
+
+For DeepSeek-V2: `[512..575] < 576` is ALL True. So `qpe` loads correctly from the original (non-quantized) Q tensor. The `qpe` vector is correct.
+
+However, note that `Q` here refers to the original **bf16 Q tensor** (not the quantized K buffer). The Q tensor has `qk_head_dim = kv_lora_rank + pe_dim = 576` elements, and the PE part starts at offset `kv_lora_rank = 512`. So `offs_dpe = [512..575]` correctly addresses the PE portion of Q. **This is correct.**
+
+#### `qk_pe` accumulation uses `+=` on `qk`
+
+Line 362: `qk += qk_pe` — once BUG 2 is fixed (using `qpe` for the dot product), this line correctly accumulates the PE attention score onto the nope score. The resulting `qk` has the right shape `[BLOCK_H, BLOCK_N]`.
+
+---
