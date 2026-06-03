@@ -1770,3 +1770,41 @@ CUDA_VISIBLE_DEVICES=0 bash simo//extensions/sglang_simo/example/online_quantiza
 日志位于 templ/llm_eval_online_quant.only-kv-cache.sh.log.2026_06_03___11_17_23
 分析日志致命错误的原因.
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+simo的commit: 74018f9851310c0a7c75220535435a24c3a59325 
+把 simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json 里面
+```
+
+        "module_configs": [
+            {
+                "targets": [
+                    "Linear"
+                ],
+                "input": {
+                    "dtype": "bfloat16"
+                },
+                "weight": {
+                    "dtype": "bfloat16"
+                }
+            }
+        ],
+```
+改成了
+```
+        "module_configs": [
+            {
+                "targets": [
+                    "*attn*",
+                    "*mlp*",
+                    "*ffn*"
+                ],
+                "input": {
+                    "dtype": "mxfp8_e4m3"
+                },
+                "weight": {
+                    "dtype": "mxfp8_e4m3"
+                }
+            }
+        ],
+```
+74018f9851310c0a7c75220535435a24c3a59325 这次修改是禁止   MOE 模型 kv cache only量化的源头吗？这次修改前可以只量化 kv cache,不量化权重吗？
