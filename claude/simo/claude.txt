@@ -1837,3 +1837,8 @@ simo的commit: 74018f9851310c0a7c75220535435a24c3a59325
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
 
 
+我已经修复了上面的问题。
+CUDA_VISIBLE_DEVICES=6 bash simo//extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.only-kv-cache.sh > templ/llm_eval_online_quant.only-kv-cache.sh.log.`nowstr.sh` 2>&1 &
+日志位于templ/llm_eval_online_quant.only-kv-cache.sh.log.2026_06_03___18_21_40
+分析日志报错原因
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面

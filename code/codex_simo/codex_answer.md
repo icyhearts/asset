@@ -6771,3 +6771,172 @@ FusedMoEQuantConfig 触发  仅当 target 匹配时           仅当 target 匹�
 kv-cache-only       excludes=["*"] 阻止                excludes=["*"] 不阻止（bug）
 ```
 
+---
+
+## 4. llm_eval_online_quant.only-kv-cache.sh 日志错误分析
+
+### 错误信息
+
+```
+triton.compiler.errors.CompilationError: at 261:15:
+    k_scale = tl.load(
+      K_Buffer + offs_buf_k_scale, ...)
+    if MX_FORMAT_ID == MXFP8_E4M3:
+      qk = tl.dot_scaled(q, None, "bf16", k, k_scale, "e4m3", fast_math=True)
+AssertionError: rhs_scale must be a tensor of shape [64, 4]. Got ['64', '16']
+```
+
+**注意**：首次运行 `mmlu_world_religions` 任务成功完成（日志第 616 行显示 100%），但在 `mmlu` 主任务进入 `loglikelihood` 评估阶段后崩溃。这是因为 `mmlu_world_religions` 的请求 token 可能较短，未进入 MLA MHA extend 路径；而 `mmlu` 主任务的长 token 触发了该路径。
+
+### 使用的模型
+
+`DeepSeek-V2-Lite-Chat-16B_A2.4B`，配置参数：
+- `kv_lora_rank = 512`
+- `qk_nope_head_dim = 128`
+- `qk_rope_head_dim = 64`
+- `num_attention_heads = 16`
+- `num_key_value_heads = 16`
+
+### 根本原因
+
+**SIMO kv-cache 量化的 MLA extend attention MHA 路径与 kv cache 存储布局存在维度不匹配。**
+
+#### 数据流追踪
+
+**Step 1: packed_head_size 的设置**
+
+`SIMODeepseekV2AttentionMLA.__init__()` 在 `simo/extensions/sglang_simo/models/deepseek_v2.py:71-72`：
+
+```python
+updata_module_head_size(self.attn_mqa, kv_lora_rank, qk_rope_head_dim)
+updata_module_head_size(self.attn_mha, kv_lora_rank, qk_rope_head_dim)
+```
+
+`updata_module_head_size()` 在 `simo/extensions/sglang_simo/models/deepseek_v2.py:6-22` 使用 **`kv_lora_rank=512`** 计算 packed/scale 大小：
+
+```python
+def updata_module_head_size(layer, kv_lora_rank, qk_rope_head_dim):
+  x_q, scale_a = layer.quant_method.kv_cache_downcast_kernel(
+      torch.randn(1, kv_lora_rank, device="meta"))  # ← 使用 kv_lora_rank=512
+  layer.packed_head_size = x_q.contiguous().view(torch.uint8).shape[-1]    # = 512
+  layer.scale_head_size = scale_a.contiguous().view(torch.uint8).shape[-1] # = 16
+```
+
+所以 `attn_mha.packed_head_size = 512`，`attn_mha.scale_head_size = 16`。
+
+**Step 2: extend attention 的 BLOCK_DMODEL**
+
+`extend_attention_fwd()` 在 `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:774-782`：
+
+```python
+Lq, Lk, Lv = q_extend.shape[-1], k_extend.shape[-1], v_extend.shape[-1]
+BLOCK_DMODEL, BLOCK_DPE, ... = _get_block_sizes_for_extend_attention(Lq, Lv)
+```
+
+对于 MLA MHA 路径，`q_extend.shape[-1]` = `qk_nope_head_dim + qk_rope_head_dim = 128 + 64 = 192`。
+
+`_get_block_sizes_for_extend_attention()` 在 `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:51-53`：
+
+```python
+elif Lq == 192:
+    BLOCK_DMODEL = 128   # ← qk_nope_head_dim
+    BLOCK_DPE = 64       # ← qk_rope_head_dim
+```
+
+所以 **BLOCK_DMODEL = 128**（per-head nope 维度）。
+
+**Step 3: MXFP8 路径中 k_scale 的加载**
+
+在 `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:351-358`：
+
+```python
+offs_buf_k_scale = (
+    offs_kv_loc[:, None] * stride_buf_kbs
+    + SCALE_PLANE_OFFSET             # = num_kv_heads * PACKED_HEAD_SIZE = 16 * 512
+    + cur_kv_head * SCALE_HEAD_SIZE  # = cur_kv_head * 16
+    + offs_d_scale[None, :]          # = [0..BLOCK_DMODEL_SCALE-1]
+)
+k_scale = tl.load(K_Buffer + offs_buf_k_scale, ...)
+```
+
+加载的 `k_scale` 形状为 `[BLOCK_N, BLOCK_DMODEL_SCALE] = [64, 32]`，其中有效数据为 `[64, 16]`（`SCALE_HEAD_SIZE=16`，其余被 mask）。
+
+**Step 4: dot_scaled 断言失败**
+
+在 `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:369`：
+
+```python
+qk = tl.dot_scaled(q, None, "bf16", k, k_scale, "e4m3", fast_math=True)
+```
+
+Triton 计算：
+- `k` 形状 = `[BLOCK_DMODEL, BLOCK_N] = [128, 64]`
+- 期望 `k_scale` 形状 = `[BLOCK_N, BLOCK_DMODEL/32] = [64, 128/32] = [64, 4]`
+- 实际 `k_scale` 形状 = `[BLOCK_N, BLOCK_DMODEL_SCALE] = [64, 32]`，有效数据 `[64, 16]`
+
+### 维度不匹配的完整链条
+
+```
+                             设置阶段                       extend 阶段
+                             ────────                      ──────────
+kv cache 存储:   c_KV（kv_lora_rank = 512）          ← SIMO 写入时使用 512
+packed_head_size: 512 字节                            ← deepseek_v2.py:7 使用 kv_lora_rank
+scale_head_size:  16（512/32）                       ← 同一位置
+BLOCK_DMODEL:     N/A                                128（qk_nope_head_dim）← extend_attention.py:52
+dot_scaled 期望:  N/A                                k_scale [64, 4]（128/32）
+实际 k_scale:     N/A                                k_scale [64, 16]（512/32）← 不匹配！
+```
+
+### 更深层的问题
+
+即使 scale 维度匹配，**数据本身也是不匹配的**。原因是：
+
+1. **KV cache 存储的是 `c_KV`**（共享隐向量，512 维）——这是 MLA 提取出的所有注意力头共享的紧凑表示
+2. **MHA extend attention 使用的是 per-head K**（经过投影的单头 K，128 = qk_nope_head_dim 维）
+3. `c_KV [512]` 需要通过 `k_b_proj` 权重矩阵投影为 `k_per_head [num_kv_heads, 128]`，但 SIMO extend kernel **没有访问 k_b_proj 权重的机制**
+
+正常（非量化）SGLang 流程中：
+- Extend 阶段：输入 hidden_states → 计算 c_KV → k_b_proj(c_KV) → per-head K [num_kv_heads, 192] → 存入 KV cache
+- 后续 decode 从 KV cache 读取 per-head K [num_kv_heads, 192]
+
+SIMO kv-cache-only 量化流程中：
+- Kv cache 写入：c_KV → 量化 → 存入 KV cache 为 packed uint8 [512 bytes]
+- Extend K 读取：从 KV cache 读取 packed uint8 → 反量化 → c_KV [512] → **但 MHA extend kernel 需要的是 per-head K [128]！**
+
+### 影响的路径
+
+| 路径 | 是否受影响 |
+|------|-----------|
+| Decode attention（MLA GQA/MQA path） | **不受影响**：decode path 使用 kv_lora_rank=512 直接计算 QK |
+| Extend attention MHA path（MLA） | **受影响**：Lq=192 → BLOCK_DMODEL=128，但 kv cache 存 512-dim 数据 |
+| Non-MLA GQA models extend | **不受影响**：不存在 c_KV vs per-head K 的区别 |
+
+### 触发条件
+
+错误仅在以下条件**同时满足**时出现：
+1. MLA 模型（有 `kv_lora_rank`）
+2. 开启 kv-cache-only 量化
+3. 进入 extend attention 的 MHA 路径（`forward_normal_core`）——需要 token 数量足够触发 extend batch
+4. 量化格式为 MXFP8 或 MXFP8_E5M2（触发 `tl.dot_scaled` 路径，会进行 shape 检查）
+
+### 修复方向
+
+三种可能的修复方案：
+
+**方案 A: 在 MHA MLA extend 路径中回退到非量化 extend**
+- 在 `triton_simo_backend.py:forward_extend` 中检测 MLA 模型 + kv-cache-only 量化 → 回退到父类（非量化）extend attention
+- 优点：最简单，不改变 kv cache 布局
+- 缺点：extend 阶段的 KV cache 无法使用量化加速（读取父类 bf16 K buffer）
+
+**方案 B: 修改 KV cache 写/读为 per-head K**
+- 在 `set_kv_buffer` 中存储 k_b_proj(c_KV) → 量化 → per-head K [num_kv_heads, 128] + scales
+- 需要使用 `k_b_proj` 权重来投影（需要更改 set_kv_buffer 的入口以接收投影后的 K）
+- 优点：与 MHA extend 路径完全兼容
+- 缺点：需要修改多个组件
+
+**方案 C: 修改 extend attention kernel 接受 c_KV 并内部应用 k_b_proj**
+- 在 extend kernel 中加载 k_b_proj 权重，将 c_KV [512] 投影为 per-head K [num_kv_heads, 128]
+- 优点：不需要修改 KV cache 布局
+- 缺点：kernel 需要额外权重参数和 GEMM 操作，复杂度高
+
+**推荐方案 A** 作为最快的修复，确保 kv-cache-only 量化在 MLA extend 阶段至少可以正常运行。
