@@ -6609,3 +6609,165 @@ assert not isinstance(weight_dtype, str) or weight_dtype in {
 
 **推荐方案 A**，与注释 "for wNa16 scenarios" 的设计意图一致。
 
+---
+
+## 3. commit 74018f98 与 kv-cache-only 量化的关系分析
+
+### 问题 1: 74018f98 这次修改是禁止 vllm_simo MOE 模型 kv cache only量化的源头吗？
+
+**不是。** commit 74018f98 本身没有添加任何代码层面的禁止逻辑。它只修改了**示例 JSON 配置文件**，将例配置从 kv-cache-only 模式改为了"同时量化权重+KV cache"模式。
+
+具体 diff（以 `quant_config_kvquant_mxfp8.json` 为例）：
+
+```diff
+- "excludes": ["*"],
++ "excludes": [],
+
+- "targets": ["Linear"],
++ "targets": ["*attn*", "*mlp*", "*ffn*"],
+
+- "dtype": "bfloat16"    // input 和 weight 都是
++ "dtype": "mxfp8_e4m3"  // input 和 weight 都是
+```
+
+修改后，示例配置不再演示 kv-cache-only 场景，但**代码层面并未禁止 kv-cache-only 量化**。用户仍可手工编写 `"excludes": ["*"]` 的配置来使用 kv-cache-only 模式（见下方问题 2 的说明）。
+
+### 问题 2: 这次修改前可以只量化 kv cache,不量化权重吗？
+
+**可以。** 修改前（以及修改后）的 vllm_simo 代码路径都支持 kv-cache-only 量化。
+
+#### 修改前的 kv-cache-only 配置如何工作
+
+旧配置的核心字段：
+```json
+{
+    "excludes": ["*"],
+    "module_configs": [
+        {
+            "targets": ["Linear"],
+            "input":  { "dtype": "bfloat16" },
+            "weight": { "dtype": "bfloat16" }
+        }
+    ],
+    "kv_cache_quant_algo": {
+        "dtype": "mxfp8_e4m3",
+        ...
+    }
+}
+```
+
+#### 关键机制：excludes 优先于 target matching
+
+`SIMOConfig.get_quant_method()` 在 `simo/extensions/vllm_simo/quantization/quantization_config.py:254` 中：
+
+```python
+# 步骤 1: KV cache 量化（最先检查，仅针对 Attention 层）
+if isinstance(layer, (Attention, MLAAttention)) and self.kv_cache_quant_dtype:
+    ...  # 返回 SIMOKVCacheMethod —— 不受 excludes 影响
+    return SIMOKVCacheMethod(self, kv_cache_spec)
+
+# 步骤 2: 排除检查（所有层类型）
+if self.excludes and any(fnmatch.fnmatch(prefix, exclude) for exclude in self.excludes):
+    return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
+
+# 步骤 3: 目标匹配（仅当步骤 2 未命中时）
+matched_specs = next(
+    (specs for target, specs in self.target_to_specs.items() if fnmatch.fnmatch(prefix, target)),
+    None,
+)
+```
+
+执行顺序是 **步骤 1 → 步骤 2 → 步骤 3**：
+
+1. **步骤 1（第 233 行）**：对 Attention 层，KV cache 量化最先执行，返回 `SIMOKVCacheMethod`。不受 excludes 影响
+2. **步骤 2（第 254 行）**：对 FusedMoE 层，`fnmatch.fnmatch(prefix, "*")` 总是返回 `True`，因此返回 `None`
+3. 因为步骤 2 返回了 `None`，`SIMOFusedMoEMethod` 永远不会被创建
+
+#### 为什么 `FusedMoEQuantConfig.make()` assertion 不报错
+
+`FusedMoEQuantConfig.make()` 仅在 `SIMOFusedMoEMethod.get_fused_moe_quant_config()` 中被调用（`simo/extensions/vllm_simo/quantization/quantization_method.py:937`）。由于 `SIMOFusedMoEMethod` 从不被创建（excludes 阻止了它），`FusedMoEQuantConfig.make()` 也从不被调用，因此 `weight_dtype="bfloat16"` 的 assertion（在 `config.py:363`）永远不会被触发。
+
+```
+kv_cache_quant JSON 配置 → excludes=["*"] → fnmatch("*") 返回 True
+    → FusedMoE 层 → get_quant_method 返回 None
+    → SIMOFusedMoEMethod 不创建
+    → FusedMoEQuantConfig.make() 不调用
+    → assertion 不触发 ✓
+```
+
+### 问题 3: 这次对 sglang_simo 也禁止了 kv cache only 量化了吗？
+
+**没有。** commit 74018f98 **只修改了 `vllm_simo` 的配置文件**，没有触碰 `sglang_simo` 的任何文件。
+
+- vllm_simo 配置目录：`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/` —— 被修改
+- sglang_simo 配置目录：`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/` —— 未被修改
+
+sglang_simo 的配置文件 `quant_config_kvquant_mxfp8.json` 至今仍保留旧格式：
+```json
+{
+    "excludes": ["*"],
+    "module_configs": [{
+        "targets": ["Linear"],
+        "input":  { "dtype": "bfloat16" },
+        "weight": { "dtype": "bfloat16" }
+    }],
+    "kv_cache_quant_algo": { "dtype": "mxfp8_e4m3", ... }
+}
+```
+
+#### 但 sglang_simo 本身存在一个 bug
+
+vllm_simo 和 sglang_simo 使用了**不同的 excludes 匹配函数**：
+
+| 框架 | 匹配函数 | 位置 | `"*"` 是否匹配所有层 |
+|------|----------|------|---------------------|
+| vllm_simo | `fnmatch.fnmatch(prefix, exclude)` | `simo/extensions/vllm_simo/quantization/quantization_config.py:254` | **是**（通配符语义） |
+| sglang_simo | `_is_equal_or_regex_match(layer_name, target)` | `simo/extensions/sglang_simo/quantization/quantization.py:333-347` | **否**（精确字符串相等） |
+
+sglang_simo 的 `_is_equal_or_regex_match()` 逻辑（`simo/extensions/sglang_simo/quantization/quantization.py:333-347`）：
+
+```python
+def _is_equal_or_regex_match(value: str, target: str, check_contains: bool = False) -> bool:
+    if target.startswith("re:"):
+        pattern = target[3:]
+        if re.match(pattern, value):
+            return True
+    elif check_contains:
+        if target.lower() in value.lower():
+            return True
+    elif target == value:      # ← "*" == "model.layers.0.mlp.experts"? → False!
+        return True
+    return False
+```
+
+因此 `"excludes": ["*"]` 在 sglang_simo 中**实际上不排除任何层**（除非某层名称恰好是字面量 `"*"`）。这意味着：
+
+1. FusedMoE 层的 `should_ignore_layer` 返回 `False`（`simo/extensions/sglang_simo/quantization/quantization.py:909`）
+2. FusedMoE 层的类型检查命中（第 915 行）
+3. `SIMOFusedMoEMethod` **被创建**
+4. `create_moe_runner()` 被调用（第 1752 行）
+5. `FusedMoEQuantConfig.make(weight_dtype="bfloat16")` 被调用（第 1770 行）
+6. **assert 失败**：`"bfloat16"` 不在 `weight_dtype` 合法集合中（`config.py:363`）
+
+这正是本会话之前分析到的致命错误（已通过添加 `"bfloat16"`, `"float16"`, `"float32"` 到 `weight_dtype` 合法集合中修复，`simo/extensions/vllm_simo/model_executor/layers/fused_moe/config.py:373-379`）。
+
+### 总结
+
+| 问题 | 答案 |
+|------|------|
+| 74018f98 是 kv-cache-only 禁止的源头？ | **否**。它只改了示例配置文件，未添加代码限制 |
+| 修改前可以只量化 kv cache 吗？ | **vllm_simo: 可以**。`excludes=["*"]` 通过 fnmatch 通配符阻止了权重量化路径 |
+| | **sglang_simo: 理论上可以，但有 bug**。`excludes=["*"]` 使用字符串相等而非通配符，不生效 |
+| sglang_simo 也被禁止了吗？ | **否**。74018f98 未修改 sglang_simo 的任何文件 |
+
+### vllm 和 sglang excludes 机制的根本差异
+
+```
+                    vllm_simo                          sglang_simo
+                    ─────────                          ───────────
+excludes 匹配       fnmatch.fnmatch("*")               精确字符串相等 "*"
+"*" 匹配所有层      ✓ 是                               ✗ 否（需用 "re:.*"）
+FusedMoEQuantConfig 触发  仅当 target 匹配时           仅当 target 匹配时且 excludes 未命中
+kv-cache-only       excludes=["*"] 阻止                excludes=["*"] 不阻止（bug）
+```
+

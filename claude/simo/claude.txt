@@ -1771,6 +1771,10 @@ CUDA_VISIBLE_DEVICES=0 bash simo//extensions/sglang_simo/example/online_quantiza
 分析日志致命错误的原因.
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
 
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于/data//like/package/vllm-for-conda-simo, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+simo 代码位于 /data/like/package/simo_conda_sglang
 simo的commit: 74018f9851310c0a7c75220535435a24c3a59325 
 把 simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp8.json 里面
 ```
@@ -1807,4 +1811,29 @@ simo的commit: 74018f9851310c0a7c75220535435a24c3a59325
             }
         ],
 ```
-74018f9851310c0a7c75220535435a24c3a59325 这次修改是禁止   MOE 模型 kv cache only量化的源头吗？这次修改前可以只量化 kv cache,不量化权重吗？
+74018f9851310c0a7c75220535435a24c3a59325 这次修改是禁止  vllm_simo  MOE 模型 kv cache only量化的源头吗？这次修改前可以只量化 kv cache,不量化权重吗？
+这次对sglan_simo 也禁止了 kv cache only 量化了 吗？
+74018f9851310c0a7c75220535435a24c3a59325 修改前, simo/extensions/vllm_simo/model_executor/layers/fused_moe/config.py, FusedMoEQuantConfig.make 也有
+```
+    assert not isinstance(weight_dtype, str) or weight_dtype in {
+      "nvfp4",
+      "mxfp4",
+      "nvfp4_e2m1",
+      "mxfp4_e2m1",
+      "mxfp6_e3m2",
+      "mxfp6_e2m3",
+      "mxfp8_e4m3",
+      "mxfp8_e5m2",
+      "mxint8",
+      # Standard FP8 types (non-MX)
+      "fp8_e4m3",
+      "fp8_e5m2",
+      # Standard INT types
+      "int4",
+      "int8",
+    }
+```
+为什么修改前允许  kv cache only 的json配置?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+
