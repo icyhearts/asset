@@ -6510,3 +6510,102 @@ qk += tl.dot(qpe, kpe)
 | Stage 2 无需修改（读取 bf16 `K_Extend`） | ✅ |
 | Stale `TODO: BLOCK_DPE` 注释已移除 | ✅ |
 
+
+---
+
+## 日志致命错误分析: KV-cache-only 量化 + MoE 模型 AssertionError
+
+### 错误摘要
+
+日志中 **6 次相同的致命错误**（每个 kv_cache_quant 配置一次），所有都导致同一个 AssertionError:
+
+```
+scheduler.py:3842 run_scheduler_process ERROR Scheduler hit an exception: ...
+AssertionError
+```
+
+### 错误根因
+
+**调用链:**
+
+1. `simo/extensions/sglang_simo/quantization/quantization.py:1770` — `SIMOFusedMoEMethod.create_moe_runner` 调用 `FusedMoEQuantConfig.make()`
+2. `simo/extensions/vllm_simo/model_executor/layers/fused_moe/config.py:363` — `make()` 中 `weight_dtype` 校验失败
+
+**详细分析:**
+
+配置 `quant_config_kvquant_mxfp8.json` 是 KV-cache-only 量化：
+- `excludes: ["*"]` — 所有权重不量化
+- `module_configs[0].input.dtype = "bfloat16"` — 输入不量化
+- `module_configs[0].weight.dtype = "bfloat16"` — 权重不量化
+
+因此，MoE 层的 `SIMOFusedMoEMethod` 被创建时：
+- `self.weight_spec.dtype = "bfloat16"`（未量化权重）
+- `self.input_spec.dtype = "bfloat16"`（未量化输入）
+
+`create_moe_runner` 在 `quantization.py:1770-1772` 无条件传入这些值：
+```python
+self.moe_quant_config = FusedMoEQuantConfig.make(
+    quant_dtype=self.input_spec.dtype,   # "bfloat16"
+    weight_dtype=self.weight_spec.dtype,  # "bfloat16"
+    ...
+)
+```
+
+`FusedMoEQuantConfig.make()` 在 `config.py:343-361` 允许 `quant_dtype` 为 `"bfloat16"`（注释标注为 "for wNa16 scenarios"），但 `config.py:363-378` 中 `weight_dtype` 的合法值集合**不包含** `"bfloat16"`：
+
+```python
+# config.py:343-361  — quant_dtype: 允许 "bfloat16", "float16", "float32" ✅
+assert not isinstance(quant_dtype, str) or quant_dtype in {
+    "nvfp4", "mxfp4", ..., "int8",
+    "bfloat16", "float16", "float32",  # Unquantized
+}
+
+# config.py:363-378  — weight_dtype: 只有量化类型，缺少 "bfloat16" 等 ❌
+assert not isinstance(weight_dtype, str) or weight_dtype in {
+    "nvfp4", "mxfp4", ..., "int4", "int8",
+    # 缺少 "bfloat16", "float16", "float32"
+}
+```
+
+当 `weight_dtype = "bfloat16"` 时，此断言失败 → `AssertionError`。
+
+### 修复方案
+
+**在 `simo/extensions/vllm_simo/model_executor/layers/fused_moe/config.py:363` 的 `FusedMoEQuantConfig.make()` 中**，将 `"bfloat16"`, `"float16"`, `"float32"` 加入 `weight_dtype` 的合法值集合：
+
+```python
+assert not isinstance(weight_dtype, str) or weight_dtype in {
+    "nvfp4",
+    "mxfp4",
+    "nvfp4_e2m1",
+    "mxfp4_e2m1",
+    "mxfp6_e3m2",
+    "mxfp6_e2m3",
+    "mxfp8_e4m3",
+    "mxfp8_e5m2",
+    "mxint8",
+    "fp8_e4m3",
+    "fp8_e5m2",
+    "int4",
+    "int8",
++   "bfloat16",   # Unquantized weight types (for kv-cache-only quantization)
++   "float16",
++   "float32",
+}
+```
+
+**为什么这样修复是正确的:**
+
+1. `quant_dtype` 已允许这三种 unquantized 类型（`:358-361`注释为 "for wNa16 scenarios like w4a16_nvfp4"）。`weight_dtype` 的允许集合也应一致
+2. 当 `weight_dtype = "bfloat16"` 且 `quant_dtype = "bfloat16"` 时，生成的 `FusedMoEQuantConfig` 所有 `use_*` 属性均为 `False`，`quant_type` 返回 `None`
+3. `fused_experts_impl` 中所有 scale/quant 相关路径会正确处理 `None` scale（跳过 renormalize 等量化路径），相当于执行普通 bf16 matmul
+
+### 其他方案对比
+
+| 方案 | 描述 | 优缺点 |
+|------|------|--------|
+| A | `config.py:363` 添加 unquantized dtypes | 最简单，与 quant_dtype 的处理一致 |
+| B | `create_moe_runner` 检测并跳过 + `apply` 回退到 sglang 原生 MoE | 改动量大，需处理两个方法 |
+
+**推荐方案 A**，与注释 "for wNa16 scenarios" 的设计意图一致。
+

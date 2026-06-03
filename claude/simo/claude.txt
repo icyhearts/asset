@@ -1760,3 +1760,13 @@ simo 代码位于 /data/like/package/simo_conda_sglang
 ```
 对 # stage 1: compute scores with prefix中的 if BLOCK_DPE > 0 分支进行修改, 使它能够正确处理 mla 模型 rope 部分的 MX format 和  per group 量化格式  kv cache。
 # stage 2: compute the triangle part 需要修改吗？
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+vllm代码位于/data//like/package/vllm-for-conda-simo, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
+simo 代码位于 /data/like/package/simo_conda_sglang
+执行simo//extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.only-kv-cache.sh的命令：
+CUDA_VISIBLE_DEVICES=0 bash simo//extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.only-kv-cache.sh > templ/llm_eval_online_quant.only-kv-cache.sh.log.`nowstr.sh` 2>&1
+日志位于 templ/llm_eval_online_quant.only-kv-cache.sh.log.2026_06_03___11_17_23
+分析日志致命错误的原因.
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
