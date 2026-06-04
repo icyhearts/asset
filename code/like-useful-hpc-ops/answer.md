@@ -866,3 +866,113 @@ Y 同理：output tensor 按 `cu_seqlens` 拼接，各 group 的子区域非均�
 │                   │constant_│              │                      │
 └───────────────────┴─────────│──────────────│─────────────────────┘
 ```
+
+## 12. 编译器探测类型技巧：为什么 `TD<Config::SLayoutXAtom>` 失败及修复
+
+### 12.1 代码意图
+
+`src/group_gemm/group_gemm_pertensor_fp8.cu:15-19` 定义了两个仅声明、无实现的模板类：
+
+```cpp
+template<typename T>
+class TD;         // 接受类型参数的 incomplete class
+template<int I>
+class ITD;        // 接受整数参数的 incomplete class
+```
+
+将它们用作**编译期类型探测器**：
+
+- `TD<Config> td1;` (`line 46`) — 让编译器在报错 "incomplete type is not allowed" 时，在错误信息中打印出 `Config` 的完整模板实例化类型
+- `TD<Config::SLayoutXAtom> config_slayout_atom_1;` (`line 48`) — 期望同样的方式打印出 `SLayoutXAtom` 的类型
+
+### 12.2 `TD<Config>` 为什么成功
+
+`temp/success.log:1-4`：
+
+```
+error: incomplete type "TD<hpc::group_gemm::GroupGEMMFp8Config<
+    cutlass::float_e4m3_t, cutlass::bfloat16_t, 16, 128, 128, 8, 2, 1, 128, 128, 64>>" is not allowed
+```
+
+成功打印出了 `Config` 的类型。原因是：
+
+`src/group_gemm/group_gemm_pertensor_fp8.cu:43-44`：
+
+```cpp
+using Config = GroupGEMMFp8Config<Tin, Tout, kTileM, kTileN, kTileK, kStage,
+                                  kWarpgroupM, kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>;
+```
+
+`Config` 是通过 `using` 声明的**类型别名**。在模板函数体内，`using Config = ...` 明确告诉编译器 "这是一个类型"（`using` 只能用于类型别名）。因此 `TD<Config>` 直接作为类型模板参数传递，无需额外关键字。
+
+### 12.3 `TD<Config::SLayoutXAtom>` 为什么失败
+
+`temp/debug.log:3-5`：
+
+```
+error: use the "typename" keyword to treat nontype
+  "hpc::group_gemm::GroupGEMMFp8Config<...>::SLayoutXAtom [with ...]"
+  as a type in a dependent context
+    TD<Config::SLayoutXAtom> config_slayout_atom_1;
+       ^
+```
+
+**根因：C++ 依赖名称规则 (dependent name rules)**
+
+`launch_group_gemm_fp8` 是一个模板函数（`src/group_gemm/group_gemm_pertensor_fp8.cu:25-27`）。`Config` 定义中使用了函数模板的参数（如 `kTileM`、`kTileN` 等），因此 `Config` 是**依赖名称**（dependent name）。
+
+当编译器在模板定义时看到 `Config::SLayoutXAtom`：
+
+1. 它知道 `Config` 是依赖的（取决于模板参数）
+2. 但它**不知道 `SLayoutXAtom` 是类型还是值** — 它可能是 `using SLayoutXAtom = ...`（类型别名），也可能是 `static constexpr int SLayoutXAtom = 42`（值）
+3. C++ 标准规定：**依赖名称默认被假定为值（non-type）**，除非用 `typename` 关键字显式标记为类型
+4. 因此 `TD<Config::SLayoutXAtom>` 被解析为 `TD<value>`，而 `TD` 的定义是 `template<typename T> class TD;` 只接受类型参数 → 编译失败
+
+`Config::SLayoutXAtom` 在 `src/group_gemm/config.h:77` 的确是一个类型别名：
+
+```cpp
+using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
+```
+
+但编译器在模板定义阶段无法确定这一点（它不进行模板定义处的完整实例化查找），所以必须由程序员通过 `typename` 告知。
+
+### 12.4 修复方法
+
+将 `TD<Config::SLayoutXAtom>` 改为：
+
+```cpp
+TD<typename Config::SLayoutXAtom> config_slayout_atom_1;
+```
+
+`typename` 关键字告诉编译器：在依赖上下文 `Config::` 中，`SLayoutXAtom` **是一个类型**。
+
+### 12.5 通用模板：如何探测依赖上下文中的嵌套类型
+
+对于模板函数/类内部的依赖嵌套类型，一律需要 `typename`：
+
+| 写法 | 是否合法 | 说明 |
+|------|:---:|------|
+| `TD<Config>` | 合法 | `Config` 由 `using` 声明，已知是类型 |
+| `TD<Config::SLayoutXAtom>` | 非法 | 依赖名称，编译器默认不假定为类型 |
+| `TD<typename Config::SLayoutXAtom>` | 合法 | `typename` 显式指明是类型 |
+| `TD<typename Config::SLayoutX>` | 合法 | 同理，嵌套依赖类型 |
+| `TD<typename Config::TiledMma>` | 合法 | 同理 |
+
+### 12.6 完整修复代码
+
+在 `src/group_gemm/group_gemm_pertensor_fp8.cu:48`，修改为：
+
+```cpp
+  TD<Config> td1;                                          // OK: Config 是 using 别名
+  TD<typename Config::SLayoutXAtom> config_slayout_atom_1; // 修复: 加上 typename
+  TD<typename Config::SLayoutWAtom> config_slayout_atom_2; // 类似地
+  TD<typename Config::SLayoutYAtom> config_slayout_atom_3;
+  TD<typename Config::SLayoutX> config_slayout_1;
+  // ...
+```
+
+类似地，对于整数模板参数使用的 `ITD`（`src/group_gemm/group_gemm_pertensor_fp8.cu:18`），使用 `Config::kTileM` 这类 `static constexpr int` 时不需要 `typename`，因为它们天然是值：
+
+```cpp
+ITD<Config::kTileM> itd_tile_m;  // OK: kTileM 是 constexpr int，默认就是值
+```

@@ -39,3 +39,22 @@ src/group_gemm/entry.cc 里面有一行代码 tmas = torch::empty({num_group * 2
 
 为什么 只有激活x和输出y，需要  cute::TmaDescriptor, 权重 weight，不需要 cute::TmaDescriptor？
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
+
+src/group_gemm/group_gemm_pertensor_fp8.cu, 如下代码:
+故意定义一个没有实现的class TD,
+希望通过编译器报错，让编译器告诉我 TD 的模板参数是什么。
+比如，被注释的:
+TD<Config> td1;
+日志在temp/success.log，可以告诉我 Config的类型是什么.
+但是，后面的代码:
+
+```
+  TD<Config::SLayoutXAtom> config_slayout_atom_1;
+```
+希望通过编译器报错，让编译器告诉我 Config::SLayoutXAtom 是什么类型，
+
+编译命令在
+temp//debug.sh  
+编译日志在temp//debug.log
+日志中并没有达到 获取Config::SLayoutXAtom 类型的效果，分析原因,应该如何修改，让编译器报错告诉我 Config::SLayoutXAtom 的类型
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
