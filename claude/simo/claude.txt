@@ -1842,3 +1842,11 @@ CUDA_VISIBLE_DEVICES=6 bash simo//extensions/sglang_simo/example/online_quantiza
 日志位于templ/llm_eval_online_quant.only-kv-cache.sh.log.2026_06_03___18_21_40
 分析日志报错原因
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+我对问题进行了简化，做了一个可以最小复现的demo.
+like-useful/load_simo_sglang_extend_attention_fwd.py.
+运行的日志位于  templ/load_simo_sglang_extend_attention_fwd.py.log.2026_06_04___18_14_37
+
+一个重要的发现是  kv_indptr 的内容全部是0, 
+
+like-useful/load_simo_sglang_extend_attention_fwd.py里面 kv_indptr=data_dict["kv_indptr"]
