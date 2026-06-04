@@ -58,3 +58,10 @@ temp//debug.sh
 编译日志在temp//debug.log
 日志中并没有达到 获取Config::SLayoutXAtom 类型的效果，分析原因,应该如何修改，让编译器报错告诉我 Config::SLayoutXAtom 的类型
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
+
+经过修复,日志位于 temp/debug.log.2, 仅考虑  kTileM=64 情况，
+打印出来的  TD<typename Config::SLayoutXAtom> 是 ：
+TD<cute::ComposedLayout<std::conditional_t<true, cute::Swizzle<3, 4, 3>, const cute::Swizzle<3, 4, 3> &>, cute::smem_ptr_flag_bits<8>, cute::Layout<cute::tuple<cute::C<8>, cute::C<128>>, cute::tuple<cute::C<128>, cute::C<1>>>>>
+这个类型是如何推导出来的?
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面

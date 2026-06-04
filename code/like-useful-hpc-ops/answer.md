@@ -976,3 +976,203 @@ TD<typename Config::SLayoutXAtom> config_slayout_atom_1;
 ```cpp
 ITD<Config::kTileM> itd_tile_m;  // OK: kTileM 是 constexpr int，默认就是值
 ```
+
+## 13. SLayoutXAtom 类型推导链
+
+### 13.1 编译器报错输出
+
+`temp/debug.log.2:18-20`，kTileM=64 实例化时：
+
+```
+TD<cute::ComposedLayout<
+    std::conditional_t<true, cute::Swizzle<3, 4, 3>, const cute::Swizzle<3, 4, 3> &>,
+    cute::smem_ptr_flag_bits<8>,
+    cute::Layout<
+        cute::tuple<cute::C<8>, cute::C<128>>,
+        cute::tuple<cute::C<128>, cute::C<1>>
+    >
+>>
+```
+
+去掉 `std::conditional_t` 存储细节和 `C`（=`Int`）别名后，逻辑类型为：
+
+```
+ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag_bits<8>, Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>>
+```
+
+### 13.2 推导步骤总览
+
+整个推导链经过 5 个关键步骤：
+
+```
+SLayoutXAtom
+  └── decltype(slayout_selector<128, float_e4m3_t>())
+        └── decltype(Layout_K_SW128_Atom<float_e4m3_t>{})
+              └── decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))
+                    ├── Swizzle: 不变（特殊化重载）
+                    ├── smem_ptr_flag_bits: ×8
+                    └── Layout shape/stride: upcast 重缩放
+```
+
+### 13.3 完整推导（逐步骤）
+
+**步骤 1 — `slayout_selector` 选择 Swizzle 原子**
+
+`src/group_gemm/config.h:77`:
+
+```cpp
+using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
+```
+
+已知 `kSwizzleX = 128`，`Tin = cute::float_e4m3_t`（`src/group_gemm/group_gemm_pertensor_fp8.cu:33`）。
+
+`src/group_gemm/config.h:13-17`:
+
+```cpp
+template <int kSwizzle, typename T, bool kKmajor = true>
+static constexpr auto slayout_selector() {
+  if constexpr (kSwizzle == 128) {
+    if constexpr (kKmajor) {
+      return cute::GMMA::Layout_K_SW128_Atom<T>{};   // ← 命中此分支
+    }
+  }
+}
+```
+
+返回值类型：`GMMA::Layout_K_SW128_Atom<float_e4m3_t>`。
+
+**步骤 2 — `Layout_K_SW128_Atom<T>` 定义**
+
+`3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:103-104`:
+
+```cpp
+template <class Type>
+using Layout_K_SW128_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits{}));
+```
+
+其中 `Layout_K_SW128_Atom_Bits` 同文件 line 84：
+
+```cpp
+using Layout_K_SW128_Atom_Bits = ComposedLayout<
+    Swizzle<3,4,3>,                        // 3-bit XOR swizzle, 4 LS bits unchanged
+    smem_ptr_flag,                         // = smem_ptr_flag_bits<1>: 未设置的指针占位符
+    Layout<Shape<_8, _1024>,               // 8 rows × 1024 columns (in BITS)
+           Stride<_1024, _1>>
+>;
+```
+
+`sizeof_bits<float_e4m3_t>` = 8。所以 `Layout_K_SW128_Atom<float_e4m3_t>` = `decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))`。
+
+**步骤 3 — `upcast` 的哪个重载被调用**
+
+存在两个针对 `ComposedLayout` 的 `upcast` 重载：
+
+重载 A（通用版），`3rd/cutlass/include/cute/layout_composed.hpp:588-591`，对所有三个组件都执行 upcast：
+
+```cpp
+template <int N, class A, class O, class B>
+CUTE_HOST_DEVICE constexpr auto
+upcast(ComposedLayout<A,O,B> const& layout) {
+  return composition(upcast<N>(layout.layout_a()), upcast<N>(layout.offset()), upcast<N>(layout.layout_b()));
+}
+```
+
+重载 B（特殊化版），`3rd/cutlass/include/cute/pointer_flagged.hpp:70-76`，仅对后两个组件执行 upcast：
+
+```cpp
+template <int N, class SwizzleFn, int B, class Layout>
+CUTE_HOST_DEVICE constexpr auto
+upcast(ComposedLayout<SwizzleFn, smem_ptr_flag_bits<B>, Layout> const& layout) {
+  return composition(layout.layout_a(),           // Swizzle 原封不动
+                     smem_ptr_flag_bits<B*N>{},   // flag bits 乘以 N
+                     upcast<N>(layout.layout_b())); // Layout shape/stride 缩放
+}
+```
+
+**重载 B 更特化，优先匹配。** 关键差异：重载 B 的 Swizzle **不经过 upcast**，直接传递（`layout.layout_a()`）。
+
+验证：若重载 A 被调用，`upcast<8>(Swizzle<3,4,3>)` 按 `3rd/cutlass/include/cute/swizzle_layout.hpp:414-423` 的逻辑：
+
+```cpp
+constexpr int log2_n = bit_width(8) - 1;     // = 3
+constexpr int NewM   = 4 - 3;                // = 1
+return Swizzle<3, 1, 3>{};                   // 非 Swizzle<3,4,3>
+```
+
+结果会是 `Swizzle<3,1,3>`。但编译器报错显示 `Swizzle<3,4,3>`，证实了**重载 B 被调用**，Swizzle 未被变换。
+
+**步骤 4 — `smem_ptr_flag_bits` 缩放**
+
+重载 B 中：`smem_ptr_flag_bits<1*8>` = `smem_ptr_flag_bits<8>`。
+
+`sme_ptr_flag_bits` 本身定义于 `3rd/cutlass/include/cute/pointer_flagged.hpp:50-51`：
+
+```cpp
+template <int Bits>
+struct smem_ptr_flag_bits : Int<0> {};
+```
+
+它是一个继承 `Int<0>` 的标记类型，不参与数学运算，纯占位：表示“此处等待一个 `<Bits>`-bit 粒度的共享内存指针”。8 对应 `float_e4m3_t` 的 bit 宽度。
+
+**步骤 5 — `upcast<8>(Layout<Shape, Stride>)` 重缩放**
+
+对 `Layout<Shape<_8, _1024>, Stride<_1024, _1>>` 的每一对 (shape, stride)：
+
+来自 `3rd/cutlass/include/cute/layout.hpp:1806-1824` 的 `upcast(N, shape, stride)` 公式：
+
+```cpp
+make_layout(
+    ceil_div(shape, ceil_div(Int<N>{}, abs(stride))),        // 新 shape
+    signum(stride) * ceil_div(abs(stride), Int<N>{})          // 新 stride
+);
+```
+
+| 原 (shape, stride) | 计算过程 | 新 (shape, stride) |
+|---|---|---|
+| `(_8, _1024)` | `ceil_div(8,1024)=1` → shape=`ceil_div(8,1)=8`; stride=`ceil_div(1024,8)=128` | `(_8, _128)` |
+| `(_1024, _1)` | `ceil_div(8,1)=8` → shape=`ceil_div(1024,8)=128`; stride=`ceil_div(1,8)=1` | `(_128, _1)` |
+
+注意 `_8`、`_128` 等是 `Int<N>` 的别名（`3rd/cutlass/include/cute/numeric/integral_constant.hpp`），编译器将它们打印为 `C<8>`、`C<128>`（`C` = `Int` 的较短别名）。`Shape` 和 `Stride` 都是 `tuple` 的别名，编译器将其展开为 `tuple<C<8>, C<128>>`。
+
+最终结果：
+
+```
+upcast<8>(Layout<Shape<_8,_1024>, Stride<_1024,_1>>)
+    = Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>
+```
+
+**步骤 6 — `composition` 组装**
+
+`3rd/cutlass/include/cute/pointer_flagged.hpp:75`:
+
+```cpp
+return composition(layout.layout_a(), smem_ptr_flag_bits<B*N>{}, upcast<N>(layout.layout_b()));
+```
+
+`composition(A, O, B)` → `ComposedLayout<A, O, B>`。
+
+### 13.4 最终结果
+
+```
+Config::SLayoutXAtom  (kSwizzleX=128, Tin=float_e4m3_t)
+  = ComposedLayout<
+      Swizzle<3,4,3>,                    // 3-bit XOR swizzle, MBase=4
+      smem_ptr_flag_bits<8>,             // 等待 8-bit 粒度指针
+      Layout<Shape<Int<8>, Int<128>>,    // 8 rows × 128 cols 在 elem 单位
+             Stride<Int<128>, Int<1>>>   // row-stride 128, col-stride 1
+    >
+```
+
+### 13.5 物理含义
+
+`SLayoutXAtom` 是 SM90 GMMA shared memory 中 **128-byte swizzle K-major** 布局的原子描述。具体地：
+
+- **`Swizzle<3,4,3>`**：3-bit XOR swizzle，保留 4 个 LS bits。对应 SM90 硬件要求的 128-byte swizzle pattern。将 shared memory 地址 bit[6:4] 与 bit[9:7] 做 XOR，分散 bank conflict。
+
+- **`smem_ptr_flag_bits<8>`**：占位符，等待一个 `float_e4m3_t*` (8-bit 粒度) 的 shared memory 指针。类型系统用它来追踪“这个布局应用了 swizzle，需要一个实际指针来解析地址”。
+
+- **`Layout<Shape<8,128>, Stride<128,1>>`**：在 `float_e4m3_t` 元素单位下的 shared memory tile 形状为 8 行 × 128 列，row-major 连续存储（row-stride=128, col-stride=1）。对应 8×128 个 `float_e4m3_t` = 1024 bytes = 1KB tile。这正是 `kTileK=128` 列的 X 数据在共享内存中的物理排布。
+
+### 13.6 `std::conditional_t` 的来源
+
+编译器输出中的 `std::conditional_t<true, Swizzle<3,4,3>, const Swizzle<3,4,3>&>` 不是类型推导的结果，而是 `ComposedLayout` 基类 `cute::tuple` 的 EBO (Empty Base Optimization) 存储细节。当 Swizzle 是空类型时，`tuple` 通过 `conditional_t` 选择值存储或引用存储。最终逻辑类型就是 `Swizzle<3,4,3>`，此包装不影响类型的语义。
