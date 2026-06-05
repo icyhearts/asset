@@ -43,4 +43,5 @@ using Layout_K_SW128_Atom_Bits = ComposedLayout<
 >;
 ```
 
-`sizeof_bits<float_e4m3_t>` = 8。所以 `Layout_K_SW128_Atom<float_e4m3_t>` = `decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))`。
+`sizeof_bits<float_e4m3_t>` = 8。所以
+`Layout_K_SW128_Atom<float_e4m3_t>` = `decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))`。
