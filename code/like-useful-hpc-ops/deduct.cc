@@ -21,7 +21,7 @@ struct GroupGEMMFp8Config {
       }
     }
 }
-现在:
+//step2:
 using SLayoutXAtom = cute::GMMA::Layout_K_SW128_Atom<float_e4m3_t>
 
 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:103-104`:
@@ -30,3 +30,17 @@ using SLayoutXAtom = cute::GMMA::Layout_K_SW128_Atom<float_e4m3_t>
 #using Layout_K_SW128_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits{}));
 template <class Type>
 using Layout_K_SW128_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits{}));
+
+
+其中 `Layout_K_SW128_Atom_Bits` 同文件 line 84：
+
+```cpp
+using Layout_K_SW128_Atom_Bits = ComposedLayout<
+    Swizzle<3,4,3>,                        // 3-bit XOR swizzle, 4 LS bits unchanged
+    smem_ptr_flag,                         // = smem_ptr_flag_bits<1>: 未设置的指针占位符
+    Layout<Shape<_8, _1024>,               // 8 rows × 1024 columns (in BITS)
+           Stride<_1024, _1>>
+>;
+```
+
+`sizeof_bits<float_e4m3_t>` = 8。所以 `Layout_K_SW128_Atom<float_e4m3_t>` = `decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))`。
