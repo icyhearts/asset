@@ -1844,9 +1844,17 @@ CUDA_VISIBLE_DEVICES=6 bash simo//extensions/sglang_simo/example/online_quantiza
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
 
 我对问题进行了简化，做了一个可以最小复现的demo.
-like-useful/load_simo_sglang_extend_attention_fwd.py.
+demo safetensors 数据来源是：用pudb  simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py extend_attention_fwd里面打断点，python 解释器执行 exec(open("like-useful/save_extend.py").read()), 把 extend_attention_fwd 的参数保存下来。
+
+
+like-useful/load_simo_sglang_extend_attention_fwd.py 加载保存的数据
 运行的日志位于  templ/load_simo_sglang_extend_attention_fwd.py.log.2026_06_04___18_14_37
 
 一个重要的发现是  kv_indptr 的内容全部是0, 
 
-like-useful/load_simo_sglang_extend_attention_fwd.py里面 kv_indptr=data_dict["kv_indptr"]
+like-useful/load_simo_sglang_extend_attention_fwd.py里面 kv_indptr=data_dict["kv_indptr"], tensor的值全部是0
+意味着  simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 的 _fwd_kernel 里面, cur_seq_len_prefix = 0
+for start_n in range(0, cur_seq_len_prefix, BLOCK_N)这个循环根本不会进去，
+for循环进不去，循环内部的 tl.dot_scaled 根本不会执行. 为什么还会在 tl.dot_scaled 这里报 rhs_scale must be a tensor of shape [64, 4]. Got ['64', '16'] 的错误？
+这是否意味着， triton 编译器的  tl.dot_scaled 对根本不会执行到的 tl.dot_scaled , 仍旧会检查输入数据的形状？
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面

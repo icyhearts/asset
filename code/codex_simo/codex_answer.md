@@ -6940,3 +6940,106 @@ SIMO kv-cache-only 量化流程中：
 - 缺点：kernel 需要额外权重参数和 GEMM 操作，复杂度高
 
 **推荐方案 A** 作为最快的修复，确保 kv-cache-only 量化在 MLA extend 阶段至少可以正常运行。
+
+---
+
+## 5. Triton JIT 编译时验证：为什么未执行的 `tl.dot_scaled` 仍报 shape 错误
+
+### 问题复现
+
+用户通过最小化 demo 发现：
+
+1. `kv_indptr` 全为 0
+2. 来源：`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:186-187`
+
+```python
+cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+```
+
+当 `kv_indptr` 全为 0 时，`cur_seq_len_prefix = 0`。
+
+3. 因此 `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:244` 的 for 循环：
+
+```python
+for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+```
+
+range(0, 0, BLOCK_N) → **零迭代**，循环体永不到达。
+
+4. **但 Triton 仍然在 `tl.dot_scaled` 处报 shape 错误**（`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:369`）：
+
+```python
+qk = tl.dot_scaled(q, None, "bf16", k, k_scale, "e4m3", fast_math=True)
+```
+
+→ `triton.compiler.errors.CompilationError: rhs_scale must be a tensor of shape [64, 4]. Got ['64', '16']`
+
+### 错误发生的阶段：编译时 vs 运行时
+
+从 `templ/load_simo_sglang_extend_attention_fwd.py.log.2026_06_04___18_14_37` 的完整调用栈可以确认：
+
+```
+_triton/runtime/jit.py:720_ run
+  → _triton/runtime/jit.py:849_ _do_compile           ← 编译入口
+    → _triton/compiler/compiler.py:304_ compile
+      → _triton/compiler/compiler.py:80_ make_ir
+        → ast_to_ttir(...)                              ← AST 到 Triton IR 转换
+          → CompilationError                           ← 在此阶段报错
+```
+
+关键点：错误发生在 **`_do_compile` → `make_ir` → `ast_to_ttir`** 链路上，而不是在 kernel 实际执行时。
+
+### 原因：Triton 的 JIT 编译模型
+
+**Triton 是 JIT（Just-In-Time）编译器**，在 kernel 首次调用时编译：
+
+1. **编译时机**：`triton/runtime/jit.py:720` 的 `run()` 方法在每次 kernel 调用时检查是否有已缓存的编译。首次调用时，进入 `_do_compile()`（`triton/runtime/jit.py:849`）
+
+2. **IR 构建**：`triton/compiler/compiler.py:80` 的 `make_ir()` 调用 `ast_to_ttir()`，遍历整个 kernel 的 Python AST（抽象语法树）
+
+3. **静态验证**：`triton/language/semantic.py:1658` 的 `dot_scaled()` 在 IR 构建时调用 `verify_scaled_shape()`（`triton/language/semantic.py:1607`）进行形状检查
+
+4. **运行时变量的宿命**：`cur_seq_len_prefix` 是一个运行时变量——它的值在编译时是未知的。编译器**无法优化掉**循环体，因为编译器不知道 `range(0, runtime_value, BLOCK_N)` 会产生多少次迭代
+
+5. **所有 tl 操作都需要经过语义验证**：`tl.load`、`tl.dot_scaled` 等操作在 `ast_to_ttir` 阶段被映射到 Triton IR 时，会进行语义层面的验证。`tl.dot_scaled` 的 `verify_scaled_shape` 方法会**在编译时**检查 tensor 形状约束
+
+### 与 Python 运行时的关键区别
+
+| 方面 | Python 解释器 | Triton JIT 编译器 |
+|------|-------------|-------------------|
+| 编译方式 | 逐条解释执行 | 先编译整个 kernel，再运行 |
+| 循环体内代码 | 运行时按需执行 | 编译时遍历所有 AST 节点 |
+| `range(0, 0, N)` | 不执行循环体 | 无法静态推断（runtime 变量）→ 仍需编译循环体 |
+| `tl.dot_scaled` 形状检查 | N/A | 在 `ast_to_ttir` 阶段执行 |
+
+### 具体验证路径
+
+`triton/language/semantic.py:1607` 的 `verify_scaled_shape`：
+
+```python
+def verify_scaled_shape(self, M, N, K, lhs_scale, rhs_scale, lhs_format, rhs_format):
+    ...
+    if rhs_format in ("e4m3", "e5m2"):  # MXFP8 formats
+        rhs_scale_shape = [rhs_scale.type.shape[0], rhs_scale.type.shape[1]]
+        assert rhs_scale_shape == [N, K // 32], ...  # ← 编译时断言
+```
+
+在编译时：
+- `N` = `BLOCK_N = 64`（来自 kernel 的 `tl.constexpr` 参数）
+- `K` = `BLOCK_DMODEL = 128`（来自 kernel 的 `tl.constexpr` 参数）
+- 期望 `rhs_scale_shape = [64, 128//32] = [64, 4]`
+- 实际 `rhs_scale` 由 `tl.load` 产生，其 shape 从加载模式和 tensor 维度推导：`[BLOCK_N, BLOCK_DMODEL_SCALE] = [64, 32]`（mask 后有效部分为 `[64, 16]`）
+- **断言失败**：`[64, 16] != [64, 4]`
+
+这发生在 `ast_to_ttir` 阶段——比任何 PTX 代码生成、GPU 执行都要早。
+
+### 结论
+
+**是的，Triton 编译器对 `tl.dot_scaled` 的形状检查发生在编译时（`ast_to_ttir` / IR 构建阶段），对所有语法可达的调用都会进行检查，不管运行时循环体是否实际执行。**
+
+这是因为：
+1. Triton 在 kernel 首次调用时一次性编译整个 kernel 为 GPU 代码
+2. 编译过程会遍历整个 kernel AST 并转换为 TTIR（Triton IR）
+3. `tl.dot_scaled` 的形状验证是编译时语义分析的一部分，不依赖于运行时控制流
+4. 循环迭代次数 `cur_seq_len_prefix` 是运行时变量（从 `kv_indptr` 加载），编译器无法静态推断为 0，因此无法消除循环体
