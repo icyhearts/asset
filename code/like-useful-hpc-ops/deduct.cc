@@ -47,6 +47,7 @@ using Layout_K_SW128_Atom_Bits = ComposedLayout<
 `sizeof_bits<float_e4m3_t>` = 8。所以
 `Layout_K_SW128_Atom<float_e4m3_t>` = `decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))`。
 answer:  decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))
+answer: decltype(composition(layout.layout_a()), smem_ptr_flag_bits<B*N>{}, Layout<Shape<_8, _128>, Stride<_128, _1>>) // 3rd/cutlass/include/cute/pointer_flagged.hpp, 72
 
 upcast<8>(Int<8>, Int<1024>)
 
