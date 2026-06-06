@@ -1176,3 +1176,155 @@ Config::SLayoutXAtom  (kSwizzleX=128, Tin=float_e4m3_t)
 ### 13.6 `std::conditional_t` 的来源
 
 编译器输出中的 `std::conditional_t<true, Swizzle<3,4,3>, const Swizzle<3,4,3>&>` 不是类型推导的结果，而是 `ComposedLayout` 基类 `cute::tuple` 的 EBO (Empty Base Optimization) 存储细节。当 Swizzle 是空类型时，`tuple` 通过 `conditional_t` 选择值存储或引用存储。最终逻辑类型就是 `Swizzle<3,4,3>`，此包装不影响类型的语义。
+
+### 13.7 `upcast` 的分支选择过程
+
+`3rd/cutlass/include/cute/layout.hpp:1806-1825`：
+
+```cpp
+template <int N, class Shape, class Stride>
+CUTE_HOST_DEVICE constexpr auto
+upcast(Shape const& shape, Stride const& stride)
+{
+  if constexpr (is_tuple<Shape>::value) {                  // Branch 1: tuple stride
+    return transform_layout(shape, stride, [](auto const& s, auto const& d) { return upcast<N>(s,d); });
+  } else if constexpr (is_constant<0, Stride>::value) {    // Branch 2: static-0 stride
+    return Layout<Shape,Stride>{shape,stride};
+  } else if constexpr (is_static<Stride>::value) {         // Branch 3: static stride
+    static_assert(Stride::value % N == 0 or N % Stride::value == 0, "Divisibility condition");
+    return make_layout(ceil_div(shape,  ceil_div(Int<N>{}, abs(stride))),
+                       signum(stride) * ceil_div(abs(stride), Int<N>{}));
+  } else {                                                 // Branch 4: dynamic stride
+    return make_layout(shape, safe_div(stride, Int<N>{}));
+  }
+}
+```
+
+入口通过 `upcast<N>(Layout<Shape,Stride>)` (`3rd/cutlass/include/cute/layout.hpp:1828-1833`)，它将 Layout 拆为 shape 和 stride 后调用上述 `upcast(shape, stride)`：
+
+```cpp
+template <int N, class Shape, class Stride>
+auto upcast(Layout<Shape,Stride> const& layout) {
+  return upcast<N>(layout.shape(), layout.stride());
+}
+```
+
+#### 第一层调用：Branch 1 (is_tuple) — 拆分元组
+
+入口参数：`Shape<Int<8>, Int<1024>>` 和 `Stride<Int<1024>, Int<1>>`。
+
+**Branch 1** 检查：`is_tuple<Shape<Int<8>, Int<1024>>>::value`
+
+`Shape` 是 `cute::tuple<Int<8>, Int<1024>>` 的类型别名。`is_tuple<T>` (`3rd/cutlass/include/cute/container/tuple.hpp:274`) 对 tuple 类型返回 `true`。
+
+→ **Branch 1 被选中。** 它调用 `transform_layout`：
+
+`transform_layout` (`3rd/cutlass/include/cute/layout.hpp:738-743`) 将 shape 和 stride 的 tuple 逐对取出，对每一对 `(s, d)` 调用 lambda `upcast<8>(s, d)`：
+
+```cpp
+return make_layout(upcast<8>(Int<8>{}, Int<1024>{}),   // 第 0 维
+                   upcast<8>(Int<1024>{}, Int<1>{}));  // 第 1 维
+```
+
+于是进入**两层递归**。
+
+#### 第二层调用：Pair 0 — `upcast<8>(Int<8>, Int<1024>)`
+
+- **Branch 1**：`is_tuple<Int<8>>` — `Int<8>` 不是 tuple → **跳过**
+- **Branch 2**：`is_constant<0, Int<1024>>` — `is_constant<0, Int<1024>>` 检查 `1024 == 0`（`integral_constant.hpp:108`）→ **false，跳过**
+- **Branch 3**：`is_static<Int<1024>>` — `is_static<T>` (`integral_constant.hpp:92`) 检查 `is_empty<T>::value`。`Int<1024>` 是 stateless 类型 → **true，选中**
+
+进入 `ceil_div` 计算：
+
+```
+static_assert(1024 % 8 == 0 or 8 % 1024 == 0);  // OK: 1024 % 8 == 0
+
+new_shape  = ceil_div(Int<8>{},  ceil_div(Int<8>{}, abs(Int<1024>{})))
+           = ceil_div(Int<8>{},  ceil_div(8, 1024))       // ceil_div(8,1024) = 1
+           = ceil_div(Int<8>{},  Int<1>{})
+           = ceil_div(8, 1)                                // = 8
+           = Int<8>{}
+
+new_stride = signum(1024) * ceil_div(abs(Int<1024>{}), Int<8>{})
+           = 1 * ceil_div(1024, 8)
+           = 128
+           = Int<128>{}
+```
+
+结果：`make_layout(Int<8>, Int<128>)` → `Layout<Int<8>, Int<128>>`。
+
+#### 第二层调用：Pair 1 — `upcast<8>(Int<1024>, Int<1>)`
+
+- **Branch 1**：`is_tuple<Int<1024>>` → **跳过**
+- **Branch 2**：`is_constant<0, Int<1>>` — `1 == 0` → **false，跳过**
+- **Branch 3**：`is_static<Int<1>>` → **true，选中**
+
+```
+static_assert(1 % 8 == 0 or 8 % 1 == 0);  // OK: 8 % 1 == 0
+
+new_shape  = ceil_div(Int<1024>{}, ceil_div(Int<8>{}, abs(Int<1>{})))
+           = ceil_div(Int<1024>{}, ceil_div(8, 1))      // ceil_div(8,1) = 8
+           = ceil_div(Int<1024>{}, Int<8>{})
+           = ceil_div(1024, 8)                            // = 128
+           = Int<128>{}
+
+new_stride = signum(1) * ceil_div(abs(Int<1>{}), Int<8>{})
+           = 1 * ceil_div(1, 8)                           // ceil_div(1,8) = 1
+           = Int<1>{}
+```
+
+结果：`make_layout(Int<128>, Int<1>)` → `Layout<Int<128>, Int<1>>`。
+
+#### 合并回去
+
+`transform_layout` 将两个结果合并回 tuple：
+
+```cpp
+make_layout(upcast<8>(Int<8>{}, Int<1024>{}),   // → Layout<Int<8>, Int<128>>
+            upcast<8>(Int<1024>{}, Int<1>{}))   // → Layout<Int<128>, Int<1>>
+```
+
+等价于：
+
+```
+Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>
+```
+
+#### 分支选择决策树
+
+```
+upcast<8>(Layout<Shape<Int<8>, Int<1024>>, Stride<Int<1024>, Int<1>>>)
+  │
+  │  upcast<8>(layout.shape(), layout.stride())
+  │
+  ├─► Branch 1: is_tuple<Shape<Int<8>,Int<1024>>> = true  ← 唯一命中
+  │     │
+  │     │  transform_layout: 逐对调用 upcast<8>
+  │     │
+  │     ├─► upcast<8>(Int<8>, Int<1024>)
+  │     │     │
+  │     │     ├─► Branch 1: is_tuple<Int<8>> = false  ← 跳过
+  │     │     ├─► Branch 2: is_constant<0, Int<1024>> = false (1024≠0)  ← 跳过
+  │     │     └─► Branch 3: is_static<Int<1024>> = true  ← 选中
+  │     │           结果: (shape=Int<8>, stride=Int<128>)
+  │     │
+  │     └─► upcast<8>(Int<1024>, Int<1>)
+  │           │
+  │           ├─► Branch 1: is_tuple<Int<1024>> = false  ← 跳过
+  │           ├─► Branch 2: is_constant<0, Int<1>> = false (1≠0)  ← 跳过
+  │           └─► Branch 3: is_static<Int<1>> = true  ← 选中
+  │                 结果: (shape=Int<128>, stride=Int<1>)
+  │
+  └─► 最终: Layout<Shape<Int<8>,Int<128>>, Stride<Int<128>,Int<1>>>
+```
+
+#### 四个分支各自的触发条件
+
+| 分支 | 条件 | 何时触发 | 本例是否触发 |
+|------|------|----------|:--:|
+| Branch 1 | `is_tuple<Shape>` | Shape 是多维 tuple → 递归拆分 | ✓ (第一层) |
+| Branch 2 | `is_constant<0, Stride>` | stride 是编译期常量 0（broadcast 维度） | ✗ |
+| Branch 3 | `is_static<Stride>` | stride 是编译期整型常量，非 0 | ✓ (第二层×2) |
+| Branch 4 | 以上都不满足 | stride 是运行时值 | ✗ |
+
+`Int<N>` 同时满足 "is_static"（空类型，无运行时成员）又不是 "is_constant<0>"（除非 N=0），因此**所有的 `Int<1024>` / `Int<1>` stride 都会落入 Branch 3** 的 `ceil_div` 逻辑。Branch 4 只在 stride 是运行时变量（如 `int` 类型）时才会命中，本例不涉及。
