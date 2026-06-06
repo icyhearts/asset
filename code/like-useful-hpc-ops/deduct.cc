@@ -31,6 +31,7 @@ using SLayoutXAtom = cute::GMMA::Layout_K_SW128_Atom<float_e4m3_t>
 template <class Type>
 using Layout_K_SW128_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits{}));
 
+answer: decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits{}))
 
 其中 `Layout_K_SW128_Atom_Bits` 同文件 line 84：
 
@@ -45,6 +46,7 @@ using Layout_K_SW128_Atom_Bits = ComposedLayout<
 
 `sizeof_bits<float_e4m3_t>` = 8。所以
 `Layout_K_SW128_Atom<float_e4m3_t>` = `decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))`。
+answer:  decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))
 
 upcast<8>(Int<8>, Int<1024>)
 
