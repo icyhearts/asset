@@ -8,7 +8,7 @@ struct GroupGEMMFp8Config {
 
 # using SLayoutXAtom = decltype(slayout_selector<128, float_e4m3_t>());
   using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
-    |{
+    |{ // slayout_selector 定义如下:
       #template <128,          float_e4m3_t, bool kKmajor = true>
       template <int kSwizzle, typename T, bool kKmajor = true>
       static constexpr auto slayout_selector()
