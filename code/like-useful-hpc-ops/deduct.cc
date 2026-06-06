@@ -45,3 +45,34 @@ using Layout_K_SW128_Atom_Bits = ComposedLayout<
 
 `sizeof_bits<float_e4m3_t>` = 8。所以
 `Layout_K_SW128_Atom<float_e4m3_t>` = `decltype(upcast<8>(Layout_K_SW128_Atom_Bits{}))`。
+
+upcast<8>(Int<8>, Int<1024>)
+
+```
+upcast<8>(Layout<Shape<Int<8>, Int<1024>>, Stride<Int<1024>, Int<1>>>)
+  │
+  │  upcast<8>(layout.shape(), layout.stride())
+  │
+  ├─► Branch 1: is_tuple<Shape<Int<8>,Int<1024>>> = true  ← 唯一命中
+  │     │
+  │     │  transform_layout: 逐对调用 upcast<8>
+  │     │
+  │     ├─► upcast<8>(Int<8>, Int<1024>)
+  │     │     │
+  │     │     ├─► Branch 1: is_tuple<Int<8>> = false  ← 跳过
+  │     │     ├─► Branch 2: is_constant<0, Int<1024>> = false (1024≠0)  ← 跳过
+  │     │     └─► Branch 3: is_static<Int<1024>> = true  ← 选中
+  │     │           shape= =ceil_div(8, ceil_div(8, 1024)) =ceil_div(8, 1) =8
+  │     │           stride= signum(1024) * ceil_div(1024,8) =1*128
+  │     │           结果: (shape=Int<8>, stride=Int<128>)
+  │     │
+  │     └─► upcast<8>(Int<1024>, Int<1>)
+  │           │shape=ceil_div(1024,ceil_div(8, 1))=ceil_div(1024,8)=128
+  │           │stride=signum(1) * ceil_div(*1,8)=1*1=1
+  │           ├─► Branch 1: is_tuple<Int<1024>> = false  ← 跳过
+  │           ├─► Branch 2: is_constant<0, Int<1>> = false (1≠0)  ← 跳过
+  │           └─► Branch 3: is_static<Int<1>> = true  ← 选中
+  │                 结果: (shape=Int<128>, stride=Int<1>)
+  │
+  └─► 最终: Layout<Shape<Int<8>,Int<128>>, Stride<Int<128>,Int<1>>>
+```
