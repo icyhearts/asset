@@ -1328,3 +1328,141 @@ upcast<8>(Layout<Shape<Int<8>, Int<1024>>, Stride<Int<1024>, Int<1>>>)
 | Branch 4 | 以上都不满足 | stride 是运行时值 | ✗ |
 
 `Int<N>` 同时满足 "is_static"（空类型，无运行时成员）又不是 "is_constant<0>"（除非 N=0），因此**所有的 `Int<1024>` / `Int<1>` stride 都会落入 Branch 3** 的 `ceil_div` 逻辑。Branch 4 只在 stride 是运行时变量（如 `int` 类型）时才会命中，本例不涉及。
+
+## 14. SLayoutX / SLayoutW 类型化简
+
+### 14.1 类型定义回顾
+
+`src/group_gemm/config.h:77-84`：
+
+```cpp
+using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
+using SLayoutWAtom = decltype(slayout_selector<kSwizzleW, Tin>());
+
+using SLayoutX = decltype(tile_to_shape(SLayoutXAtom{},
+    make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
+using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{},
+    make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+```
+
+`SLayoutXAtom` / `SLayoutWAtom` 均为 `ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag_bits<8>, Layout<Shape<_8,_128>, Stride<_128,_1>>>`（第 13 章已推导）。`tile_to_shape` 将原子布局平铺到指定的 tile 尺寸上。
+
+### 14.2 化简规则
+
+编译器报错中有两类噪声需要去掉：
+
+**规则 1**：`std::conditional_t<true, T, X>` 恒等于 `T`。例如：
+```
+std::conditional_t<true, Swizzle<3,4,3>, const Swizzle<3,4,3>&>  →  Swizzle<3,4,3>
+```
+嵌套亦然：`std::conditional_t<true, std::conditional_t<true, C<0>, C<0>&>, ...>` → `C<0>`。
+
+**规则 2**：`cute::C<N>` 是 `cute::Int<N>`（即 `cute::integral_constant<int, N>`），在 CuTe 中通常记作 `_N`。本次用 `Int<N>` 表示。
+
+### 14.3 SLayoutX (kTileM=64, kTileK=128, kStage=8)
+
+`temp/debug.log.2:33-36`，化简前：
+
+```
+ComposedLayout<
+    std::conditional_t<true, Swizzle<3,4,3>, const Swizzle<3,4,3>&>,
+    std::conditional_t<true, smem_ptr_flag_bits<8>, const smem_ptr_flag_bits<8>&>,
+    Layout<
+        tuple<
+            tuple<C<8>, C<8>>,
+            tuple<C<128>, C<1>>,
+            tuple<C<1>, C<8>>
+        >,
+        tuple<
+            tuple<
+                std::conditional_t<true, C<128>, const _128&>,
+                std::conditional_t<true, C<1024>, const _1024&>
+            >,
+            tuple<C<1>, std::conditional_t<true, C<0>, C<0>&&>>,
+            tuple<
+                std::conditional_t<true,
+                    std::conditional_t<true, C<0>, C<0>&>,
+                    const std::conditional_t<true, C<0>, C<0>&>&>,
+                std::conditional_t<true, C<8192>, const C<8192>&>
+            >
+        >
+    >
+>
+```
+
+**化简后**：
+
+```cpp
+// Config::SLayoutX  (kTileM=64, kTileK=128, kStage=8)
+ComposedLayout<
+    Swizzle<3, 4, 3>,
+    smem_ptr_flag_bits<8>,
+    Layout<
+        // Shape: 3 个 mode，每个是一对 (atom_count, atom_size)
+        tuple<
+            tuple<Int<8>, Int<8>>,     // Mode 0 (Stage): 8 阶段 × 8 子块
+            tuple<Int<128>, Int<1>>,   // Mode 1 (K):     128 列 × 1 元素连续
+            tuple<Int<1>, Int<8>>      // Mode 2 (M):     1 块 × 8 行
+        >,
+        // Stride: 每个 mode 的前进步长
+        tuple<
+            tuple<Int<128>, Int<1024>>,  // Stage stride
+            tuple<Int<1>, Int<0>>,       // K stride
+            tuple<Int<0>, Int<8192>>     // M stride (= kTileN * kTileM = 128*64)
+        >
+    >
+>
+```
+
+### 14.4 SLayoutW (kTileN=128, kTileK=128, kStage=8)
+
+`temp/debug.log.2:38-41`。注意 `SLayoutW` 定义中用的 tile size 是 `(kTileN, kTileK, kStage)` 即 `(128, 128, 8)`，与 `kTileM` 无关，因此对所有 kTileM 取值类型相同。
+
+**化简后**：
+
+```cpp
+// Config::SLayoutW  (kTileN=128, kTileK=128, kStage=8)
+ComposedLayout<
+    Swizzle<3, 4, 3>,
+    smem_ptr_flag_bits<8>,
+    Layout<
+        tuple<
+            tuple<Int<8>, Int<16>>,     // Mode 0 (Stage): 8 阶段 × 16 子块
+            tuple<Int<128>, Int<1>>,    // Mode 1 (K):     128 列 × 1 元素连续
+            tuple<Int<1>, Int<8>>       // Mode 2 (N):     1 块 × 8 行
+        >,
+        tuple<
+            tuple<Int<128>, Int<1024>>,  // Stage stride
+            tuple<Int<1>, Int<0>>,       // K stride
+            tuple<Int<0>, Int<16384>>    // N stride (= kTileK * kTileN = 128*128)
+        >
+    >
+>
+```
+
+### 14.5 SLayoutX 的 kTileM 敏感性
+
+对比 4 个 kTileM 值下的 SLayoutX（`temp/debug.log.2:3/13/23/33`），变化的仅最后一列：
+
+| kTileM | Shape Mode-2 (M) | Stride Mode-2 末值 | 来源 |
+|--------|-------------------|---------------------|------|
+| 16 | `tuple<Int<8>, Int<2>>` | `Int<2048>` | `16 = 8×2`, `2048 = 128×16` |
+| 32 | `tuple<Int<8>, Int<4>>` | `Int<4096>` | `32 = 8×4`, `4096 = 128×32` |
+| 48 | `tuple<Int<8>, Int<6>>` | `Int<6144>` | `48 = 8×6`, `6144 = 128×48` |
+| 64 | `tuple<Int<8>, Int<8>>` | `Int<8192>` | `64 = 8×8`, `8192 = 128×64` |
+
+规律：Mode-2 的 Shape 第二分量 = `kTileM / 8`，Stride 第二分量 = `kTileN * kTileM = 128 * kTileM`。
+
+### 14.6 与 SLayoutXAtom 的区别对比
+
+`SLayoutXAtom` 是**原子布局**（2D），仅描述单个 swizzle tile 在 shared memory 中形态：
+
+```
+Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>
+```
+
+`SLayoutX` 是 `tile_to_shape` 对原子布局**平铺 3 维**的结果（Stage × K × M），其 Shape/Stride 变为 3 元 tuple（每 mode 又拆为 atom_count/atom_size 二元组）。原子的 Swizzle+smem_ptr_flag 部分在平铺后**原封不动地保留在外层** `ComposedLayout` 的前两个参数中。
+
+`SLayoutW` 同理，它与 `SLayoutX` 内核 Layout 差异仅在于：
+- Mode-0 Shape 第二分量：`Int<16>` vs `Int<8>`（因为 `kTileN/kTileK=128/128` 平铺出 16 而非 8 的子块）
+- Mode-2 Stride 第二分量：`Int<16384>` vs `Int<8192>`（= `128*kTileN` vs `128*kTileM`）

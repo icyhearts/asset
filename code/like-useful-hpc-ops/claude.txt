@@ -70,3 +70,17 @@ TD<cute::ComposedLayout<std::conditional_t<true, cute::Swizzle<3, 4, 3>, const c
 **步骤 5 — `upcast<8>(Layout<Shape, Stride>)` 重缩放**
 `3rd/cutlass/include/cute/layout.hpp:1806-1824`, upcast里面有if else分支，分支选择是如何选择的，为什么选了 ceil_div 的那个分支
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
+
+src/group_gemm/group_gemm_pertensor_fp8.cu 有如下代码
+```
+  TD<typename Config::SLayoutX> Config_SLayoutX1; 
+  TD<typename Config::SLayoutW> Config_SLayoutW1;
+```
+故意定义一个没有实现的class TD,
+希望通过编译器报错，让编译器告诉我 TD 的模板参数是什么。
+现在我想知道 Config::SLayoutX Config::SLayoutW 的类型是什么。编译命令如下:
+bash temp//debug.sh  > temp//debug.log.2 2>&1 &
+编译的日志在 temp//debug.log.2
+只考虑  kTileM=64 的情况, 编译器成功打印出了 Config::SLayoutX Config::SLayoutW 的类型，但是有很多 std::conditional_t, 看上去比较繁琐，你现在对 Config::SLayoutX Config::SLayoutW 进行化简。
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
