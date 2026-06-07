@@ -308,3 +308,4 @@ examples/cute/tutorial/tma_tensor.cu运行的 日志位于run.tma_tensor.log
 examples/cute/tutorial/tma_tensor.cu编译报错，日志位于 make.log
 如何解决错误
 要求：要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到 like-useful/answer.md里面
+examples/cute/tutorial/like_layout.cu
