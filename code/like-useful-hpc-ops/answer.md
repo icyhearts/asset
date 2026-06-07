@@ -1465,4 +1465,126 @@ Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>
 
 `SLayoutW` 同理，它与 `SLayoutX` 内核 Layout 差异仅在于：
 - Mode-0 Shape 第二分量：`Int<16>` vs `Int<8>`（因为 `kTileN/kTileK=128/128` 平铺出 16 而非 8 的子块）
+
+---
+
+## 15. SLayoutY 与 CopyBoxY 类型化简
+
+### 15.1 定义回顾
+
+`config.h:79,85-88`：
+
+```cpp
+using SLayoutYAtom = decltype(slayout_selector<kSwizzleY, Tout, false>());
+using SLayoutY     = decltype(tile_to_shape(SLayoutYAtom{},
+                           make_shape(Int<kTileN>{}, Int<kTileM>{})));
+using CopyBoxY     = decltype(tile_to_shape(SLayoutYAtom{},
+                           make_shape(Int<kTileN / kWarpgroupM>{}, Int<kTileM>{})));
+```
+
+关键差异：
+- `slayout_selector<kSwizzleY, Tout, **false**>()`：第三个参数 `false` → **MN-major**（非 K-major），与 X/W 的 `true`（K-major）不同
+- `kSwizzleY=64` → 对应 `Layout_MN_SW64_Atom<bfloat16_t>`，Swizzle 是 `Swizzle<2,4,3>`（64字节），不同于 X/W 的 `Swizzle<3,4,3>`（128字节）
+- `Tout=bfloat16_t` → `smem_ptr_flag_bits<16>`（16 bit），区别于 float_e4m3_t 的 `smem_ptr_flag_bits<8>`
+- Y 不需要多 stage 双缓冲 → SLayoutY/CopyBoxY 是 **2D**（N × M），不像 SLayoutX/SLayoutW 是 3D（Stage × K × M/N）
+
+### 15.2 SLayoutYAtom 类型
+
+```
+ComposedLayout<
+    Swizzle<2, 4, 3>,
+    smem_ptr_flag_bits<16>,
+    Layout<
+        tuple<Int<32>, Int<8>>,    // Shape: 32 × 8
+        tuple<Int<1>, Int<32>>     // Stride: MN-major
+    >
+>
+```
+
+32×8 原子，MN-major 排布（N 方向 32 元素连续，M 方向 stride=32）。
+
+### 15.3 SLayoutY 化简类型
+
+`SLayoutY = tile_to_shape(SLayoutYAtom{}, Shape<Int<128>, Int<kTileM>>)`
+
+平铺后为 2D，Mode-0=N（128列），Mode-1=M（kTileM行）。
+
+**以 kTileM=64 为例**：
+
+```cpp
+// Config::SLayoutY  (kTileN=128, kTileM=64)
+ComposedLayout<
+    Swizzle<2, 4, 3>,
+    smem_ptr_flag_bits<16>,
+    Layout<
+        // Shape: 2 个 mode，每 mode (atom_count, atom_size)
+        tuple<
+            tuple<Int<32>, Int<4>>,     // Mode 0 (N): 4 atoms × 32 elems = 128
+            tuple<Int<8>,  Int<8>>      // Mode 1 (M): 8 atoms × 8 elems  = 64
+        >,
+        // Stride
+        tuple<
+            tuple<Int<1>, Int<256>>,    // Mode 0: atom-inner=1, atom-stride=256
+            tuple<Int<32>, Int<1024>>   // Mode 1: atom-inner=32, atom-stride=1024
+        >
+    >
+>
+```
+
+**kTileM 差异**（仅 Mode-1 Shape 第二分量变化，stride 不变）：
+
+| kTileM | Shape Mode-1 (M)      | Stride Mode-1                     |
+|--------|-----------------------|-----------------------------------|
+| 16     | `tuple<Int<8>, Int<2>>`  | `tuple<Int<32>, Int<1024>>` |
+| 32     | `tuple<Int<8>, Int<4>>`  | `tuple<Int<32>, Int<1024>>` |
+| 48     | `tuple<Int<8>, Int<6>>`  | `tuple<Int<32>, Int<1024>>` |
+| 64     | `tuple<Int<8>, Int<8>>`  | `tuple<Int<32>, Int<1024>>` |
+
+规律：Mode-1 Shape 第二分量 = `kTileM / 8`。
+
+### 15.4 CopyBoxY 化简类型
+
+`CopyBoxY = tile_to_shape(SLayoutYAtom{}, Shape<Int<64>, Int<kTileM>>)`
+
+N 维减半（`kTileN/kWarpgroupM = 128/2 = 64`），因为 tile 被 2 个 warpgroup 沿 M 维切分，每个 warpgroup 负责全部 N 维。
+
+**以 kTileM=64 为例**：
+
+```cpp
+// Config::CopyBoxY  (kTileN/kWarpgroupM=64, kTileM=64)
+ComposedLayout<
+    Swizzle<2, 4, 3>,
+    smem_ptr_flag_bits<16>,
+    Layout<
+        tuple<
+            tuple<Int<32>, Int<2>>,     // Mode 0 (N): 2 atoms × 32 elems = 64
+            tuple<Int<8>,  Int<8>>      // Mode 1 (M): 与 SLayoutY 相同
+        >,
+        tuple<
+            tuple<Int<1>, Int<256>>,    // Mode 0: 内层 stride 与 SLayoutY 相同
+            tuple<Int<32>, Int<512>>    // Mode 1: atom-stride 减半 (512 vs 1024)
+        >
+    >
+>
+```
+
+**kTileM 差异**：
+
+| kTileM | Shape Mode-1 (M)      | Stride Mode-1                     |
+|--------|-----------------------|-----------------------------------|
+| 16     | `tuple<Int<8>, Int<2>>`  | `tuple<Int<32>, Int<512>>`  |
+| 32     | `tuple<Int<8>, Int<4>>`  | `tuple<Int<32>, Int<512>>`  |
+| 48     | `tuple<Int<8>, Int<6>>`  | `tuple<Int<32>, Int<512>>`  |
+| 64     | `tuple<Int<8>, Int<8>>`  | `tuple<Int<32>, Int<512>>`  |
+
+### 15.5 与 SLayoutX/SLayoutW 的关键差异对比
+
+| 属性 | SLayoutX / SLayoutW | SLayoutY / CopyBoxY |
+|------|---------------------|---------------------|
+| Swizzle | `Swizzle<3,4,3>`（128字节） | `Swizzle<2,4,3>`（64字节） |
+| smem_ptr_flag_bits | `8`（float_e4m3_t） | `16`（bfloat16_t） |
+| 维度数 | **3D**（Stage × K × M/N） | **2D**（N × M） |
+| 原子形状 | 8 × 128 | 32 × 8 |
+| 排布方向 | K-major（swizzle selector 第3参数=true） | MN-major（第3参数=false） |
+| 用途 | TMA load（X从global→smem，W从global→smem） | TMA store（Y从smem→global） |
 - Mode-2 Stride 第二分量：`Int<16384>` vs `Int<8192>`（= `128*kTileN` vs `128*kTileM`）

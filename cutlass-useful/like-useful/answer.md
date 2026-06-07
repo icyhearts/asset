@@ -2998,18 +2998,25 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
 
 **子步骤 2a: `thr_layout` 填充到 3D**
 
-传入：`thr_layout = Layout<Shape<_1,_1>>{}`。这是一个 2D 布局，默认 LayoutLeft stride 为 `Stride<_1,_0>`。
+传入：`thr_layout = Layout<Shape<_1,_1>>{}`。这是一个 2D 布局。
+
+默认 LayoutLeft 生成 stride。`compact_col_major(Shape<_1,_1>)` → `detail::compact<LayoutLeft>` 逐 mode 计算（`stride.hpp:291-306`）：
+- Mode 0 (shape=_1)：`is_constant<1, _1>::value` 为 true → stride 优化为 `Int<0>{}`（shape=1 时无需非零 stride）
+- Mode 1 (shape=_1)：同理，stride=`Int<0>{}`
+→ 结果 `Stride<_0,_0>`
+
+（非 1 的 shape 则正常累乘：对 `Shape<_2,_3>` 得 `Stride<_1,_2>`）
 
 `append<3>(thr_layout, Layout<_1,_0>{})`（`include/cute/layout.hpp:961-979`）：
 
 将 2D Layout 扩充到 3D 的 Shape/Stride tuple 尾部追加 `(_1, _0)`：
 
 ```
-Layout<Shape<_1,_1>, Stride<_1,_0>>
-  → append<3> → Layout<Shape<_1,_1,_1>, Stride<_1,_0,_0>>
+Layout<Shape<_1,_1>, Stride<_0,_0>>
+  → append<3> → Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>
 ```
 
-结果：`thr_layout_mnk = Layout<Shape<_1,_1,_1>, Stride<_1,_0,_0>>`。
+结果：`thr_layout_mnk = Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>`。
 
 **子步骤 2b: `permutations` 填充到 3D**
 
