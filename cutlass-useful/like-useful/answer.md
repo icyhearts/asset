@@ -2921,3 +2921,252 @@ ArithmeticTupleIterator citer_1 = make_inttuple_iter(make_tuple(42, Int<2>{}, In
 ```cpp
 ArithmeticTupleIterator citer_1 = make_inttuple_iter(make_tuple(42, Int<2>{}, Int<7>{}));
 ```
+
+## make_tiled_mma 与 MMA_Atom 等价的构造过程分析
+
+### 分析目标
+
+`examples/cute/tutorial/like_layout.cu` 中 `doc05_mma_atom` 函数，line 727-730：
+
+```cpp
+TiledMMA mma2 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
+                                Layout<Shape<_1,_1>>{},   // Layout of Atoms
+                                Tile<_8,_8,_4>{});        // Tiler
+```
+
+该构造与 line 720 的 `auto mma = cute::MMA_Atom<cute::SM70_8x8x4_F32F16F16F32_NT>{};` 等价。以下逐步分析构造过程。
+
+---
+
+### 步骤 1: 重载解析 — Overload 2 包装原始 MMA_Op
+
+`include/cute/atom/mma_atom.hpp:543-554`
+
+```cpp
+template <class MMA_Op,
+          class MMAThrLayout = Layout<Shape<_1,_1,_1>>,
+          class Permutations = Tile<Underscore,Underscore,Underscore>>
+CUTE_HOST_DEVICE constexpr auto
+make_tiled_mma(MMA_Op       const&,          // ← 原始 MMA_Op (非 MMA_Atom)
+               MMAThrLayout const& thr_layout   = {},
+               Permutations const& permutations = {})
+{
+  return make_tiled_mma(MMA_Atom<MMA_Op>{}, thr_layout, permutations);
+  //                       ^^^^^^^^^^^^^^^ 包装为 MMA_Atom
+}
+```
+
+传入的 `SM70_8x8x4_F32F16F16F32_NT{}` 是原始 MMA 操作类型，不是 `MMA_Atom`。Overload 2 将其包装为 `MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>{}`，并转发到 Overload 1。
+
+`MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>` 的定义（`include/cute/atom/mma_atom.hpp:44-46`）：
+
+```cpp
+template <class MMAOperation>
+struct MMA_Atom<MMAOperation> : MMA_Atom<MMA_Traits<MMAOperation>> {};
+```
+
+其中 `MMA_Traits<SM70_8x8x4>` 定义于 `include/cute/atom/mma_traits_sm70.hpp:149-158`：
+
+```cpp
+using Shape_MNK = Shape<_8,_8,_4>;   // 原子 tile 大小 M=8, N=8, K=4
+using ThrID     = SM70_QuadPair;     // 线程布局 (32 threads per atom)
+```
+
+---
+
+### 步骤 2: Overload 1 — 3D 填充
+
+`include/cute/atom/mma_atom.hpp:526-541`
+
+```cpp
+template <class MMA_Op,
+          class MMAThrLayout = Layout<Shape<_1,_1,_1>>,
+          class Permutations = Tile<Underscore,Underscore,Underscore>>
+CUTE_HOST_DEVICE constexpr auto
+make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
+               MMAThrLayout     const& thr_layout   = {},
+               Permutations     const& permutations = {})
+{
+  auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
+  auto permutation_mnk = append<3>(permutations, _);
+
+  return TiledMMA<MMA_Atom<MMA_Op>,
+                  decltype(thr_layout_mnk),
+                  decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
+}
+```
+
+**子步骤 2a: `thr_layout` 填充到 3D**
+
+传入：`thr_layout = Layout<Shape<_1,_1>>{}`。这是一个 2D 布局，默认 LayoutLeft stride 为 `Stride<_1,_0>`。
+
+`append<3>(thr_layout, Layout<_1,_0>{})`（`include/cute/layout.hpp:961-979`）：
+
+将 2D Layout 扩充到 3D 的 Shape/Stride tuple 尾部追加 `(_1, _0)`：
+
+```
+Layout<Shape<_1,_1>, Stride<_1,_0>>
+  → append<3> → Layout<Shape<_1,_1,_1>, Stride<_1,_0,_0>>
+```
+
+结果：`thr_layout_mnk = Layout<Shape<_1,_1,_1>, Stride<_1,_0,_0>>`。
+
+**子步骤 2b: `permutations` 填充到 3D**
+
+传入：`permutations = Tile<_8,_8,_4>{}`。`Tile` 是 `cute::tuple` 别名（`include/cute/layout.hpp:45`），`Tile<_8,_8,_4>` 是 `tuple<Int<8>, Int<8>, Int<4>>`。
+
+`append<3>(Tile<_8,_8,_4>{}, _)` → `Tile<_8,_8,_4,_>`，即 `tuple<Int<8>, Int<8>, Int<4>, Underscore>`。
+
+结果：`permutation_mnk = Tile<_8,_8,_4,_>`。
+
+---
+
+### 步骤 3: TiledMMA 构造
+
+`include/cute/atom/mma_atom.hpp:228-231`
+
+```cpp
+CUTE_HOST_DEVICE constexpr
+TiledMMA(MMA_Atom const& mma_atom = {}, AtomLayoutMNK const& thr_layout_mnk = {})
+  : MMA_Atom(mma_atom),
+    thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}
+```
+
+**子步骤 3a: 类型参数**
+
+构造的 TiledMMA 类型为（`include/cute/atom/mma_atom.hpp:208-211`）：
+
+```cpp
+template <class MMA_Atom,
+          class AtomLayoutMNK,        // = decltype(thr_layout_mnk) = Layout<Shape<_1,_1,_1>>
+          class PermutationMNK>       // = decltype(permutation_mnk) = Tile<_8,_8,_4,_>
+struct TiledMMA : MMA_Atom
+```
+
+TiledMMA **公有继承** `MMA_Atom`。这是等价性的结构基础 — TiledMMA 直接拥有 MMA_Atom 的所有能力。
+
+**子步骤 3b: `tiled_product` 计算 ThrLayoutVMNK**
+
+`AtomThrID` = `SM70_QuadPair`（32 threads 分配到 M,N 的 2D 布局）。
+
+`AtomLayoutMNK` = `Layout<Shape<_1,_1,_1>>`，语义：在 M、N、K 各方向各有 **1 个原子**（即不 tile）。
+
+`tiled_product(AtomThrID{}, AtomLayoutMNK{})`（`include/cute/layout.hpp:1698-1705`）：
+
+```cpp
+auto tiled_product(Layout<LShape,LStride> const& block, Tiler const& tiler) {
+  auto result = zipped_product(block, tiler);   // 2D ThrID × 3D AtomLayout → 5D
+  auto R1 = rank<1>(result);
+  return result(_, repeat<R1>(_));               // unpack 为 4D: (ThrV, ThrM, ThrN, ThrK)
+}
+```
+
+具体过程：
+1. `zipped_product(ThrID(M,N), AtomLayoutMNK(M,N,K))` → 5D layout `(ThrM, ThrN, AtomM, AtomN, AtomK)`
+2. `result(_, repeat<R1>(_))` 将 Atom 维拆为对应 ThrID 的子维度
+3. 最终 4D layout：`(ThrV, ThrM, ThrN, ThrK)`，每个维度的 size 由 ThrID × AtomLayout 决定
+
+由于 `AtomLayoutMNK = Shape<_1,_1,_1>`（每个方向 1 个原子），`ThrV = 1`（只有 1 个原子），`ThrM`、`ThrN`、`ThrK` 均等于 ThrID 的 M、N 维度（K=1）。
+
+**子步骤 3c: `PermutationMNK` 的作用**
+
+`PermutationMNK = Tile<_8,_8,_4,_>`。它控制 `tile_size_mnk<I>()` 和 `permutation_mnk<I>()` 的返回值（`include/cute/atom/mma_atom.hpp:379-395`）：
+
+```cpp
+template <int I>
+auto permutation_mnk() const {
+    auto perm = get<I>(PermutationMNK{});
+    return conditional_return(
+        is_underscore<decltype(perm)>{},
+        size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk()),
+        perm);                    // ← _8,_8,_4 均非 Underscore，返回自身
+}
+```
+
+- `permutation_mnk<0>()` = `_8` (M 方向 tile 大小)
+- `permutation_mnk<1>()` = `_8` (N 方向 tile 大小)
+- `permutation_mnk<2>()` = `_4` (K 方向 tile 大小)
+
+这些值在 `thrfrg_C/A/B` 中用于做 `logical_divide`（tile 输入 tensor 为 `_8×_8` / `_8×_4` 块）。但由于 `AtomLayoutMNK` 是 `_1,_1,_1`（单个原子），这些 tile 大小正好等于原子本身的 shape (M=8,N=8,K=4)，所以它们不引入额外的多重原子 tiling。
+
+---
+
+### 步骤 4: 等价性验证
+
+**为什么 mma2 等价于 mma？**
+
+`TiledMMA` 继承 `MMA_Atom`，因此 mma2 直接拥有 MMA_Atom 的全部接口。
+
+关键的 `thrfrg_C` 方法（`include/cute/atom/mma_atom.hpp:249-275`）在 `AtomLayoutMNK = Shape<_1,_1,_1>` 时的行为：
+
+```
+输入 tensor (M,N)
+  │ logical_divide with Tile<_8,_8>      → (PermM,PermN) = (M/8,N/8) 个 8×8 tiles
+  │ zipped_divide with Tile<_8,_8>       → ((AtomM,AtomN),(RestM,RestN))
+  │                                      → 每 tile 内又是 8×8 原子 = 恰好 1 个原子
+  │ compose(AtomLayoutC_TV{}, _)         → ((ThrV,FrgV),(RestM,RestN))
+  │ zipped_divide with thr_tile          → ((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN)))
+```
+
+由于 `AtomLayoutMNK = _1,_1,_1`，`thr_layout_vmnk_` 的 ThrV 为 1，ThrM/ThrN 恰好等于原子 ThrID 的维度。因此最后一层的 thread tiling 不会引入额外的多重度 — 它只是把单原子的 32 个线程映射到 token 上。
+
+**核心等价原因**：
+
+1. `TiledMMA` **继承** `MMA_Atom`，所有 MMA_Atom 的公共接口（`get_slice`、`partition_fragment_C/A/B`）都直接可用
+2. `AtomLayoutMNK = Shape<_1,_1,_1>` 表示 **0 重 tiling** — 每个方向恰好 1 个原子，tile 逻辑退化为恒等
+3. `PermutationMNK = Tile<_8,_8,_4,_>` 中的 tile 大小 (`8,8,4`) 恰好等于原子本身的 `Shape_MNK`，不引入额外的重数
+4. `tiled_product(ThrID, Shape<_1,_1,_1>)` 计算出的 `ThrLayoutVMNK` 退化为原子 ThrID 增加一个 V=1 的维度
+
+因此，在 `AtomLayoutMNK = Shape<_1,_1,_1>` 条件下，`TiledMMA` 的 `thrfrg_C/A/B`、`get_slice`、`partition_fragment_C/A/B` 均产生与原始 `MMA_Atom` **相同**的 tensor 分区结果。
+
+---
+
+### 完整的调用/构造函数链
+
+```
+make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
+               Layout<Shape<_1,_1>>{},
+               Tile<_8,_8,_4>{})
+  │
+  │  [重载 2] include/cute/atom/mma_atom.hpp:548
+  │
+  ├─► 包装: MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>{}
+  │     │
+  │     └─► 继承自 MMA_Traits: Shape_MNK = (_8,_8,_4), ThrID = SM70_QuadPair
+  │
+  ├─► 转发到重载 1
+  │     │
+  │     [重载 1] include/cute/atom/mma_atom.hpp:531
+  │     │
+  │     ├─► append<3>(Layout<Shape<_1,_1>>{}, Layout<_1,_0>{})
+  │     │     ──► Layout<Shape<_1,_1,_1>, Stride<_1,_0,_0>>
+  │     │
+  │     ├─► append<3>(Tile<_8,_8,_4>{}, _)
+  │     │     ──► Tile<_8,_8,_4,_>
+  │     │
+  │     └─► 构造 TiledMMA<MMA_Atom<SM70_8x8x4>,
+  │                        Layout<Shape<_1,_1,_1>>,     // AtomLayoutMNK
+  │                        Tile<_8,_8,_4,_>>             // PermutationMNK
+  │           │
+  │           [TiledMMA 构造] include/cute/atom/mma_atom.hpp:228
+  │           │
+  │           ├─► 继承 MMA_Atom (公有继承)
+  │           │
+  │           └─► tiled_product(AtomThrID{}, Shape<_1,_1,_1>)
+  │                 ──► ThrLayoutVMNK = 4D layout (ThrV=1, ThrM, ThrN, ThrK=1)
+  │
+  └─► TiledMMA mma2 = 结果
+        │
+        └─► is-a MMA_Atom + AtomLayoutMNK = _1,_1,_1 → 无实际 tiling → 等价于 MMA_Atom
+```
+
+### 对照不同的 tiling 示例
+
+`examples/cute/tutorial/like_layout.cu:735-740` 展示了不同 `thr_layout` 的效果：
+
+```cpp
+auto mma3 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
+                           Layout<Shape<_2,_2>, Stride<_2,_1>>{});  // 2×2 atoms
+```
+
+这里 `thr_layout = Shape<_2,_2>` → `AtomLayoutMNK = Shape<_2,_2,_1>`，产生 `2×2×1 = 4` 个原子的 tile（总形状 16×16×4）。此时 TiledMMA 与单原子 MMA_Atom 不再等价 — `tile_size_mnk` 增大，`thr_layout_vmnk_` 跨原子分配线程。这反衬了 `Shape<_1,_1>` 的退化为恒等意图。
