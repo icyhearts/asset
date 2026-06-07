@@ -26,10 +26,17 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom, //actual=MMA_Atom<MMA_Op>{}=MMA
                MMAThrLayout     const& thr_layout   = {},//=actual=Layout<Shape<_1,_1,_1>>
                Permutations     const& permutations = {})//actual=Tile<_8,_8,_4>{}
 {
-  auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
-  auto permutation_mnk = append<3>(permutations, _);
+  auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});//=Layout<Shape<_1,_1,_1>>
+  auto permutation_mnk = append<3>(permutations, _); //Tile<_8,_8,_4>{}
 
   return TiledMMA<MMA_Atom<MMA_Op>,
                   decltype(thr_layout_mnk),
                   decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
+}
+step3:
+
+template <class MMA_Atom,//= MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>
+          class AtomLayoutMNK,// Layout<Shape<_1,_1,_1>>
+          class PermutationMNK = Tile<Underscore,Underscore,Underscore>>// Tile<_8,_8,_4>
+struct TiledMMA : MMA_Atom {
 }
