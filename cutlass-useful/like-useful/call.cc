@@ -43,5 +43,5 @@ struct TiledMMA : MMA_Atom {
   CUTE_HOST_DEVICE constexpr
   TiledMMA(MMA_Atom const& mma_atom = {}, AtomLayoutMNK const& thr_layout_mnk = {})
     : MMA_Atom(mma_atom),
-      thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}
+      thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}// AtomThrID: Layout<Shape <_4, _2>, Stride<_1,_16>>, thr_layout_mnk==Layout<Shape<_1,_1,_1>>
 }
