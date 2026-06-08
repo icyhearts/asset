@@ -7043,3 +7043,313 @@ def verify_scaled_shape(self, M, N, K, lhs_scale, rhs_scale, lhs_format, rhs_for
 2. 编译过程会遍历整个 kernel AST 并转换为 TTIR（Triton IR）
 3. `tl.dot_scaled` 的形状验证是编译时语义分析的一部分，不依赖于运行时控制流
 4. 循环迭代次数 `cur_seq_len_prefix` 是运行时变量（从 `kv_indptr` 加载），编译器无法静态推断为 0，因此无法消除循环体
+
+---
+
+## sglang `max_total_num_tokens` 调用链与 SIMO KV cache 量化后的计算方式
+
+### 1. sglang 当前 `config.max_total_num_tokens` 的来源
+
+结论：`model_runner_kv_cache_mixin.py` 里的 `self.max_total_num_tokens = config.max_total_num_tokens` 使用的是 `MemoryPoolConfig`。这个 config 在 target worker 初始化 memory pool 时由 `_resolve_memory_pool_config()` 计算出来；draft worker 场景会复用 target worker 传入的 `memory_pool_config`。
+
+调用链如下：
+
+1. `[sglang] python/sglang/srt/managers/tp_worker.py:344 _init_model_runner`
+
+   `TpWorker._init_model_runner()` 构造 `ModelRunner`，并把 `memory_pool_config` 参数传进去。draft worker 时这个参数可以来自 target worker。
+
+2. `[sglang] python/sglang/srt/model_executor/model_runner.py:338 ModelRunner.__init__`
+
+   `ModelRunner.__init__()` 保存 `self.memory_pool_config`，随后加载模型、设置层范围与 KV cache dtype。
+
+3. `[sglang] python/sglang/srt/model_executor/model_runner.py:748 ModelRunner.__init__`
+
+   初始化路径调用 `self.init_memory_pool(pre_model_load_memory)`。
+
+4. `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:902 init_memory_pool`
+
+   `init_memory_pool()` 对非 draft/非复用 config 的 worker 调用 `_resolve_memory_pool_config(pre_model_load_memory)`，然后调用 `_apply_memory_pool_config(self.memory_pool_config)`。
+
+5. `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:875 _resolve_memory_pool_config`
+
+   `_resolve_memory_pool_config()` 的主要步骤是：
+
+   - `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:883 _resolve_memory_pool_config`: 调用 `_profile_available_bytes(pre_model_load_memory)` 得到可用于 pool 的字节数。
+   - `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:886 _resolve_memory_pool_config`: 调用 `create_memory_pool_configurator(self)` 选择 configurator。
+   - `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:887 _resolve_memory_pool_config`: 调用 `configurator.calculate_pool_sizes(available_bytes, page_size)` 得到初始 `MemoryPoolConfig`。
+   - `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:890 _resolve_memory_pool_config`: 调用 `_apply_token_constraints(config.max_total_num_tokens)` 应用 `--max-total-tokens` 和 PP rank 间同步。
+   - `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:892 _resolve_memory_pool_config`: 如果约束改变了 token 数，再用 `calculate_pool_sizes_from_max_tokens(constrained, page_size)` 重算并对齐 page。
+   - `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:896 _resolve_memory_pool_config`: 调用 `_resolve_max_num_reqs(config.max_total_num_tokens)` 只计算 `max_running_requests`，不再改变 `max_total_num_tokens`。
+
+6. `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:61 _profile_available_bytes`
+
+   可用字节数来自：
+
+   ```text
+   available_bytes = int((post_model_load_memory - pre_model_load_memory * (1 - mem_fraction_static)) * 2^30)
+   ```
+
+   如果是 mamba/hybrid linear 模型，还会先通过 `handle_max_mamba_cache()` 扣掉 mamba state 相关显存。
+
+7. `[sglang] python/sglang/srt/model_executor/pool_configurator.py:471 create_memory_pool_configurator`
+
+   configurator 选择逻辑：
+
+   - DeepSeek-V4 且 hybrid SWA：`DSV4PoolConfigurator`
+   - hybrid SWA：`HybridSWAPoolConfigurator`
+   - 其他普通 MHA/MLA/DSA：`DefaultPoolConfigurator`
+
+8. `[sglang] python/sglang/srt/model_executor/pool_configurator.py:86 DefaultPoolConfigurator`
+
+   普通 MHA/MLA 默认走 `DefaultPoolConfigurator`。核心是先算 `_cell_size`，再用 `available_bytes // _cell_size` 算 token 容量。
+
+   MHA 分支：
+
+   ```text
+   cell_size =
+     get_num_kv_heads(attention_tp_size)
+     * (head_dim + v_head_dim)
+     * num_effective_layers
+     * element_size(kv_cache_dtype)
+   ```
+
+   代码位置：`[sglang] python/sglang/srt/model_executor/pool_configurator.py:163 _compute_cell_size`
+
+   MLA 分支：
+
+   ```text
+   cell_size =
+     (kv_lora_rank + qk_rope_head_dim)
+     * num_effective_layers
+     * element_size(kv_cache_dtype)
+   ```
+
+   代码位置：`[sglang] python/sglang/srt/model_executor/pool_configurator.py:134 _compute_cell_size`
+
+   最后：
+
+   ```text
+   max_total_num_tokens = floor(available_bytes / cell_size)
+   max_total_num_tokens = align_down(max_total_num_tokens, page_size)
+   ```
+
+   代码位置：`[sglang] python/sglang/srt/model_executor/pool_configurator.py:182 calculate_pool_sizes`
+
+9. `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:794 _apply_token_constraints`
+
+   `--max-total-tokens` 只能作为上限。如果用户传入值大于 profile 出来的 token_capacity，代码会使用 profiled value，而不是用户值。因此在当前代码不改 configurator 的情况下，不能靠 `--max-total-tokens` 把容量提高到 SIMO 量化后理论可用的值。
+
+10. `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:844 _apply_memory_pool_config`
+
+    `_apply_memory_pool_config()` 最终把 `config.max_total_num_tokens` 赋给 `self.max_total_num_tokens`，再调用 `_init_pools()` 分配实际 KV pool。
+
+### 2. 当前 SIMO patch 对这条链的影响
+
+结论：当前 SIMO 代码只替换实际分配的 KV pool class，没有替换 sglang 的 `pool_configurator`。因此当前实际运行时，`config.max_total_num_tokens` 仍按 sglang 原始 KV dtype 的 bytes/token 计算；SIMO 量化 pool 只是用更少显存承载这个 token 数。这是安全但保守的，会留下量化节省出来的 KV cache 显存没有转化为更大的 `max_total_num_tokens`。
+
+证据：
+
+1. `[simo] simo/extensions/sglang_simo/__init__.py:11 register_simo_extensions`
+
+   注册 SIMO extension 时调用 `apply_init_memory_pool_patch()`。
+
+2. `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:169 apply_init_memory_pool_patch`
+
+   patch 的目标是 `ModelRunnerKVCacheMixin.init_memory_pool`。
+
+3. `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:150 _patched_init_memory_pool`
+
+   `_patched_init_memory_pool()` 先从 model layer 提取 KV quant 参数，然后在调用原始 `init_memory_pool()` 时临时替换 `kv_mixin.MHATokenToKVPool` 和 `kv_mixin.MLATokenToKVPool`。
+
+4. `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:36 _temporarily_replace_simo_kv_pool_cls`
+
+   这里替换的是 `sglang.srt.model_executor.model_runner_kv_cache_mixin` 模块里的 `MHATokenToKVPool` / `MLATokenToKVPool` 符号。没有替换 `[sglang] python/sglang/srt/model_executor/pool_configurator.py:471 create_memory_pool_configurator`。
+
+5. `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:160 _patched_init_memory_pool`
+
+   当前 patch 对 hybrid SWA path 直接跳过，因此以下 SIMO MHA/MLA 结论只针对实际使用 `SIMOMHATokenToKVPool` / `SIMOMLATokenToKVPool` 的非 hybrid-SWA 路径。
+
+### 3. 使用 `SIMOMHATokenToKVPool` 时应该如何计算 `max_total_num_tokens`
+
+sglang 原始 MHA pool 的物理布局是：
+
+- `[sglang] python/sglang/srt/mem_cache/memory_pool.py:941 MHATokenToKVPool._create_buffers`
+- K buffer: `(size + page_size, head_num, head_dim)`
+- V buffer: `(size + page_size, head_num, v_head_dim)`
+- dtype 是 `store_dtype`
+
+所以 sglang 默认 `cell_size` 用 `head_num * (head_dim + v_head_dim) * num_layers * element_size(kv_cache_dtype)` 是匹配原始 MHA pool 的。
+
+但 SIMO MHA pool 的物理布局变成：
+
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:41 SIMOMHATokenToKVPool`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:91 SIMOMHATokenToKVPool.__init__`
+- K combined head bytes = `k_packed_head_size + k_scale_head_size`
+- V combined head bytes = `v_packed_head_size + v_scale_head_size`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:152 SIMOMHATokenToKVPool._create_buffers`
+- K buffer: `(size + page_size, head_num, k_combined_head_size)`，dtype `torch.uint8`
+- V buffer: `(size + page_size, head_num, v_combined_head_size)`，dtype `torch.uint8`
+
+因此，SIMO MHA 正确的 per-token KV cache cost 应该是：
+
+```text
+simo_mha_cell_size =
+  num_effective_layers
+  * num_kv_heads_per_attention_tp
+  * (
+      k_packed_head_size + k_scale_head_size
+      + v_packed_head_size + v_scale_head_size
+    )
+```
+
+当前 adapter 对 K/V 使用同一组 packed/scale size：
+
+- `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:80 SIMOMHATokenToKVPoolAdapter.__init__`
+- `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:90 SIMOMHATokenToKVPoolAdapter.__init__`
+
+所以当前代码下也可以写成：
+
+```text
+simo_mha_cell_size =
+  num_effective_layers
+  * num_kv_heads_per_attention_tp
+  * 2
+  * (packed_head_size + scale_head_size)
+```
+
+`packed_head_size` / `scale_head_size` 的来源：
+
+- `[simo] simo/extensions/sglang_simo/quantization/quantization.py:1396 SIMOKVCacheMethod.create_weights`
+- `[simo] simo/extensions/sglang_simo/quantization/quantization.py:1410 SIMOKVCacheMethod.create_weights`
+
+`SIMOKVCacheMethod.create_weights()` 用 meta tensor 调用 `kv_cache_downcast_kernel(torch.randn(1, layer.head_dim, device="meta"))`，然后用 `view(torch.uint8).shape[-1]` 预先得到 packed bytes 和 scale bytes。
+
+MHA 写入 kernel 也按同一布局写：
+
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:19 set_kv_buffer_kernel`
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:57 set_kv_buffer_kernel`
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:84 set_kv_buffer_kernel`
+
+即每个 token/head/tile 写 packed plane 和 scale plane；MX scale 是 1 byte/tile，per-group FP8/INT8 scale 是 4 bytes/group。
+
+最终应使用：
+
+```text
+max_total_num_tokens =
+  align_down(floor(available_bytes / simo_mha_cell_size), page_size)
+```
+
+然后继续走 sglang 原有约束：
+
+```text
+max_total_num_tokens = min(max_total_num_tokens, server_args.max_total_tokens)  # 如果用户设置了上限
+max_total_num_tokens = pp_all_reduce_min(max_total_num_tokens)                 # 如果 pp_size > 1
+max_total_num_tokens = align_down(max_total_num_tokens, page_size)
+```
+
+### 4. 使用 `SIMOMLATokenToKVPool` 时应该如何计算 `max_total_num_tokens`
+
+sglang 原始 MLA pool 的物理布局是：
+
+- `[sglang] python/sglang/srt/mem_cache/memory_pool.py:1692 MLATokenToKVPool`
+- `[sglang] python/sglang/srt/mem_cache/memory_pool.py:1737 MLATokenToKVPool.__init__`
+- `[sglang] python/sglang/srt/mem_cache/memory_pool.py:1754 MLATokenToKVPool._create_buffers`
+- buffer shape: `(size + page_size, 1, kv_cache_dim)`，其中普通 MLA 的 `kv_cache_dim = kv_lora_rank + qk_rope_head_dim`
+
+所以 sglang 默认 MLA 公式是：
+
+```text
+default_mla_cell_size =
+  num_effective_layers
+  * (kv_lora_rank + qk_rope_head_dim)
+  * element_size(kv_cache_dtype)
+```
+
+SIMO MLA pool 的物理布局变成：
+
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:236 SIMOMLATokenToKVPool`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:258 SIMOMLATokenToKVPool.__init__`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:281 SIMOMLATokenToKVPool._create_buffers`
+- buffer shape: `(size + page_size, 1, kv_cache_dim_in_bytes)`，dtype `torch.uint8`
+
+其中 `kv_cache_dim_in_bytes` 由：
+
+```text
+x_q, s = kv_cache_downcast_kernel(meta_tensor[*, kv_lora_rank + qk_rope_head_dim])
+kv_cache_dim_in_bytes = bytes(x_q) + bytes(s)
+```
+
+得到。对应代码位置：
+
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:258 SIMOMLATokenToKVPool.__init__`
+
+因此 SIMO MLA 正确的 per-token KV cache cost 应该是：
+
+```text
+simo_mla_cell_size =
+  num_effective_layers
+  * kv_cache_dim_in_bytes
+```
+
+也可以按 tile 写成：
+
+```text
+tile_size = kv_cache_quant_spec.block_size  # MX
+tile_size = kv_cache_quant_spec.group_size  # per-group FP8/INT8
+
+packed_tile_bytes = bytes(downcast_kernel(meta[1, tile_size]).packed)
+scale_tile_bytes  = bytes(downcast_kernel(meta[1, tile_size]).scale)
+
+num_nope_tiles = kv_lora_rank // tile_size
+num_rope_tiles = qk_rope_head_dim // tile_size
+
+kv_cache_dim_in_bytes =
+  (num_nope_tiles + num_rope_tiles)
+  * (packed_tile_bytes + scale_tile_bytes)
+
+simo_mla_cell_size =
+  num_effective_layers * kv_cache_dim_in_bytes
+```
+
+代码依据：
+
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:323 SIMOMLATokenToKVPool.set_mla_kv_buffer`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:342 SIMOMLATokenToKVPool.set_mla_kv_buffer`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:355 SIMOMLATokenToKVPool.set_mla_kv_buffer`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:361 SIMOMLATokenToKVPool.set_mla_kv_buffer`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:366 SIMOMLATokenToKVPool.set_mla_kv_buffer`
+- `[simo] simo/extensions/sglang_simo/mem_cache/memory_pool.py:381 SIMOMLATokenToKVPool.set_mla_kv_buffer`
+
+`concat_and_cache_mla_kernel` 对 nope 和 rope 两段都写 packed + scale：
+
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:307 concat_and_cache_mla_kernel`
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:370 concat_and_cache_mla_kernel`
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:374 concat_and_cache_mla_kernel`
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:429 concat_and_cache_mla_kernel`
+- `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:457 concat_and_cache_mla_kernel`
+
+最终应使用：
+
+```text
+max_total_num_tokens =
+  align_down(floor(available_bytes / simo_mla_cell_size), page_size)
+```
+
+然后同样应用 `--max-total-tokens` 上限、PP rank min 同步和 page 对齐。
+
+### 5. 实际建议
+
+如果目标只是正确运行，当前代码按 sglang 原始 `DefaultPoolConfigurator` 计算 `max_total_num_tokens` 是安全的，因为实际 SIMO KV pool 更小，只会保守低估容量。
+
+如果目标是让 SIMO KV cache 量化带来的显存节省转化为更大的 token capacity，则应该实现 SIMO-aware memory pool configurator，替换或 patch：
+
+- `[sglang] python/sglang/srt/model_executor/pool_configurator.py:471 create_memory_pool_configurator`
+- 或 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:875 _resolve_memory_pool_config`
+
+新的 configurator 应复用 sglang 原来的：
+
+- `available_bytes` 计算：`[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:61 _profile_available_bytes`
+- `--max-total-tokens` 和 PP 约束：`[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:794 _apply_token_constraints`
+- `max_running_requests` 计算：`[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:823 _resolve_max_num_reqs`
+
+只把 `DefaultPoolConfigurator._compute_cell_size()` 的 MHA/MLA bytes/token 换成上面的 SIMO 物理布局 bytes/token。否则即使设置更大的 `--max-total-tokens`，也会被 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:803 _apply_token_constraints` 限制到未量化 profile 出来的 token capacity。

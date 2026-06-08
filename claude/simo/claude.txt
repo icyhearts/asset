@@ -1869,7 +1869,10 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 simo 代码位于 /data/like/package/simo_conda_sglang
-sglang code base python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py _apply_memory_pool_config有如下代码:
- self.max_total_num_tokens = config.max_total_num_tokens 这个   config.max_total_num_tokens 是如何计算出来的，给出 计算 max_total_num_tokens 过程中函数调用链。
+1) sglang code base python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py _apply_memory_pool_config有如下代码:
+ self.max_total_num_tokens = config.max_total_num_tokens 这个   config.max_total_num_tokens 是如何计算出来的? 给出 计算 max_total_num_tokens 过程中函数调用链。
+2) simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py, set_kv_buffer_kernel 实现了对MHA kv pool的 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group 格式的量化写入。 kernel调用方在 simo/extensions/sglang_simo/mem_cache/memory_pool.py的 SIMOMHATokenToKVPool。
+simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py, concat_and_cache_mla_kernel 实现了对MLA kv pool的 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group 格式的量化写入。 kernel调用方位于 simo/extensions/sglang_simo/mem_cache/memory_pool.py的  SIMOMLATokenToKVPool
+分析，在使用 SIMOMHATokenToKVPool SIMOMLATokenToKVPool 的时候，应该如何计算 sglang 的 config.max_total_num_tokens?
 
-simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py, set_kv_buffer_kernel 实现了对MHA kv pool的 mx
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
