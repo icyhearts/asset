@@ -3220,3 +3220,124 @@ TiledMMA<MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>,
 | thr_layout | `Layout<Shape<_1,_1>>{}` (2D) | `Layout<Shape<_1,_1,_1>>{}` (3D) |
 | 末尾 stride | `Stride<_1,_0,_0>` | `Stride<_0,_0,_0>` (is_constant<1> 优化) |
 | permutation_mnk | `Tile<_8,_8,_4,_>` (4D) | `Tile<_8,_8,_4>` (3D) |
+
+---
+
+## `zipped_product` 编译错误: `logical_product` 的 Tuple/Layout 重载选择
+
+### 错误现象
+
+`examples/cute/tutorial/like_layout.cu:746`, `doc05_mma_atom()`:
+
+```cpp
+auto tiler = Tile<_8,_8,_4>{};
+auto result = zipped_product(block, tiler);
+```
+
+编译报错（`make.log:29-34`）：
+
+```
+include/cute/layout.hpp:1666 — static assertion failed:
+  "logical_product: Too many modes in tiler."
+
+  instantiation: logical_product(block, Tiler) [with
+    LShape=tuple<_4,_2>, LStride=tuple<_1,_16>,
+    Tiler=tuple<_8,_8,_4>]
+  → zipped_product(...) at like_layout.cu:746
+```
+
+### 根因: `logical_product` 对 Tuple 和 Layout 走不同重载
+
+`logical_product` 有两个重载（`include/cute/layout.hpp:1649-1675`）:
+
+**重载 1** (`include/cute/layout.hpp:1653-1656`): 两个参数都是 Layout
+
+```cpp
+template <class LShape, class LStride,
+          class TShape, class TStride>
+constexpr auto
+logical_product(Layout<LShape,LStride> const& block,
+                Layout<TShape,TStride> const& tiler)
+{
+  return make_layout(block, composition(complement(block, size(block)*cosize(tiler)), tiler));
+}
+```
+
+— **无 rank 检查**，直接构造 layout 组合。
+
+**重载 2** (`include/cute/layout.hpp:1662-1667`): block 是 Layout，tiler 是 **tuple**
+
+```cpp
+template <class LShape, class LStride, class Tiler>
+constexpr auto
+logical_product(Layout<LShape,LStride> const& block,
+                Tiler                  const& tiler)
+{
+  if constexpr (is_tuple<Tiler>::value) {
+    static_assert(tuple_size<Tiler>::value <= Layout<LShape,LStride>::rank,
+                  "logical_product: Too many modes in tiler.");
+    ...
+  }
+}
+```
+
+— **有 rank 检查**: tiler 的 mode 数不能超过 block 的 rank。
+
+### 为什么真实 TiledMMA 构造不报错，但 like_layout.cu:746 报错
+
+真实 `TiledMMA` 构造函数 (`include/cute/atom/mma_atom.hpp:231`, `TiledMMA::TiledMMA()`):
+
+```cpp
+thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}
+```
+
+其中 `thr_layout_mnk` 来自 `include/cute/atom/mma_atom.hpp:535` 的 `append<3>(thr_layout, ...)`，结果是 `Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>` —— 一个 **Layout**，不是 tuple。
+
+而 `like_layout.cu:746` 传入 `Tile<_8,_8,_4>{}` —— 这是一个 **`tuple<Int<8>,Int<8>,Int<4>>`**（`include/cute/layout.hpp:45`: `Tile = cute::tuple`）。
+
+调用链走法完全不同：
+
+| 场景 | block | tiler 类型 | `logical_product` 重载 | 结果 |
+|------|-------|-----------|----------------------|------|
+| TiledMMA ctor | `Layout<Shape<_4,_2>>` (rank=2) | `Layout<Shape<_1,_1,_1>>` (Layout) | 重载 1 (line 1653) | 无 rank 检查，通过 |
+| like_layout.cu:746 | `Layout<Shape<_4,_2>>` (rank=2) | `tuple<_8,_8,_4>` (tuple) | 重载 2 (line 1662) | `3 > 2`, static_assert 失败 |
+
+**关键概念区分**:
+
+- `thr_layout_mnk`（AtomLayoutMNK）：原子的 3D 排列，传给 `tiled_product(AtomThrID{}, thr_layout_mnk)`
+- `permutation_mnk`（PermutationMNK = `Tile<_8,_8,_4>`）：tile 大小，**不传给** `tiled_product`
+
+两者是不同的模板参数（`include/cute/atom/mma_atom.hpp:208-211`），功能也不同。
+
+### 修复方法
+
+将 `like_layout.cu:746` 的 tiler 从 tuple `Tile<_8,_8,_4>` 改为 Layout:
+
+```cpp
+// 错误 — tuple 触发 noexcept 重载 2 的 rank 检查
+auto tiler = Tile<_8,_8,_4>{};
+
+// 正确 — 模拟 thr_layout_mnk，必须用 Layout
+auto tiler = Layout<Shape<_1,_1,_1>>{};
+auto result = zipped_product(block, tiler);
+```
+
+或显式写出 stride（等效）:
+
+```cpp
+auto tiler = Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>{};
+auto result = zipped_product(block, tiler);
+```
+
+### `zipped_product` 结果含义
+
+`zipped_product(Layout<Shape<_4,_2>,...>, Layout<Shape<_1,_1,_1>>{})` 计算的是原子内的线程到 (V,M,N,K) 的 4D layout 映射。对于单原子（`Shape<_1,_1,_1>`），`zipped_product` 的结果等价于：
+
+```
+zipped_product(ThrID=Layout<Shape<_4,_2>, Stride<_1,_16>>,
+               AtomLayout=Layout<Shape<_1,_1,_1>>)
+  → logical_product  → Layout<Shape<_4,_2,_1,_1,_1>>
+  → tile_unzip       → (ThrV=1, ThrM=4, ThrN=2, ThrK=1)
+```
+
+然后 `tiled_product` 在此基础上多一步 `result(_, repeat<R1>(_))` (`include/cute/layout.hpp:1703-1704`)，将 ThrV 维展平为单 mode。

@@ -29,9 +29,9 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom, //actual=MMA_Atom<MMA_Op>{}=MMA
   auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});//=Layout<Shape<_1,_1,_1>>
   auto permutation_mnk = append<3>(permutations, _); //Tile<_8,_8,_4>{}
 
-  return TiledMMA<MMA_Atom<MMA_Op>,
-                  decltype(thr_layout_mnk),
-                  decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
+  return TiledMMA<MMA_Atom<MMA_Op>,//MMA_Atom<MMA_Op>{}=MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>
+                  decltype(thr_layout_mnk), // Layout<Shape<_1,_1,_1>>
+                  decltype(permutation_mnk)/*Tile<_8,_8,_4> */>{mma_atom, thr_layout_mnk/*Layout<Shape<_1,_1,_1>> */};
 }
 step3: ctor of the following classs:
 
