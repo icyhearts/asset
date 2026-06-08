@@ -1,4 +1,4 @@
-  TiledMMA mma2 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
+caller:  TiledMMA mma2 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
                                 Layout<Shape<_1,_1,_1>>{},   // Layout of Atoms
                                 Tile<_8,_8,_4>{});           // Tiler
 step1:
@@ -13,7 +13,7 @@ make_tiled_mma(MMA_Op       const&,
                Permutations const& permutations = {})
 {
   // Attempt to wrap in an MMA_Atom<> and forward
-  return make_tiled_mma(MMA_Atom<MMA_Op>{}, thr_layout, permutations);
+  return make_tiled_mma(MMA_Atom<MMA_Op>{}, thr_layout/*  Layout<Shape<_1,_1,_1>>{} */, permutations/* Tile<_8,_8,_4>{}*/);
 }
 step2
 
