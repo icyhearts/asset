@@ -7353,3 +7353,64 @@ max_total_num_tokens =
 - `max_running_requests` 计算：`[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:823 _resolve_max_num_reqs`
 
 只把 `DefaultPoolConfigurator._compute_cell_size()` 的 MHA/MLA bytes/token 换成上面的 SIMO 物理布局 bytes/token。否则即使设置更大的 `--max-total-tokens`，也会被 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:803 _apply_token_constraints` 限制到未量化 profile 出来的 token capacity。
+
+---
+
+## Llama3.1-8B-Instruct 在 TP=2 下 KV head 数与 triton decode head 维度
+
+结论：`pool_configurator.py` 165 行使用 `model_config.get_num_kv_heads(tp_size)` 是因为这里在算“单个 attention TP worker / 单个 GPU 上每 token 的 KV cache bytes”，不是全局模型的 KV cache bytes。开启 tensor parallel 后，正常情况下每个 TP worker 只保存本 rank 的 KV head slice；对 Llama3.1-8B-Instruct、TP=2 来说，是每个 worker 保存 4 个 KV heads，而不是 8 个全局 KV heads。
+
+### 1. Llama3.1-8B-Instruct 的具体 head 数
+
+模型配置里 `hidden_size=4096`、`num_attention_heads=32`、`num_key_value_heads=8`，见 `/data/like/hf-models/Llama3.1-8B-Instruct/config.json:14`、`:20`、`:22`。因此：
+
+- `head_dim = 4096 / 32 = 128`
+- TP=2 时，本地 Q heads = `32 // 2 = 16`
+- TP=2 时，本地 KV heads = `8 // 2 = 4`
+- GQA group 数 = `local_q_heads / local_kv_heads = 16 / 4 = 4`
+
+所以如果“total head”指 `num_attention_heads=32`，那么 KV cache 不是存 `32 // 2 = 16` 个 head；KV cache 的 head 轴按 `num_key_value_heads=8` 切分，也就是每 rank 4 个 KV heads。只有 MHA 模型里 `num_key_value_heads == num_attention_heads` 时，KV head 数才等于 attention head 数。
+
+### 2. 为什么 `pool_configurator.py:165` 用 `get_num_kv_heads(tp_size)`
+
+`DefaultPoolConfigurator._compute_cell_size()` 的注释明确说它计算的是 “per-token KV cache cost in bytes”，并且先取 `tp_size = get_attention_tp_size()`，见 `[sglang] python/sglang/srt/model_executor/pool_configurator.py:125 DefaultPoolConfigurator._compute_cell_size` 和 `[sglang] python/sglang/srt/model_executor/pool_configurator.py:132 DefaultPoolConfigurator._compute_cell_size`。MHA/GQA 分支的 cell size 是：
+
+`local_kv_heads * (head_dim + v_head_dim) * num_layers * kv_element_size`
+
+对应代码是 `[sglang] python/sglang/srt/model_executor/pool_configurator.py:165 DefaultPoolConfigurator._compute_cell_size`。这里用的是 `model_config.get_num_kv_heads(tp_size)`，因为实际 KV pool 也是按这个本地 KV head 数创建的：`_init_pools()` 给 `MHATokenToKVPool` 传入 `head_num=self.model_config.get_num_kv_heads(get_attention_tp_size())`，见 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:648 _init_pools` 和 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:652 _init_pools`。
+
+`MHATokenToKVPool._create_buffers()` 的实际 buffer 形状也验证了这一点：K buffer 是 `(size + page_size, head_num, head_dim)`，V buffer 是 `(size + page_size, head_num, v_head_dim)`，见 `[sglang] python/sglang/srt/mem_cache/memory_pool.py:941 MHATokenToKVPool._create_buffers`、`[sglang] python/sglang/srt/mem_cache/memory_pool.py:952 MHATokenToKVPool._create_buffers`、`[sglang] python/sglang/srt/mem_cache/memory_pool.py:960 MHATokenToKVPool._create_buffers`。所以 line 165 必须用本地 KV head 数，否则 `max_total_num_tokens` 的 profile 会和真实 pool 形状不一致。
+
+以 Llama3.1-8B-Instruct、TP=2、BF16 KV cache、32 层为例，非量化 MHA/GQA KV cache 的单 worker bytes/token 是：
+
+`4 * (128 + 128) * 32 * 2 = 65536 bytes/token/worker`
+
+如果错误使用全局 KV heads 8，会把单 worker bytes/token 算成 2 倍；如果错误使用本地 Q heads 16，会算成 4 倍。
+
+### 3. `get_num_kv_heads(tp_size)` 的语义：每 GPU 的 KV heads
+
+`ModelConfig.get_num_kv_heads()` 的 docstring 就是 “Returns the number of KV heads per GPU”，它先取全局 KV heads，再按 tensor parallel size 做切分，见 `[sglang] python/sglang/srt/configs/model_config.py:865 ModelConfig.get_num_kv_heads`、`[sglang] python/sglang/srt/configs/model_config.py:867 ModelConfig.get_num_kv_heads`、`[sglang] python/sglang/srt/configs/model_config.py:872 ModelConfig.get_num_kv_heads`。
+
+注意一个边界条件：如果 `total_num_kv_heads < tp_size`，SGLang 不会让每个 rank 变成 0 个 KV head，而是复制 KV heads，让每个 GPU 至少有 1 个 KV head；这个逻辑写在注释和 `max(1, total_num_kv_heads // tensor_parallel_size)` 里，见 `[sglang] python/sglang/srt/configs/model_config.py:868 ModelConfig.get_num_kv_heads` 到 `[sglang] python/sglang/srt/configs/model_config.py:872 ModelConfig.get_num_kv_heads`。Llama3.1-8B-Instruct 的 `total_num_kv_heads=8`、`tp_size=2`，不触发复制，直接是每 rank 4 个 KV heads。
+
+### 4. QKV projection 和 attention layer 接收的也是本地 heads
+
+`LlamaAttention.__init__()` 在 TP 初始化时把全局 Q heads 和全局 KV heads 都转成本地数量：`self.num_heads = self.total_num_heads // tp_size`，`self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)`，见 `[sglang] python/sglang/srt/models/llama.py:156 LlamaAttention.__init__`、`[sglang] python/sglang/srt/models/llama.py:159 LlamaAttention.__init__`、`[sglang] python/sglang/srt/models/llama.py:169 LlamaAttention.__init__`。随后 `q_size` 和 `kv_size` 也都由本地 head 数计算，见 `[sglang] python/sglang/srt/models/llama.py:176 LlamaAttention.__init__` 和 `[sglang] python/sglang/srt/models/llama.py:177 LlamaAttention.__init__`。
+
+`QKVParallelLinear` 的类注释说明这个 layer 沿 head dimension 做并行，Q heads 被切分，KV heads 在 GQA/MQA 情况下可能切分或复制，见 `[sglang] python/sglang/srt/layers/linear.py:902 QKVParallelLinear`、`[sglang] python/sglang/srt/layers/linear.py:907 QKVParallelLinear`、`[sglang] python/sglang/srt/layers/linear.py:908 QKVParallelLinear`。它的初始化里本地 Q heads 是 `total_num_heads / tp_size`，本地 KV heads 是 `total_num_kv_heads / tp_size` 或复制后的 1 个 head，见 `[sglang] python/sglang/srt/layers/linear.py:958 QKVParallelLinear.__init__` 到 `[sglang] python/sglang/srt/layers/linear.py:963 QKVParallelLinear.__init__`。
+
+`LlamaAttention.forward_prepare_native()` 从本地 `qkv_proj` 输出里按本地 `q_size/kv_size` split 出 `q, k, v`，见 `[sglang] python/sglang/srt/models/llama.py:217 LlamaAttention.forward_prepare_native` 到 `[sglang] python/sglang/srt/models/llama.py:219 LlamaAttention.forward_prepare_native`。`RadixAttention` 保存的也是本地 TP head 数：`tp_q_head_num=num_heads`、`tp_k_head_num=num_kv_heads`、`tp_v_head_num=num_kv_heads`，见 `[sglang] python/sglang/srt/layers/radix_attention.py:59 RadixAttention.__init__`、`[sglang] python/sglang/srt/layers/radix_attention.py:78 RadixAttention.__init__` 到 `[sglang] python/sglang/srt/layers/radix_attention.py:80 RadixAttention.__init__`。
+
+### 5. triton decode backend 处理的是本地 Q heads 和本地 KV heads
+
+triton backend 初始化时也按 attention TP size 保存本地 head 数：`num_head = num_attention_heads // get_attention_tp_size()`，`num_kv_head = get_num_kv_heads(get_attention_tp_size())`，见 `[sglang] python/sglang/srt/layers/attention/triton_backend.py:121 TritonAttnBackend.__init__` 到 `[sglang] python/sglang/srt/layers/attention/triton_backend.py:125 TritonAttnBackend.__init__`。
+
+decode 时，`TritonAttnBackend.forward_decode()` 把 `q` reshape 成 `(-1, layer.tp_q_head_num, layer.qk_head_dim)`，并传入当前 rank 的 `token_to_kv_pool.get_key_buffer()/get_value_buffer()`，见 `[sglang] python/sglang/srt/layers/attention/triton_backend.py:1171 TritonAttnBackend.forward_decode`、`[sglang] python/sglang/srt/layers/attention/triton_backend.py:1254 TritonAttnBackend.forward_decode` 到 `[sglang] python/sglang/srt/layers/attention/triton_backend.py:1258 TritonAttnBackend.forward_decode`。这里的 `layer.tp_q_head_num` 对 Llama3.1 TP=2 是 16；key/value buffer 的 head 轴对同一 rank 是 4。
+
+`decode_attention_fwd()` 用 `q.shape[1] // v_buffer.shape[1]` 计算 `kv_group_num`，见 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:745 decode_attention_fwd` 和 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:769 decode_attention_fwd`。对 Llama3.1 TP=2，这里就是 `16 // 4 = 4`，因此进入 grouped 分支，见 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:790 decode_attention_fwd` 到 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:792 decode_attention_fwd`。
+
+`_decode_grouped_att_m_fwd()` 进一步从本地 `q.shape[1]` 得到 `head_num`，从本地 `k_buffer.shape[1]` 得到 GQA group 数，并用 `head_num` 构造 grid，见 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:464 _decode_grouped_att_m_fwd`、`[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:465 _decode_grouped_att_m_fwd`、`[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:469 _decode_grouped_att_m_fwd` 到 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:472 _decode_grouped_att_m_fwd`。对 Llama3.1 TP=2，`head_num=16`，`kv_group_num=4`，`BLOCK_H=16` 时 head 维 grid 是 `ceil(16 / min(16, 4)) = 4`。
+
+在 `_fwd_grouped_kernel_stage1()` 里，`cur_head_id` 是本地 head-grid id，`cur_kv_head` 由 `cur_head_id` 映射到本地 KV head，`cur_head` 被 `q_head_num` 限制在本地 Q head 范围内，见 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:253 _fwd_grouped_kernel_stage1`、`[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:287 _fwd_grouped_kernel_stage1` 到 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:299 _fwd_grouped_kernel_stage1`。实际读 K/V 时，offset 使用的是 `cur_kv_head * stride_buf_kh` 和 `cur_kv_head * stride_buf_vh`，见 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:335 _fwd_grouped_kernel_stage1` 到 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:339 _fwd_grouped_kernel_stage1`；输出写回时按本地 `cur_head` 写，见 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:400 _fwd_grouped_kernel_stage1` 到 `[sglang] python/sglang/srt/layers/attention/triton_ops/decode_attention.py:409 _fwd_grouped_kernel_stage1`。
+
+因此，以 triton backend 为例，单个 TP worker 的 `_fwd_grouped_kernel_stage1()` 处理的是本地 `total_attention_heads // tp_size = 16` 个 Q heads，并通过本地 `total_kv_heads // tp_size = 4` 个 KV heads 做 GQA；它不是在一个 worker 内处理全局 32 个 Q heads 或全局 8 个 KV heads。

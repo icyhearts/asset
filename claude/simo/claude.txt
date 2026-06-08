@@ -1876,3 +1876,10 @@ simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_bu
 分析，在使用 SIMOMHATokenToKVPool SIMOMLATokenToKVPool 的时候，应该如何计算 sglang 的 config.max_total_num_tokens?
 
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+以 /data/like/hf-models/Llama3.1-8B-Instruct/ 这个模型为例，假设tp size=2.
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo 代码位于 /data/like/package/simo_conda_sglang
+sglang code base python/sglang/srt/model_executor/pool_configurator.py 165行，为什么使用model_config.get_num_kv_heads(tp_size)? 开启 tensor parallel的时候，每个 tp worker 只存储了  total head // tp size个head吗？
+如果每个 tp worker 只保存 total head // tp size个head, 在进行 attention 计算的时候，以triton backend 为例， sglang code base, python/sglang/srt/layers/attention/triton_ops/decode_attention.py _fwd_grouped_kernel_stage1 处理的也是total head // tp size个head吗？
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
