@@ -2974,7 +2974,7 @@ using ThrID     = SM70_QuadPair;     // 线程布局 (32 threads per atom)
 
 ---
 
-### 步骤 2: Overload 1 — 3D 填充
+### 步骤 2: Overload 1 — 已有 3D 参数，append<3> 为 no-op
 
 `include/cute/atom/mma_atom.hpp:526-541`
 
@@ -2996,35 +2996,32 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
 }
 ```
 
-**子步骤 2a: `thr_layout` 填充到 3D**
+**子步骤 2a: `thr_layout` — 已 3D，无需填充**
 
-传入：`thr_layout = Layout<Shape<_1,_1>>{}`。这是一个 2D 布局。
+注意 `like_layout.cu:728` 传入的是 `Layout<Shape<_1,_1,_1>>{}`，**已是 3D**。因此 `append<3>` 是 no-op。
 
-默认 LayoutLeft 生成 stride。`compact_col_major(Shape<_1,_1>)` → `detail::compact<LayoutLeft>` 逐 mode 计算（`stride.hpp:291-306`）：
-- Mode 0 (shape=_1)：`is_constant<1, _1>::value` 为 true → stride 优化为 `Int<0>{}`（shape=1 时无需非零 stride）
-- Mode 1 (shape=_1)：同理，stride=`Int<0>{}`
-→ 结果 `Stride<_0,_0>`
+`append<3>` 的 no-op 逻辑位于 `include/cute/algorithm/tuple_algorithms.hpp:783-785`：
 
-（非 1 的 shape 则正常累乘：对 `Shape<_2,_3>` 得 `Stride<_1,_2>`）
-
-`append<3>(thr_layout, Layout<_1,_0>{})`（`include/cute/layout.hpp:961-979`）：
-
-将 2D Layout 扩充到 3D 的 Shape/Stride tuple 尾部追加 `(_1, _0)`：
-
-```
-Layout<Shape<_1,_1>, Stride<_0,_0>>
-  → append<3> → Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>
+```cpp
+if constexpr (N == tuple_size<T>::value) {
+  return a;  // 已满足 rank N，原样返回
+}
 ```
 
-结果：`thr_layout_mnk = Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>`。
+- Shape：`tuple_size<Shape<_1,_1,_1>> = 3`，`N=3` → 命中 → 原样返回
+- Stride（LayoutLeft 默认）：`is_constant<1,_1>` 优化 → `Stride<_0,_0,_0>`，同样已 3D → 原样返回
 
-**子步骤 2b: `permutations` 填充到 3D**
+结果：`thr_layout_mnk = Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>`（与输入相同）。
 
-传入：`permutations = Tile<_8,_8,_4>{}`。`Tile` 是 `cute::tuple` 别名（`include/cute/layout.hpp:45`），`Tile<_8,_8,_4>` 是 `tuple<Int<8>, Int<8>, Int<4>>`。
+（如果是 `include/cute/atom/mma_atom.hpp:549` 的 2-arg `make_tiled_mma(mma_op, Layout<Shape<_1,_1>>{})` 调用，才会触发 `append<3>` 的从 2D→3D 填充逻辑。）
 
-`append<3>(Tile<_8,_8,_4>{}, _)` → `Tile<_8,_8,_4,_>`，即 `tuple<Int<8>, Int<8>, Int<4>, Underscore>`。
+**子步骤 2b: `permutations` — 已 3D，无需填充**
 
-结果：`permutation_mnk = Tile<_8,_8,_4,_>`。
+`like_layout.cu:729` 传入 `Tile<_8,_8,_4>{}`（`cute::tuple<Int<8>,Int<8>,Int<4>>`，`include/cute/layout.hpp:45`）。这已是 3D，`append<3>` 同样命中 `tuple_size=3, N=3` → no-op，原样返回。
+
+结果：`permutation_mnk = Tile<_8,_8,_4>{}`。
+
+（`TiledMMA` 对 `PermutationMNK` 的约束为 `include/cute/atom/mma_atom.hpp:221` 的 `static_assert(rank_v<PermutationMNK> == 3)`。）
 
 ---
 
@@ -3046,7 +3043,7 @@ TiledMMA(MMA_Atom const& mma_atom = {}, AtomLayoutMNK const& thr_layout_mnk = {}
 ```cpp
 template <class MMA_Atom,
           class AtomLayoutMNK,        // = decltype(thr_layout_mnk) = Layout<Shape<_1,_1,_1>>
-          class PermutationMNK>       // = decltype(permutation_mnk) = Tile<_8,_8,_4,_>
+          class PermutationMNK>       // = decltype(permutation_mnk) = Tile<_8,_8,_4>
 struct TiledMMA : MMA_Atom
 ```
 
@@ -3077,7 +3074,7 @@ auto tiled_product(Layout<LShape,LStride> const& block, Tiler const& tiler) {
 
 **子步骤 3c: `PermutationMNK` 的作用**
 
-`PermutationMNK = Tile<_8,_8,_4,_>`。它控制 `tile_size_mnk<I>()` 和 `permutation_mnk<I>()` 的返回值（`include/cute/atom/mma_atom.hpp:379-395`）：
+`PermutationMNK = Tile<_8,_8,_4>`。它控制 `tile_size_mnk<I>()` 和 `permutation_mnk<I>()` 的返回值（`include/cute/atom/mma_atom.hpp:379-395`）：
 
 ```cpp
 template <int I>
@@ -3121,7 +3118,7 @@ auto permutation_mnk() const {
 
 1. `TiledMMA` **继承** `MMA_Atom`，所有 MMA_Atom 的公共接口（`get_slice`、`partition_fragment_C/A/B`）都直接可用
 2. `AtomLayoutMNK = Shape<_1,_1,_1>` 表示 **0 重 tiling** — 每个方向恰好 1 个原子，tile 逻辑退化为恒等
-3. `PermutationMNK = Tile<_8,_8,_4,_>` 中的 tile 大小 (`8,8,4`) 恰好等于原子本身的 `Shape_MNK`，不引入额外的重数
+3. `PermutationMNK = Tile<_8,_8,_4>` 中的 tile 大小 (`8,8,4`) 恰好等于原子本身的 `Shape_MNK`，不引入额外的重数
 4. `tiled_product(ThrID, Shape<_1,_1,_1>)` 计算出的 `ThrLayoutVMNK` 退化为原子 ThrID 增加一个 V=1 的维度
 
 因此，在 `AtomLayoutMNK = Shape<_1,_1,_1>` 条件下，`TiledMMA` 的 `thrfrg_C/A/B`、`get_slice`、`partition_fragment_C/A/B` 均产生与原始 `MMA_Atom` **相同**的 tensor 分区结果。
@@ -3145,15 +3142,15 @@ make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
   │     │
   │     [重载 1] include/cute/atom/mma_atom.hpp:531
   │     │
-  │     ├─► append<3>(Layout<Shape<_1,_1>>{}, Layout<_1,_0>{})
-  │     │     ──► Layout<Shape<_1,_1,_1>, Stride<_1,_0,_0>>
+  │     ├─► append<3>(Layout<Shape<_1,_1,_1>>{}, Layout<_1,_0>{})
+  │     │     ──► no-op (已 3D) → Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>
   │     │
   │     ├─► append<3>(Tile<_8,_8,_4>{}, _)
-  │     │     ──► Tile<_8,_8,_4,_>
+  │     │     ──► Tile<_8,_8,_4>
   │     │
   │     └─► 构造 TiledMMA<MMA_Atom<SM70_8x8x4>,
   │                        Layout<Shape<_1,_1,_1>>,     // AtomLayoutMNK
-  │                        Tile<_8,_8,_4,_>>             // PermutationMNK
+  │                        Tile<_8,_8,_4>>             // PermutationMNK
   │           │
   │           [TiledMMA 构造] include/cute/atom/mma_atom.hpp:228
   │           │
@@ -3177,3 +3174,49 @@ auto mma3 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
 ```
 
 这里 `thr_layout = Shape<_2,_2>` → `AtomLayoutMNK = Shape<_2,_2,_1>`，产生 `2×2×1 = 4` 个原子的 tile（总形状 16×16×4）。此时 TiledMMA 与单原子 MMA_Atom 不再等价 — `tile_size_mnk` 增大，`thr_layout_vmnk_` 跨原子分配线程。这反衬了 `Shape<_1,_1>` 的退化为恒等意图。
+
+---
+
+## 附录: 前文修正
+
+### `like_layout.cu:728` 的 `thr_layout` 和 `permutations` 已是 3D，`append<3>` 为 no-op
+
+原分析将 `like_layout.cu:728` 的调用误当作传入了 2D 参数。纠正如下：
+
+**实际代码** (`examples/cute/tutorial/like_layout.cu:727-729`, `doc05_mma_atom()`):
+
+```cpp
+TiledMMA mma2 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
+                              Layout<Shape<_1,_1,_1>>{},   // ← 3D，非 2D
+                              Tile<_8,_8,_4>{});           // ← 3D
+```
+
+此 3-arg 调用匹配重载 2 (`include/cute/atom/mma_atom.hpp:548-554`, `make_tiled_mma(MMA_Op, MMAThrLayout, Permutations)`) → 包装为 MMA_Atom → 转发到重载 1。
+
+在重载 1 (`include/cute/atom/mma_atom.hpp:531-541`, `make_tiled_mma(MMA_Atom, MMAThrLayout, Permutations)`) 中：
+
+```
+thr_layout   = Layout<Shape<_1,_1,_1>>{}    → tuple_size = 3
+permutations = Tile<_8,_8,_4>{}             → tuple_size = 3
+
+append<3>(thr_layout, Layout<_1,_0>{})    → N=3, tuple_size=3 → no-op (include/cute/algorithm/tuple_algorithms.hpp:784)
+append<3>(permutations, _)                → N=3, tuple_size=3 → no-op
+```
+
+**结果类型**:
+
+```
+TiledMMA<MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>,
+         Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>,   // AtomLayoutMNK (3D)
+         Tile<_8,_8,_4>>                               // PermutationMNK (3D)
+```
+
+`TiledMMA` 强制要求 `rank_v<PermutationMNK> == 3` (`include/cute/atom/mma_atom.hpp:221`)，若 `PermutationMNK = Tile<_8,_8,_4,_>` (4D) 则 static_assert 失败。实测 `like_layout.cu:730` 的 `print(mma2)` 编译通过也印证了类型正确性。
+
+**之前错误写法对照**:
+
+| 错误项 | 错误值 | 正确值 |
+|--------|--------|--------|
+| thr_layout | `Layout<Shape<_1,_1>>{}` (2D) | `Layout<Shape<_1,_1,_1>>{}` (3D) |
+| 末尾 stride | `Stride<_1,_0,_0>` | `Stride<_0,_0,_0>` (is_constant<1> 优化) |
+| permutation_mnk | `Tile<_8,_8,_4,_>` (4D) | `Tile<_8,_8,_4>` (3D) |

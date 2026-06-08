@@ -33,10 +33,15 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom, //actual=MMA_Atom<MMA_Op>{}=MMA
                   decltype(thr_layout_mnk),
                   decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
 }
-step3:
+step3: ctor of the following classs:
 
 template <class MMA_Atom,//= MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>
           class AtomLayoutMNK,// Layout<Shape<_1,_1,_1>>
           class PermutationMNK = Tile<Underscore,Underscore,Underscore>>// Tile<_8,_8,_4>
 struct TiledMMA : MMA_Atom {
+  using AtomThrID      = typename MMA_Atom::ThrID;//= typename MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>::ThrID= SM70_QuadPair=Layout<Shape <_4, _2>, Stride<_1,_16>>
+  CUTE_HOST_DEVICE constexpr
+  TiledMMA(MMA_Atom const& mma_atom = {}, AtomLayoutMNK const& thr_layout_mnk = {})
+    : MMA_Atom(mma_atom),
+      thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}
 }

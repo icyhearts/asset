@@ -308,4 +308,7 @@ examples/cute/tutorial/tma_tensor.cu运行的 日志位于run.tma_tensor.log
 examples/cute/tutorial/tma_tensor.cu编译报错，日志位于 make.log
 如何解决错误
 要求：要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到 like-useful/answer.md里面
-examples/cute/tutorial/like_layout.cu
+
+
+/data/like/package/cutlass/examples/cute/tutorial/like_layout.cu, 728 行传的  Layout  已经是 3D 的, /softhome/like/asset/cutlass-useful/like-useful/answer.md 3021行为什么还说要填充到3D? 是否要修复  answer.md
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到 like-useful/answer.md里面
