@@ -1858,3 +1858,18 @@ for start_n in range(0, cur_seq_len_prefix, BLOCK_N)这个循环根本不会进�
 for循环进不去，循环内部的 tl.dot_scaled 根本不会执行. 为什么还会在 tl.dot_scaled 这里报 rhs_scale must be a tensor of shape [64, 4]. Got ['64', '16'] 的错误？
 这是否意味着， triton 编译器的  tl.dot_scaled 对根本不会执行到的 tl.dot_scaled , 仍旧会检查输入数据的形状？
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+
+写一个python代码  获取 https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash 这个模型里面所有 safetensors 文件的 sha256值，
+只获取sha256 ，不要真的下载文件。
+代码放到  like-useful/sha256-deepseek-v4-flash.py
+
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo 代码位于 /data/like/package/simo_conda_sglang
+sglang code base python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py _apply_memory_pool_config有如下代码:
+ self.max_total_num_tokens = config.max_total_num_tokens 这个   config.max_total_num_tokens 是如何计算出来的，给出 计算 max_total_num_tokens 过程中函数调用链。
+
+simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py, set_kv_buffer_kernel 实现了对MHA kv pool的 mx
