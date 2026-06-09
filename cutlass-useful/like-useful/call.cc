@@ -41,7 +41,7 @@ template <class MMA_Atom,//= MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>
 struct TiledMMA : MMA_Atom {
   using AtomThrID      = typename MMA_Atom::ThrID;//= typename MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>::ThrID= SM70_QuadPair=Layout<Shape <_4, _2>, Stride<_1,_16>>
   CUTE_HOST_DEVICE constexpr
-  TiledMMA(MMA_Atom const& mma_atom = {}, AtomLayoutMNK const& thr_layout_mnk = {})
+  TiledMMA(MMA_Atom const& mma_atom = {}, AtomLayoutMNK/*Layout<Shape<_1,_1,_1>> */ const& thr_layout_mnk = {}/* Layout<Shape<_1,_1,_1>> */)
     : MMA_Atom(mma_atom),
       thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}// AtomThrID: Layout<Shape <_4, _2>, Stride<_1,_16>>, thr_layout_mnk==Layout<Shape<_1,_1,_1>>
 }
