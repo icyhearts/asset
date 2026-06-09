@@ -1883,3 +1883,11 @@ simo 代码位于 /data/like/package/simo_conda_sglang
 sglang code base python/sglang/srt/model_executor/pool_configurator.py 165行，为什么使用model_config.get_num_kv_heads(tp_size)? 开启 tensor parallel的时候，每个 tp worker 只存储了  total head // tp size个head吗？
 如果每个 tp worker 只保存 total head // tp size个head, 在进行 attention 计算的时候，以triton backend 为例， sglang code base, python/sglang/srt/layers/attention/triton_ops/decode_attention.py _fwd_grouped_kernel_stage1 处理的也是total head // tp size个head吗？
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo 代码位于 /data/like/package/simo_conda_sglang
+对simo代码的 commit: 040c90b4596cbf2f7381354341b4572b0db2e468 进行 code review.
+它的功能是对 sglang 的  _compute_cell_size 函数进行替换，检查这个commit有没有bug
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
