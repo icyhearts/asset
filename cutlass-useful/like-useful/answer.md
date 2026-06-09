@@ -3525,3 +3525,141 @@ make_layout(
 ```
 
 这正是 `logical_product` 的语义: 按 mode 逐对 tiling，多出的 mode 保留原样。
+
+---
+
+## `make_range` 实现原理
+
+### 定义链
+
+`include/cute/numeric/integer_sequence.hpp:118-119`:
+
+```cpp
+template <int Min, int Max>
+using make_range = make_int_range<Min, Max>;
+```
+
+→ `include/cute/numeric/integer_sequence.hpp:88-89`:
+
+```cpp
+template <int Begin, int End>
+using make_int_range = make_integer_range<int, Begin, End>;
+```
+
+→ `include/cute/numeric/integer_sequence.hpp:63-67`:
+
+```cpp
+template <class T, T Begin, T End>
+using make_integer_range = typename detail::range_impl<
+    T,
+    make_integer_sequence<T, (End-Begin > 0) ? (End-Begin) : 0>,
+    Begin>::type;
+```
+
+→ `include/cute/numeric/integer_sequence.hpp:48-51`, `detail::range_impl()`:
+
+```cpp
+template <class T, T... N, T Begin>
+struct range_impl<T, integer_sequence<T, N...>, Begin> {
+  using type = integer_sequence<T, N+Begin...>;  // 核心: 每个元素 + Begin
+};
+```
+
+### 核心思想: '平移法'
+
+`make_range<Min, Max>` 生成 `integer_sequence<int, Min, Min+1, ..., Max-1>`（半开区间 `[Min, Max)`）。
+
+它复用了已有工具 `make_integer_sequence<T, N>`（生成 `0, 1, ..., N-1`），通过**整体平移**从 `[0, Count)` 变为 `[Begin, End)`：
+
+```
+            make_integer_sequence<T, Count>
+生成:       int_seq<0,   1,   2,   ..., Count-1>
+     → range_impl 每个元素 +Begin  →
+结果:       int_seq<Begin, Begin+1, Begin+2, ..., Begin+Count-1> = int_seq<Begin, ..., End-1>
+```
+
+### 逐步推导
+
+#### Step 1: 计算长度 Count = End - Begin
+
+`make_integer_range<T, Begin, End>` 的第二个模板参数为:
+
+```cpp
+make_integer_sequence<T, (End-Begin > 0) ? (End-Begin) : 0>
+```
+
+这生成长度为 `Count = max(End - Begin, 0)` 的整数序列 `0, 1, ..., Count-1`:
+
+| 调用 | End-Begin | Count | 生成序列 |
+|------|-----------|-------|---------|
+| `make_range<2, 2>` | 0 | 0 | `integer_sequence<int>` (空) |
+| `make_range<2, 5>` | 3 | 3 | `integer_sequence<int, 0, 1, 2>` |
+| `make_range<0, 3>` | 3 | 3 | `integer_sequence<int, 0, 1, 2>` |
+
+三元 `(End-Begin > 0) ? ... : 0` 防止负数: C++ 标准中 `make_integer_sequence<T, N>` 要求 `N >= 0`。
+
+#### Step 2: `range_impl` 平移每个元素
+
+`range_impl` 的**模板偏特化** (`include/cute/numeric/integer_sequence.hpp:48-51`) 匹配 `integer_sequence<T, 0, 1, ..., Count-1>`:
+
+```cpp
+template <class T, T... N, T Begin>
+struct range_impl<T, integer_sequence<T, N...>, Begin> {
+  using type = integer_sequence<T, (N + Begin)...>;  // 包展开, 每元素 +Begin
+};
+```
+
+将每个元素 N 加上 Begin:
+
+```
+0+Begin, 1+Begin, 2+Begin, ..., Count-1+Begin
+= Begin, Begin+1, Begin+2, ..., End-1
+```
+
+### 示例追踪
+
+**`make_range<2, 5>`**:
+
+```
+make_range<2, 5>
+  = make_int_range<2, 5>
+  = make_integer_range<int, 2, 5>
+  = range_impl<int,
+        make_integer_sequence<int, (5-2)>,  // = int_seq<0, 1, 2>
+        2
+      >::type
+  = range_impl<int, integer_sequence<int, 0, 1, 2>, 2>::type
+  = integer_sequence<int, 0+2, 1+2, 2+2>
+  = integer_sequence<int, 2, 3, 4>
+  = seq<2, 3, 4>{}
+```
+
+**`make_range<2, 2>`** (边界: Begin == End):
+
+```
+make_range<2, 2>
+  = range_impl<int,
+        make_integer_sequence<int, (2-2 > 0) ? 0 : 0>,  // = int_seq<> (空序列)
+        2
+      >::type
+  = range_impl<int, integer_sequence<int>, 2>::type
+  = integer_sequence<int>        // 空序列, 无元素可平移
+  = seq<>{}                      // 空
+```
+
+**`make_range<0, 3>`** (Begin=0 的退化):
+
+```
+make_range<0, 3>
+  = range_impl<int, int_seq<0, 1, 2>, 0>::type
+  = integer_sequence<int, 0+0, 1+0, 2+0>
+  = seq<0, 1, 2>{}               // 退化等效于 make_seq<3>
+```
+
+事实上 `make_seq<N>` = `make_integer_sequence<int, N>` 即 `make_range<0, N>` 的特例。
+
+### `make_range` 的序列运算意义
+
+从数学角度就是**集合平移运算**: 给定集合 `S = {0, 1, 2}` 和偏移 `Begin = 2`，生成 `S + Begin = {2, 3, 4}`。
+
+这使得 C++ 元编程中能在编译期自然地表达**切片和拼接**，是 `transform_layout` 中 `make_range<R,R0>` 和 `make_range<R,R1>` 的基础 — 前者从 rank R 开始提取 t0 的剩余 mode，后者提取 t1 的剩余 mode。
