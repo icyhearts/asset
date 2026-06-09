@@ -322,3 +322,16 @@ cmake 编译命令是  cmake --build /data/like/package/cutlass/build-bjh100/  -
 给出错误原因和修复方法
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
 
+cutlass  位于 /data/like/package/cutlass
+cutlass code base examples/cute/tutorial/like_layout.cu 547 行调用 auto logical_product_a_tiler  = logical_product(A, tiler), tiler是一个Tile类型，
+
+logical_product 会调用 transform_layout, 对 transform_layout 的调用，一步步地进行讲解。
+transform_layout 实现中, 在 examples/cute/tutorial/like_layout.cu 547调用中 
+{
+  constexpr int R0 = decltype(rank(t0))::value; // R0 等于几 ？
+  constexpr int R1 = decltype(rank(t1))::value; // R1 是多少?
+  constexpr int R  = (R0 < R1) ? R0 : R1; // R是多少?
+  return detail::transform_layout(t0, t1, f, make_seq<R>{}, make_range<R,R0>{}, make_range<R,R1>{}); //对这里以等价的循环地形式，进行讲解
+}
+运行日志位于 cutlass code base run.like_layout.log
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面

@@ -3341,3 +3341,187 @@ zipped_product(ThrID=Layout<Shape<_4,_2>, Stride<_1,_16>>,
 ```
 
 然后 `tiled_product` 在此基础上多一步 `result(_, repeat<R1>(_))` (`include/cute/layout.hpp:1703-1704`)，将 ThrV 维展平为单 mode。
+
+---
+
+## `transform_layout` 逐 step 剖析: `like_layout.cu:547` 调用
+
+### 调用起点
+
+`examples/cute/tutorial/like_layout.cu:547`, `doc04_mma_atom()`:
+
+```cpp
+auto A = Layout<Shape<Int<2>, Int<5>>, Stride<Int<5>, Int<1>>>{};
+auto tiler = make_tile(Layout<Shape<_3>, Stride<_5>>{},
+                       Layout<Shape<_4>, Stride<_6>>{});
+auto logical_product_a_tiler = logical_product(A, tiler);
+```
+
+`logical_product(A, tiler)` 中 `tiler` 是 tuple 类型（`tuple<Layout<Shape<_3>,Stride<_5>>, Layout<Shape<_4>,Stride<_6>>>`），命中 `include/cute/layout.hpp:1662-1667` 的 tuple-tiler 重载:
+
+```cpp
+static_assert(tuple_size<Tiler>::value <= Layout<LShape,LStride>::rank, ...); // 2 <= 2, OK
+return transform_layout(block, tiler, [](auto const& l, auto const& t) { return logical_product(l,t); });
+```
+
+逻辑: **按 mode 逐对配对**，对每一对 mode 调用 `logical_product(layout_mode, tiler_element)`。
+
+---
+
+### Step 1: 进入 `transform_layout(t0, t1, f)` — 计算 R0, R1, R
+
+`include/cute/layout.hpp:756-764`, `transform_layout()`:
+
+```cpp
+template <class Tuple0, class Tuple1, class F>
+constexpr auto
+transform_layout(Tuple0 const& t0, Tuple1 const& t1, F&& f)
+{
+  constexpr int R0 = decltype(rank(t0))::value;
+  constexpr int R1 = decltype(rank(t1))::value;
+  constexpr int R  = (R0 < R1) ? R0 : R1;
+  return detail::transform_layout(t0, t1, f, make_seq<R>{}, make_range<R,R0>{}, make_range<R,R1>{});
+}
+```
+
+计算各值:
+
+| 变量 | 值 | 推导过程 |
+|------|-----|---------|
+| **R0** | **2** | `rank(Layout<Shape<_2,_5>,...>)` → `rank(Shape<_2,_5>)` (`include/cute/layout.hpp:616-618`) → `tuple_size<Shape<_2,_5>>` (`include/cute/int_tuple.hpp:79-80`) = 2 |
+| **R1** | **2** | `rank(tuple<Layout,Layout>)` → `is_tuple<T>` 为 true → `tuple_size` (`include/cute/int_tuple.hpp:79-80`) = 2 |
+| **R** | **2** | `min(2, 2)` = 2 |
+
+`R` 的含义: **同时迭代的 mode 数量** — 取两个 tuple 中较少的 rank。
+
+序列生成 (`include/cute/numeric/integer_sequence.hpp:83,89,113,119`):
+
+| 序列 | 展开 | 含义 |
+|------|------|------|
+| `make_seq<2>{}` | `seq<0, 1>{}` | 配对迭代索引: mode-0, mode-1 |
+| `make_range<2, 2>{}` | `seq<>{}` (空) | t0 剩余 mode (R0=2 已耗尽, 无剩余) |
+| `make_range<2, 2>{}` | `seq<>{}` (空) | t1 剩余 mode (R1=2 已耗尽, 无剩余) |
+
+因此最终调用:
+```
+detail::transform_layout(t0, t1, f, seq<0,1>{}, seq<>{}, seq<>{})
+```
+
+---
+
+### Step 2: `detail::transform_layout` — 展开为 `make_layout(...)`
+
+`include/cute/layout.hpp:738-744`, `detail::transform_layout()`:
+
+```cpp
+template <class Tuple0, class Tuple1, class F, int... I, int... I0, int... I1>
+constexpr auto
+transform_layout(Tuple0 const& t0, Tuple1 const& t1, F&& f,
+                 seq<I...>,   // 配对迭代索引
+                 seq<I0...>,  // t0 剩余 mode 索引 (单程)
+                 seq<I1...>)  // t1 剩余 mode 索引 (单程)
+{
+  return make_layout(
+      f(get<I>(t0),get<I>(t1))...,   // 展开: 配对调用 f(mode_i(t0), mode_i(t1))
+      get<I0>(t0)...,                // 展开: t0 多余 mode 直接追加
+      get<I1>(t1)...                 // 展开: t1 多余 mode 直接追加
+  );
+}
+```
+
+代入 `I={0,1}`, `I0={}`, `I1={}`:
+
+```cpp
+return make_layout(
+    // f(get<0>(t0), get<0>(t1))
+    logical_product(layout<0>(A),     get<0>(tiler)),
+    // f(get<1>(t0), get<1>(t1))
+    logical_product(layout<1>(A),     get<1>(tiler))
+    // t0 无剩余 mode, t1 无剩余 mode (两个 seq<> 均为空)
+);
+```
+
+**等价的 for 循环写法**:
+
+```cpp
+// 等价于: 对每个 shared mode index i ∈ [0, R), 调用 f(t0.mode(i), t1.mode(i))
+auto results = []() {
+    std::vector<decltype(f(layout<0>(t0), get<0>(t1)))> out;
+    for (int i = 0; i < R; ++i) {
+        out.push_back(f(layout<i>(t0), get<i>(t1)));
+    }
+    // 追加 t0 剩余 mode: for (int i = R; i < R0; ++i) out.push_back(layout<i>(t0));
+    // 追加 t1 剩余 mode: for (int i = R; i < R1; ++i) out.push_back(get<i>(t1));
+    return out;
+}();
+return make_layout(results...); // 拼接为嵌套 layout
+```
+
+在本例中 `R = R0 = R1 = 2`，无剩余 mode，循环体仅执行 mode-0 和 mode-1 的配对。
+
+---
+
+### Step 3: 每对 mode 的 `logical_product` 结果
+
+#### Mode 0: `logical_product(Layout<Shape<_2>, Stride<_5>>, Layout<Shape<_3>, Stride<_5>>)`
+
+`layout<0>(A)` 返回 `Layout<Shape<_2>, Stride<_5>>` — 一个**单 mode Layout**（rank=1）。`get<0>(tiler)` 是 `Layout<Shape<_3>, Stride<_5>>`。
+
+两者都是 Layout 类型 → `logical_product` 走 `include/cute/layout.hpp:1653-1656` 的重载 1:
+
+```cpp
+logical_product(Layout<LShape,LStride> const& block, Layout<TShape,TStride> const& tiler)
+{
+  return make_layout(block, composition(complement(block, size(block)*cosize(tiler)), tiler));
+}
+```
+
+结果 mode-0: `Shape = (_2, (_3))`, `Stride = (_5, (_10))`
+
+解释: 在 block (2 元素, stride=5) 的每个元素位置上, "嵌入" tiler (3 元素, stride=5), 形成嵌套 `(block_shape, (tiler_shape))`。
+
+#### Mode 1: `logical_product(Layout<Shape<_5>, Stride<_1>>, Layout<Shape<_4>, Stride<_6>>)`
+
+同理, mode-1: `Shape = (_5, (_4))`, `Stride = (_1, (_30))`
+
+---
+
+### Step 4: 最终拼接结果
+
+`make_layout` 将两个 mode 的 Layout 结果拼接为 2D 嵌套 layout:
+
+```
+((_2,(_3)),(_5,(_4))):((_5,(_10)),(_1,(_30)))
+```
+
+与 `run.like_layout.log:695` 输出一致:
+
+```
+result=((_2,(_3)),(_5,(_4))):((_5,(_10)),(_1,(_30)))
+```
+
+---
+
+### 参数不对称时 range 的作用
+
+若 `R0 ≠ R1`（如 `logical_product(Shape<_2,_3,_4>, Tile<_8,_9>{})` 中 R0=3, R1=2），则:
+
+| 变量 | 值 | 说明 |
+|------|-----|------|
+| R0 | 3 | block rank |
+| R1 | 2 | tiler tuple_size |
+| R  | 2 | min(3, 2) |
+| `seq<I...>` | `seq<0, 1>{}` | 配对 mode-0, mode-1 |
+| `range<R,R0>` | `range<2, 3>{}` → `seq<2>{}` | t0 剩余 mode-2 直接追加 |
+| `range<R,R1>` | `range<2, 2>{}` → `seq<>{}` | t1 无剩余 |
+
+展开:
+```cpp
+make_layout(
+    f(get<0>(t0), get<0>(t1)),  // paired
+    f(get<1>(t0), get<1>(t1)),  // paired
+    get<2>(t0)                   // t0 leftover mode-2, appended as-is
+)
+```
+
+这正是 `logical_product` 的语义: 按 mode 逐对 tiling，多出的 mode 保留原样。
