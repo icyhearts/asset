@@ -7453,3 +7453,47 @@ sglang 里不止 DeepSeekV2 是 MLA：`ModelRunner` 用 `attention_arch == Atten
 
 - DSA 和原生 `fp4_e2m1` KV cache 路径没有看到这个 commit 引入的 cell-size/pool mismatch：`_compute_cell_size()` 对这些分支 fallback 原版，见 `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:190 _compute_cell_size` 到 `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:191 _compute_cell_size`、`[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:199 _compute_cell_size` 到 `[simo] simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:200 _compute_cell_size`；sglang 对这些分支实际创建的是 `DSATokenToKVPool`、`MHATokenToKVPoolFP4` 或 `MLATokenToKVPoolFP4`，见 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:502 _init_pools` 到 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:530 _init_pools`、`[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:622 _init_pools` 到 `[sglang] python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:641 _init_pools`。
 - 语法检查已通过：`/data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py simo/extensions/sglang_simo/models/deepseek_v2.py`。
+
+---
+
+## sglang_simo NVFP4 KV cache 支持修改
+
+本次修改对齐 vLLM SIMO 的 NVFP4 KV cache 约定：`nvfp4_e2m1` 是 4bit E2M1 packed data，scale byte 是 FP8 E4M3。配置层面 `QuantizeSpecMX` 已经把 `mxfp4_e2m1 + scale_mode=e4m3 + block_size=16` 校准为 `nvfp4_e2m1`，并要求显式 `nvfp4_e2m1` 必须搭配 `scale_mode=e4m3` 和 `block_size=16`，见 `[simo] simo/quantization/config.py:466 QuantizeSpecMX.calibrate_dtype` 到 `[simo] simo/quantization/config.py:473 QuantizeSpecMX.calibrate_dtype`。
+
+### 1. 写入 MHA KV cache
+
+`[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:20 set_kv_buffer_kernel` 现在显式定义 `IS_NVFP4`，并把它纳入 `IS_4BIT`，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:59 set_kv_buffer_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:64 set_kv_buffer_kernel`。这样 NVFP4 写入时 `PACKED_TILE_SIZE = TILE_SIZE // 2`；在 `block_size=16` 时每个 tile 写 8 个 packed bytes。
+
+实际量化仍走通用 `_compute_and_pack_mxfmt`，并把 `MX_FORMAT_ID` 和 `MX_BLOCK_SIZE=TILE_SIZE` 传进去，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:93 set_kv_buffer_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:127 set_kv_buffer_kernel`。4bit packed data 不再做 8bit MX 的 bitcast，写入位置见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:157 set_kv_buffer_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:170 set_kv_buffer_kernel`。scale 仍按 1 byte 原样 bitcast 成 `uint8` 存储；对 NVFP4 这 1 byte 是 E4M3 scale，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:172 set_kv_buffer_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:178 set_kv_buffer_kernel`。
+
+这和 vLLM SIMO 写入路径一致：`reshape_and_cache_kernel_flash` 也把 `NVFP4_E2M1` 归入 4bit 路径，见 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py:117 reshape_and_cache_kernel_flash` 到 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py:123 reshape_and_cache_kernel_flash`；随后同样调用 `_compute_and_pack_mxfmt` 并把 scale byte 存成 `uint8`，见 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py:151 reshape_and_cache_kernel_flash` 到 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py:230 reshape_and_cache_kernel_flash`。
+
+### 2. 写入 MLA KV cache
+
+`[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:307 concat_and_cache_mla_kernel` 同样显式定义 `IS_NVFP4`，并归入 4bit packed 分支，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:345 concat_and_cache_mla_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:347 concat_and_cache_mla_kernel`。MLA 的 nope/rope tile 使用 `_compute_and_pack_mxfmt` 量化，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:382 concat_and_cache_mla_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:391 concat_and_cache_mla_kernel`；4bit packed size 取 `TILE_SIZE // 2`，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:420 concat_and_cache_mla_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:430 concat_and_cache_mla_kernel`；NVFP4 的 E4M3 scale byte 原样存到 scale 区，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:432 concat_and_cache_mla_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:435 concat_and_cache_mla_kernel`。
+
+### 3. decode attention 读取 NVFP4 cache
+
+`[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:47 _fwd_grouped_kernel_stage1` 现在也显式定义 `IS_NVFP4`，并把它归入 software dequant 路径，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:95 _fwd_grouped_kernel_stage1` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:102 _fwd_grouped_kernel_stage1`。关键点是 NVFP4 不能走 MXFP4 的 `tl.dot_scaled(..., "e2m1")` 路径，因为它的 scale 是 E4M3，不是 MXFP4 的 E8M0。
+
+因此 decode 读取 K、MLA rope K、V 的 scale 后，都会在调用 `_unpack_and_dequant_mxfmt` 前把 scale byte bitcast 成 `tl.float8e4nv`：普通 K 见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:221 _fwd_grouped_kernel_stage1` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:234 _fwd_grouped_kernel_stage1`；rope K 见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:336 _fwd_grouped_kernel_stage1` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:349 _fwd_grouped_kernel_stage1`；V 见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:447 _fwd_grouped_kernel_stage1` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:454 _fwd_grouped_kernel_stage1`。
+
+底层 `_unpack_and_dequant_mxfmt` 已经知道 NVFP4 的 quant block 是 16 个元素，并且当 scale dtype 是 `tl.float8e4nv` 时会按 E4M3 scale 转回输出 dtype，见 `[simo] simo/ops/kernels/upcast/_upcast_from_mxfmt.py:18 _unpack_and_dequant_mxfmt` 到 `[simo] simo/ops/kernels/upcast/_upcast_from_mxfmt.py:33 _unpack_and_dequant_mxfmt`、`[simo] simo/ops/kernels/upcast/_upcast_from_mxfmt.py:170 _unpack_and_dequant_mxfmt` 到 `[simo] simo/ops/kernels/upcast/_upcast_from_mxfmt.py:180 _unpack_and_dequant_mxfmt`。
+
+### 4. extend attention 读取 NVFP4 cache
+
+`[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:113 _fwd_kernel` 的 prefix-cache 读取路径做了同样处理：`IS_NVFP4` 被归入 software dequant，见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:173 _fwd_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:180 _fwd_kernel`。普通 K、MLA rope K、V 的 scale 读取后都会先 bitcast 成 `tl.float8e4nv`，再调用 `_unpack_and_dequant_mxfmt`，分别见 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:340 _fwd_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:351 _fwd_kernel`、`[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:445 _fwd_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:455 _fwd_kernel`、`[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:546 _fwd_kernel` 到 `[simo] simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:552 _fwd_kernel`。
+
+extend 的当前-token triangle 部分仍然读取未量化的 `K_Extend/V_Extend`，没有走 KV cache 读取，因此这部分不需要 NVFP4 dequant 分支。
+
+### 5. 与 vLLM attention 读取路径的关系
+
+vLLM SIMO 的 unified attention 读取 NVFP4 时也是先把 scale byte bitcast 成 `tl.float8e4nv`，见 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py:381 kernel_unified_attention_2d` 到 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py:391 kernel_unified_attention_2d`；QK 对 NVFP4 走 software dequant 分支，见 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py:484 kernel_unified_attention_2d` 到 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py:498 kernel_unified_attention_2d`；V 也通过 `_unpack_and_dequant_mxfmt` 解包，见 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py:560 kernel_unified_attention_2d` 到 `[simo] simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py:562 kernel_unified_attention_2d`。sglang_simo 这次修改后的读路径与这个逻辑一致。
+
+### 验证
+
+已通过语法检查：
+
+`/data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py`
+
+没有在本次执行 GPU 数值对齐测试；如果要进一步验证，建议用同一个 prompt/input 分别跑 bf16 KV cache 与 `dtype=nvfp4_e2m1, scale_mode=e4m3, group_size=16` 的 sglang_simo 路径，对比 decode 和 extend 阶段输出误差。
