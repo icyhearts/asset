@@ -1896,8 +1896,19 @@ simo 代码位于 /data/like/package/simo_conda_sglang
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 simo 代码位于 /data/like/package/simo_conda_sglang
 vllm代码位于/data//like/package/vllm-for-conda-simo, vllm conda 环境位于 /data/like/miniconda3/envs/simo_vllm/
-
-
+vllm_simo现在对 nvfp4  kv cache支持情况如下:
 simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py reshape_and_cache_kernel_flash 支持 nvfp4 量化格式的 kv cache 量化,
+simo/extensions/vllm_simo/example/online_quantization/llm_vlm_eval_online_quant.sh  run_kv_cache_quant_evaluations_gqa 函数展示了如何使用配置文件  simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json 进行 nvfp4 kkv cache量化。
+关键配置如下: "dtype": "nvfp4_e2m1", "scale_mode": "e4m3", "group_size": 16,
 
 simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py 
+simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py 展示了在 attention kernel中读取 nvfp4 格式的 kv cache，进行 attention计算的逻辑。
+
+现在我的需求是:
+想让 sglang_simo 也支持 nvfp4 kv cache 写入，支持 nvfp4 kv cache读取和attention计算。
+1) simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py concat_and_cache_mla_kernel set_kv_buffer_kernel
+已经支持 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group 格式的量化写入,  你需要参照  simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py reshape_and_cache_kernel_flash，修改 simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py, 让它支持   nvfp4 kv cache写入。
+2)  simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py _fwd_grouped_kernel_stage1 已经支持  mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group 格式的量化读取，你需要对它进行修改，支持 nvfp4 格式。
+3) simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py _fwd_kernel 已经支持 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group 格式的量化读取，你需要对它进行修改，支持 nvfp4 格式。
+
+4) 修改完对你的修改进行讲解， 把答案追加在 temp/codex_answer.md 里面
