@@ -7497,3 +7497,126 @@ vLLM SIMO 的 unified attention 读取 NVFP4 时也是先把 scale byte bitcast 
 `/data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py`
 
 没有在本次执行 GPU 数值对齐测试；如果要进一步验证，建议用同一个 prompt/input 分别跑 bf16 KV cache 与 `dtype=nvfp4_e2m1, scale_mode=e4m3, group_size=16` 的 sglang_simo 路径，对比 decode 和 extend 阶段输出误差。
+
+---
+
+## lm-eval GSM8K 日志错误修复
+
+这次日志里的失败点不是 SGLang，也不是 `kv_cache_dtype=fp8_e4m3`。模型已经加载成功，KV cache 也已经分配成功：日志显示 `Load weight end`、`KV Cache is allocated. dtype: torch.float8_e4m3fn`，以及 `Tree cache initialized`。真正的异常在 lm-eval 加载 GSM8K 数据集时抛出：
+
+`templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_10___16_35_25:44` 开始进入 traceback，根因在 `templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_10___16_35_25:85` 到 `templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_10___16_35_25:86`：
+
+`FileNotFoundError: Couldn't find any data file at /data/like/package/simo_conda_sglang/openai/gsm8k. Couldn't find 'openai/gsm8k' on the Hugging Face Hub either ...`
+
+当前 `lm-eval` 的 GSM8K task 使用的是 `dataset_path: openai/gsm8k`、`dataset_name: main`，见 `/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/tasks/gsm8k/gsm8k.yaml:4` 到 `/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/tasks/gsm8k/gsm8k.yaml:5`。而原先 `/data/like/huggingface_cache` 里面只有旧路径 `gsm8k/main/...` 的 Arrow cache，不是 `openai___gsm8k/main/...`；Hub repo cache 里也只有旧的 `datasets--gsm8k`，没有 `datasets--openai--gsm8k`。所以 `HF_DATASETS_CACHE=/data/like/huggingface_cache` 并不能复用旧的 `gsm8k` 缓存。
+
+修复方式是先用同一个 conda 环境和同一个 cache 目录，把 `openai/gsm8k` 预热到本地缓存：
+
+```bash
+HF_DATASETS_CACHE=/data/like/huggingface_cache \
+HF_ENDPOINT=https://huggingface.co \
+/data/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+from datasets import load_dataset
+
+dataset = load_dataset("openai/gsm8k", "main", split="test")
+print(dataset)
+print(len(dataset))
+PY
+```
+
+我已经执行验证通过，输出 `Dataset({ features: ['question', 'answer'], num_rows: 1319 })`，并且二次加载输出 `1319`。现在已经生成了新的数据集缓存：
+
+- `/data/like/huggingface_cache/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866/gsm8k-train.arrow`
+- `/data/like/huggingface_cache/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866/gsm8k-test.arrow`
+- `/softhome/like/.cache/huggingface/hub/datasets--openai--gsm8k/...`
+
+预热后重跑原命令即可。建议显式带上 `HF_ENDPOINT=https://huggingface.co`，避免继承到其他 shell 里的镜像/离线配置：
+
+```bash
+HF_DATASETS_CACHE=/data/like/huggingface_cache \
+HF_ENDPOINT=https://huggingface.co \
+CUDA_VISIBLE_DEVICES=7 \
+lm-eval --model sglang \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B", "tp_size": 1, "dtype": "auto", "mem_fraction_static": 0.5, "kv_cache_dtype": "fp8_e4m3", "log_level": "info"}' \
+  --tasks gsm8k \
+  --batch_size auto \
+  > templ/sglang.gsm8k.lm-eval-kv-fp8.log.`nowstr.sh` 2>&1 &
+```
+
+如果后续要在无网络环境跑，先保证上面的 `openai___gsm8k` 和 `datasets--openai--gsm8k` 两类缓存都存在，再加：
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+```
+
+日志末尾的 `ResourceTracker.__del__ ... ChildProcessError` 是主异常退出后的清理副作用，不是根因；修复数据集加载后它通常会一起消失。
+
+---
+
+## lm-eval GSM8K 第二次日志错误修复
+
+这次已经不是数据集缓存问题。新日志已经成功加载 GSM8K，并构建完 1319 条 context：`templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_10___16_49_05:44` 到 `templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_10___16_49_05:49` 显示 task 选中、context 构建完成并进入 `Running generate_until requests`。模型和 FP8 KV cache 也已经成功初始化，见同一日志的 `KV Cache is allocated. dtype: torch.float8_e4m3fn`。
+
+真正的根因是 lm-eval 的 SGLang adapter 传了错误的 sampling 参数名：
+
+```text
+TypeError: SamplingParams.__init__() got an unexpected keyword argument 'max_tokens'
+```
+
+调用链是：
+
+- `/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py:261 generate_until` 到 `/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py:263 generate_until` 构造 `sampling_params` 时写入了 `{"max_tokens": max_gen_toks, "stop": until}`。
+- `/data/like/package/sglang_kernel_src/python/sglang/srt/managers/tokenizer_manager.py:1011 _create_tokenized_object` 到 `/data/like/package/sglang_kernel_src/python/sglang/srt/managers/tokenizer_manager.py:1018 _create_tokenized_object` 会直接把这个 dict 展开传给 `SamplingParams(**sampling_kwargs)`。
+- 当前 SGLang 的 `/data/like/package/sglang_kernel_src/python/sglang/srt/sampling/sampling_params.py:40 SamplingParams.__init__` 到 `/data/like/package/sglang_kernel_src/python/sglang/srt/sampling/sampling_params.py:67 SamplingParams.__init__` 只接受 `max_new_tokens`，不接受 `max_tokens`。
+
+我做了轻量验证：
+
+```text
+SamplingParams(max_tokens=8) -> TypeError
+SamplingParams(max_new_tokens=8) -> OK
+```
+
+推荐修复 lm-eval adapter，改一行即可：
+
+```diff
+--- /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py
++++ /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py
+@@
+-                sampling_params.append(
+-                    kwargs | {"max_tokens": max_gen_toks, "stop": until}
+-                )
++                sampling_params.append(
++                    kwargs | {"max_new_tokens": max_gen_toks, "stop": until}
++                )
+```
+
+也可以用命令直接打补丁：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+from pathlib import Path
+
+path = Path("/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py")
+text = path.read_text()
+old = 'kwargs | {"max_tokens": max_gen_toks, "stop": until}'
+new = 'kwargs | {"max_new_tokens": max_gen_toks, "stop": until}'
+if old not in text:
+    raise SystemExit(f"pattern not found in {path}")
+path.write_text(text.replace(old, new, 1))
+print(f"patched {path}")
+PY
+```
+
+修完后重跑原命令即可。传 `--gen_kwargs max_new_tokens=...` 不能解决这个问题，因为 adapter 仍然会额外塞入 `max_tokens`，SGLang 仍会在 `SamplingParams(**sampling_kwargs)` 处报错。
+
+如果希望把兼容逻辑放在 SGLang 侧，而不是改 conda 里的 lm-eval，可以在 `/data/like/package/sglang_kernel_src/python/sglang/srt/managers/tokenizer_manager.py:1014 _create_tokenized_object` 到 `/data/like/package/sglang_kernel_src/python/sglang/srt/managers/tokenizer_manager.py:1018 _create_tokenized_object` 之间加入别名转换：
+
+```python
+sampling_kwargs = dict(sampling_kwargs)
+if "max_tokens" in sampling_kwargs and "max_new_tokens" not in sampling_kwargs:
+    sampling_kwargs["max_new_tokens"] = sampling_kwargs.pop("max_tokens")
+else:
+    sampling_kwargs.pop("max_tokens", None)
+```
+
+两种修复选一种即可。对这次 `lm-eval --model sglang` 来说，最小且最直接的是修 lm-eval adapter 的 `max_tokens -> max_new_tokens`。日志最后的 `resource_tracker ... KeyError` 是主进程异常退出后的清理副作用，不是根因。
