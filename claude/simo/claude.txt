@@ -1976,3 +1976,18 @@ sglang fp8 kv cache:
 分析 sglang_simo 的 kv cache 量化，为什么在 Llama3.1-8B-Instruct 上gsm8k 得分是正常的， 在 DeepSeek-V2-Lite-Chat-16B_A2.4B 上 mxfp4 mxfp6 nvfp4 得分很差的原因。
 
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/cld_answer.md 里面
+vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+vllm 源码 位于 /data/like/package/vllm-for-conda-simo
+vllm编译脚本是:  /softhome/like/asset/code/like-useful-vllm/install-vllm.sh
+vllm 编译 日志: /share_data/users/like/package/h100/package/other/vllm/temp/pip-vllm-src.log.txt.2026_05_26___23_06_19
+在  vllm conda 环境下 import 报错:
+>>> import vllm._C
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+ImportError: /data/like/package/vllm-for-conda-simo/vllm/_C.abi3.so: undefined symbol: _ZN3c1013MessageLoggerC1EPKciib
+
+分析错误原因，  vllm 是直接调用 c10::MessageLogger::MessageLogger 函数了吗？ vllm是 如何 依赖 c10::MessageLogger::MessageLogger 的?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
