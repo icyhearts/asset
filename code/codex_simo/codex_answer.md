@@ -7620,3 +7620,64 @@ else:
 ```
 
 两种修复选一种即可。对这次 `lm-eval --model sglang` 来说，最小且最直接的是修 lm-eval adapter 的 `max_tokens -> max_new_tokens`。日志最后的 `resource_tracker ... KeyError` 是主进程异常退出后的清理副作用，不是根因。
+
+---
+
+## sglang_simo DeepSeek-V2 MLA KV cache 低比特量化低分原因
+
+结论：这不是 `lm-eval`、BOS 参数、模型加载或者 SIMO KV cache 通用读写路径整体失效导致的。更可能的根因是：DeepSeek-V2 走 MLA cache，当前 SIMO MLA writer 把 `kv_lora_rank` 部分和 RoPE 后的 `k_pe` 位置分量都用同一个低比特 KV cache 格式写入；`mxfp4`、`mxfp6`、`nvfp4` 对 DeepSeek MLA 的 `k_pe` 精度破坏太大，导致 attention logits 中的 `q_pe @ k_pe` 项失真。Llama3.1-8B-Instruct 走普通 MHA/GQA KV cache，没有这个单独的 MLA RoPE cache 分量，所以同一套低比特 K/V 读写不会直接崩掉。
+
+### 日志现象
+
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh:41 top-level` 到 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh:54 top-level` 根据 `DEBUG_ID` 选择 KV cache 配置。四份日志对齐后是：
+
+| KV cache 格式 | Llama3.1-8B GSM8K | DeepSeek-V2-Lite GSM8K |
+|---|---:|---:|
+| `mxfp8` | 0.7642 | 0.6505 |
+| `mxfp4` | 0.6929 | 0.0099 |
+| `mxfp6` | 0.7832 | 0.0728 |
+| `mxint8` | 0.7794 | 0.6619 |
+| `fp8_per_group` | 0.7612 | 0.6710 |
+| `int8_per_group` | 0.7756 | 0.6475 |
+| `nvfp4` | 0.7672 | 0.0099 |
+
+参考的 SGLang 原生 `fp8_e4m3` KV cache：Llama 是 0.7824，DeepSeek 是 0.6702。也就是说 DeepSeek 上 8-bit 类格式是正常的，只有 `mxfp4/mxfp6/nvfp4` 低比特格式崩掉；这基本排除了“DeepSeek 跑法本身错了”或“SIMO MLA cache 布局完全错位”的解释。
+
+### 相关代码链路
+
+SIMO 配置只打开 KV cache 量化，权重仍是 bf16。`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp4.json:23 kv_cache_quant_algo` 到 `simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp4.json:27 kv_cache_quant_algo`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp6.json:23 kv_cache_quant_algo` 到 `simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp6.json:27 kv_cache_quant_algo`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:23 kv_cache_quant_algo` 到 `simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:28 kv_cache_quant_algo` 都只设置 `kv_cache_quant_algo`，且 `key_hadamard_transform_size/value_hadamard_transform_size` 都是 0。
+
+这些 KV cache 配置会挂到每个 `RadixAttention` 上：`simo/extensions/sglang_simo/quantization/quantization.py:905 SIMOConfig.get_quant_method` 到 `simo/extensions/sglang_simo/quantization/quantization.py:916 SIMOConfig.get_quant_method` 对 `RadixAttention` 返回 `SIMOKVCacheMethod`；`simo/extensions/sglang_simo/quantization/quantization.py:1400 SIMOKVCacheMethod.create_weights` 到 `simo/extensions/sglang_simo/quantization/quantization.py:1417 SIMOKVCacheMethod.create_weights` 设置 `layer.kv_cache_quant_spec/kv_cache_downcast_kernel` 并预计算 packed/scale 大小。
+
+Llama 走 MHA/GQA pool：`simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:52 SIMOMHATokenToKVPoolAdapter.__init__` 注入 `SIMOMHATokenToKVPool`；`simo/extensions/sglang_simo/mem_cache/memory_pool.py:152 SIMOMHATokenToKVPool._create_buffers` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:176 SIMOMHATokenToKVPool._create_buffers` 分别创建 K buffer 和 V buffer；`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:20 set_kv_buffer_kernel` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:178 set_kv_buffer_kernel` 对普通 K/V tile 做量化写入。Llama 的日志说明这条路径对低比特格式至少不是灾难性错误。
+
+DeepSeek-V2 走 MLA pool：`python/sglang/srt/models/deepseek_v2.py:1556 DeepseekV2AttentionMLA.__init__` 到 `python/sglang/srt/models/deepseek_v2.py:1564 DeepseekV2AttentionMLA.__init__` 创建 `attn_mqa`，它的 key 维度是 `kv_lora_rank + qk_rope_head_dim`，`num_kv_heads=1`，value 维度是 `kv_lora_rank`。本地模型配置里这两个维度分别是 512 和 64，所以 decode kernel 也在 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:535 _decode_grouped_att_m_fwd` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:538 _decode_grouped_att_m_fwd` 把 `Lk=576` 拆成 `BLOCK_DMODEL=512` 和 `BLOCK_DPE=64`。
+
+DeepSeek MLA 前向会显式产生 RoPE 后的 `k_pe`：`python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:284 DeepseekMLAForwardMixin.forward_absorb_prepare` 到 `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:285 DeepseekMLAForwardMixin.forward_absorb_prepare` 拆出 `q_pe/k_pe`；`python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:376 DeepseekMLAForwardMixin.forward_absorb_prepare` 到 `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:382 DeepseekMLAForwardMixin.forward_absorb_prepare` 对 `q_pe/k_pe` 做 rotary；`python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:494 DeepseekMLAForwardMixin.forward_absorb_core` 到 `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:500 DeepseekMLAForwardMixin.forward_absorb_core` 调用 `attn_mqa(q_nope_out, k_nope, k_nope, q_rope=q_pe, k_rope=k_pe)`。
+
+SIMO MLA cache 写入端把 `k_nope` 和 `k_pe` 都量化：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:318 SIMOMLATokenToKVPool.set_kv_buffer` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:320 SIMOMLATokenToKVPool.set_kv_buffer` 把 `cache_k` 拆成 `kv_lora_rank` 和 rope 两段；`simo/extensions/sglang_simo/mem_cache/memory_pool.py:381 SIMOMLATokenToKVPool.set_mla_kv_buffer` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:405 SIMOMLATokenToKVPool.set_mla_kv_buffer` 把两段都传给 `concat_and_cache_mla_kernel`。在 kernel 内，`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:356 concat_and_cache_mla_kernel` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:380 concat_and_cache_mla_kernel` 根据 tile 落在 KV_C 还是 K_PE 区域选择写入 offset；`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:382 concat_and_cache_mla_kernel` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:435 concat_and_cache_mla_kernel` 对当前 tile 调 `_compute_and_pack_mxfmt` 并写 packed data/scale。这里没有给 K_PE 单独保留高精度路径，且 `HADAMARD_TRANSFORM_SIZE=0`。
+
+读取端也会把量化后的 K_PE 解出来参与 logits。decode 中，`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:261 _fwd_grouped_kernel_stage1` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:384 _fwd_grouped_kernel_stage1` 从 cache 的 rope 区域读 K_PE，计算 `qk_pe`，再 `qk += qk_pe`。prefill/extend 中同样如此：`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:378 _fwd_kernel` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:485 _fwd_kernel` 读量化 K_PE 并加到 `qk`。
+
+### 为什么只在 DeepSeek-V2 上崩
+
+Llama 的 cache 是普通 GQA/MHA K/V。低比特量化会引入误差，但误差分散在普通 key/value 上；日志里 `mxfp4` 从 fp8 baseline 0.7824 掉到 0.6929，但没有崩成随机水平。
+
+DeepSeek-V2 MLA 的 cache 不同：attention score 实际是 `q_nope_out @ k_nope + q_pe @ k_pe`。其中 `k_pe` 是 RoPE 后的位置分量，维度只有 64，但它直接控制位置相关 logits。当前 SIMO MLA layout 对 `k_pe` 也使用和 `kv_lora_rank` 一样的低比特块量化；`mxfp4/nvfp4` 是 4-bit E2M1，`mxfp6` 也只有 6-bit，且配置没有 Hadamard/smoothing。这个误差会直接污染 `q_pe @ k_pe`，decode 阶段又会反复读取历史 cache，所以 GSM8K 这种生成任务会快速劣化。
+
+8-bit 类格式正常是关键证据：DeepSeek 的 `mxfp8=0.6505`、`mxint8=0.6619`、`fp8_per_group=0.6710`、`int8_per_group=0.6475` 都接近 SGLang 原生 fp8 的 0.6702。如果 MLA cache offset、`packed_head_size_rope/scale_head_size_rope`、decode/extend 读写布局整体错了，8-bit 类格式通常也会明显崩掉；现在只崩低比特，说明主要矛盾是 MLA K_PE 的低比特精度，而不是通用布局错误。
+
+### 建议修复和验证
+
+推荐修复方向：DeepSeek MLA 不要把 `k_pe` 按 `mxfp4/mxfp6/nvfp4` 存。可以允许 `kv_lora_rank`/`k_nope` 低比特量化，但 `k_pe` 应保留 bf16，或者至少用 `mxfp8/mxint8/fp8_per_group` 这类 8-bit 格式。需要同步改四处：
+
+1. `simo/extensions/sglang_simo/mem_cache/memory_pool.py:323 SIMOMLATokenToKVPool.set_mla_kv_buffer` 的 MLA cache layout，拆成 `KV_C` 低比特区和 `K_PE` 高精度/8-bit 区。
+2. `simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:310 concat_and_cache_mla_kernel` 给 K_PE 单独写入格式，不再无条件复用 `MX_FORMAT_ID`。
+3. `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:261 _fwd_grouped_kernel_stage1` 和 `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:378 _fwd_kernel` 的 rope 读取分支按 K_PE 的真实格式读取。
+4. `simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:189 _compute_cell_size` 到 `simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:197 _compute_cell_size` 当前按 `packed_head_size + scale_head_size + packed_head_size_rope + scale_head_size_rope` 估算 MLA cell size，改 mixed-format 后也要同步更新。
+
+最小验证实验：
+
+1. 只改 MLA writer/read，让 `kv_lora_rank` 仍用 `mxfp4/mxfp6/nvfp4`，但 K_PE 强制用 bf16 或 mxfp8；如果 DeepSeek GSM8K 恢复到 0.65 左右，就能确认问题在 K_PE 低比特量化。
+2. 反向实验：只量化 K_PE，KV_C 保持 bf16/8-bit；如果分数仍崩，说明 `q_pe @ k_pe` 是主因。
+3. 对同一批 token dump bf16 cache 与低比特 cache 的 `q_nope_out @ k_nope`、`q_pe @ k_pe` 两项误差；预期 DeepSeek 低分配置里 `q_pe @ k_pe` 误差会显著大于 8-bit 配置。
