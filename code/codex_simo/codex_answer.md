@@ -7681,3 +7681,149 @@ DeepSeek-V2 MLA 的 cache 不同：attention score 实际是 `q_nope_out @ k_nop
 1. 只改 MLA writer/read，让 `kv_lora_rank` 仍用 `mxfp4/mxfp6/nvfp4`，但 K_PE 强制用 bf16 或 mxfp8；如果 DeepSeek GSM8K 恢复到 0.65 左右，就能确认问题在 K_PE 低比特量化。
 2. 反向实验：只量化 K_PE，KV_C 保持 bf16/8-bit；如果分数仍崩，说明 `q_pe @ k_pe` 是主因。
 3. 对同一批 token dump bf16 cache 与低比特 cache 的 `q_nope_out @ k_nope`、`q_pe @ k_pe` 两项误差；预期 DeepSeek 低分配置里 `q_pe @ k_pe` 误差会显著大于 8-bit 配置。
+
+---
+
+## vLLM `_C.abi3.so` undefined symbol `c10::MessageLogger` 原因分析
+
+结论：`vllm._C` 不是在业务代码里手写调用 `c10::MessageLogger::MessageLogger`。这个符号是 vLLM C++/CUDA 扩展使用 PyTorch C++ API、`TORCH_CHECK`/`TORCH_CHECK_EQ`/`AT_CUDA_CHECK` 等宏后，由 PyTorch 头文件展开出来的间接依赖。当前报错的核心是 `_C.abi3.so` 编译时使用的 PyTorch/c10 头文件 ABI 和 import 时加载到的 `libc10.so` ABI 不一致。
+
+报错符号 `_ZN3c1013MessageLoggerC1EPKciib` demangle 后是：
+
+```text
+c10::MessageLogger::MessageLogger(char const*, int, int, bool)
+```
+
+我检查 `_C.abi3.so`，它确实有这个未解析符号：
+
+```text
+U c10::MessageLogger::MessageLogger(char const*, int, int, bool)
+U c10::MessageLogger::stream[abi:cxx11]()
+U c10::MessageLogger::~MessageLogger()
+```
+
+### 环境差异
+
+我在当前机器上分别用两个 conda 前缀复测：
+
+```text
+/data/like/miniconda3/envs/simo_vllm/bin/python
+  torch 2.11.0+cu128
+  import vllm._C -> 复现 undefined symbol: _ZN3c1013MessageLoggerC1EPKciib
+
+/share_data/users/like/miniconda3/envs/simo_vllm/bin/python
+  torch 2.10.0+cu128
+  import vllm._C -> OK
+```
+
+也就是说，用户描述的错误更符合 `/data/like/miniconda3/envs/simo_vllm` 这个 torch 2.11 运行环境，或者 `/share_data/users/like/miniconda3/envs/simo_vllm` 运行时被 `LD_LIBRARY_PATH/LD_PRELOAD` 混入了不兼容的 torch/libc10 动态库。
+
+这两个环境的 `libc10.so` 符号也正好不同：
+
+```text
+/data/.../torch/lib/libc10.so
+  exports c10::MessageLogger::MessageLogger(c10::SourceLocation, int, bool)
+  does not export c10::MessageLogger::MessageLogger(char const*, int, int, bool)
+
+/share_data/.../torch/lib/libc10.so
+  exports c10::MessageLogger::MessageLogger(char const*, int, int, bool)
+```
+
+对应的 PyTorch 头文件也不同。torch 2.11 的外部头文件 `/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/logging_common.h:13 MessageLogger` 到 `/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/logging_common.h:18 MessageLogger` 声明的是 `MessageLogger(SourceLocation, int, bool)`；torch 2.10 的外部头文件 `/share_data/users/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/logging_common.h:12 MessageLogger` 到 `/share_data/users/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/logging_common.h:18 MessageLogger` 声明的是 `MessageLogger(const char*, int, int, bool)`。
+
+### 编译日志暴露的问题
+
+编译脚本 `/softhome/like/asset/code/like-useful-vllm/install-vllm.sh:2 top-level` source 了构建环境脚本，`/softhome/like/asset/code/like-useful-vllm/install-vllm.sh:5 top-level` 用裸 `pip install -e . --no-build-isolation` 编译安装。`--no-build-isolation` 意味着 CMake/PyTorch 头文件来自当时已激活环境里的 torch。
+
+但编译日志 `/share_data/users/like/package/h100/package/other/vllm/temp/pip-vllm-src.log.txt.2026_05_26___23_06_19:68` 显示 pip 解析到 `torch==2.11.0`；`/share_data/users/like/package/h100/package/other/vllm/temp/pip-vllm-src.log.txt.2026_05_26___23_06_19:209` 到 `:227` 先构建 editable vLLM；之后 `/share_data/users/like/package/h100/package/other/vllm/temp/pip-vllm-src.log.txt.2026_05_26___23_06_19:264` 到 `:267` 才卸载已有 `torch 2.10.0`；最后 `/share_data/users/like/package/h100/package/other/vllm/temp/pip-vllm-src.log.txt.2026_05_26___23_06_19:289` 安装 `torch-2.11.0+cu128`。
+
+这会产生典型 ABI 错配：
+
+1. 构建 `_C.abi3.so` 时，环境里还是 torch 2.10 头文件，所以编译产物引用旧符号 `MessageLogger(char const*, int, int, bool)`。
+2. pip 构建完成后又把环境升级到 torch 2.11。
+3. import 时加载 torch 2.11 的 `libc10.so`，但该库只提供新符号 `MessageLogger(SourceLocation, int, bool)`。
+4. 动态链接器无法解析旧符号，于是报 `undefined symbol: _ZN3c1013MessageLoggerC1EPKciib`。
+
+还有一个路径问题：构建日志里的依赖路径是 `/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages`，不是用户这次写的 `/share_data/users/like/miniconda3/envs/simo_vllm`。因此要确认实际运行的 `python/pip/torch/libc10.so` 是同一个前缀。
+
+### vLLM 如何间接依赖 `MessageLogger`
+
+vLLM 的 `_C` 扩展由 `CMakeLists.txt:285 top-level` 到 `CMakeLists.txt:310 top-level` 的 `VLLM_EXT_SRC` 源文件构成，`CMakeLists.txt:660 top-level` 到 `CMakeLists.txt:671 top-level` 用这些源文件定义 `_C` extension。CMake 会通过当前 Python 环境查找 torch：`CMakeLists.txt:77 top-level` 把 torch 的 `cmake_prefix_path` 加到 CMake 搜索路径，`CMakeLists.txt:91 top-level` 执行 `find_package(Torch REQUIRED)`。
+
+`_C` 扩展会链接 torch/c10 动态库。`readelf -d vllm/_C.abi3.so` 显示它需要：
+
+```text
+libtorch.so
+libtorch_cpu.so
+libtorch_cuda.so
+libc10_cuda.so
+libc10.so
+```
+
+vLLM 代码里没有直接写 `MessageLogger`。依赖来自 PyTorch 宏和注册 API，例如：
+
+- `csrc/torch_bindings.cpp:18 TORCH_LIBRARY_EXPAND` 到 `csrc/torch_bindings.cpp:49 TORCH_LIBRARY_EXPAND` 用 `TORCH_LIBRARY` 注册自定义 op。
+- `csrc/torch_bindings.cpp:547 TORCH_LIBRARY_EXPAND` 到 `csrc/torch_bindings.cpp:588 TORCH_LIBRARY_EXPAND` 注册 cache ops。
+- `csrc/torch_bindings.cpp:654 TORCH_LIBRARY_EXPAND` 到 `csrc/torch_bindings.cpp:668 TORCH_LIBRARY_EXPAND` 注册 cuda utils/custom all-reduce ops。
+- `csrc/custom_all_reduce.cu:68 all_reduce` 到 `csrc/custom_all_reduce.cu:76 all_reduce` 使用 `TORCH_CHECK_EQ/TORCH_CHECK/AT_CUDA_CHECK`。
+- `csrc/custom_all_reduce.cu:153 allocate_shared_buffer_and_handle` 到 `csrc/custom_all_reduce.cu:165 allocate_shared_buffer_and_handle` 使用 `AT_CUDA_CHECK`。
+- `csrc/custom_all_reduce.cu:179 open_mem_handle` 到 `csrc/custom_all_reduce.cu:183 open_mem_handle` 使用 `AT_CUDA_CHECK`。
+- `csrc/cache_kernels_fused.cu:204 concat_and_cache_mla_rope_fused` 到 `csrc/cache_kernels_fused.cu:253 concat_and_cache_mla_rope_fused` 大量使用 `TORCH_CHECK_EQ`。
+
+这些宏在 torch 2.10 头文件里会展开到旧签名的 `MessageLogger`。例如外部 PyTorch 2.10 头文件 `/share_data/users/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/Exception.h:710 FATAL_IF` 到 `:721 FATAL_IF` 使用 `::c10::MessageLogger(__FILE__, __LINE__, ::c10::GLOG_FATAL)`；`/share_data/users/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/Exception.h:725 NON_FATAL_IF` 到 `:738 NON_FATAL_IF` 使用 `::c10::MessageLogger(__FILE__, __LINE__, ::c10::GLOG_FATAL, false)`。
+
+torch 2.11 改成了 `SourceLocation` 签名：外部 PyTorch 2.11 头文件 `/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/Exception.h:710 FATAL_IF` 到 `:724 FATAL_IF` 使用 `::c10::MessageLogger(::c10::SourceLocation::current(), ::c10::GLOG_FATAL)`；`/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/include/c10/util/Exception.h:728 NON_FATAL_IF` 到 `:741 NON_FATAL_IF` 使用 `SourceLocation` 版本。
+
+所以答案是：vLLM 没有直接调用 `c10::MessageLogger::MessageLogger`；vLLM 通过 PyTorch 的 C++ extension 注册、检查宏、CUDA 检查宏间接依赖 c10 的日志/异常实现。编译时这些宏展开成了旧 ABI，运行时却加载了新 ABI 的 `libc10.so`。
+
+### 修复建议
+
+推荐做法是固定一个 conda 前缀和一个 torch 版本，然后清理旧 build 产物后重编译 vLLM。不要让 pip 在构建完 vLLM 后再升级 torch。
+
+如果目标是 torch 2.11：
+
+```bash
+/data/like/miniconda3/envs/simo_vllm/bin/python -m pip install \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  torch==2.11.0+cu128 torchvision==0.26.0+cu128 torchaudio==2.11.0+cu128
+
+cd /data/like/package/vllm-for-conda-simo
+rm -rf build-src-bjh-v0.20.0-like-dev-v2026_05_25
+/data/like/miniconda3/envs/simo_vllm/bin/python -m pip install \
+  --config-settings=build.verbose=true -vvv -e . --no-build-isolation --no-deps \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+如果目标是 `/share_data/users/like/miniconda3/envs/simo_vllm`，就把上面的 python 路径全部换成 `/share_data/users/like/miniconda3/envs/simo_vllm/bin/python`，并确保 `LD_LIBRARY_PATH` 没有指向 `/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/torch/lib` 或其他 torch/lib 目录。
+
+建议把编译脚本里的裸 `pip` 改成明确的：
+
+```bash
+${CONDA_PREFIX}/bin/python -m pip ...
+```
+
+并在 build 前后打印：
+
+```bash
+python - <<'PY'
+import sys, torch, pathlib
+print(sys.executable)
+print(torch.__version__)
+print(torch.__file__)
+print(pathlib.Path(torch.__file__).resolve().parent / "lib/libc10.so")
+PY
+```
+
+验证符号是否匹配：
+
+```bash
+readelf -Ws vllm/_C.abi3.so | c++filt | grep 'MessageLogger::MessageLogger'
+readelf -Ws "$(python - <<'PY'
+import torch, pathlib
+print(pathlib.Path(torch.__file__).resolve().parent / 'lib/libc10.so')
+PY
+)" | c++filt | grep 'MessageLogger::MessageLogger'
+```
+
+两边的 `MessageLogger` 构造函数签名必须一致，否则 `_C.abi3.so` 就会在 import 时继续报 undefined symbol。
