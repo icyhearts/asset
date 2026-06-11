@@ -1979,10 +1979,10 @@ sglang fp8 kv cache:
 
 
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/cld_answer.md 里面
-vllm conda环境位/share_data/users/like/miniconda3/envs/simo_vllm
+vllm conda环境位 于 /data/like/miniconda3/envs/simo_vllm/
 vllm 源码 位于 /data/like/package/vllm-for-conda-simo
 vllm编译脚本是:  /softhome/like/asset/code/like-useful-vllm/install-vllm.sh
-vllm 编译 日志: /share_data/users/like/package/h100/package/other/vllm/temp/pip-vllm-src.log.txt.2026_05_26___23_06_19
+vllm 编译 日志: /data/like/package/vllm-for-conda-simo/temp/pip-vllm-src.log.txt.2026_05_26___23_06_19
 在  vllm conda 环境下 import 报错:
 >>> import vllm._C
 Traceback (most recent call last):
