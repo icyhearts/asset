@@ -1931,7 +1931,7 @@ templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_10___16_49_05
 如何修复日志中的错误, 把答案追加在 temp/codex_answer.md 里面
 
 
-
+# mxfp4 gsm8k 精度差
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/cld_answer.md 里面
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 simo 代码位于 /data/like/package/simo_conda_sglang
