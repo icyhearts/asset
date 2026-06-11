@@ -1931,12 +1931,48 @@ templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_10___16_49_05
 如何修复日志中的错误, 把答案追加在 temp/codex_answer.md 里面
 
 
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/cld_answer.md 里面
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 simo 代码位于 /data/like/package/simo_conda_sglang
+
+simo/extensions/sglang_simo/mem_cache/memory_pool.py 实现了 SIMOMLATokenToKVPool SIMOMHATokenToKVPool, 对 sglang 的 kv pool 进行功能增强。
+simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py concat_and_cache_mla_kernel set_kv_buffer_kernel 实现 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group nvfp4 格式 kv cache 量化格式写入。
+simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 对 sglang 的原本 decode attention kernel 进行扩展， 支持 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group nvfp4 格式 kv cache 量化格式读取。
+simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 对 sglang 的原本 prefill attention kernel 进行扩展， 支持 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group nvfp4 格式 kv cache 量化格式读取。
+
 simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh 的功能是根据 DEBUG_ID, 使用不同的数据类型，进行lm-eval --model sglang进行任务测试。
-# 使用 lm-eval 进行 gsm8k 任务测试，分别测试不同的kv cache数据量化类型。
+# 下面使用 lm-eval 进行 gsm8k 任务测试，分别测试不同的kv cache数据量化类型。
+
+# 1. llama 模型
 ## 命令: MODEL_PATH=/data/like/hf-models/Llama3.1-8B-Instruct/ DEBUG_add_bos_token=true CUDA_LAUNCH_BLOCKING=0 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=7 DEBUG_LOG_LEVEL=info DEBUG_ID=0 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh > templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.`nowstr.sh` 2>&1 &
 日志: templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.2026_06_11___15_14_10
 
 ## 命令: MODEL_PATH=/data/like/hf-models/Llama3.1-8B-Instruct/ DEBUG_add_bos_token=true CUDA_LAUNCH_BLOCKING=0 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=6 DEBUG_LOG_LEVEL=info DEBUG_ID=1 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh > templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.`nowstr.sh` 2>&1
 日志: templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.2026_06_11___15_03_46
+
+Llama3.1-8B-Instruct 模型的两份日志，得到的gsm8k 得分基本符合预期。
+
+# 2. DeepSeek-V2-Lite-Chat-16B_A2.4B 模型
+## 命令: MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ DEBUG_add_bos_token=true CUDA_LAUNCH_BLOCKING=0 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=7 DEBUG_LOG_LEVEL=info DEBUG_ID=0 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh > templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.`nowstr.sh` 2>&1 &
+日志: templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.2026_06_11___15_32_24
+
+## 命令: MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ DEBUG_add_bos_token=true CUDA_LAUNCH_BLOCKING=0 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=6 DEBUG_LOG_LEVEL=info DEBUG_ID=1 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh > templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.`nowstr.sh` 2>&1 &
+日志: templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.2026_06_11___15_32_52
+从 /data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B 的两个日志， mxfp4 mxfp6 nvfp4 这三个数据类型的 gsm8k 得分很差:
+ mxfp4=0.0099, mxfp6=0.0728, nvfp4=0.0099
+
+# 3.作为参考, 使用 sglang 自己的 fp8 kv cache 量化，
+sglang fp8 kv cache:
+## DeepSeek-V2-Lite-Chat-16B_A2.4B模型
+命令:CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",  "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3"  }' --tasks gsm8k --batch_size auto > templ/lm-eval-gsm8k-dsv2-fp8kv.log.`nowstr.sh` 2>&1 &
+日志: templ/lm-eval-gsm8k-dsv2-fp8kv.log.2026_06_11___14_47_46
+结果: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.6702|±  |0.0129|
+## /data/like/hf-models/Llama3.1-8B-Instruct 模型
+命令: lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/Llama3.1-8B-Instruct/",  "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3"  }' --tasks gsm8k --batch_size auto > templ/lm-eval-gsm8k-llama-fp8kv.log.`nowstr.sh` 2>&1 &
+日志: templ/lm-eval-gsm8k-llama-fp8kv.log.2026_06_11___14_46_14
+结果: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7824|±  |0.0114|
+
+分析 sglang_simo 的 kv cache 量化，为什么在 Llama3.1-8B-Instruct 上gsm8k 得分是正常的， 在 DeepSeek-V2-Lite-Chat-16B_A2.4B 上 mxfp4 mxfp6 nvfp4 得分很差的原因。
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
