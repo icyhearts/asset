@@ -1998,5 +1998,15 @@ ImportError: /data/like/package/vllm-for-conda-simo/vllm/_C.abi3.so: undefined s
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
 
 
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
 vllm conda环境位 于 /data/like/miniconda3/envs/simo_vllm/
 vllm 源码 位于 /data/like/package/vllm-for-conda-simo
+在 vllm conda 环境中，lm_eval 使用 lm_eval --model vllm 进行 gsm8k 任务测试 ， simo/extensions/vllm_simo/ 是对 vllm 的 kv cache 量化做了mx 量化和 per group 量化。
+MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=7 bash simo//extensions/vllm_simo/example/online_quantization/llm_vlm_eval_online_quant.kv-cache-only.sh > templ/llm_vlm_eval_online_quant.kv-cache-only.sh.log.`nowstr.sh` 2>&1
+日志位于 templ/llm_vlm_eval_online_quant.kv-cache-only.sh.log.2026_06_11___21_31_50
+日志中，vllm_simo 的 gsm8k 得分如下
+mxfp4=0.2934, 
+mxfp6=0.6490,
+nxfp4=0.4951
+在 mxfp4,mxfp6,nvfp4格式 kv cache 量化上，vllm_simo的得分比 sglang_simo 高，bit数并不是导致 sglang_simo mxfp4=0.0099, mxfp6=0.0728, nvfp4=0.0099得分低的真正原因。继续深入分析 , sglang_simo 的 kv cache 量化，为什么在 Llama3.1-8B-Instruct 上gsm8k 得分是正常的， 在 DeepSeek-V2-Lite-Chat-16B_A2.4B 上 mxfp4 mxfp6 nvfp4 得分很差的原因
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面

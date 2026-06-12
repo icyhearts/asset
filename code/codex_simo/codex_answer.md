@@ -7939,3 +7939,42 @@ PY
 ```
 
 两边的 `MessageLogger` 构造函数签名必须一致，否则 `_C.abi3.so` 就会在 import 时继续报 undefined symbol。
+
+## 2026-06-12: 继续分析 sglang_simo DeepSeek-V2-Lite 低 bit KV cache 分数异常
+
+结论：vLLM_simo 的 DeepSeek-V2-Lite 结果说明 `mxfp4/mxfp6/nvfp4` 的 bit 数不是根因。sglang_simo 的问题更像是 DeepSeek MLA 专用 KV cache 读路径的实现问题：Llama3.1 走 GQA/MHA cache，DeepSeek-V2-Lite 走 MLA latent cache；sglang_simo 在 MLA 的低 bit 读取、以及 prefix cache 回读上和 vLLM_simo 不等价。
+
+证据如下。
+
+1. vLLM_simo 和 sglang_simo 的测试配置基本等价，不是 Hadamard 或 query quantization 差异。
+   - vLLM_simo `kv_only_quant_config_kvquant_mxfp4.json` 使用 `"dtype": "mxfp4_e2m1"`、`"scale_mode": "e8m0_sipu"`、`query_quantization_enabled=false`、Hadamard size 为 0：`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_mxfp4.json:20`
+   - sglang_simo `quant_config_kvquant_mxfp4.json` 也是 `"dtype": "mxfp4_e2m1"`、`"scale_mode": "e8m0_sipu"`、Hadamard size 为 0：`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp4.json:24`
+   - nvfp4 两边也都是 `"dtype": "nvfp4_e2m1"`、`"scale_mode": "e4m3"`、`"group_size": 16`：`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:20`，`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:24`
+
+2. MLA 写入 layout 不是主要矛盾。vLLM_simo 和 sglang_simo 都把 MLA cache 写成 `[KV_C packed | KV_C scales | K_PE packed | K_PE scales]`。
+   - vLLM_simo 写入 offset：`simo/extensions/vllm_simo/v1/attention/ops/triton_concat_and_cache_mla.py:25 concat_and_cache_mla_kernel`，`simo/extensions/vllm_simo/v1/attention/ops/triton_concat_and_cache_mla.py:83 concat_and_cache_mla_kernel`
+   - sglang_simo 写入 offset：`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:310 concat_and_cache_mla_kernel`，`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:373 concat_and_cache_mla_kernel`
+
+3. DeepSeek 和 Llama 的关键差别是执行路径。DeepSeek-V2-Lite 是 MLA，SGLang 原始模型里 `attn_mqa` 的 head dim 是 `kv_lora_rank + qk_rope_head_dim`，value dim 是 `kv_lora_rank`，而 `attn_mha` 是 dense MHA 维度：`python/sglang/srt/models/deepseek_v2.py:1556 __init__`，`python/sglang/srt/models/deepseek_v2.py:1567 __init__`。sglang_simo 只在 DeepSeek wrapper 里给这两个 RadixAttention patch packed size：`simo/extensions/sglang_simo/models/deepseek_v2.py:8 updata_module_head_size`，`simo/extensions/sglang_simo/models/deepseek_v2.py:69 __init__`。Llama3.1 不走这套 MLA latent cache 和 K_PE 分段逻辑，所以 Llama 正常不能证明 DeepSeek MLA 低 bit path 正确。
+
+4. 最明确的实现差异在 MLA 读取。vLLM_simo 的 MLA decode 对 MX cache 统一先 `_unpack_and_dequant_mxfmt`，再用 bf16/float path 做 `tl.dot`。
+   - K content dequant：`simo/extensions/vllm_simo/v1/attention/ops/triton_decode_attention.py:437 _fwd_grouped_kernel_stage1`
+   - K_PE dequant：`simo/extensions/vllm_simo/v1/attention/ops/triton_decode_attention.py:486 _fwd_grouped_kernel_stage1`
+   - dot：`simo/extensions/vllm_simo/v1/attention/ops/triton_decode_attention.py:457 _fwd_grouped_kernel_stage1`，`simo/extensions/vllm_simo/v1/attention/ops/triton_decode_attention.py:506 _fwd_grouped_kernel_stage1`
+
+   sglang_simo 的 MLA decode 则对 `mxfp4_e2m1` 使用 `tl.dot_scaled` 特例，K content 和 K_PE 都走这个分支：`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:230 _fwd_grouped_kernel_stage1`，`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:345 _fwd_grouped_kernel_stage1`。这和 vLLM_simo 的 DeepSeek MLA kernel 不一致，是解释 `mxfp4=0.0099` 的第一嫌疑点。建议先把 MLA 的 MXFP4 也改成 vLLM_simo 那种 `_unpack_and_dequant_mxfmt -> tl.dot`，不要在 DeepSeek MLA path 里走 `dot_scaled` 特例。
+
+5. sglang_simo 的 extend/prefix 也直接在 attention kernel 中读 packed cache，而 vLLM_simo 在 MLA prefill context 中先 gather 并 dequant 到 workspace，再走后续 MLA prefill 计算。
+   - vLLM_simo prefill context 调用量化 cache gather/dequant：`simo/extensions/vllm_simo/v1/attention/backends/simo_mla.py:291 _compute_prefill_context`，`simo/extensions/vllm_simo/v1/attention/backends/simo_mla.py:356 _compute_prefill_context`
+   - vLLM_simo gather kernel 按同一 layout 解包回 dequantized entry：`simo/extensions/vllm_simo/v1/attention/ops/triton_gather_and_maybe_dequant_cache.py:21 gather_and_maybe_dequant_cache_kernel`，`simo/extensions/vllm_simo/v1/attention/ops/triton_gather_and_maybe_dequant_cache.py:76 gather_and_maybe_dequant_cache_kernel`
+   - sglang_simo extend 直接读 packed/scales 并做低 bit attention：`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:113 _fwd_kernel`，其中 K_PE 的 mxfp4 分支同样使用 `tl.dot_scaled`：`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:451 _fwd_kernel`
+
+6. 还有一个需要修的确定性 bug：`SIMOMLATokenToKVPool` 没有覆盖 `get_mla_kv_buffer()`。它只实现了 `get_key_buffer()`、`get_value_buffer()`、`set_kv_buffer()`、`set_mla_kv_buffer()`：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:236 SIMOMLATokenToKVPool`，`simo/extensions/sglang_simo/mem_cache/memory_pool.py:303 get_key_buffer`，`simo/extensions/sglang_simo/mem_cache/memory_pool.py:309 set_kv_buffer`，`simo/extensions/sglang_simo/mem_cache/memory_pool.py:323 set_mla_kv_buffer`。因此 DeepSeek MHA one-shot/chunked prefix path 会继承 SGLang 原始 `MLATokenToKVPool.get_mla_kv_buffer()`，该方法直接从 `get_key_buffer()` 拿 cache，然后调用 `get_mla_kv_buffer_triton()` 按原始 latent layout 拆成 `kv_lora_rank/qk_rope_head_dim`：`python/sglang/srt/mem_cache/memory_pool.py:1955 get_mla_kv_buffer`，`python/sglang/srt/mem_cache/memory_pool.py:1971 get_mla_kv_buffer`，`python/sglang/srt/mem_cache/memory_pool.py:1983 get_mla_kv_buffer`。但 sglang_simo 的 cache 实际是 uint8 packed/scales layout，这个回读函数不做 dequant，语义不对。
+
+   这个 bug 会影响需要从 prefix cache 拉回 MLA latent 的路径，例如 `forward_normal_prepare()` 的 one-shot prefix 分支和 `_chunked_prefix_attn_mha()`：`python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:270 forward_normal_prepare`，`python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:417 _chunked_prefix_attn_mha`。即使当前 gsm8k 的主损失主要来自 decode low-bit kernel，这个 `get_mla_kv_buffer()` 也必须补，否则 prefix cache 命中时会把 packed bytes 当 latent 值处理。
+
+建议的修复顺序：
+
+1. 先把 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py` 和 `extend_attention.py` 的 DeepSeek MLA low-bit MX path 对齐 vLLM_simo：MXFP4/MXFP6/NVFP4 都统一 `_unpack_and_dequant_mxfmt` 后 `tl.dot`，不要对 MLA 的 MXFP4 单独走 `tl.dot_scaled`。
+2. 给 `SIMOMLATokenToKVPool` 实现 layout-aware 的 `get_mla_kv_buffer()`，逻辑可参考 vLLM_simo 的 `gather_and_maybe_dequant_cache()`：从 `[KV_C packed | KV_C scales | K_PE packed | K_PE scales]` 解包成 `(cache_k_nope, cache_k_rope)`，返回 bf16/fp16 latent。
+3. 加一个最小 correctness test：同一批 DeepSeek token，写入 `SIMOMLATokenToKVPool` 后，分别用 `get_mla_kv_buffer()` 和 decode/extend kernel 读回，与直接 bf16 latent 计算的 attention logits/output 比较。先测 `mxfp8/mxint8`，再测 `mxfp6/nvfp4/mxfp4`；如果修复正确，DeepSeek 的低 bit 分数应该靠近 vLLM_simo 的量级，而不是接近随机。

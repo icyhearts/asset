@@ -8797,7 +8797,98 @@ MX_QUANT_DIM: tl.constexpr = 16 if MX_FORMAT_ID == NVFP4_E2M1 else 32
 
 2. **MLA 对量化误差更敏感**：MLA 的 latent 表示 c_KV 是 512 维低秩压缩，信息密度高。4-bit 量化在 512 维空间中引入的巨大误差经过 kv_b_proj 投影后被放大，导致 attention 输出失真。
 
-3. **E4M3 尺度的特殊性**：NVFP4 使用 `scale_mode: "e4m3"`（float8e4nv 存储尺度），而其他 MX 格式使用 `e8m0_sipu`（uint8 E8M0）。两种 scale 格式的精度和范围不同，E4M3 scale 的精度可能不足以支持 4-bit 的细粒度量化需求。
+### 8. mxfp4 和 mxfp6 在 MLA 上分数异常的原因排查
 
-**注意**：`temp/cld_answer.md` 文件不存在（会话恢复后丢失），无需更新其中的第 3 节。原 `_upcast_from_mxfmt.py:33` 的代码已经是正确的原始形式，不需要修改。
+#### 8.1 问题描述
+
+DeepSeek-V2-Lite MLA + kv cache only 量化，gsm8k 分数：
+
+| 格式 | 分数 | 状态 |
+|------|------|------|
+| mxfp8_e4m3 | 0.6505 | 正常 |
+| mxint8 | 0.6619 | 正常 |
+| fp8_per_group | 0.6710 | 正常 |
+| int8_per_group | 0.6475 | 正常 |
+| **mxfp4_e2m1** | **0.0099** | 异常 |
+| **mxfp6_e2m3** | **0.0728** | 异常 |
+| **nvfp4_e2m1** | **0.0099** | 异常 |
+
+但所有格式在 Llama3.1-8B-Instruct GQA 上均正常工作（0.69-0.78）。
+
+#### 8.2 已排查的项目（均已确认一致，排除作为根因）
+
+1. **MX_BLOCK_SIZE / MX_QUANT_DIM 一致性**：所有格式的 block_size 读写一致
+2. **Buffer 分配大小一致性**：`SIMOMLATokenToKVPool.__init__`（`memory_pool.py:259-264`）与 `set_mla_kv_buffer`（`memory_pool.py:362-372`）计算结果一致
+3. **Buffer 布局读写一致性**：`concat_and_cache_mla_kernel` 存储的 `[KV_C_packed | KV_C_scales | K_PE_packed | K_PE_scales]` 布局，与读取时的 `SCALE_PLANE_OFFSET`、`rope_offset_in_token` 等偏移一致
+4. **FP6 打包/解包往返一致性**：SIPU 打包（`_downcast_to_mxfmt.py:498-513`）→ 3 字节存储（`set_kv_buffer.py:398-419`）→ 加载重建 uint32（`common.py:202-208`）→ 解包上采样（`_upcast_from_mxfmt.py:43-85`），逐字节验证互通
+5. **mxfp4 打包/解包往返一致性**：2 个 E2M1 值打包为 1 字节（`_downcast_to_mxfmt.py:514-517`），读路径正确分离 nibble（`_upcast_from_mxfmt.py:87-129`）
+6. **Scale 计算格式**：mxfp4 使用 `scale_mode: "e8m0_sipu"`，mxfp6 使用 `scale_mode: "e8m0_floor"`（同 mxfp8/mxint8），均为 E8M0 uint8
+
+#### 8.3 关键发现：`tl.dot_scaled("e2m1")` 是 mxfp4 的根因
+
+mxfp4_e2m1 在 K 的 QK 计算中使用 `tl.dot_scaled("e2m1")`，而其他格式均使用软件解量或 `tl.dot_scaled("e4m3"/"e5m2")`。
+
+`tl.dot_scaled("e2m1")` 的使用位置（4 处）：
+
+- `decode_attention.py:231`，`_fwd_grouped_kernel_stage1`：nope 部分的 K
+- `decode_attention.py:346`，`_fwd_grouped_kernel_stage1`：rope 部分的 K
+- `extend_attention.py:348`，`_fwd_kernel_stage1`：nope 部分的 K
+- `extend_attention.py:452`，`_fwd_kernel_stage1`：rope 部分的 K
+
+**为什么 Llama GQA 上正常而 DeepSeek MLA 上失败？**
+
+`tl.dot_scaled("e2m1")` 在两种架构下的关键差异：
+
+A. **MLA 有 nope (512d) + rope (64d) 分开计算再合并**：
+   ```python
+   # nope (decode_attention.py:230-231)
+   qk = tl.dot_scaled(q, None, "bf16", k_packed.T, k_scale, "e2m1")  # → [BLOCK_H, BLOCK_N]
+   # rope (decode_attention.py:345-346)
+   qk_pe = tl.dot_scaled(qpe, None, "bf16", k_packed.T, k_scale, "e2m1")  # → [BLOCK_H, BLOCK_N]
+   qk += qk_pe  # decode_attention.py:384
+   ```
+   如果 rope 部分（64d，只有 2 个 scale group）的 `tl.dot_scaled("e2m1")` 产生异常值，`qk += qk_pe` 会破坏整个 QK。
+
+B. **极少数 scale group 下 Triton 可能有 bug**：
+   - GQA：每个 head 4 个 scale group（128/32=4）
+   - MLA nope：16 个 scale group（512/32=16）
+   - **MLA rope：只有 2 个 scale group（64/32=2）**
+   - 只有 2 个 scale group 时，如果 `tl.dot_scaled("e2m1")` 内部对 scale 索引作了错误的假设，`qk_pe` 可能为 NaN/inf/极端值
+   - `qk += qk_pe` 后 QK 被污染 → softmax 后 uniform → attention 输出被破坏 → 分数 ~0.01
+
+#### 8.4 mxfp6 的可能根因
+
+mxfp6 使用软件解量路径（`_unpack_and_dequant_mxfmt`），避免了 `tl.dot_scaled("e2m1")`。但仍然失败（0.0728）。软件解量路径逻辑已确认正确，**可能的根因是 Triton 编译器在 MLA 大维度下的优化 bug**：
+
+- FP6 解包使用了 `tl.interleave`（`_upcast_from_mxfmt.py:71-73`），MLA 的 512 维需要更大的 interleave 规模
+- FP6→FP32 上采样有较大的指数偏置调整（`exponent_diff = 126`，`tl.exp2(126) ≈ 8.5e37`），配合 scale 乘法可能达到 float32 上限
+- Triton 编译器对 GPU 架构和 num_warps 的不同选择可能导致 latent bug
+
+**对比**：mxfp6 在 Llama GQA（128d per head）上正常，说明编译器在较小维度下能正确编译。MLA 的 512d + 64d 混合布局可能触发了不同的编译器优化路径。
+
+#### 8.5 推荐的验证和修复方案
+
+**方案 A（优先，验证 mxfp4/nvfp4 根因）**：将 mxfp4 的 K dequant 强制走软件解量路径：
+
+修改 `decode_attention.py:230-231`、`decode_attention.py:345-346`、`extend_attention.py:347-348`、`extend_attention.py:451-452`，去掉 `if MX_FORMAT_ID == MXFP4_E2M1` 的特殊分支，统一使用：
+```python
+K_dequant = tl.trans(_unpack_and_dequant_mxfmt(k_packed, k_scale, MX_FORMAT_ID))
+qk = tl.dot(q, K_dequant)
+```
+
+如果修改后 mxfp4 和 nvfp4 分数恢复正常，则根因确认为 `tl.dot_scaled("e2m1")`。
+
+**方案 B（调试 mxfp6）**：在 decode kernel 中 dump mxfp6 和 mxfp8 的 K_dequant 与 QK 中间值，对比差异。检查是否有 NaN、inf 或数量级异常。
+
+**方案 C（独立测试）**：写独立测试 kernel，用已知值填入模拟的 MLA buffer，验证 `_unpack_and_dequant_mxfmt` 对 FP6 和 E2M1 的解量输出。
+
+#### 8.6 总结
+
+| 格式 | 最可能根因 | 优先级 | 修复方向 |
+|------|-----------|--------|---------|
+| mxfp4_e2m1 | `tl.dot_scaled("e2m1")` 在 MLA rope（2 scale groups）下有 bug | 高 | 方案 A：改用软件解量 |
+| mxfp6_e2m3 | Triton 编译器在大维度 MLA 下对 FP6 解量路径有优化 bug | 中 | 方案 B/C：dump 调试 |
+| nvfp4_e2m1 | 同 mxfp4（但 nvfp4 的 K 走软件解量，问题可能在 V 解量或 scale 处理） | 中 | 方案 A 确认后进一步排查 |
+
+**重点**：先执行方案 A。如果 `tl.dot_scaled("e2m1")` 的验证结果不是根因（即换成软件解量后 mxfp4 仍然失败），则说明问题出在更深层——可能是写入端的数据存储或所有 4-bit/6-bit 格式共有的问题
 
