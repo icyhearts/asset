@@ -8006,3 +8006,71 @@ PY
 3. 如果第 2 步 dequant 误差正常，再比较 attention 中间量：保存同一个 decode step 的 `q`、`kv_indices`、`kv_buffer`，分别用 bf16 latent cache 和 quantized direct-read 计算 `qk`、softmax output。若 `qk` 在 K_PE 部分偏差很大，查 `rope_offset_in_token` 和 `SCALE_PLANE_OFFSET_ROPE`；若 V 部分偏差大，查 `V_Buffer` 复用 full MLA buffer 时的 `PACKED_HEAD_SIZE/SCALE_HEAD_SIZE` offset。
 
 当前结论：`get_mla_kv_buffer()` 在你这条 GSM8K/triton_simo 路径里不是必须函数；`tl.dot_scaled` 也不是三种低 bit 共同根因。更可能的问题是 SGLang_simo 的 DeepSeek MLA low-bit direct-read kernel 中 packed/scales 的解包、scale 解释或 KV_C/K_PE/V offset 在 prefix/decode 路径上存在不一致。`attn_mha` layout 被误 patch 是另一个需要修的潜在 bug，但不应作为这次日志中 `get_mla_kv_buffer` 未调用的解释。
+
+## 2026-06-12: lm-eval 固定 GSM8K 单条请求发给 SGLang
+
+结论：GSM8K 不是在读取数据集时立刻“一条一条发给 SGLang”。lm-eval 先遍历 task 文档构造 `Instance`，再按 request type 聚合，最后调用模型后端；真正调用 SGLang offline engine 的位置在 `SGLangLM.generate_until()` 里的 `for chunk in chunks`。当 `--batch_size 1` 时，每个 chunk 只有一条 request，因此就是一条一条调用 SGLang。
+
+代码路径如下。
+
+1. GSM8K 配置声明它的 `output_type` 是 `generate_until`，所以最终会调用模型的 `generate_until()`，不是 `loglikelihood()`：`lm_eval/tasks/gsm8k/gsm8k.yaml:6 (task config)`。默认 few-shot 是 5：`lm_eval/tasks/gsm8k/gsm8k.yaml:31 (task config)`。
+2. `--limit` 先被转成样本数：`lm_eval/evaluator_utils.py:49 get_sample_size`。随后 `evaluate()` 调用 `task.build_all_requests(limit=...)`：`lm_eval/evaluator.py:537 evaluate`。
+3. `Task.build_all_requests()` 里通过 `doc_iterator()` 得到文档列表：`lm_eval/api/task.py:324 build_all_requests`，然后 `for doc_id, doc in tqdm(...)` 遍历文档：`lm_eval/api/task.py:332 build_all_requests`，对每个 doc 调用 `construct_requests()` 生成 request instance：`lm_eval/api/task.py:350 build_all_requests`，最后用 `instances[:og_limit]` 截断：`lm_eval/api/task.py:365 build_all_requests`。
+4. `evaluate()` 再按 `instance.request_type` 聚合 request：`lm_eval/evaluator.py:560 evaluate`，然后对每个 request type 执行 `getattr(lm, reqtype)(cloned_reqs)`：`lm_eval/evaluator.py:584 evaluate`、`lm_eval/evaluator.py:596 evaluate`。GSM8K 的 reqtype 是 `generate_until`。
+5. SGLang 后端的实际 batching 在 `SGLangLM.generate_until()` 中完成：`lm_eval/models/sglang_causallms.py:232 generate_until`。它先用 `Collator` 排序/分组：`lm_eval/models/sglang_causallms.py:259 generate_until`，然后按 `self.batch_size` 得到 chunks：`lm_eval/models/sglang_causallms.py:260 generate_until`。
+6. 真正“向 SGLang 发请求”的循环是 `for chunk in chunks`：`lm_eval/models/sglang_causallms.py:271 generate_until`。循环内调用 `_model_generate()`：`lm_eval/models/sglang_causallms.py:316 generate_until`，而 `_model_generate()` 最终调用 `self.model.generate(input_ids=requests, sampling_params=...)`：`lm_eval/models/sglang_causallms.py:339 _model_generate`、`lm_eval/models/sglang_causallms.py:360 _model_generate`。
+
+我已经修改了 `/data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py`，增加了两个只影响 `--model sglang` 的调试参数：
+
+1. `debug_lm_eval_single_request`：启用后要求后端只收到 1 条 request，并且 `--batch_size` 必须是 1；否则直接报错。实现位置：`lm_eval/models/sglang_causallms.py:67 __init__`、`lm_eval/models/sglang_causallms.py:123 __init__`、`lm_eval/models/sglang_causallms.py:133 _ensure_debug_single_request`。
+2. `debug_lm_eval_dump_request_path`：把发给 SGLang 的首条 prompt、token ids、generation kwargs、sampling params dump 成 JSON，方便后续固定输入复现。实现位置：`lm_eval/models/sglang_causallms.py:68 __init__`、`lm_eval/models/sglang_causallms.py:149 _dump_debug_request_once`、`lm_eval/models/sglang_causallms.py:304 generate_until`。
+
+我没有在后端静默截断多条 request，因为 evaluator 后面用 `zip(resps, cloned_reqs, strict=True)` 要求 response 数量和 request 数量一致：`lm_eval/evaluator.py:599 evaluate`。如果后端偷偷只返回 1 条，但 evaluator 认为有很多条，会导致结果错位或直接异常。因此正确做法是：用命令行先让 lm-eval 只构造 1 条 request，再让 sglang 后端调试开关做校验。
+
+推荐命令如下，使用 `--samples '{"gsm8k":[0]}'` 固定 GSM8K test split 的第 0 条样本：
+
+```bash
+HF_DATASETS_CACHE=/data/like/huggingface_cache \
+CUDA_VISIBLE_DEVICES=7 \
+lm-eval \
+  --model sglang \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "tp_size": 1, "dtype": "auto", "attention_backend": "triton", "mem_fraction_static": 0.5, "log_level": "info", "add_bos_token": true, "disable_cuda_graph": true, "skip_server_warmup": true, "disable_piecewise_cuda_graph": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/gsm8k-one-request.json"}' \
+  --tasks gsm8k \
+  --samples '{"gsm8k":[0]}' \
+  --num_fewshot 5 \
+  --batch_size 1 \
+  --seed 0,1234,1234,1234
+```
+
+也可以不用 `--samples`，改用 `--limit 1` 取当前 task 的第一条样本：
+
+```bash
+HF_DATASETS_CACHE=/data/like/huggingface_cache \
+CUDA_VISIBLE_DEVICES=7 \
+lm-eval \
+  --model sglang \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "tp_size": 1, "dtype": "auto", "attention_backend": "triton", "mem_fraction_static": 0.5, "log_level": "info", "add_bos_token": true, "disable_cuda_graph": true, "skip_server_warmup": true, "disable_piecewise_cuda_graph": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/gsm8k-one-request.json"}' \
+  --tasks gsm8k \
+  --limit 1 \
+  --num_fewshot 5 \
+  --batch_size 1 \
+  --seed 0,1234,1234,1234
+```
+
+两种方式不要同时使用，因为 CLI 明确把 `--samples` 定义成和 `--limit` 不兼容：`lm_eval/_cli/run.py:186 _add_args`，`lm_eval/config/evaluate_config.py:316 _validate_arguments`。更推荐 `--samples '{"gsm8k":[0]}'`，因为它固定的是样本索引；`--limit 1` 只是取当前遍历顺序的前 1 条。
+
+这些参数能被传到 `SGLangLM.__init__()` 的原因是：`--model_args` 支持 JSON dict，解析逻辑在 `MergeDictAction.__call__()`：`lm_eval/_cli/utils.py:128 MergeDictAction.__call__`；如果是 dict，`simple_evaluate()` 会走 `create_from_arg_obj()`：`lm_eval/evaluator.py:238 simple_evaluate`、`lm_eval/api/model.py:149 create_from_arg_obj`。`--batch_size`、`--limit`、`--seed` 的 CLI 定义分别在 `lm_eval/_cli/run.py:131 _add_args`、`lm_eval/_cli/run.py:104 _add_args`、`lm_eval/_cli/run.py:312 _add_args`，最终传给 `simple_evaluate()` 的位置在 `lm_eval/_cli/run.py:391 _execute`、`lm_eval/_cli/run.py:407 _execute`、`lm_eval/_cli/run.py:423 _execute`。
+
+修改后的行为：
+
+1. 如果 `debug_lm_eval_single_request=true`，但忘了传 `--batch_size 1`，会在 `SGLangLM.generate_until()` 一开始报错：`lm_eval/models/sglang_causallms.py:236 generate_until`、`lm_eval/models/sglang_causallms.py:136 _ensure_debug_single_request`。
+2. 如果 `debug_lm_eval_single_request=true`，但没有通过 `--samples '{"gsm8k":[0]}'` 或 `--limit 1` 把 request 数量限制为 1，也会报错：`lm_eval/models/sglang_causallms.py:141 _ensure_debug_single_request`。
+3. 正常配置下，`generate_until()` 的 chunk 循环只会执行一次；我也显式加了调试 break：`lm_eval/models/sglang_causallms.py:333 generate_until`。
+4. 为了同类任务调试，`_loglikelihood_tokens()` 也加了同样的校验、dump 和 break：`lm_eval/models/sglang_causallms.py:481 _loglikelihood_tokens`、`lm_eval/models/sglang_causallms.py:509 _loglikelihood_tokens`、`lm_eval/models/sglang_causallms.py:540 _loglikelihood_tokens`。GSM8K 本身不会走这里，因为它是 `generate_until`。
+
+已验证修改后的文件能通过语法检查：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile \
+  /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py
+```

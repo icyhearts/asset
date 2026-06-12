@@ -2029,3 +2029,8 @@ sglang 在 gsm8k任务下，get_mla_kv_buffer真的必须的吗？
 继续分析 sglang_simo mxfp4,mxfp6,nvfp4 得分差的原因。
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+lm-eval 遍历 gsm8k 数据集的时候，是否通过一个for 循环把数据逐条向sglang 发请求的，遍历的逻辑在哪里？
+应该如何修改 /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py , 并如何传lm-eval 命令行参数，让 lm-eval 向 sglang发请求的时候，遍历数据发请求的for循环，只循环一次就退出循环，并且 batch size=1,  
+总之，最终目的是，得到可以稳定复现的单条请求数据，方便多次反复测试，每次测试 sglang得到固定的一条数据
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
