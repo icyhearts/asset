@@ -8892,3 +8892,208 @@ qk = tl.dot(q, K_dequant)
 
 **重点**：先执行方案 A。如果 `tl.dot_scaled("e2m1")` 的验证结果不是根因（即换成软件解量后 mxfp4 仍然失败），则说明问题出在更深层——可能是写入端的数据存储或所有 4-bit/6-bit 格式共有的问题
 
+### 9. SGLang vs vLLM MLA KV Cache 量化对比分析（基于实际 benchmark 数据）
+
+#### 9.1 vLLM benchmark 数据（关键新证据）
+
+从 vLLM 环境测试获得 DeepSeek-V2-Lite-Chat gsm8k 5-shot 分数：
+
+| 格式 | vLLM 分数 | SGLang 分数 | vLLM 状态 | SGLang 状态 |
+|------|----------|------------|----------|------------|
+| mxfp8_e4m3 | - | 0.6505 | - | 正常 |
+| mxint8 | - | 0.6619 | - | 正常 |
+| **mxfp4_e2m1** | **0.2934** | **0.0099** | 偏低但可用 | 近乎随机 |
+| **mxfp6_e2m3** | **0.6490** | **0.0728** | 正常 | 异常 |
+| **nvfp4_e2m1** | **0.4951** | **0.0099** | 中等 | 近乎随机 |
+
+**关键结论**：
+1. **低 bit-width 不是根因** — vLLM 在 mxfp4 (0.29)、mxfp6 (0.65)、nvfp4 (0.50) 上都有可用的分数，说明 4/6-bit 量化在 MLA 上可以工作
+2. **`tl.dot_scaled("e2m1")` 不是根本性问题** — vLLM 的 unified attention (prefill) 路径也使用 `tl.dot_scaled("e2m1")`（见下），整体仍能达到 0.2934
+3. **Bug 是 SGLang 独有的** — 同样的量化格式、同样的存储布局，SGLang 分数几乎为零
+
+#### 9.2 写路径对比：SGLang 与 vLLM 一致
+
+**SGLang MLA 写路径** — `simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:309-467`，`concat_and_cache_mla_kernel`：
+- 将 `kv_c_normed`（512d）和 `k_pe`（64d）拼接后，按 tile_size 逐个 tile 调用 `_compute_and_pack_mxfmt` 量化写入
+- Buffer 布局：`[KV_C_packed | KV_C_scales | K_PE_packed | K_PE_scales]`
+- 输出 shape: `[num_tokens, 1, kv_cache_dim_in_bytes]` uint8
+
+**vLLM MLA 写路径** — `simo/extensions/vllm_simo/v1/attention/ops/triton_concat_and_cache_mla.py`，`concat_and_cache_mla`：
+- 同样将 `kv_c + k_pe` 拼接后量化写入
+- 使用相同的 `_compute_and_pack_mxfmt` → 相同的数据布局
+
+**结论**：写路径一致，buffer 中存储的数据是相同的。
+
+#### 9.3 读路径对比：CRITICAL 差异
+
+##### 9.3.1 vLLM decode 路径：对所有格式统一使用软件解量
+
+**文件**: `simo/extensions/vllm_simo/v1/attention/ops/triton_decode_attention.py`，`_fwd_grouped_kernel_stage1`
+
+vLLM decode 路径对 **所有 MX 格式** (包括 mxfp4) 统一走软件解量路径：
+
+**K content 解量**（lines 437-457）：
+```python
+if MX_FORMAT_ID > 0:
+    if MX_FORMAT_ID == NVFP4_E2M1:
+        k_content_scales = k_content_scales.to(tl.float8e4nv, bitcast=True)
+    k = _unpack_and_dequant_mxfmt(k_content_packed, k_content_scales, MX_FORMAT_ID)
+else:
+    # Per-group dequant
+    ...
+qk = tl.dot(q, k.trans().to(q.dtype))
+```
+
+**K PE 解量**（lines 486-506）：
+```python
+if MX_FORMAT_ID > 0:
+    if MX_FORMAT_ID == NVFP4_E2M1:
+        k_pe_scales = k_pe_scales.to(tl.float8e4nv, bitcast=True)
+    kpe = _unpack_and_dequant_mxfmt(k_pe_packed, k_pe_scales, MX_FORMAT_ID)
+qk += tl.dot(qpe, kpe.trans().to(qpe.dtype))
+```
+
+**V 解量**（lines 530-548）：同样的软件解量方式。
+
+**关键**：vLLM decode 完全**不使用 `tl.dot_scaled("e2m1")`**，对所有格式（mxfp4、mxfp6、nvfp4、mxfp8、mxint8）都是：
+1. 加载 packed 数据
+2. 加载 scale 数据
+3. 调用 `_unpack_and_dequant_mxfmt` 软件解量
+4. 用标准 `tl.dot` 计算注意力
+
+##### 9.3.2 SGLang decode 路径：对 mxfp4 使用硬件加速指令
+
+**文件**: `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py`，`_fwd_grouped_kernel_stage1`
+
+SGLang 对 mxfp4 使用 `tl.dot_scaled("e2m1")` 硬件加速：
+
+**K content——mxfp4 特殊分支**（lines 230-231）：
+```python
+if MX_FORMAT_ID == MXFP4_E2M1:
+    qk = tl.dot_scaled(q, None, "bf16", k_packed.T, k_scale, "e2m1", fast_math=True)
+else:
+    K_dequant = tl.trans(_unpack_and_dequant_mxfmt(k_packed, k_scale, MX_FORMAT_ID))
+    qk = tl.dot(q, K_dequant)
+```
+
+**K PE——mxfp4 特殊分支**（lines 345-346）：
+```python
+if MX_FORMAT_ID == MXFP4_E2M1:
+    qk_pe = tl.dot_scaled(qpe, None, "bf16", k_packed.T, k_scale, "e2m1", fast_math=True)
+else:
+    K_dequant = tl.trans(_unpack_and_dequant_mxfmt(k_packed, k_scale, MX_FORMAT_ID))
+    qk_pe = tl.dot(qpe, K_dequant)
+```
+
+**V 解量**（line 454）：使用 `_unpack_and_dequant_mxfmt` 软件解量（与 vLLM 一致）。
+
+**extend_attention.py 中同样存在**（`simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:347-348` 和 `:451-452`）。
+
+##### 9.3.3 buffer view 差异：K/V 分离 vs 同一 buffer
+
+**vLLM** — `simo/extensions/vllm_simo/v1/attention/backends/simo_mla.py:259-266`，`forward_mqa`：
+```python
+kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
+kv_c_cache = kv_c_and_k_pe_cache[..., : self._kv_c_cache_size]  # KV_C 子视图
+# ...
+decode_attention_fwd(
+    q,
+    kv_c_and_k_pe_cache,  # K buffer — 完整 cache（nope + pe 部分）
+    kv_c_cache,           # V buffer — 仅 KV_C 子视图
+    ...
+)
+```
+其中 `self._kv_c_cache_size = self._packed_head_size + self._scale_head_size`（line 458）。
+
+vLLM 传入 **两个不同的 tensor**：K 用完整 cache，V 用 KV_C 子视图（slice）。
+
+**SGLang** — `simo/extensions/sglang_simo/mem_cache/memory_pool.py:303-307`：
+```python
+def get_key_buffer(self, layer_id: int):
+    return self.kv_buffer[layer_id - self.start_layer]
+def get_value_buffer(self, layer_id: int):
+    return self.kv_buffer[layer_id - self.start_layer]
+```
+
+SGLang 传入 **同一个 tensor** 给 K 和 V。虽然 decode kernel 内部通过不同的偏移量（V 只读 KV_C 部分，K 分别读 KV_C 和 K_PE 部分）来区分，但 `stride_buf_vbs` 和 `stride_buf_kbs` 完全相同（都是 `kv_cache_dim_in_bytes`）。
+
+#### 9.4 根因分析
+
+##### 9.4.1 mxfp4：`tl.dot_scaled("e2m1")` 在 SGLang decode 路径中的问题
+
+vLLM 的 unified (prefill) 路径使用 `tl.dot_scaled("e2m1")` 且能正常工作（整体 score 0.2934）。但 SGLang 的 decode 路径同样使用 `tl.dot_scaled("e2m1")` 却分数几乎为零（0.0099）。
+
+可能的原因：
+1. **scale layout 差异**：SGLang decode 中 scale 的 load shape 为 `[BLOCK_N, SCALE_HEAD_SIZE]` = `[32, 16]`，而 `tl.dot_scaled("e2m1")` 可能期望 scale shape 为 `[groups, N]` = `[16, 32]`。这个转置在 mxint8 做软件解量时不存在，而在 mxfp4 直接传给 `tl.dot_scaled` 时可能被错误解释。
+2. **nvfp4 不能复现此问题**：nvfp4 在 decode 中走软件解量路径，但仍然得 0.0099。这说明 mxfp4 的 `tl.dot_scaled` 可能不是唯一问题，或者 nvfp4 在 SGLang 中有独立的问题。
+
+##### 9.4.2 nvfp4：分数与 mxfp4 相同但走不同 K 路径
+
+nvfp4 在 SGLang decode 中使用 `_unpack_and_dequant_mxfmt` 软件解量（非 `tl.dot_scaled`），但同样得到 0.0099。而 vLLM 中 nvfp4 得分 0.4951。
+
+nvfp4 与 mxfp4 在 SGLang 中的共同点：
+- **V 解量路径相同**：都走 `NEEDS_SW_DEQUANT` → `_unpack_and_dequant_mxfmt`
+- **K/V buffer 相同**：都使用 SGLang 的同一 buffer view
+- **PACKED_HEAD_SIZE / SCALE_HEAD_SIZE 相同**：packing ratio 都是 2:1（4-bit）
+
+nvfp4 在 SGLang 和 vLLM 中的重要差异：
+- vLLM：V buffer 是 KV_C 子视图（`kv_c_cache = full_cache[..., :kv_c_cache_size]`）
+- SGLang：V buffer 是完整 cache（但通过 offset 只读前 N 字节）
+
+虽然加载到的数据相同（都读取 KV_C 部分），但 buffer stride 不同。**这可能影响 Triton 的 coalesced memory access pattern**。
+
+但更可能的情况是：nvfp4 因 block_size=16（而非默认的 32），在 `_unpack_and_dequant_mxfmt` 中使用 `MX_QUANT_DIM=16`。这个参数虽然已被确认与写路径一致（写路径的 MX_BLOCK_SIZE 也是 16），但整个 `_unpack_and_dequant_mxfmt` 函数对 MX_QUANT_DIM=16 的代码路径与 MX_QUANT_DIM=32 不同，可能存在未被发现的数值 bug。
+
+##### 9.4.3 mxfp6：分数极低但有微弱信号
+
+mxfp6 vLLM 0.6490 vs SGLang 0.0728。SGLang 得分为 0.07，不是绝对零值，说明解量后 K/V 值有残留信息，但严重失真。
+
+可能的原因：
+- FP6 的 3-byte packing 在 SGLang decode 的 `_load_fp6_packed` → `_unpack_and_dequant_mxfmt` 链条中有数值问题
+- FP6 解包过程中 `tl.exp2(126)` 的大范围浮点操作在 MLA 512 维下被放大
+
+#### 9.5 修复建议（按优先级排序）
+
+**方案 A（最高优先级：修复 mxfp4）**：
+去掉 SGLang 中 mxfp4 的 `tl.dot_scaled("e2m1")` 特殊路径，与 vLLM 行为一致，统一使用软件解量。
+
+修改位置（共 4 处）：
+1. `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:230-231`
+2. `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:345-346`
+3. `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:347-348`
+4. `simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py:451-452`
+
+将 `if MX_FORMAT_ID == MXFP4_E2M1: qk = tl.dot_scaled(...)` 的特殊分支删除，统一走软件解量路径：
+```python
+K_dequant = tl.trans(_unpack_and_dequant_mxfmt(k_packed, k_scale, MX_FORMAT_ID))
+qk = tl.dot(q, K_dequant)
+```
+
+**方案 B（高优先级：对齐 V buffer view）**：
+参照 vLLM 的做法，让 SGLang 的 MLA 也传 K/V 分开的 buffer view，而非同一 buffer。可以在 `triton_simo_backend.py:189-192` 处：
+```python
+kv_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+# V 只取 KV_C 部分
+v_buffer = kv_buffer[..., :self.simo_pool.kv_c_cache_size]
+```
+
+这保证了 V buffer 的 stride 更短，且与 vLLM 的 buffer 访问模式对齐。
+
+**方案 C（中优先级：调试 nvfp4 和 mxfp6）**：
+在 decode kernel 中 dump nvfp4 和 mxfp6 的 K_dequant 与 mxfp8 的 K_dequant 进行逐元素对比，确认数值差异的量级和模式。
+
+**方案 D（验证性：独立测试 kernel）**：
+写独立 Python 测试，用已知值填入模拟 MLA buffer，分别用 SGLang 和 vLLM 的解量路径解量，逐元素对比结果。
+
+#### 9.6 总结
+
+| 对比维度 | vLLM | SGLang | 影响 |
+|----------|------|--------|------|
+| mxfp4 K 解量方式 | 软件解量 (`_unpack_and_dequant_mxfmt`) | 硬件加速 (`tl.dot_scaled("e2m1")`) | **关键差异** |
+| nvfp4 K 解量方式 | 软件解量 | 软件解量 | 一致 (但都近 0 分) |
+| mxfp6 K 解量方式 | 软件解量 | 软件解量 | 一致 (但 SGLang 极低) |
+| K/V buffer view | 分离（K=完整, V=KV_C subset） | 同一 buffer | 中等差异 |
+| 写路径 | `_compute_and_pack_mxfmt` | `_compute_and_pack_mxfmt` | 一致 |
+
+**最可能的根因**：SGLang 对 mxfp4 使用 `tl.dot_scaled("e2m1")` 在 MLA decode 路径下产生错误的 QK 值。nvfp4 和 mxfp6 虽然走软件解量，但 SGLang 中可能存在额外的 buffer layout 差异或 Triton 编译器优化差异导致解量结果仍有数值误差。方案 A+B 是最直接的修复方向。
+
