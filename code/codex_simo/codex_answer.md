@@ -1,3 +1,115 @@
+## 2026-06-05: `:YcmCompleter Format` 不能用于当前 Python 文件的原因
+
+结论：这不是 `autopep8` 没安装，也不是 `let g:ycm_python_formatting = 'autopep8'` 没写进去；根因是当前安装的 YouCompleteMe/ycmd 对 Python 使用的是 Jedi completer，而这个 Python completer 没有实现 `Format` 子命令。
+
+证据如下：
+
+1. `temp/ycm-debug-info.txt` 显示当前 Python 后端是 Jedi：
+
+   - Python completer debug information
+   - Python interpreter: `/data/like/miniconda3/envs/simo_sglang/bin/python`
+   - Jedi version: `0.18.2`
+   - Parso version: `0.8.3`
+
+   也就是说，`extend_attention-pep8.py` 当前走的是 YCM 内置的 Jedi Python completer，不是支持 LSP `documentFormattingProvider` 的语言服务器 completer。
+
+2. 本地源码里 Python completer 暴露的命令表不包含 `Format`。
+
+   文件：`/data/like/vim-port-all/config/.vim/pack/vendor/start/YouCompleteMe/third_party/ycmd/ycmd/completers/python/python_completer.py`
+
+   `PythonCompleter.GetSubcommandsMap()` 只返回这些命令：
+
+   - `GoTo`
+   - `GoToDefinition`
+   - `GoToDeclaration`
+   - `GoToReferences`
+   - `GoToSymbol`
+   - `GoToType`
+   - `GetType`
+   - `GetDoc`
+   - `RefactorRename`
+   - `RefactorInline`
+   - `RefactorExtractVariable`
+   - `RefactorExtractFunction`
+
+   这和报错里的命令列表一致。`Format` 不在这个 map 里。
+
+3. 报错路径也吻合源码逻辑。
+
+   文件：`/data/like/vim-port-all/config/.vim/pack/vendor/start/YouCompleteMe/third_party/ycmd/ycmd/completers/completer.py`
+
+   `OnUserCommand()` 会从 `GetSubcommandsMap()` 取用户输入的子命令；如果 key 不存在，就抛出 `ValueError(self.UserCommandsHelpMessage())`。你执行 `:YcmCompleter Format` 时，`Format` 在 Python completer 的命令表中不存在，所以正好得到：
+
+   ```text
+   ValueError: Supported commands are:
+   GetDoc
+   GetType
+   GoTo
+   GoToDeclaration
+   GoToDefinition
+   GoToReferences
+   GoToSymbol
+   GoToType
+   RefactorExtractFunction
+   RefactorExtractVariable
+   RefactorInline
+   RefactorRename
+   ```
+
+4. YCM 自带文档也说明 `Format` 不支持 Python。
+
+   文件：`/data/like/vim-port-all/config/.vim/pack/vendor/start/YouCompleteMe/doc/youcompleteme.txt`
+
+   `Format` 小节写的 supported filetypes 是：
+
+   ```text
+   c, cpp, objc, objcpp, cuda, java, javascript, go, typescript, rust, cs
+   ```
+
+   这里没有 `python`。
+
+5. `let g:ycm_python_formatting = 'autopep8'` 对这份 YCM 无效。
+
+   我在当前安装的 YouCompleteMe 目录中查找了 `ycm_python_formatting`、`python_formatting`、`autopep8`，没有发现插件或 ycmd 代码读取这个变量。因此这行配置不会给 Python completer 增加 `Format` 子命令。
+
+6. `autopep8` 本身是可用的。
+
+   当前环境中可以通过 conda Python 找到 autopep8：
+
+   ```text
+   autopep8 2.3.2
+   /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/autopep8.py
+   ```
+
+   `.vimrc` 里也已经有：
+
+   ```vim
+   au FileType python setlocal formatprg=autopep8\ -
+   ```
+
+   这说明可以用 Vim 自己的外部 formatter 机制调用 `autopep8`，但这和 `:YcmCompleter Format` 是两套机制。
+
+可用替代方式：
+
+- 在 Python buffer 里直接执行：
+
+  ```vim
+  :%!autopep8 -
+  ```
+
+- 或利用已经配置的 `formatprg=autopep8\ -`，在普通模式下对范围执行 `gq`，例如全文可用：
+
+  ```vim
+  gggqG
+  ```
+
+- 如果想绑定快捷键，可以在 Python ftplugin 或 vimrc 中配置类似：
+
+  ```vim
+  autocmd FileType python nnoremap <buffer> <leader>f :%!autopep8 -<CR>
+  ```
+
+补充：日志里还出现过 `No semantic completer exists for filetypes: ['text']`。这是另一个现象，表示有几次 `YcmCompleter` 请求发生时当前 buffer 的 filetype 是 `text`，不是 Python；但你贴出的 `Supported commands are ...` 这次错误已经进入了 Python completer，真正失败原因仍然是 Python completer 不支持 `Format`。
 ## 2026-05-11 all_reduce debug 修改记录
 
 已完成两处修改：

@@ -8166,3 +8166,532 @@ bitwise_equal=True
 
 否则在默认配置下，**bitwise 不一致是必然的，不是 bug**。
 
+# w_kc 初始化分析
+
+## 问题背景
+
+在测试 DeepSeekV2 模型使用 SIMO int4 量化时��遇到错误：
+```
+RuntimeError: expected scalar type BFloat16 but Found Int
+```
+
+错误发生在 `forward_absorb_prepare` 中的 `torch.bmm(q_nope.transpose(0, 1), self.w_kc)` 调用，因为 `w_kc` 是 int 类型而不是 bfloat16。
+
+## w_kc 初始化流程
+
+在 DeepSeekV2 模型的 `post_load_weights` 方法中（`deepseek_v2.py` 第 3595-3644 行），`w_kc` 的初始化流程如下：
+
+```python
+# 1. 获取 kv_b_proj 的权重
+w = self_attn.kv_b_proj.weight
+
+# 2. 根据量化类型处理
+if 有 weight_scale (block-wise):
+    if use_deep_gemm_bmm:
+        block_scale = weight_scale
+    else:
+        w = block_quant_dequant(weight, weight_scale, weight_block_size, torch.bfloat16)
+else:
+    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+
+# 3. int8 特殊处理
+if w.dtype == torch.int8:
+    if weight_block_size is not None:  # block-wise int8
+        w = int8_block_dequant(weight, weight_scale, weight_block_size).to(torch.bfloat16)
+    else:  # channel-wise int8
+        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale
+
+# 4. 分割出 w_kc 和 w_vc
+w_kc, w_vc = w.unflatten(0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)).split(
+    [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
+)
+
+# 5. 赋值
+self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+```
+
+## int4 量化的问题
+
+关键在于第 3 步的检查条件：`if w.dtype == torch.int8:`
+
+| 量化类型 | 打包后 dtype | 代码检查条件 | 结果 |
+|----------|-------------|-------------|------|
+| int8 | `torch.int8` | `w.dtype == torch.int8` ✅ | 被解量化 |
+| int4 | `torch.int32` | `w.dtype == torch.int8` ❌ | 保持 int32 类型 |
+
+**验证 int4 打包后的 dtype**：
+```python
+import torch
+from simo.extensions.sglang_simo.quantization.quantization import get_downcast_kernel, parse_quantize_spec
+
+weight_spec = parse_quantize_spec({'dtype': 'int4', 'axis': -1, 'group_size': 32})
+downcast_kernel = get_downcast_kernel(weight_spec, 0)
+
+test_weight = torch.randn(128, 256, dtype=torch.bfloat16)
+packed_weight, scale = downcast_kernel(test_weight)
+
+print(f'Original dtype: {test_weight.dtype}')  # torch.bfloat16
+print(f'Packed dtype: {packed_weight.dtype}')  # torch.int32
+print(f'Packed shape: {packed_weight.shape}')    # torch.Size([128, 32]) - 形状减半
+```
+
+**输出**：
+```
+Original dtype: torch.bfloat16
+Packed dtype: torch.int32
+Packed shape: torch.Size([128, 32])
+```
+
+## 结论
+
+int4 量化后，权重被打包存储为 `torch.int32` 类型（2个int4值打包进1个int32），而不是 `torch.int8`。DeepSeekV2 的 `post_load_weights` 方法只检查 `w.dtype == torch.int8`，不会处理 int32 类型的权重，导致：
+
+1. `w_kc` 保持为 int32 类型
+2. 后续的 `torch.bmm(q_nope, self.w_kc)` 期望 bfloat16 类型
+3. 报错：`RuntimeError: expected scalar type BFloat16 but Found Int`
+
+## 解决方案
+
+### 方案 1：排除 kv_b_proj（临时方案）
+
+在量化配置文件中排除 `kv_b_proj`：
+```json
+{
+    "excludes": [
+        "lm_head",
+        "re:.*kv_b_proj"
+    ]
+}
+```
+
+这样 `kv_b_proj` 不会被量化，`w_kc` 保持为 bfloat16 类型。
+
+### 方案 2：修改 sglang 代码（根本方案）
+
+在 DeepSeekV2 的 `post_load_weights` 中添加 int4 解量化支持：
+```python
+if w.dtype == torch.int32:  # int4 packed
+    # 需要实现 int4 解包和解量化
+    w = int4_unpack_and_dequant(w, weight_scale, group_size).to(torch.bfloat16)
+```
+
+这需要修改 sglang 源码 `deepseek_v2.py` 中的 `post_load_weights` 方法。
+
+## 相关代码位置
+
+- DeepSeekV2 `post_load_weights`: `/softhome/like/package/h100/package/sglang_kernel_src/python/sglang/srt/models/deepseek_v2.py:3595-3696`
+- `w_kc` 使用位置: `deepseek_v2.py:1893` (`q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)`)
+
+## vLLM 编译后 `import vllm._C` 报错分析 (修正版)
+
+### 报错信息
+
+```
+>>> import vllm._C
+ImportError: /data/like/package/vllm-for-conda-simo/vllm/_C.abi3.so: undefined symbol: _ZN3c1013MessageLoggerC1EPKciib
+```
+
+### 1. 符号解析
+
+Demangled 名称: **`c10::MessageLogger::MessageLogger(char const*, int, int, bool)`**
+
+| 参数 | C++ 类型 | 含义 |
+|---|---|---|
+| 1 | `char const*` | 源文件名 (如 `__FILE__`) |
+| 2 | `int` | 行号 (如 `__LINE__`) |
+| 3 | `int` | 严重级别 (severity level) |
+| 4 | `bool` | 是否限流/洪水控制 |
+
+### 2. vLLM 是否直接调用了 `c10::MessageLogger`？
+
+**否。** vLLM 源码中没有任何地方直接引用 `MessageLogger`。该符号的依赖是**间接的**，通过 vLLM C++/CUDA 扩展代码中使用的 PyTorch 宏产生：
+
+- `TORCH_CHECK(condition, msg)` — 条件检查失败时抛出异常
+- `TORCH_WARN(msg)` — 发出警告
+- `AT_ERROR(msg)` — 抛出 Aten 错误
+
+这些宏内部构造 `c10::MessageLogger` 对象来格式化消息。
+
+vLLM 中 40+ 个 `.cu/.cuh` 文件使用了 `TORCH_CHECK`，关键文件：
+
+- `csrc/cache_kernels.cu` (lines 44, 52, 58, 81-90, 135, 749, 763, 826-835, 891-893, 935)
+- `csrc/attention/paged_attention_v1.cu` (lines 122, 156)
+- `csrc/attention/paged_attention_v2.cu` (lines 128, 163)
+- `csrc/attention/merge_attn_states.cu` (lines 208, 261, 268, 317, 322)
+- `csrc/attention/dtype_fp8.cuh` (line 33)
+- `csrc/quantization/marlin/kernel_selector.h` (line 1468)
+- `csrc/moe/marlin_moe_wna16/kernel_selector.h` (line 1468)
+
+### 3. 编译依赖链
+
+CMakeLists.txt 通过 `find_package(Torch REQUIRED)` 链接：
+
+```
+CMakeLists.txt:91: find_package(Torch REQUIRED)
+cmake/utils.cmake:574: target_link_libraries(${MOD_NAME} PRIVATE torch ${ARG_LIBRARIES})
+```
+
+`_C.abi3.so` 的 `NEEDED` 依赖（`readelf -d`）：
+```
+NEEDED  libtorch.so
+NEEDED  libc10.so          ← c10::MessageLogger 的来源
+NEEDED  ...
+```
+
+无需 RPATH/RUNPATH。
+
+### 4. 根因: PyTorch 2.10 → 2.11 ABI 断裂
+
+#### 4.1 实证: 两个版本的 libc10.so 符号对比
+
+**vllm `_C.abi3.so` 需要的符号** (`nm -D`，类型 `U` = undefined):
+
+```
+U _ZN3c1013MessageLoggerC1EPKciib    ← OLD ABI: MessageLogger(char const*, int, int, bool)
+U _ZN3c1013MessageLoggerD1Ev         ← 析构函数 (ABI 没变)
+U _ZN3c1013MessageLogger6streamB5cxx11Ev  ← stream() (ABI 没变)
+```
+
+**torch 2.10.0 `libc10.so` 提供的符号** (类型 `T` = defined):
+
+```
+T _ZN3c1013MessageLoggerC1EPKciib    ← ✅ 匹配 vllm 需要
+T _ZN3c1013MessageLoggerD1Ev
+T _ZN3c1013MessageLogger6streamB5cxx11Ev
+```
+
+**torch 2.11.0 `libc10.so` 提供的符号** (类型 `T` = defined):
+
+```
+T _ZN3c1013MessageLoggerC1ENS_14SourceLocationEib  ← ❌ 不匹配！
+T _ZN3c1013MessageLoggerD1Ev                        ← ✅ 匹配
+T _ZN3c1013MessageLogger6streamB5cxx11Ev            ← ✅ 匹配
+```
+
+#### 4.2 ABI 变更细节
+
+`c10::MessageLogger` 构造函数在 torch 2.11.0 中发生了 **参数类型变更**:
+
+| 版本 | 构造函数签名 | mangled name 后缀 |
+|---|---|---|
+| torch 2.10.0 | `MessageLogger(char const*, int, int, bool)` | `C1EPKciib` |
+| torch 2.11.0 | `MessageLogger(c10::SourceLocation, int, bool)` | `C1ENS_14SourceLocationEib` |
+
+PyTorch 将单独的 `(char const* file, int line)` 两个参数合并为一个 `c10::SourceLocation` 结构体。新的 `SourceLocation` 封装了文件名和行号：
+
+```cpp
+// torch 2.10.0 头文件
+class MessageLogger {
+  MessageLogger(const char* file, int line, int severity, bool graph);
+};
+
+// torch 2.11.0 头文件
+class MessageLogger {
+  MessageLogger(SourceLocation loc, int severity, bool graph);
+  // 其中 SourceLocation 内部包含 file 和 line
+};
+```
+
+#### 4.3 为什么 `import torch` 也无法修复
+
+vllm `_C.abi3.so` 在编译时就嵌入了对 OLD ABI 符号 `MessageLogger(char const*, int, int, bool)` 的依赖。torch 2.11.0 的 `libc10.so` **完全不含这个符号**（被 `MessageLogger(SourceLocation, int, bool)` 替换）。这是永久性缺失，无法通过调整加载顺序修复。
+
+验证：conda env 中 torch=2.11.0，**即便先 import torch，再 import vllm._C 仍然报同样错误**。
+
+#### 4.4 为什么编译时用了 torch 2.10.0 的 ABI
+
+编译脚本 (`install-vllm.sh:5`):
+```bash
+pip install --config-settings=build.verbose=true -vvv -e . --no-build-isolation
+```
+
+`--no-build-isolation` 使用当前 Python 环境中的 torch 头文件进行编译。编译时的 conda 环境包含 **torch 2.10.0**。
+
+但编译日志第 264-267 行显示 pip 在安装依赖时 **将 torch 升级到了 2.11.0**。由于 pip 先安装依赖再编译，编译究竟用了哪个版本取决于具体时序：如果 `--no-build-isolation` 在 torch 升级后生效，则编译用了 2.11.0 头文件；如果在升级前生效，则用了 2.10.0。
+
+实际情况：`_C.abi3.so` 编译时链接的是 OLD ABI 符号（`C1EPKciib`），说明**编译时使用的 torch 头文件 ≤ 2.10.0**。而运行时 conda 环境被升级到了 torch 2.11.0，导致 ABI 不兼容。
+
+### 5. 修复方案
+
+**方案 A (推荐): 重新编译** — 在当前 torch 2.11.0 环境下重新编译 vllm：
+
+```bash
+cd /data/like/package/vllm-for-conda-simo
+rm -rf build/
+pip install --config-settings=build.verbose=true -vvv -e . --no-build-isolation
+```
+
+重新编译后 `_C.abi3.so` 会需要 `_ZN3c1013MessageLoggerC1ENS_14SourceLocationEib`，与 torch 2.11.0 的 `libc10.so` 匹配。
+
+**方案 B: 降级 torch** — 将 conda 环境中的 torch 降级回 2.10.0：
+
+```bash
+pip install torch==2.10.0
+```
+
+### 6. 依赖关系总结
+
+```
+vllm/_C.abi3.so
+  └── 链接时: TORCH_CHECK → c10::MessageLogger(char const*, int, int, bool)  [torch ≤ 2.10 ABI]
+  └── 运行时: libc10.so (torch 2.11.0) 只提供 MessageLogger(SourceLocation, int, bool)  [torch ≥ 2.11 ABI]
+  └── 结果: 符号找不到 → undefined symbol error
+```
+
+### 7. 如何在未来 torch 升级中避免 ABI 不兼容问题
+
+#### 7.1 当前编译命令的问题
+
+当前编译脚本 (`install-vllm.sh:5`)：
+
+```bash
+pip install --config-settings=build.verbose=true -vvv -e . --no-build-isolation
+```
+
+`--no-build-isolation` 的含义：**不在隔离的 build venv 中编译**，而是直接使用当前 Python 环境中的包（包括 torch）的**头文件和库**进行编译。
+
+配合 `pyproject.toml:9` 的 `requires = ["torch == 2.11.0"]`，产生了以下时序问题：
+
+```
+1. pip 检查当前环境: torch == 2.10.0
+2. pip 发现 requires 不满足 (需要 2.11.0)
+3. pip 自动升级 torch: 2.10.0 → 2.11.0
+4. cmake 编译 vllm → 使用哪个 torch 头文件？不确定
+   ├── 如果用 2.10.0 头文件编译 → OLD ABI → 报错
+   └── 如果用 2.11.0 头文件编译 → NEW ABI → 正常
+5. 结果: 运行时 torch == 2.11.0，但 .so 链接了 OLD ABI → undefined symbol
+```
+
+#### 7.2 ❌ 编译前卸载旧版 torch 不能解决
+
+卸载 torch 后 vllm 无法编译——cmake 需要 `find_package(Torch REQUIRED)` 找到 torch 头文件和 `.so` 文件。没有 torch 就无法编译。
+
+所以**卸载旧 torch 不行**。正确思路是**确保编译时 torch 版本 ≡ 运行时 torch 版本**。
+
+#### 7.3 ✅ 推荐方案
+
+**方案 A (最简单、最安全): 去掉 `--no-build-isolation`**
+
+```bash
+pip install -e . --no-build-isolation  # ❌ 当前方式
+pip install -e .                        # ✅ 推荐方式
+```
+
+去除 `--no-build-isolation` 后，pip 会：
+1. 创建一个**隔离的临时 build venv**
+2. 在其中安装 `pyproject.toml` 的 `[build-system].requires`（含 `torch == 2.11.0`）
+3. 在隔离 venv 中编译 vllm
+4. 将编译产物安装到当前环境
+
+这样编译时的 torch 和 build venv 中的 torch 完全一致，避免了版本交错。即使当前环境的 torch 版本不同，编译过程也不受影响。
+
+**方案 B: 如果必须保留 `--no-build-isolation`**（例如需要特定的 CUDA torch）
+
+用 `--no-deps` 阻止 pip 自动修改依赖：
+
+```bash
+# 第1步: 确保当前环境装好目标 torch 版本
+pip install torch==2.11.0
+
+# 第2步: 编译时禁止依赖变更
+pip install -e . --no-build-isolation --no-deps
+```
+
+加上 `--no-deps` 后，pip 不会再自动升级/降级任何包，编译时 torch 版本 ≡ 运行时 torch 版本。
+
+**方案 C: 使用 lock 文件固定依赖版本**
+
+在 pyproject.toml 的 `requires` 中固定精确版本（当前已做：`torch == 2.11.0`），且确保当前环境的 torch 与之一致再进行编译。
+
+#### 7.4 核心原则
+
+```
+编译时 torch 头文件版本 ≡ 运行时 torch 版本 → ABI 安全 ✅
+编译时 torch 头文件版本 ≠ 运行时 torch 版本 → ABI 风险 ❌
+```
+
+**未来任何时候升级 torch，都应当重新编译 vllm。** 没有自动检测 ABI 断裂的通用方法——最佳实践是保持 build-time == runtime。
+
+**DeepSeek-V2-Lite-Chat-16B_A2.4B (MLA 模型, gsm8k 5-shot):**
+
+| KV Cache 量化配置 | flexible-extract exact_match | 状态 |
+|---|---|---|
+| `fp8_per_group` | 0.6710 | 正常 |
+| `mxint8` | 0.6619 | 正常 |
+| `mxfp8` | 0.6505 | 正常 |
+| `int8_per_group` | 0.6475 | 正常 |
+| `mxfp6` | **0.0728** | 异常 |
+| `mxfp4` | **0.0099** | 异常 |
+| `nvfp4` | **0.0099** | 异常 |
+
+**Llama3.1-8B-Instruct (GQA 模型, gsm8k 5-shot):**
+
+| KV Cache 量化配置 | flexible-extract exact_match | 状态 |
+|---|---|---|
+| `mxfp6` | 0.7832 | 正常 |
+| `mxint8` | 0.7794 | 正常 |
+| `int8_per_group` | 0.7756 | 正常 |
+| `nvfp4` | 0.7672 | 正常 |
+| `mxfp8` | 0.7642 | 正常 |
+| `fp8_per_group` | 0.7612 | 正常 |
+| `mxfp4` | 0.6929 | 正常 |
+
+### 2. 背景: MLA 模型的 KV Cache 布局差异
+
+DeepSeek-V2-Lite 使用 MLA (Multi-head Latent Attention)，与 Llama3.1 的 GQA 架构在 KV Cache 层面完全不同：
+
+**常规 GQA 模型 (Llama) — `set_kv_buffer_kernel`:**
+- KV cache 按 kv_head 维度展开，每个 head 独立存储
+- 布局 per token: `[head0_packed | head1_packed | ... | head0_scale | head1_scale | ...]`
+- `SCALE_PLANE_OFFSET = num_kv_heads * PACKED_HEAD_SIZE`
+
+**MLA 模型 (DeepSeek-V2-Lite) — `concat_and_cache_mla_kernel`:**
+- KV cache 只存储 1 个"kv head"的 latent 表示 c_KV (dim=512) + k_pe (dim=64)
+- 布局 per token（tile 交错的 packed/scales）:
+  ```
+  [ kv_c_tile0_packed(16B) | ... | kv_c_tile15_packed(16B) | kv_c_tile0_scale(1B) | ... | kv_c_tile15_scale(1B) | k_pe_tile0_packed | k_pe_tile1_packed | k_pe_tile0_scale | k_pe_tile1_scale ]
+  ```
+- 总 packed: 16 × PACKED_TILE_BYTES ; 总 scales: 16 × SCALE_TILE_BYTES
+- `SCALE_PLANE_OFFSET = num_kv_heads * PACKED_HEAD_SIZE = 1 * PACKED_HEAD_SIZE`
+- 代码位置: `simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:309-467` 函数 `concat_and_cache_mla_kernel`
+
+decode 阶段通过 `self.attn_mqa` 读写 KV cache (`Lk=576, BLOCK_DMODEL=512, BLOCK_DPE=64`)。Q 使用 c_KV-like 表示 (512 dim)，K/V 均从同一个 latent buffer 读取。
+
+### 3. 已确认的 Bug: NVFP4 的 MX_QUANT_DIM 不一致
+
+**文件:** `simo/ops/kernels/upcast/_upcast_from_mxfmt.py:33`
+
+```python
+MX_QUANT_DIM: tl.constexpr = 16 if MX_FORMAT_ID == NVFP4_E2M1 else 32
+```
+
+**写路径** (`_compute_and_pack_mxfmt`, `_downcast_to_mxfmt.py:240`):
+- `MX_BLOCK_SIZE = tile_size = 32` — 每 32 个值对应 1 个 scale
+- 对于 kv_lora_rank=512: 产生 16 个 scale，每个覆盖 32 个值
+
+**读路径** (`_unpack_and_dequant_mxfmt`, `_upcast_from_mxfmt.py:31-37`):
+- `MX_QUANT_DIM = 16` — 认为每个 scale 只覆盖 16 个值
+- `BLOCK_SIZE_QUANT_DIM = scale.shape[1] * 16 = 16 * 16 = 256`
+- 只产出 256 个 dequant 值，而非正确的 512 个
+
+**后果:**
+- scale 被应用到错误的数值组（一个为 32 个值计算的 scale 被分到两个 16 值组上分别应用）
+- dequant 后的 K/V 值完全错误
+- `tl.dot(q [BLOCK_H, 512], K_dequant [256, BLOCK_N])` 的 contracting dimension 不匹配 (512 ≠ 256)
+- (Triton 3.x 在这个场景下似乎接受了 reshape，但产生了垃圾输出而非崩溃)
+
+**注意:** 这个 bug 在 Llama GQA 上不影响正确性，因为 GQA 模型的 SCALE_HEAD_SIZE = head_dim/32 = 128/32 = 4。对于 head_dim=128、SCALE_HEAD_SIZE=4:
+- 写: 128/32 = 4 个 scale，每个覆盖 32 个值
+- 读 (MX_QUANT_DIM=16): scale.shape[1] * 16 = 4 * 16 = 64 ≤ 128 — 但这也会产生维度问题
+
+实际上，对于 NVFP4 + Llama 得分为 0.7672 是正常的。这说明 NVFP4 在 Llama 上确实工作正常。进一步的维度分析: 对于 GQA, `sparse_head_size` 在 extend_attention 的 `NEEDS_SW_DEQUANT` 路径中加载 PACKED_HEAD_SIZE 字节。如果 head_dim=128 → PACKED_HEAD_SIZE=64 (NVFP4 2 值/字节)。读路径用 MX_QUANT_DIM=16 做 dequant: scale.shape[1] * 16 = head_dim/MX_BLOCK_SIZE * 16 = 128/32 * 16 = 4 * 16 = 64。但加载了 64 字节 → 128 个 fp4 值。reshape [BLOCK_N, 128] → [BLOCK_N, 4, 16] = [BLOCK_N, 64]。128 ≠ 64，同样会有 reshape 失败…
+
+这里可能 Triton 做了沉默的重塑形适配导致数值错误；但在 MLA (更大的维度) 上暴露得更严重。
+
+**修复建议:** 将 `_upcast_from_mxfmt.py:33` 改为 `MX_QUANT_DIM: tl.constexpr = 32`（去掉 NVFP4 的特判），因为两种 fp4 格式都使用相同的 MX_BLOCK_SIZE=32。
+
+### 4. mxfp4/mxfp6 异常分析
+
+#### 4.1 Decode 路径维度和布局验证
+
+对 MLA decode 路径逐一验证数据布局：
+
+**PACKED_HEAD_SIZE 计算** (`simo/extensions/sglang_simo/models/deepseek_v2.py:8-19`, 函数 `updata_module_head_size`):
+```python
+x_q, scale_a = layer.kv_cache_downcast_kernel(torch.randn(1, kv_lora_rank, device="meta"))
+layer.packed_head_size = x_q.contiguous().view(torch.uint8).shape[-1]
+```
+- mxfp4: PACKED_HEAD_SIZE = 512/2 = **256** 字节
+- mxfp6: PACKED_HEAD_SIZE = 512×6/8 = **384** 字节
+- mxint8: PACKED_HEAD_SIZE = **512** 字节
+- mxfp8: PACKED_HEAD_SIZE = **512** 字节
+- SCALE_HEAD_SIZE (全部格式): 512/32 = **16**
+
+**MLA KV Cache 写布局** (`concat_and_cache_mla_kernel`, `set_kv_buffer.py:309-467`):
+```
+KV_C_PACKED_BYTES = 16 * PACKED_TILE_BYTES   (tile_size=32)
+  mxfp4: 16 * 16 = 256
+  mxfp6: 16 * 24 = 384  (32元素 × 6bit / 8 = 24字节 packed per tile)
+  mxint8: 16 * 32 = 512
+KV_C_SCALE_BYTES = 16 * 1 = 16
+KV_C_TOTAL_BYTES = KV_C_PACKED_BYTES + KV_C_SCALE_BYTES
+  mxfp4: 272, mxfp6: 400, mxint8: 528
+```
+
+**Decode 读路径 loaded 数据验证** (`decode_attention.py:196-234`):
+```
+# Packed K: kv_loc * stride + 0 * PACKED_HEAD_SIZE + [0..PACKED_HEAD_SIZE-1]
+# Scale K: kv_loc * stride + 1*PACKED_HEAD_SIZE + 0*SCALE_HEAD_SIZE + [0..15]
+
+对于 mxfp4: packed = offset [0..255], scale = offset [256..271]  ✓ (与写一致)
+对于 mxfp6: packed = offset [0..383], scale = offset [384..399]  ✓ (与写一致)
+对于 mxint8: packed = offset [0..511], scale = offset [512..527]  ✓ (与写一致)
+```
+
+**维度匹配:**
+- mxfp4 decode: `tl.dot_scaled(q [BLOCK_H,512], None, "bf16", k_packed.T [256, BLOCK_N], k_scale, "e2m1")`
+- mxfp6 decode: `tl.dot(q [BLOCK_H,512], K_dequant [512, BLOCK_N])` (dequant 从 384 字节解出 512 个 fp6 值)
+- mxint8 decode: `tl.dot(q [BLOCK_H,512], K_dequant [512, BLOCK_N])` (dequant 从 512 字节 bitcast 出 512 个 int8)
+
+所有维度在数值上匹配。K dequant 产出 512 个值，Q 的 contracting dim 也为 512。
+
+**Rope PE 路径验证:**
+- rope_offset_in_token = 1 * (PACKED_HEAD_SIZE + SCALE_HEAD_SIZE)
+  - mxfp4: 256+16 = 272 = KV_C_TOTAL_BYTES ✓
+  - mxfp6: 384+16 = 400 = KV_C_TOTAL_BYTES ✓
+- PACKED_HEAD_SIZE_ROPE (pe_dim=64):
+  - mxfp4: 64/2 = 32, SCALE_HEAD_SIZE_ROPE = 64/32 = 2
+  - mxfp6: ceil(64*6/8) = 48, SCALE_HEAD_SIZE_ROPE = 64/32 = 2
+- PE packed 读偏移: rope_offset + 0 * PACKED_HEAD_SIZE_ROPE + [0..packed-1]
+  - mxfp4: 272 + [0..31] → 读写一致 ✓
+  - mxfp6: 400 + [0..47] → 读写一致 ✓
+
+#### 4.2 FP6 打包/解包验证
+
+写 (SIPU 模式, `_downcast_to_mxfmt.py:498-513`):
+```
+byte0 = (x3 << 2) | (x2 >> 4)   — bits [7:2]=x3, [1:0]=x2的高位
+byte1 = ((x2 & 0x0F) << 4) | (x1 >> 2)  — bits [7:4]=x2的低位, [3:0]=x1的高位
+byte2 = ((x1 & 0x03) << 6) | x0   — bits [7:6]=x1的低位, [5:0]=x0
+```
+存储为 3 字节 uint32: `b0 | (b1 << 8) | (b2 << 16)`。
+在 cache 中按 `[b2, b1, b0]` 顺序存储 (每 3 字节一组)。
+
+读 (`_upcast_from_mxfmt.py:55-68` 和 `common.py:202-208`):
+```
+加载: b2=pos[3i], b1=pos[3i+1], b0=pos[3i+2]
+重构 uint32: b0 | (b1 << 8) | (b2 << 16)
+解包: x0, x1, x2, x3 = d, c, b, a (反向顺序, 对应原来的 x0, x1, x2, x3)
+```
+
+打包和解包互逆 ✓，数值恢复应正确。
+
+#### 4.3 疑点总结
+
+对于 mxfp4 (0.0099) 和 mxfp6 (0.0728) 在 DeepSeek MLA 上的异常，**所有已知的维度、布局、打包/解包路径均已验证一致**。可能的原因包括:
+
+1. **V (value) 路径问题**: MLA 的 V_Buffer 和 K_Buffer 指向同一块内存（`memory_pool.py:306-307`），但 V 的 dequant 使用同样的 packed/scales 布局。虽然布局一致，但在 NLP 任务中 V 的精度比 K 更关键（attention 权重 softmax 对 K 的误差有一定容忍度，但 V 直接加权求和）。
+
+2. **Triton dot_scaled e2m1 的实际行为**: mxfp4 使用 `tl.dot_scaled(q, None, "bf16", k_packed.T, k_scale, "e2m1")`，而 mxint8 使用 dequant + `tl.dot`。dot_scaled 对 e2m1 格式的 block size 假设可能与我们实际的 MX block size (32) 不匹配。mxfp6 虽然也使用 dequant + tl.dot，但代码路径经过了更复杂的 FP6 上采样 (从 6-bit → fp32，经过指数偏置调整)。
+
+3. **数值精度累积**: 4-bit 和 6-bit 格式的量化误差更大，对 MLA 架构中需要经过 kv_b_proj 投影的 latent 表示 (c_KV) 更敏感。MLA 的 c_KV 是 512 维的低秩压缩表示，量化误差在 512 维空间中产生的信息损失比 GQA 的 128 维 per-head K 更大。
+
+**建议进一步调试方向**: 在 decode kernel 中 dump mxfp4/mxfp6 的 dequant K/V 值与 mxfp8 的进行对比，确认数值差异的量级；单独验证 V dequant 结果的正确性。
+
+### 5. 为什么 8-bit 格式在 MLA 上正常工作
+
+1. **mxfp8 (E4M3)**: decode 走 transposed 路径 (`decode_attention.py:236-260`)，直接加载 PACKED_HEAD_SIZE=BLOCK_DMODEL=512 个 fp8 元素，通过 `tl.dot_scaled` 计算 QK。没有打包/解包步骤，维度匹配且数值路径简单。
+
+2. **mxint8**: 走 NEEDS_SW_DEQUANT 路径，但解包只需 bitcast (int8→fp32) + scale × 2^(-6)，没有复杂的 6-bit/4-bit 上采样和 interleave 操作。scale 与数值组的对应关系也正确匹配 (MX_QUANT_DIM=32 = MX_BLOCK_SIZE=32)。
+
+3. **fp8_per_group / int8_per_group**: 走 PG_QUANT 路径 (`decode_attention.py:165-194`)，使用 per-group 的 `_dequant_pg_fused` 解量，与 MX 打包无关。
+
+### 6. 为什么 Llama GQA 上所有格式都正常
+
+Llama3.1-8B-Instruct 使用标准 GQA 架构：
+- head_dim = 128, kv_head = 8
+- KV cache 使用 `set_kv_buffer` 的常规路径，每个 kv head 独立量化
+- PACKED_HEAD_SIZE 基于 head_dim (128)，不是 kv_lora_rank (512)
+- 无 MLA 特有的 concat interleave 布局
+- Per-head K/V 直接量化存储，无需后续投影
+- 数值误差影响较 MLA 小（128 维 vs 512 维低秩投影）
