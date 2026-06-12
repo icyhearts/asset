@@ -8695,3 +8695,109 @@ Llama3.1-8B-Instruct 使用标准 GQA 架构：
 - 无 MLA 特有的 concat interleave 布局
 - Per-head K/V 直接量化存储，无需后续投影
 - 数值误差影响较 MLA 小（128 维 vs 512 维低秩投影）
+
+### 7. NVFP4 MX_QUANT_DIM 不一致排查结果：确认不是 Bug
+
+#### 7.1 问题背景
+
+之前怀疑 `_upcast_from_mxfmt.py:33` 中 NVFP4 的 `MX_QUANT_DIM=16` 与写路径的 `MX_BLOCK_SIZE=32` 不一致，认为是一个 bug。但实际排查后发现 **这不是 bug**，读写路径的 block size 是一致的。
+
+#### 7.2 NVFP4 配置文件
+
+`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json`:
+
+```json
+{
+    "dtype": "nvfp4_e2m1",
+    "scale_mode": "e4m3",
+    "group_size": 16
+}
+```
+
+关键点：`group_size: 16`。
+
+#### 7.3 写路径：MX_BLOCK_SIZE 的实际值
+
+**Step 1**: `QuantizeSpecMX` 中 `group_size` → `block_size`
+
+`simo/quantization/config.py`, `QuantizeSpecMX` 类，validator `sync_group_size_with_block_size`:
+```python
+self.block_size = self.group_size  # 16
+```
+
+另外 `calibrate_dtype` validator 还强制约束 nvfp4_e2m1 + e4m3 scale_mode 时 `block_size=16`:
+```python
+if self.dtype == "nvfp4_e2m1" and self.scale_mode == "e4m3":
+    self.block_size = 16
+```
+
+因此 `kv_cache_quant_spec.block_size = 16`。
+
+**Step 2**: `set_kv_buffer` / `set_mla_kv_buffer` 中 `tile_size = block_size`
+
+非 MLA 路径 — `simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py`, `simo_set_kv_buffer()`:
+```python
+tile_size = kv_cache_quant_spec.block_size  # = 16
+```
+
+MLA 路径 — `simo/extensions/sglang_simo/mem_cache/memory_pool.py:346`, `set_mla_kv_buffer()`:
+```python
+tile_size = kv_cache_quant_spec.block_size  # = 16
+```
+
+**Step 3**: `TILE_SIZE` → `MX_BLOCK_SIZE` — `set_kv_buffer.py`:
+
+`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py`, `set_kv_buffer_kernel()` 和 `concat_and_cache_mla_kernel()`, 调用 `_compute_and_pack_mxfmt()` 时:
+```python
+MX_BLOCK_SIZE = TILE_SIZE  # = 16
+```
+
+因此写路径实际传入 `_compute_and_pack_mxfmt` 的 `MX_BLOCK_SIZE = 16`，**不是默认值 32**。
+
+#### 7.4 读路径：MX_QUANT_DIM 的值
+
+`simo/ops/kernels/upcast/_upcast_from_mxfmt.py:32-33`, `_unpack_and_dequant_mxfmt()`:
+```python
+# 使用三元表达式定义 MX_QUANT_DIM，避免 Triton 编译器的 constexpr 识别问题
+MX_QUANT_DIM: tl.constexpr = 16 if MX_FORMAT_ID == NVFP4_E2M1 else 32
+```
+
+对于 NVFP4，`MX_QUANT_DIM = 16`。
+
+#### 7.5 结论：读写一致，非 Bug
+
+| 路径 | 变量 | 值 |
+|------|------|----|
+| 配置 | `group_size` / `block_size` | **16** |
+| 写路径 | `MX_BLOCK_SIZE` (= `tile_size` = `block_size`) | **16** |
+| 读路径 | `MX_QUANT_DIM` (NVFP4 分支) | **16** |
+
+读写路径的 block size 完全一致（都是 16），不存在不匹配的问题。**这不是 bug**。
+
+#### 7.6 对比：其他格式的 block_size
+
+其他 MX 格式的配置文件没有显式指定 `group_size`，使用 `QuantizeSpecMX` 的默认值 `block_size=32`：
+
+| 格式 | 配置文件 group_size | block_size | 读路径 MX_QUANT_DIM | 匹配？ |
+|------|---------------------|------------|-------------------|--------|
+| nvfp4_e2m1 | 16 (显式) | 16 | 16 | ✓ |
+| mxfp4_e2m1 | 未指定 (默认32) | 32 | 32 | ✓ |
+| mxfp6_e2m3 | 未指定 (默认32) | 32 | 32 | ✓ |
+| mxfp6_e3m2 | 未指定 (默认32) | 32 | 32 | ✓ |
+| mxfp8_e4m3 | 未指定 (默认32) | 32 | 32 | ✓ |
+| mxint8 | 未指定 (默认32) | 32 | 32 | ✓ |
+
+所有格式的读写路径 block size 都是一致的。
+
+#### 7.7 NVFP4 仍然分数异常的原因？
+
+虽然 MX_QUANT_DIM 不是 bug，但 NVFP4 在 DeepSeek-V2-Lite 上的 gsm8k 分数仍然是 0.0099。这可能与以下因素有关：
+
+1. **4-bit 极低精度**：NVFP4 只有 4 位（1 sign + 2 exp + 1 mantissa），可表示的数值非常有限（只有 16 个值），量化误差远大于 8-bit 格式。
+
+2. **MLA 对量化误差更敏感**：MLA 的 latent 表示 c_KV 是 512 维低秩压缩，信息密度高。4-bit 量化在 512 维空间中引入的巨大误差经过 kv_b_proj 投影后被放大，导致 attention 输出失真。
+
+3. **E4M3 尺度的特殊性**：NVFP4 使用 `scale_mode: "e4m3"`（float8e4nv 存储尺度），而其他 MX 格式使用 `e8m0_sipu`（uint8 E8M0）。两种 scale 格式的精度和范围不同，E4M3 scale 的精度可能不足以支持 4-bit 的细粒度量化需求。
+
+**注意**：`temp/cld_answer.md` 文件不存在（会话恢复后丢失），无需更新其中的第 3 节。原 `_upcast_from_mxfmt.py:33` 的代码已经是正确的原始形式，不需要修改。
+

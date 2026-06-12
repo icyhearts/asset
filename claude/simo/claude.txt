@@ -1991,3 +1991,12 @@ ImportError: /data/like/package/vllm-for-conda-simo/vllm/_C.abi3.so: undefined s
 
 分析错误原因，  vllm 是直接调用 c10::MessageLogger::MessageLogger 函数了吗？ vllm是 如何 依赖 c10::MessageLogger::MessageLogger 的?
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 temp/codex_answer.md 里面
+
+你确定  已确认的 Bug: NVFP4 的 MX_QUANT_DIM 不一致，真的是bug吗？
+**写路径** (`_compute_and_pack_mxfmt`, `_downcast_to_mxfmt.py:240`):
+`MX_BLOCK_SIZE = tile_size = 32 只是默认值， sglang_simo kv cache  nvfp4 量化的实际，调用 _compute_and_pack_mxfmt 实际传的 MX_BLOCK_SIZE 是多少？
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
+
+
+vllm conda环境位 于 /data/like/miniconda3/envs/simo_vllm/
+vllm 源码 位于 /data/like/package/vllm-for-conda-simo
