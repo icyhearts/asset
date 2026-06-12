@@ -2010,3 +2010,22 @@ mxfp6=0.6490,
 nxfp4=0.4951
 在 mxfp4,mxfp6,nvfp4格式 kv cache 量化上，vllm_simo的得分比 sglang_simo 高，bit数并不是导致 sglang_simo mxfp4=0.0099, mxfp6=0.0728, nvfp4=0.0099得分低的真正原因。继续深入分析 , sglang_simo 的 kv cache 量化，为什么在 Llama3.1-8B-Instruct 上gsm8k 得分是正常的， 在 DeepSeek-V2-Lite-Chat-16B_A2.4B 上 mxfp4 mxfp6 nvfp4 得分很差的原因
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+1: 你确定 mxfp4 精度低是 tl.dot_scaled 引起的吗？ simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 和 simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py ，对于 nvfp4 可是使用 _unpack_and_dequant_mxfmt + tl.dot 的组合， nvfp4 的 gsm8k 得分也很低。 tl.dot_scaled 不是根本原因
+2:  你确定  get_mla_kv_buffer 会被调用到吗？ 
+我使用如下命令验证 get_mla_kv_buffer 没有被调用:
+cp /share/users/like/ipc.sglang.1.json  /dev/shm/like/ipc.sglang.1.json  ; SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json   HF_DATASETS_CACHE=/data/like/huggingface_cache debug_env_file=/dev/shm/like/ipc.sglang.1.json  CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B",   "tp_size": 1, "dtype": "auto", "mem_fraction_static": 0.5, "kv_cache_dtype": "fp8_e4m3" , "log_level":"info", "disable_cuda_graph":true, "attention_backend":"triton",  "skip_server_warmup":true , "watchdog_timeout": 2592000,  "disable_piecewise_cuda_graph": true }' --tasks gsm8k --batch_size auto > templ/sglang.gsm8k.lm-eval-kv-fp8.log.`nowstr.sh` 2>&1 &
+日志位于 //data/like/package/simo_conda_sglang/templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_12___16_46_56
+sglang code base python/sglang/srt/mem_cache/memory_pool.py， 我加了 很多  logger.info("MLATokenToKVPool called") 打印，在 SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json这一配置下， logger.info 会打印出 函数名。//data/like/package/simo_conda_sglang/templ/sglang.gsm8k.lm-eval-kv-fp8.log.2026_06_12___16_46_56显示 , 只有如下函数被调用
+__init__
+_create_buffers
+get_key_buffer
+get_kv_size_bytes
+get_value_buffer
+set_kv_buffer
+set_mla_kv_buffer
+并没有发生 get_mla_kv_buffer 的调用。
+sglang 在 gsm8k任务下，get_mla_kv_buffer真的必须的吗？
+继续分析 sglang_simo mxfp4,mxfp6,nvfp4 得分差的原因。
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
