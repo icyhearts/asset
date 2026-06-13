@@ -8074,3 +8074,39 @@ lm-eval \
 /data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile \
   /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py
 ```
+
+## 2026-06-13: GSM8K 默认 few-shot 是 5 的含义
+
+`默认 few-shot 是 5` 的意思是：lm-eval 在构造每一条 GSM8K 测试样本的 prompt 时，会先从 GSM8K 的 few-shot split 中选 5 个示例题目和答案，拼到当前测试题目前面，作为 in-context examples。然后模型再回答当前这 1 条测试题。
+
+它不是说一次评测 5 条 GSM8K 测试数据，也不是说向 SGLang 发 5 条请求。它只影响单条请求里的 prompt 内容。
+
+对应配置在 `lm_eval/tasks/gsm8k/gsm8k.yaml:31 (task config)`：
+
+```yaml
+num_fewshot: 5
+```
+
+GSM8K 配置还声明 few-shot 示例来自 train split：`lm_eval/tasks/gsm8k/gsm8k.yaml:8 (task config)`，真正评测的样本来自 test split：`lm_eval/tasks/gsm8k/gsm8k.yaml:9 (task config)`。prompt 模板是 `Question: {{question}}\nAnswer:`：`lm_eval/tasks/gsm8k/gsm8k.yaml:10 (task config)`。
+
+构造逻辑在 `Task.build_all_requests()` 中：它遍历当前要评测的 doc 后，会调用 `fewshot_context(..., num_fewshot=self.config.num_fewshot, ...)` 生成包含 few-shot 示例的上下文：`lm_eval/api/task.py:332 build_all_requests`、`lm_eval/api/task.py:337 build_all_requests`、`lm_eval/api/task.py:340 build_all_requests`。之后再调用 `construct_requests()` 把这个上下文变成要发给模型的 request：`lm_eval/api/task.py:350 build_all_requests`。
+
+所以当你使用：
+
+```bash
+--samples '{"gsm8k":[0]}' --batch_size 1
+```
+
+含义是：只评测 GSM8K test split 的第 0 条测试题，并且只向 SGLang 发 1 条 request；但这 1 条 request 的 prompt 里默认仍然包含 5 个 few-shot 示例。
+
+如果想明确控制这个数量，可以传：
+
+```bash
+--num_fewshot 5
+```
+
+如果想改成 zero-shot，也就是 prompt 里不放示例题，只放当前测试题，可以传：
+
+```bash
+--num_fewshot 0
+```
