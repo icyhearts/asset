@@ -5253,3 +5253,198 @@ ComposedLayout<
 | 排布方向 | K-major（swizzle selector 第3参数=true） | MN-major（第3参数=false） |
 | 用途 | TMA load（X从global→smem，W从global→smem） | TMA store（Y从smem→global） |
 - Mode-2 Stride 第二分量：`Int<16384>` vs `Int<8192>`（= `128*kTileN` vs `128*kTileM`）
+
+## 16. SM80_16x8x16_F16F16F16F16_TN 和 `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16`
+
+### 16.1 CUTLASS/CUTE 这个 struct 封装了什么
+
+`cute-gemm/3rd/cutlass/include/cute/arch/mma_sm80.hpp` 中的
+`SM80_16x8x16_F16F16F16F16_TN` 是对 Ampere SM80 warp-level MMA 指令的很薄封装：
+
+```cpp
+using DRegisters = uint32_t[2];
+using ARegisters = uint32_t[4];
+using BRegisters = uint32_t[2];
+using CRegisters = uint32_t[2];
+
+asm volatile(
+  "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+  "{%0,  %1},"
+  "{%2,  %3,  %4,  %5},"
+  "{%6,  %7},"
+  "{%8,  %9};\n"
+  : "=r"(d0), "=r"(d1)
+  :  "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+     "r"(b0), "r"(b1),
+     "r"(c0), "r"(c1));
+```
+
+这条指令计算：
+
+```text
+D = A * B + C
+```
+
+其中 `.m16n8k16` 表示单条 warp-level MMA 覆盖的逻辑 tile 是：
+
+| 矩阵 | 逻辑形状 |
+|------|----------|
+| A | `16 x 16`，即 `M x K` |
+| B | `16 x 8`，即 `K x N` |
+| C | `16 x 8`，即 `M x N` |
+| D | `16 x 8`，即 `M x N` |
+
+`row.col` 表示这条 PTX 指令视角下 A fragment 按 row-major 解释，B fragment 按 column-major 解释。CUTE 上层 tensor 的真实全局内存 layout 可以不同，关键是 `MMA_Traits` 和 copy/partition 负责把每个 lane 的寄存器 fragment 放到这条指令要求的位置。
+
+### 16.2 输入输出操作数是否都必须在寄存器
+
+是的，对 `mma.sync.aligned...` 这条 PTX 指令本身来说，`a`、`b`、`c`、`d` 全部都是寄存器 fragment，不是 global/shared memory 地址。
+
+也就是说：
+
+- A/B 在执行 MMA 前必须已经被加载到每个线程自己的寄存器中，常见来源是 shared memory，经 `ldmatrix` 或普通 load 进入寄存器。
+- C 是输入累加器 fragment，也在寄存器中。
+- D 是输出 fragment，也写回寄存器；后续再由代码把 D store 到 shared/global memory。
+- `mma.sync` 不会直接从 shared/global memory 读 A/B，也不会直接把 D 写到内存。
+
+NVIDIA PTX ISA 对 `mma` 的描述也是这种模型：矩阵 A、B、C、D 的 fragment 分布在 warp 内各线程的寄存器中；`.sync` 要求执行线程等待同一 warp 中其他线程执行相同 MMA 指令；`.aligned` 要求同一 warp 内线程执行相同指令，否则行为未定义。
+
+参考：NVIDIA PTX ISA, `mma` instruction:
+<https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma>
+
+### 16.3 后缀是 `f16.f16.f16.f16`，为什么 CUTLASS 用 `uint32_t` 寄存器
+
+`mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` 末尾四个类型按 PTX 语法分别表示：
+
+```text
+dtype.atype.btype.ctype
+```
+
+所以这里表示：
+
+| PTX 后缀位置 | 含义 | 类型 |
+|--------------|------|------|
+| 第 1 个 `f16` | D 元素类型 | fp16 |
+| 第 2 个 `f16` | A 元素类型 | fp16 |
+| 第 3 个 `f16` | B 元素类型 | fp16 |
+| 第 4 个 `f16` | C 元素类型 | fp16 |
+
+它描述的是矩阵元素类型，不等价于“每个 PTX 操作数寄存器只有 16 bit”。
+
+对 `.m16n8k16` 的 fp16 MMA，PTX fragment 以 `.f16x2` 形式传参：一个 32-bit register 里 packed 两个 fp16 元素。对应关系是：
+
+| fragment | PTX/CUTE 寄存器数量 | 每个寄存器内容 | 每线程 fp16 元素数 |
+|----------|----------------------|----------------|--------------------|
+| A | 4 个 `.f16x2`，CUTLASS 写成 `uint32_t[4]` | 每个寄存器 2 个 fp16 | 8 |
+| B | 2 个 `.f16x2`，CUTLASS 写成 `uint32_t[2]` | 每个寄存器 2 个 fp16 | 4 |
+| C | 2 个 `.f16x2`，CUTLASS 写成 `uint32_t[2]` | 每个寄存器 2 个 fp16 | 4 |
+| D | 2 个 `.f16x2`，CUTLASS 写成 `uint32_t[2]` | 每个寄存器 2 个 fp16 | 4 |
+
+因此 CUTLASS 使用 `uint32_t` 不是因为矩阵元素变成了 int32 或 fp32，而是因为 inline asm 需要把一个 packed `.f16x2` 操作数放进 32-bit register。`"r"` constraint 对应 32-bit general register，`uint32_t` 只是承载这 32 bit 的位模式。
+
+换句话说：
+
+```text
+1 个 uint32_t register = 1 个 .f16x2 packed operand = 2 个 fp16 matrix elements
+```
+
+这里还要注意一个命名陷阱：CUTLASS `fma` 形参里的 `a0..a3` 是 4 个 packed 32-bit register；PTX 文档中描述 fragment layout 时的 `a0..a7` 通常指展开后的 8 个 fp16 元素。二者不是同一层级的编号。
+
+PTX ISA 示例也给出了相同的寄存器形态：
+
+```ptx
+.reg .f16x2 %Ra<4>, %Rb<2>, %Rc<2>, %Rd<2>;
+mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
+  {%Rd0, %Rd1},
+  {%Ra0, %Ra1, %Ra2, %Ra3},
+  {%Rb0, %Rb1},
+  {%Rc0, %Rc1};
+```
+
+参考：NVIDIA PTX ISA, `mma` examples:
+<https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma>
+
+### 16.4 需要几个线程协同参与
+
+需要一个完整 warp，也就是 32 个线程协同参与。
+
+这不是单线程指令。每个 lane 只持有整个矩阵 tile 的一个 fragment，32 个 lane 合起来才构成完整的 A/B/C/D fragment。对除 `.m8n8k4` 以外的 `mma.sync`，PTX 文档说明是每个 warp 计算一个 MMA operation；这里的 `.m16n8k16` 就是一个 warp 计算一个 `16 x 8 x 16` 的矩阵乘加。
+
+如果 warp 中有线程没有执行同一条 `mma.sync.aligned`，或者有线程已经退出，行为未定义。
+
+### 16.5 每个线程提供多少 A/B/C/D 数据
+
+对 `SM80_16x8x16_F16F16F16F16_TN`，每个线程提供：
+
+| fragment | 每线程 packed register | 每线程 fp16 元素 |
+|----------|-------------------------|------------------|
+| A | 4 个 `uint32_t` | 8 个 fp16 |
+| B | 2 个 `uint32_t` | 4 个 fp16 |
+| C | 2 个 `uint32_t` | 4 个 fp16 |
+| D | 2 个 `uint32_t` | 4 个 fp16 输出 |
+
+一个 warp 合计：
+
+| fragment | warp 总 fp16 元素 | 对应逻辑 tile |
+|----------|-------------------|---------------|
+| A | `32 * 8 = 256` | `16 x 16` |
+| B | `32 * 4 = 128` | `16 x 8` |
+| C | `32 * 4 = 128` | `16 x 8` |
+| D | `32 * 4 = 128` | `16 x 8` |
+
+### 16.6 每个 lane 的 fragment 坐标
+
+令：
+
+```cpp
+groupID           = laneid >> 2;  // 0..7
+threadID_in_group = laneid & 3;   // 0..3
+```
+
+#### A fragment，8 个 fp16 元素
+
+对展开后的 A 元素 `ai, i = 0..7`：
+
+```text
+row = groupID      if i in {0,1,4,5}
+row = groupID + 8  if i in {2,3,6,7}
+
+col = threadID_in_group * 2 + (i & 1)      if i < 4
+col = threadID_in_group * 2 + (i & 1) + 8  if i >= 4
+```
+
+这 8 个 half 被 packed 到 CUTLASS 的 4 个 `uint32_t` A registers 中。
+
+#### B fragment，4 个 fp16 元素
+
+对展开后的 B 元素 `bi, i = 0..3`：
+
+```text
+row = threadID_in_group * 2 + (i & 1)      if i < 2
+row = threadID_in_group * 2 + (i & 1) + 8  if i >= 2
+
+col = groupID
+```
+
+这 4 个 half 被 packed 到 CUTLASS 的 2 个 `uint32_t` B registers 中。
+
+#### C/D fragment，4 个 fp16 元素
+
+对展开后的 C 或 D 元素 `ci/di, i = 0..3`：
+
+```text
+row = groupID      if i < 2
+row = groupID + 8  if i >= 2
+
+col = threadID_in_group * 2 + (i & 1)
+```
+
+这 4 个 half 被 packed 到 CUTLASS 的 2 个 `uint32_t` C/D registers 中。
+
+这也解释了为什么 CUTE 的 `MMA_Traits<SM80_16x8x16_F16F16F16F16_TN>` 中有：
+
+```cpp
+using ThrID = Layout<_32>;
+```
+
+即一个 MMA atom 的 thread-id 空间就是 32 个 lane；而 A/B/C layout 描述的正是这些 lane 内 value fragment 到 `M/N/K` 坐标的映射。
