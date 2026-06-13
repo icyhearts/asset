@@ -1,0 +1,6 @@
+cute-gemm 仓库位于 /data/like/package/cute-gemm
+cute-gemm code base 3rd/cutlass/include/cute/arch/mma_sm80.hpp, 对 struct SM80_16x8x16_F16F16F16F16_TN 进行讲解, mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 指令的输入输出操作数全部都要在寄存器吗？
+f16.f16.f16.f16 后辍表示A,B,C,D矩阵都是fp16，为什么用32位寄存器作为A,B,C,D矩阵操作数？
+这个指令需要几个线程协同参与？每个线程提供A,B,C,D的多少数据量？
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
+
