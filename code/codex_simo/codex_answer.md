@@ -8110,3 +8110,76 @@ GSM8K 配置还声明 few-shot 示例来自 train split：`lm_eval/tasks/gsm8k/g
 ```bash
 --num_fewshot 0
 ```
+
+## 2026-06-13: 单条 GSM8K 请求下如何保证 SGLang 输出稳定复现
+
+结论：只保证“每次 lm-eval 只发 1 条请求”还不等于输出一定稳定。要让多次运行 `lm-eval --model sglang` 得到同样输出，需要同时固定三层东西：
+
+1. 固定 lm-eval 构造出来的 prompt。
+2. 固定 generation/sampling 参数，优先使用 greedy decoding。
+3. 固定 SGLang engine 的随机种子和确定性执行模式。
+
+对 GSM8K 默认配置来说，输出稳定性相对容易保证，因为它默认就是 greedy：`do_sample: false`、`temperature: 0.0`，见 `lm_eval/tasks/gsm8k/gsm8k.yaml:23 (task config)`、`lm_eval/tasks/gsm8k/gsm8k.yaml:28 (task config)`、`lm_eval/tasks/gsm8k/gsm8k.yaml:29 (task config)`。在 SGLang 的 `SamplingParams` 里，`temperature` 接近 0 时会被转成 `top_k = 1`，也就是 greedy 取最大概率 token：`python/sglang/srt/sampling/sampling_params.py:113 __init__`、`python/sglang/srt/sampling/sampling_params.py:114 __init__`、`python/sglang/srt/sampling/sampling_params.py:116 __init__`。
+
+### 1. 固定 prompt
+
+要固定 prompt，必须固定评测样本、few-shot 示例和 prompt 构造参数。
+
+建议使用 `--samples '{"gsm8k":[0]}'`，不要只依赖 `--limit 1`。`--samples` 是按 task 指定样本索引，CLI 定义在 `lm_eval/_cli/run.py:186 _add_args`；`--limit 1` 只是取当前遍历顺序的前 1 条，定义在 `lm_eval/_cli/run.py:104 _add_args`。
+
+few-shot 示例由 lm-eval 的 fewshot seed 控制。CLI 的 `--seed` 是四元组：python、numpy、torch、fewshot，默认说明在 `lm_eval/_cli/run.py:310 _add_args`、`lm_eval/_cli/run.py:312 _add_args`、`lm_eval/_cli/run.py:317 _add_args`。`evaluate()` 会设置 python/numpy/torch seed：`lm_eval/evaluator.py:196 evaluate`、`lm_eval/evaluator.py:200 evaluate`、`lm_eval/evaluator.py:204 evaluate`、`lm_eval/evaluator.py:208 evaluate`，并把 fewshot seed 设置到 task：`lm_eval/evaluator.py:341 evaluate`、`lm_eval/evaluator.py:342 evaluate`。task 内部用 `random.Random(seed)` 固定 few-shot sampler：`lm_eval/api/task.py:560 set_fewshot_seed`、`lm_eval/api/task.py:563 set_fewshot_seed`。
+
+GSM8K 是 `generate_until` 任务，请求参数由 task 构造时把 `ctx` 和 `generation_kwargs` 打包出来：`lm_eval/api/task.py:1407 construct_requests`、`lm_eval/api/task.py:1408 construct_requests`。我之前加的 `debug_lm_eval_dump_request_path` 会 dump `context`、`context_token_ids`、`gen_kwargs`、`sampling_params`，位置在 `lm_eval/models/sglang_causallms.py:304 generate_until`、`lm_eval/models/sglang_causallms.py:308 generate_until`、`lm_eval/models/sglang_causallms.py:309 generate_until`、`lm_eval/models/sglang_causallms.py:310 generate_until`、`lm_eval/models/sglang_causallms.py:311 generate_until`。如果两次运行 dump 出来的 JSON 不一致，说明还没有固定住输入，不应该继续查 SGLang kernel。
+
+### 2. 固定 generation 参数
+
+`SGLangLM.generate_until()` 会把 task 的 `generation_kwargs` 深拷贝出来：`lm_eval/models/sglang_causallms.py:279 generate_until`，再通过 `modify_gen_kwargs()` 设置默认 `temperature`：`lm_eval/models/sglang_causallms.py:300 generate_until`、`lm_eval/models/sglang_causallms.py:582 modify_gen_kwargs`、`lm_eval/models/sglang_causallms.py:584 modify_gen_kwargs`，最后把 `max_new_tokens` 和 `stop` 放进 `sampling_params`：`lm_eval/models/sglang_causallms.py:301 generate_until`、`lm_eval/models/sglang_causallms.py:302 generate_until`。真正调用 SGLang 的位置是 `_model_generate()` 里的 `self.model.generate(...)`：`lm_eval/models/sglang_causallms.py:316 generate_until`、`lm_eval/models/sglang_causallms.py:340 _model_generate`、`lm_eval/models/sglang_causallms.py:361 _model_generate`。
+
+因此推荐显式传 `--gen_kwargs temperature=0.0,do_sample=false`，让 CLI 覆盖 task 的 generation kwargs。lm-eval 会把 `--gen_kwargs` 更新到 generate_until task：`lm_eval/evaluator.py:223 evaluate`、`lm_eval/evaluator.py:225 evaluate`、`lm_eval/evaluator.py:309 evaluate`、`lm_eval/evaluator.py:312 evaluate`。
+
+如果你以后改成非 greedy，例如 `temperature > 0`，那输出稳定还需要固定 SGLang 的 request-level `sampling_seed`。SGLang 的 `SamplingParams` 支持 `sampling_seed`：`python/sglang/srt/sampling/sampling_params.py:66 __init__`、`python/sglang/srt/sampling/sampling_params.py:110 __init__`；采样时会把 request 的 `sampling_seed` 组装进 batch：`python/sglang/srt/sampling/sampling_batch_info.py:94 from_schedule_batch`、`python/sglang/srt/sampling/sampling_batch_info.py:98 from_schedule_batch`。不过当前 GSM8K greedy path 不依赖 multinomial sampling。
+
+### 3. 固定 SGLang engine seed 和确定性执行
+
+lm-eval 的 `--model_args` 会被 `SGLangLM.__init__()` 放进 `self.model_args`，未显式列出的参数会通过 `kwargs` 传给 SGLang Engine：`lm_eval/models/sglang_causallms.py:69 __init__`、`lm_eval/models/sglang_causallms.py:92 __init__`、`lm_eval/models/sglang_causallms.py:107 __init__`。SGLang `Engine.__init__()` 说明它的参数和 `ServerArgs` 一致，并用 kwargs 构造 `ServerArgs`：`python/sglang/srt/entrypoints/engine.py:199 __init__`、`python/sglang/srt/entrypoints/engine.py:201 __init__`、`python/sglang/srt/entrypoints/engine.py:218 __init__`。
+
+所以可以在 `--model_args` 里传：
+
+```json
+"random_seed": 1234,
+"enable_deterministic_inference": true
+```
+
+`random_seed` 是 SGLang server 参数：`python/sglang/srt/server_args.py:430 ServerArgs`。如果不传，SGLang 会随机生成一个：`python/sglang/srt/server_args.py:1164 __post_init__`、`python/sglang/srt/server_args.py:1165 __post_init__`。TP worker 会把这个 seed 广播到各个 worker 并调用 `set_random_seed()`：`python/sglang/srt/managers/tp_worker.py:313 __init__`、`python/sglang/srt/managers/tp_worker.py:320 __init__`；`set_random_seed()` 会设置 python/numpy/torch/cuda seed：`python/sglang/srt/utils/common.py:778 set_random_seed`、`python/sglang/srt/utils/common.py:780 set_random_seed`、`python/sglang/srt/utils/common.py:784 set_random_seed`。
+
+`enable_deterministic_inference` 是 SGLang server 参数：`python/sglang/srt/server_args.py:755 ServerArgs`，CLI 说明是 batch invariant ops：`python/sglang/srt/server_args.py:6514 add_cli_args`、`python/sglang/srt/server_args.py:6516 add_cli_args`。triton attention backend 会读取它并切到 deterministic 配置：`python/sglang/srt/layers/attention/triton_backend.py:174 __init__`、`python/sglang/srt/layers/attention/triton_backend.py:176 __init__`、`python/sglang/srt/layers/attention/triton_backend.py:180 __init__`，decode split 也会避开 legacy dynamic splitting：`python/sglang/srt/layers/attention/triton_backend.py:253 init_forward_metadata`、`python/sglang/srt/layers/attention/triton_backend.py:260 init_forward_metadata`。extend 时 deterministic 模式会走 unified 1-stage kernel：`python/sglang/srt/layers/attention/triton_backend.py:982 forward_extend`、`python/sglang/srt/layers/attention/triton_backend.py:984 forward_extend`。
+
+### 推荐命令
+
+推荐用下面这种方式做单条请求的稳定复现：
+
+```bash
+HF_DATASETS_CACHE=/data/like/huggingface_cache \
+CUDA_VISIBLE_DEVICES=7 \
+lm-eval \
+  --model sglang \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "tp_size": 1, "dtype": "auto", "attention_backend": "triton", "mem_fraction_static": 0.5, "log_level": "info", "add_bos_token": true, "random_seed": 1234, "enable_deterministic_inference": true, "disable_cuda_graph": true, "disable_piecewise_cuda_graph": true, "skip_server_warmup": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/gsm8k-one-request.json"}' \
+  --tasks gsm8k \
+  --samples '{"gsm8k":[0]}' \
+  --num_fewshot 5 \
+  --batch_size 1 \
+  --seed 0,1234,1234,1234 \
+  --gen_kwargs temperature=0.0,do_sample=false
+```
+
+这条命令的含义：
+
+1. `--samples '{"gsm8k":[0]}'` 固定测试样本。
+2. `--num_fewshot 5 --seed 0,1234,1234,1234` 固定 few-shot 示例选择。
+3. `--batch_size 1` 和 `debug_lm_eval_single_request=true` 保证 SGLang backend 只收到 1 条 request。
+4. `--gen_kwargs temperature=0.0,do_sample=false` 固定 greedy decoding。
+5. `"random_seed": 1234` 固定 SGLang engine seed。
+6. `"enable_deterministic_inference": true` 让 SGLang 尽量使用 batch-invariant/deterministic inference path。
+7. `debug_lm_eval_dump_request_path` 用来检查两次运行发给 SGLang 的 prompt/token ids/sampling params 是否完全一样。
+
+实际排查时建议先比较 `templ/gsm8k-one-request.json`。如果两次运行这个 JSON 不一样，问题在 lm-eval 输入构造；如果 JSON 一样但输出不一样，问题才在 SGLang 执行路径或底层 GPU kernel 的非确定性。对于默认 GSM8K greedy 配置，在固定上述参数后，多次运行一般应该得到相同文本；如果仍然不同，就要进一步检查是否启用了 speculative decoding、非确定性自定义 kernel、不同 attention backend、不同模型权重/量化配置或不同 GPU/驱动运行环境。

@@ -2034,3 +2034,7 @@ lm-eval 遍历 gsm8k 数据集的时候，是否通过一个for 循环把数据�
 应该如何修改 /data/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/lm_eval/models/sglang_causallms.py , 并如何传lm-eval 命令行参数，让 lm-eval 向 sglang发请求的时候，遍历数据发请求的for循环，只循环一次就退出循环，并且 batch size=1,  
 总之，最终目的是，得到可以稳定复现的单条请求数据，方便多次反复测试，每次测试 sglang得到固定的一条数据
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+在 每次运行 lm-eval 命令已经实现只有一条请求的前提下，重复运行lm-eval, sglang能够得到稳定可复现的结果吗？如何保证每次运行，sglang的输出是固定的？
+总之，最终目的是，多次运行 lm-eval --model sglang, 模型的输出结果是一样的
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
