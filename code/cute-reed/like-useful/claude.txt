@@ -4,3 +4,7 @@ f16.f16.f16.f16 后辍表示A,B,C,D矩阵都是fp16，为什么用32位寄存器
 这个指令需要几个线程协同参与？每个线程提供A,B,C,D的多少数据量？
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
 
+cutlass 代码仓库位于 /data/like/package/cutlass,
+在使用 mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16  指令计算大矩阵乘法时，如何处理不能A,B,C,D矩阵不能被m=16,n=8,k=16整除的情况？
+cutlass作为一个通用矩阵乘法库，应该有能力处理任意形状的矩阵乘法， 比如，M=16*128+1, 多出来的一行A矩阵和C,D矩阵的数据，在cutlass中一般怎么处理？ 
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
