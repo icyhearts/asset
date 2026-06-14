@@ -5448,3 +5448,198 @@ using ThrID = Layout<_32>;
 ```
 
 即一个 MMA atom 的 thread-id 空间就是 32 个 lane；而 A/B/C layout 描述的正是这些 lane 内 value fragment 到 `M/N/K` 坐标的映射。
+
+## 17. `mma.sync.m16n8k16` 做大矩阵乘法时如何处理 M/N/K 不能整除
+
+`mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` 这条指令本身**不处理任意形状**。它每次只接受一个 warp 内已经排好的寄存器 fragment，并固定计算一个 `16 x 8 x 16` 的 MMA atom：
+
+```text
+D[16 x 8] = A[16 x 16] * B[16 x 8] + C[16 x 8]
+```
+
+所以不能把问题理解成“最后多出来 1 行时，mma 指令只算 1 行”。真实做法是：CUTLASS 外层仍然发射固定形状的 threadblock/warp/MMA tile，但在 global memory load 和 epilogue store 阶段加 predicate，把越界元素屏蔽掉。越界的 A/B 乘数按 0 参与计算，越界的 C/D 输出不读或不写。
+
+### 17.1 CUTLASS 的三层粒度
+
+以 SM80 默认 half tensorop GEMM 为例，`DefaultGemmConfiguration<arch::OpClassTensorOp, arch::Sm80, ...>` 里常见配置是：
+
+```cpp
+using ThreadblockShape = GemmShape<128, 256, 64>;
+using WarpShape        = GemmShape<64, 64, 64>;
+using InstructionShape = GemmShape<16, 8, 16>;
+```
+
+对应关系是：
+
+| 层级 | 典型形状 | 是否要求用户矩阵整除 |
+|------|----------|----------------------|
+| MMA instruction | `16 x 8 x 16` | 指令固定形状 |
+| warp tile | 例如 `64 x 64 x 64` | 内部编译期 tile 要能组合 MMA |
+| threadblock tile | 例如 `128 x 256 x 64` | grid 会向上取整，边界 block 可不满 |
+| problem shape | 用户传入 `M,N,K` | 可以不是上述 tile 的整数倍 |
+
+因此 `InstructionShape`、`WarpShape`、`ThreadblockShape` 是内核内部 tile 形状；用户的 `problem_size = {M,N,K}` 可以不被它们整除。
+
+### 17.2 M/N 尾块：多出来的输出 tile 只写合法元素
+
+CUTLASS kernel 按 threadblock tile 对 M/N 维度做 grid：
+
+```text
+grid_m = ceil_div(M, ThreadblockShape::kM)
+grid_n = ceil_div(N, ThreadblockShape::kN)
+```
+
+例如 `M = 16 * 128 + 1 = 2049`，若 threadblock M tile 是 `128`，则：
+
+```text
+grid_m = ceil_div(2049, 128) = 17
+```
+
+前 16 个 M 方向 block 覆盖 `0..2047` 行，最后一个 block 的起始行是 `2048`，理论 tile 覆盖 `2048..2175`。其中只有第 `2048` 这一行是真实矩阵数据，其余 `2049..2175` 都是越界行。
+
+CUTLASS 不会为这 1 行生成一套特殊 MMA 指令。最后一个 block 仍然按完整 tile 运行，内部仍然执行若干个 `m16n8k16`。区别在于：
+
+- A 的 global load iterator 看到 `row >= M` 的访问会用 predicate 屏蔽。
+- C/D 的 epilogue iterator 看到 `row >= M` 或 `col >= N` 的访问会用 predicate 屏蔽。
+- D 的 store 只写合法的 `(m,n)` 元素，不写越界地址。
+
+在 `include/cutlass/gemm/kernel/gemm.h` 中，A/B iterator 构造时传入了真实 problem extent：
+
+```cpp
+typename Mma::IteratorA iterator_A(
+  params.params_A,
+  params.ref_A.data(),
+  {params.problem_size.m(), problem_size_k},
+  thread_idx,
+  tb_offset_A,
+  params.gather_A_indices);
+
+typename Mma::IteratorB iterator_B(
+  params.params_B,
+  params.ref_B.data(),
+  {problem_size_k, params.problem_size.n()},
+  thread_idx,
+  tb_offset_B,
+  params.gather_B_indices);
+```
+
+epilogue 里 C/D iterator 也传入真实 `params.problem_size.mn()`：
+
+```cpp
+typename Epilogue::OutputTileIterator iterator_C(
+  params.params_C,
+  params.ref_C.data(),
+  params.problem_size.mn(),
+  thread_idx,
+  threadblock_offset,
+  params.scatter_D_indices);
+
+typename Epilogue::OutputTileIterator iterator_D(
+  params.params_D,
+  params.ref_D.data(),
+  params.problem_size.mn(),
+  thread_idx,
+  threadblock_offset,
+  params.scatter_D_indices);
+```
+
+这些 iterator 内部用 extent 做谓词判断。例如 epilogue 的 `PredicatedTileIterator` 会保存：
+
+```cpp
+extent_row_ = extent.row();
+extent_column_ = extent.column();
+```
+
+store/load 时会检查：
+
+```cpp
+bool row_guard = ((row_offset + thread_start_row_) < extent_row_);
+bool guard = row_guard && mask_.predicates[column];
+```
+
+所以最后一个 M/N tile 中的越界 C/D 元素不会访问内存。
+
+### 17.3 K 尾块：多算的 K 项用 A/B predicate 变成 0
+
+K 维度不能整除 `k=16` 或 threadblock K tile 时，做法类似，但重点在 A/B load。
+
+`gemm.h` 中 threadblock mainloop 的 K 迭代次数是向上取整：
+
+```cpp
+int gemm_k_iterations =
+  (problem_size_k - tb_offset_A.column() + Mma::Shape::kK - 1) / Mma::Shape::kK;
+```
+
+也就是说，如果最后剩余 K 不是完整 `Mma::Shape::kK`，CUTLASS 仍然执行最后一次 K tile 的 MMA。不同之处是 A/B 的 global-memory iterator 对越界 K 坐标建 predicate。
+
+`transform/threadblock/predicated_tile_access_iterator.h` 中会根据真实 `extent` 计算每次访问是否合法：
+
+```cpp
+guard = (coord.strided() < extent.strided() &&
+         coord.contiguous() < extent.contiguous());
+```
+
+SM80 multistage mainloop 中，global 到 shared 的 async copy 使用这个 predicate：
+
+```cpp
+cutlass::arch::cp_async_zfill<kSrcBytes, kCacheOpA>(
+  dst_ptr + v, gmem_ptr, iterator_A.valid());
+```
+
+或普通 predicated `cp_async`：
+
+```cpp
+cutlass::arch::cp_async<kSrcBytes, kCacheOpA>(
+  dst_ptr + v, gmem_ptr, iterator_A.valid());
+```
+
+当 `iterator_A.valid()` / `iterator_B.valid()` 为 false 时，越界 A/B 元素不会被当作有效乘数。使用 zfill 路径时，shared memory 里的对应位置填 0；普通 predicated copy 路径也依赖 mainloop 对无效访问的屏蔽和清零策略。这样最后一次 `mma.sync` 虽然仍然按 `k=16` 形状执行，但越界 K lane 对应的 A/B 数据是 0，因此数学效果等价于只累加合法的 K 项。
+
+### 17.4 对 `M = 16*128 + 1` 的直观解释
+
+假设 `N`、`K` 暂时都是整 tile，只有 `M=2049`：
+
+```text
+A: [2049 x K]
+B: [K x N]
+C/D: [2049 x N]
+```
+
+最后一个 M 方向 threadblock 的起点是第 2048 行。这个 block 内部仍然会排出多个 warp tile 和多个 `m16n8k16` instruction，逻辑上会覆盖一个完整的 `128 x N_tile` 输出区域。
+
+但在这个 block 中：
+
+- 对 A 来说，只有 `m = 2048` 的那一行 load predicate 为 true；`m = 2049..2175` 的 A load 为 false，数据被屏蔽或置 0。
+- 对 accumulator 来说，内部寄存器仍然会产生完整 tile 的结果，包括无意义的越界行结果。
+- 对 C/D 来说，epilogue 只对 `m = 2048` 且 `n < N` 的元素执行合法 load/store；越界行不读 C，也不写 D。
+
+所以最终全局内存里只会得到真实的第 2048 行输出，不会写坏 D 后面的内存。
+
+### 17.5 CUTLASS 通用 GEMM 的关键思想
+
+可以把 CUTLASS 的边界处理总结成三句话：
+
+1. `mma.sync` 总是固定形状，不能单独处理残缺 tile。
+2. 残缺的 A/B tile 在 load 阶段由 predicated iterator 处理，越界乘数视为 0。
+3. 残缺的 C/D tile 在 epilogue 阶段由 predicated output iterator 处理，越界输出不读不写。
+
+这种方式的优点是主计算路径仍然使用高吞吐的固定形状 tensor core 指令，只有边界 block 多做少量无效计算；代价是边界处会有 predicate 判断和 padding/zero-fill 开销，但通常只发生在矩阵边缘，整体影响很小。
+
+### 17.6 “任意形状”不等于“任意 alignment”
+
+还要区分两个概念：
+
+- **tile residue**：`M/N/K` 不能整除 `ThreadblockShape`、`WarpShape`、`InstructionShape`，通常由 predicate 处理。
+- **memory alignment / vectorization requirement**：某个高性能 kernel 可能要求 A/B/C 的访问维度满足向量化对齐，例如 128-bit load/store 对 half 通常对应 8 个元素一组。
+
+在 CUTLASS 2.x 的 `GemmUniversal::can_implement()` 中可以看到类似检查：
+
+```cpp
+static int const kAlignmentA = Mma::IteratorA::AccessType::kElements;
+static int const kAlignmentB = Mma::IteratorB::AccessType::kElements;
+static int const kAlignmentC = Epilogue::OutputTileIterator::kElementsPerAccess;
+```
+
+然后根据 layout 检查 `problem_size.k()`、`problem_size.n()` 或 `problem_size.m()` 是否满足 alignment。如果不满足，这个具体 kernel 可能返回 `kErrorMisalignedOperand`。这不是 tensor core 指令无法处理尾块，而是该 kernel 为了使用高效向量化访存，对问题形状或 layout 做了额外约束。
+
+通用库的做法通常是：能满足 alignment 时走最快的 tensorop kernel；不满足时选择 alignment 更小的 kernel、SIMT kernel，或由调用方 padding 输入矩阵。
