@@ -5643,3 +5643,240 @@ static int const kAlignmentC = Epilogue::OutputTileIterator::kElementsPerAccess;
 然后根据 layout 检查 `problem_size.k()`、`problem_size.n()` 或 `problem_size.m()` 是否满足 alignment。如果不满足，这个具体 kernel 可能返回 `kErrorMisalignedOperand`。这不是 tensor core 指令无法处理尾块，而是该 kernel 为了使用高效向量化访存，对问题形状或 layout 做了额外约束。
 
 通用库的做法通常是：能满足 alignment 时走最快的 tensorop kernel；不满足时选择 alignment 更小的 kernel、SIMT kernel，或由调用方 padding 输入矩阵。
+
+## 18. `make_tiled_mma` 的 `permutations = make_layout(Shape<_1,_2,_1>{})` 是否有实际作用
+
+问题代码在 `/data/like/package/cute-gemm/gemm-simple-like.cu` 第 88-90 行：
+
+```cpp
+using MMA = decltype(make_tiled_mma(mma_atom{},
+                    make_layout(Shape<_2, _2, _1>{}),
+                    make_layout(Shape<_1, _2, _1>{})));
+```
+
+这里三个对象分别是：
+
+| 参数 | 当前值 | 作用 |
+|------|--------|------|
+| `mma_atom{}` | `SM80_16x8x16_F16F16F16F16_TN` | 单个 MMA atom，能力是 `16 x 8 x 16` |
+| `MMAThrLayout` | `make_layout(Shape<_2,_2,_1>{})` | 把 atom 在 `M,N,K` 方向重复排列成 `2 x 2 x 1` |
+| `permutations` | `make_layout(Shape<_1,_2,_1>{})` | 对 M/N/K mode 先做一个逻辑分块/排列，再放置 MMA atom |
+
+结论先说清楚：**在这份代码的这个具体取值下，第三个参数 `(1,2,1)` 基本没有实际效果，不会把 TiledMMA 能处理的矩阵乘法形状从 `32 x 16 x 16` 继续扩大，也不会改变打印出来的 A/B/C thread-value layout。**
+
+### 18.1 第二个参数已经把 atom 扩展到 `32 x 16 x 16`
+
+`mma_op = SM80_16x8x16_F16F16F16F16_TN` 的 atom shape 是：
+
+```text
+AtomShape_MNK = (16, 8, 16)
+```
+
+第二个参数：
+
+```cpp
+make_layout(Shape<_2,_2,_1>{})
+```
+
+会被 `make_tiled_mma` 变成 `AtomLayoutMNK`，表示 MMA atom 在 M/N/K 三个方向重复：
+
+```text
+Repeat_MNK = (2, 2, 1)
+```
+
+所以这个 `TiledMMA` 的核心 tile shape 是：
+
+```text
+M = 16 * 2 = 32
+N =  8 * 2 = 16
+K = 16 * 1 = 16
+
+tile_shape = (32, 16, 16)
+```
+
+运行日志 `/data/like/package/cute-gemm/run.gemm-simple-like.log` 也打印了：
+
+```text
+ThrLayoutVMNK:  (_32,_2,_2,_1):(_1,_32,_64,_0)
+```
+
+含义是：
+
+```text
+ThrV = 32  // 每个 mma atom 内 32 lane
+ThrM = 2   // M 方向 2 个 atom
+ThrN = 2   // N 方向 2 个 atom
+ThrK = 1   // K 方向 1 个 atom
+```
+
+因此一个 `TiledMMA` 需要的线程数是：
+
+```text
+32 * 2 * 2 * 1 = 128 threads
+```
+
+这也对应 `gemm-simple-like.cu` 第 95 行：
+
+```cpp
+dim3 block(size(MMA{}));  // 打印为 block.x = 128
+```
+
+### 18.2 第三个参数在源码中的位置
+
+`cute/atom/mma_atom.hpp` 中 `make_tiled_mma` 的实现是：
+
+```cpp
+auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
+auto permutation_mnk = append<3>(permutations, _);
+
+return TiledMMA<MMA_Atom<MMA_Op>,
+                decltype(thr_layout_mnk),
+                decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
+```
+
+也就是说，第三个参数会成为 `TiledMMA` 的模板参数 `PermutationMNK`。它不是 runtime 参数，而是编译期 layout 信息。
+
+`PermutationMNK` 主要在 `thrfrg_C/A/B()` 中起作用：
+
+```cpp
+// C: (M,N)
+auto t_tile = make_tile(get<0>(PermutationMNK{}),
+                        get<1>(PermutationMNK{}));
+auto t_tensor = logical_divide(ctensor, t_tile);
+
+// A: (M,K)
+auto t_tile = make_tile(get<0>(PermutationMNK{}),
+                        get<2>(PermutationMNK{}));
+auto t_tensor = logical_divide(atensor, t_tile);
+
+// B: (N,K)
+auto t_tile = make_tile(get<1>(PermutationMNK{}),
+                        get<2>(PermutationMNK{}));
+auto t_tensor = logical_divide(btensor, t_tile);
+```
+
+所以它的设计目的不是“增加 MMA atom 的数量”，而是**在把 tensor 切成 atom tile 之前，先对 M/N/K 维做一个逻辑分块/排列**，从而影响 thread/value 到矩阵坐标的映射。
+
+### 18.3 但当前 `(1,2,1)` 不改变可处理 shape
+
+`TiledMMA::tile_size_mnk<I>()` 的源码是：
+
+```cpp
+auto core_size = size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk());
+auto perm_size = size<I>(PermutationMNK{});
+return cute::max(core_size, perm_size);
+```
+
+对当前配置：
+
+```text
+core_size_M = 16 * 2 = 32
+core_size_N =  8 * 2 = 16
+core_size_K = 16 * 1 = 16
+
+perm_size_M = 1
+perm_size_N = 2
+perm_size_K = 1
+```
+
+因此：
+
+```text
+tile_size_M = max(32, 1) = 32
+tile_size_N = max(16, 2) = 16
+tile_size_K = max(16, 1) = 16
+```
+
+也就是说，第三个参数 `(1,2,1)` 没有把 tile shape 变成更大的形状，仍然是：
+
+```text
+tile_shape(MMA{}) = (32, 16, 16)
+```
+
+我用一个临时对比程序分别打印：
+
+```cpp
+make_tiled_mma(mma_atom{}, make_layout(Shape<_2,_2,_1>{}))
+
+make_tiled_mma(mma_atom{}, make_layout(Shape<_2,_2,_1>{}),
+               make_layout(Shape<_1,_2,_1>{}))
+```
+
+两者输出的关键部分相同：
+
+```text
+tile_shape: (_32,_16,_16)
+layoutC_TV: 相同
+layoutA_TV: 相同
+layoutB_TV: 相同
+```
+
+因此在这份 `gemm-simple-like.cu` 中，第三参数可以理解为“形式上指定了一个 N 方向大小为 2 的 permutation tile，但它被已有的 N 方向 `2` 个 atom repeat 覆盖掉了，实际映射没有变化”。
+
+### 18.4 `permutations` 什么时候会有实际作用
+
+`permutations` 有用的场景是：你想指定一个比 `atom_shape * thr_repeat` 更大的逻辑排列周期，或者想让 atom 按某种 swizzle/permutation 顺序覆盖 M/N/K 坐标。
+
+例如源码的 `tile_size_mnk()` 使用 `max(core_size, perm_size)`，所以如果某个方向：
+
+```text
+perm_size_I > atom_shape_I * repeat_I
+```
+
+那么 `PermutationMNK` 会扩大 `TiledMMA` 的逻辑 tile size。或者即使 size 不扩大，非平凡 permutation layout 也可能改变 `thrfrg_A/B/C()` 中 `logical_divide` 后的坐标组织，从而改变每个 thread 看到的 fragment 排布。
+
+不过当前：
+
+```cpp
+make_layout(Shape<_1,_2,_1>{})
+```
+
+只是一个很简单的 layout，而且 `N` 方向的 `perm_size = 2` 远小于当前 `core_size_N = 16`。所以它不会影响 `partition_A/B/C` 得到的实际 thread-value layout。
+
+### 18.5 回答问题中的两个判断
+
+**判断 1：`(1,2,1)` 作为 permutations 参数是否有实际作用？**
+
+在当前代码中，基本没有实际作用。它会出现在 `TiledMMA` 的类型和打印结果里：
+
+```text
+PermutationMNK: ((_1,_2,_1):(_0,_1,_0),_,_)
+```
+
+但对 `tile_shape`、`layoutA_TV`、`layoutB_TV`、`layoutC_TV` 的结果没有影响。
+
+**判断 2：是否会影响 TiledMMA 能处理的矩阵乘法形状？**
+
+当前不会。能处理的单次 `cute::gemm(tiled_mma, ...)` tile 形状仍由：
+
+```text
+AtomShape_MNK * MMAThrLayout = (16,8,16) * (2,2,1) = (32,16,16)
+```
+
+决定。
+
+更准确地说，CUTE 里的计算公式是：
+
+```text
+tile_size_i = max(atom_shape_i * repeat_i, permutation_size_i)
+```
+
+而当前 permutation size 是 `(1,2,1)`，没有任何一维超过 `(32,16,16)`，所以 shape 不变。
+
+**判断 3：第三参数到底起什么作用？**
+
+它的通用作用是控制 TiledMMA 在 M/N/K 维度上的逻辑 permutation/分块顺序，影响 `thrfrg_A/B/C()` 中 tensor 被切成 atom tile 前的坐标组织。它是 layout/mapping 参数，不是直接增加 MMA 数量的参数。
+
+但在这份代码里，真正把 `SM80_16x8x16` 扩展成 `32x16x16` 的是第二参数：
+
+```cpp
+make_layout(Shape<_2,_2,_1>{})
+```
+
+第三参数：
+
+```cpp
+make_layout(Shape<_1,_2,_1>{})
+```
+
+可以删掉而不改变这个 `TiledMMA` 的实际 tile shape 和当前打印出的 A/B/C 映射。
