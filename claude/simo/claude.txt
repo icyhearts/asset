@@ -2051,3 +2051,7 @@ lm_eval --model vllm 可以支持"debug_lm_eval_single_request": true, "debug_lm
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
 
 vllm conda环境 的 lm-eval 从 0.4.9.2升级到了 0.4.12, 原来的修改被覆盖了，你要阅读升级后的/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/lm_eval/models/vllm_causallms.py， 重新做一遍修改
+
+
+
+HF_DATASETS_CACHE=/data/like/huggingface_cache lm_eval --model vllm --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json"}, "tensor_parallel_size": 1, "dtype": "auto", "gpu_memory_utilization": 0.6, "attention_config": {"backend": "TRITON_MLA"}, "seed": 1234, "max_num_seqs": 1, "enforce_eager": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/vllm-gsm8k-one-request.json"}' --tasks gsm8k --samples '{"gsm8k":[0]}' --num_fewshot 5 --batch_size 1 --seed 0,1234,1234,1234 --gen_kwargs '{"temperature": 0.0, "do_sample": false, "seed": 1234}'
