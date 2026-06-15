@@ -2055,3 +2055,13 @@ vllm conda环境 的 lm-eval 从 0.4.9.2升级到了 0.4.12, 原来的修改被�
 
 
 HF_DATASETS_CACHE=/data/like/huggingface_cache lm_eval --model vllm --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json"}, "tensor_parallel_size": 1, "dtype": "auto", "gpu_memory_utilization": 0.6, "attention_config": {"backend": "TRITON_MLA"}, "seed": 1234, "max_num_seqs": 1, "enforce_eager": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/vllm-gsm8k-one-request.json"}' --tasks gsm8k --samples '{"gsm8k":[0]}' --num_fewshot 5 --batch_size 1 --seed 0,1234,1234,1234 --gen_kwargs '{"temperature": 0.0, "do_sample": false, "seed": 1234}'
+
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo 代码位于 /data/like/package/simo_conda_sglang
+lm-eval命令是:
+rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-sgl/ /data/like/temp/sgl_safe_tensor_all_input_2026_06_13___15_44_11  /data/like/temp/sgl_safe_tensor_only_input_id_2026_06_13___15_44_11 ; cp /share/users/like/ipc.sglang.1.json  /dev/shm/like/ipc.sglang.1.json  ; SIMO_SGLANG_REGISTER=1  SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json   HF_DATASETS_CACHE=/data/like/huggingface_cache debug_env_file=/dev/shm/like/ipc.sglang.1.json  CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json\"}", "tp_size": 1, "dtype": "auto",  "attention_backend": "triton_simo", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true   , "disable_cuda_graph": true, "skip_server_warmup": true, "disable_piecewise_cuda_graph": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/sgl-gsm8k-one-request.json", "watchdog_timeout": 2592000 , "random_seed": 1234 }'  --tasks gsm8k --samples '{"gsm8k":[0]}' --num_fewshot 5 --batch_size 1 --seed 0,1234,1234,1234  --gen_kwargs temperature=0.0,do_sample=false > templ/sgl-gsm8k.log.`nowstr.sh` 2>&1 &
+日志位于 /data/like/package/simo_conda_sglang/templ/sgl-gsm8k.log.2026_06_15___15_30_42 
+如何解决日志中的报错 
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面

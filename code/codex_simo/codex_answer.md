@@ -8231,3 +8231,77 @@ lm_eval \
 6. `debug_lm_eval_dump_request_path` 会写出实际发给 vLLM 的 `context`、`context_token_ids`、`gen_kwargs`、`sampling_params`。如果两次运行这个 JSON 不一致，先查 lm-eval 输入构造；如果 JSON 一致但输出不同，再查 vLLM/simo attention kernel、量化 kernel 或 GPU kernel 非确定性。
 
 不传 `"debug_lm_eval_single_request": true` 时，新增逻辑是 no-op，`lm_eval --model vllm --tasks gsm8k --batch_size auto` 原来的完整 GSM8K 数据集测试仍然可以继续使用。
+
+## 2026-06-15: sglang 单条 GSM8K 日志里的 EADDRINUSE 报错
+
+日志 `templ/sgl-gsm8k.log.2026_06_15___15_30_42` 里的真正失败点是：
+
+```text
+torch.distributed.DistNetworkError: The server socket has failed to listen on any local network address. port: 34337 ... EADDRINUSE
+```
+
+这不是 nvfp4 kv cache kernel 的错误，也不是 `debug_lm_eval_single_request` 的错误，而是 SGLang 初始化 torch distributed 的 TCPStore 时，端口 `34337` 已经被其他进程占用。
+
+调用链是：
+
+1. `SGLangLM.__init__()` 把 `--model_args` 里的未知参数透传给 `sgl.Engine`：`lm_eval/models/sglang_causallms.py:107 __init__`、`lm_eval/models/sglang_causallms.py:117 __init__`。所以可以在 `--model_args` 里传 SGLang 原生参数 `"nccl_port": 34338`。
+2. `Engine._launch_subprocesses()` 会创建 `PortArgs`：`python/sglang/srt/entrypoints/engine.py:765 _launch_subprocesses`、`python/sglang/srt/entrypoints/engine.py:767 _launch_subprocesses`。
+3. `PortArgs.init_new()` 如果 `server_args.nccl_port is None`，就调用 `get_free_port()` 随机选端口；否则使用用户传入的 `server_args.nccl_port`：`python/sglang/srt/server_args.py:7677 PortArgs.init_new`、`python/sglang/srt/server_args.py:7678 PortArgs.init_new`、`python/sglang/srt/server_args.py:7680 PortArgs.init_new`。
+4. `get_free_port()` 只是 bind 一下拿到端口，然后马上 close：`python/sglang/srt/utils/network.py:170 get_free_port`、`python/sglang/srt/utils/network.py:171 get_free_port`、`python/sglang/srt/utils/network.py:173 get_free_port`。这意味着端口没有被长期保留，在后续初始化前可能被别的进程抢走。
+5. Scheduler 把 `port_args.nccl_port` 保存为 `self.nccl_port`：`python/sglang/srt/managers/scheduler.py:316 __init__`，再传给 `TpModelWorker`：`python/sglang/srt/managers/scheduler.py:847 init_tp_model_worker`、`python/sglang/srt/managers/scheduler.py:857 init_tp_model_worker`、`python/sglang/srt/managers/scheduler.py:868 init_tp_model_worker`。
+6. `TpModelWorker._init_model_runner()` 再把 `nccl_port` 传给 `ModelRunner`：`python/sglang/srt/managers/tp_worker.py:347 _init_model_runner`、`python/sglang/srt/managers/tp_worker.py:357 _init_model_runner`。
+7. `ModelRunner.__init__()` 保存为 `self.dist_port`：`python/sglang/srt/model_executor/model_runner.py:381 __init__`。
+8. `ModelRunner.init_torch_distributed()` 用 `self.dist_port` 构造 `tcp://host:port`，然后调用 `init_distributed_environment()`：`python/sglang/srt/model_executor/model_runner.py:1036 init_torch_distributed`、`python/sglang/srt/model_executor/model_runner.py:1075 init_torch_distributed`、`python/sglang/srt/model_executor/model_runner.py:1077 init_torch_distributed`、`python/sglang/srt/model_executor/model_runner.py:1102 init_torch_distributed`、`python/sglang/srt/model_executor/model_runner.py:1107 init_torch_distributed`。
+9. `init_distributed_environment()` 最终调用 `torch.distributed.init_process_group()`：`python/sglang/srt/distributed/parallel_state.py:1697 init_distributed_environment`、`python/sglang/srt/distributed/parallel_state.py:1720 init_distributed_environment`、`python/sglang/srt/distributed/parallel_state.py:1722 init_distributed_environment`。
+
+这次为什么容易复现端口冲突：日志里有 `pudb:5091: Waiting for client...`，而 `/dev/shm/like/ipc.sglang.1.json` 里当前是 `"debug_pudb": 1`、`"debug_pudb_port": 5091`。代码里有多处按 `debug_env_file` 读取这个开关并进入 pudb，例如 `ModelRunner.configure_kv_cache_dtype()`：`python/sglang/srt/model_executor/model_runner.py:2195 configure_kv_cache_dtype`、`python/sglang/srt/model_executor/model_runner.py:2200 configure_kv_cache_dtype`、`python/sglang/srt/model_executor/model_runner.py:2202 configure_kv_cache_dtype`，以及 `DeepseekV2Model.forward()`：`python/sglang/srt/models/deepseek_v2.py:2319 forward`、`python/sglang/srt/models/deepseek_v2.py:2338 forward`、`python/sglang/srt/models/deepseek_v2.py:2340 forward`。SGLang 先随机选到了 `34337`，随后被 pudb 暂停；暂停期间另一个进程占用了该端口，恢复后 torch distributed 才真正 bind，于是报 `EADDRINUSE`。
+
+我在现场检查到 `34337` 当时被 vLLM 进程占用：
+
+```bash
+ss -ltnp 'sport = :34337'
+```
+
+显示 `VLLM::EngineCore` 正在监听 `10.96.11.5:34337`。这和日志里的失败端口一致。
+
+修复方式：
+
+1. 不需要调 pudb 时，把 `/dev/shm/like/ipc.sglang.1.json` 里的 `debug_pudb` 改成 `0`。否则 SGLang 初始化过程中会长时间停住，端口更容易被其他任务抢走。
+2. 在 `--model_args` 里显式指定一个当前空闲的 `nccl_port`，不要依赖随机端口。例如这次可以用 `34338` 或其他确认空闲的端口。
+3. 如果同时跑 vLLM 和 SGLang，每个任务都要使用不同的 distributed/NCCL 端口；如果不需要当前 vLLM 任务，也可以先停止占用端口的 vLLM 进程。
+
+可以这样改命令前置部分：
+
+```bash
+cp /share/users/like/ipc.sglang.1.json /dev/shm/like/ipc.sglang.1.json
+/data/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+import json
+path = "/dev/shm/like/ipc.sglang.1.json"
+with open(path) as f:
+    data = json.load(f)
+data["debug_pudb"] = 0
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+```
+
+然后在原来的 `--model_args` JSON 里加：
+
+```json
+"nccl_port": 34338
+```
+
+也就是保留原有参数，只增加一项：
+
+```bash
+--model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json\"}", "tp_size": 1, "dtype": "auto", "attention_backend": "triton_simo", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "disable_cuda_graph": true, "skip_server_warmup": true, "disable_piecewise_cuda_graph": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/sgl-gsm8k-one-request.json", "watchdog_timeout": 2592000, "random_seed": 1234, "nccl_port": 34338}'
+```
+
+如果换机器或并发任务变多，先检查端口是否空闲：
+
+```bash
+ss -ltnp 'sport = :34338'
+```
+
+没有输出再使用。若仍然报同类错误，就换另一个未占用端口，例如 `35338`、`36338`，并确认没有其他 vLLM/SGLang 任务监听该端口。
