@@ -2038,3 +2038,14 @@ lm-eval 遍历 gsm8k 数据集的时候，是否通过一个for 循环把数据�
 在 每次运行 lm-eval 命令已经实现只有一条请求的前提下，重复运行lm-eval, sglang能够得到稳定可复现的结果吗？如何保证每次运行，sglang的输出是固定的？
 总之，最终目的是，多次运行 lm-eval --model sglang, 模型的输出结果是一样的
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+
+vllm conda环境位 于 /data/like/miniconda3/envs/simo_vllm/
+vllm 源码 位于 /data/like/package/vllm-for-conda-simo
+在 vllm conda 环境下, simo 源码位于 /data/like/package/simo_conda_vllm, /data/like/package/simo_conda_vllm和  /data/like/package/simo_conda_sglang/ 是同步的。
+lm_eval 向 vllm  发送请求, 并且使用 simo kv cache 量化的命令是:
+HF_DATASETS_CACHE=/data/like/huggingface_cache lm_eval --model vllm --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json"}, "tensor_parallel_size": 1, "dtype": "auto", "gpu_memory_utilization": 0.6, "attention_config": {"backend": "TRITON_MLA"}}' --tasks gsm8k --batch_size auto
+应该 如何修改 /data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/lm_eval/models/vllm_causallms.py, 并修改 lm_eval 命令行参数，和 lm-eval --model sglang 实现 同样的目的: 得到可以稳定复现的单条请求数据，方便多次反复测试，每次测试 vllm得到固定的一条数据, 
+重复运行lm-eval, vllm能够得到稳定可复现的结果, 保证每次运行，vllm的输出是固定的, 最终目的是，多次运行 lm_eval --model vllm, 模型的输入只有一条数据，输出结果是一样的
+lm_eval --model vllm 可以支持"debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/gsm8k-one-request.json", 这样的参数吗?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
