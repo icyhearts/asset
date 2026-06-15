@@ -8183,3 +8183,51 @@ lm-eval \
 7. `debug_lm_eval_dump_request_path` 用来检查两次运行发给 SGLang 的 prompt/token ids/sampling params 是否完全一样。
 
 实际排查时建议先比较 `templ/gsm8k-one-request.json`。如果两次运行这个 JSON 不一样，问题在 lm-eval 输入构造；如果 JSON 一样但输出不一样，问题才在 SGLang 执行路径或底层 GPU kernel 的非确定性。对于默认 GSM8K greedy 配置，在固定上述参数后，多次运行一般应该得到相同文本；如果仍然不同，就要进一步检查是否启用了 speculative decoding、非确定性自定义 kernel、不同 attention backend、不同模型权重/量化配置或不同 GPU/驱动运行环境。
+
+## 2026-06-15: vLLM 版 lm_eval 固定单条 GSM8K 请求并稳定复现
+
+这里的 `lm_eval/...` 路径相对 `/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages`；`vllm/...` 路径相对 `/data/like/package/vllm-for-conda-simo`。
+
+结论：原始 `lm_eval --model vllm` 不能直接支持 `"debug_lm_eval_single_request": true`、`"debug_lm_eval_dump_request_path": "templ/gsm8k-one-request.json"` 这两个参数。原因是 vLLM wrapper 的 `VLLM.__init__()` 会把未知 `kwargs` 合并进 `self.model_args`，再传给 `vllm.LLM(**self.model_args)`：`lm_eval/models/vllm_causallms.py:154 __init__`、`lm_eval/models/vllm_causallms.py:191 __init__`、`lm_eval/models/vllm_causallms.py:198 __init__`。`vllm.LLM.__init__()` 又把剩余 `kwargs` 继续传给 `EngineArgs(...)`：`vllm/entrypoints/llm.py:255 __init__`、`vllm/entrypoints/llm.py:340 __init__`、`vllm/entrypoints/llm.py:376 __init__`；而 `EngineArgs` 是 dataclass，字段里没有这两个 debug 参数：`vllm/engine/arg_utils.py:402 EngineArgs`。所以修改前这两个参数会被误传给 vLLM engine 参数层，不能作为 lm-eval wrapper 自己的 debug 参数使用。
+
+我已经修改 `/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/lm_eval/models/vllm_causallms.py`，让 vLLM wrapper 自己消费这两个参数，不再透传给 `vllm.LLM`：
+
+1. 在 `VLLM.__init__()` 里新增 `debug_lm_eval_single_request` 和 `debug_lm_eval_dump_request_path` 参数：`lm_eval/models/vllm_causallms.py:152 __init__`、`lm_eval/models/vllm_causallms.py:153 __init__`。
+2. 保存 debug 开关和 dump 路径：`lm_eval/models/vllm_causallms.py:212 __init__`、`lm_eval/models/vllm_causallms.py:213 __init__`、`lm_eval/models/vllm_causallms.py:214 __init__`。
+3. `_ensure_debug_single_request()` 要求 debug 模式下 `--batch_size 1` 且 lm-eval request 数量必须是 1，否则直接报错，避免不小心跑完整数据集：`lm_eval/models/vllm_causallms.py:282 _ensure_debug_single_request`、`lm_eval/models/vllm_causallms.py:285 _ensure_debug_single_request`、`lm_eval/models/vllm_causallms.py:290 _ensure_debug_single_request`。
+4. `_dump_debug_request_once()` 把单条请求的 prompt/token ids/gen kwargs/sampling params 写到 JSON：`lm_eval/models/vllm_causallms.py:298 _dump_debug_request_once`、`lm_eval/models/vllm_causallms.py:304 _dump_debug_request_once`、`lm_eval/models/vllm_causallms.py:307 _dump_debug_request_once`。
+5. GSM8K 走 `generate_until()`，这里会先检查单条请求，再 dump 当前请求：`lm_eval/models/vllm_causallms.py:644 generate_until`、`lm_eval/models/vllm_causallms.py:648 generate_until`、`lm_eval/models/vllm_causallms.py:718 generate_until`、`lm_eval/models/vllm_causallms.py:722 generate_until`、`lm_eval/models/vllm_causallms.py:723 generate_until`、`lm_eval/models/vllm_causallms.py:724 generate_until`、`lm_eval/models/vllm_causallms.py:725 generate_until`。
+6. 真正向 vLLM 发送请求的位置仍然是 `_model_generate()` 里的 `self.model.generate(...)`：`lm_eval/models/vllm_causallms.py:449 _model_generate`、`lm_eval/models/vllm_causallms.py:567 _model_generate`、`lm_eval/models/vllm_causallms.py:568 _model_generate`、`lm_eval/models/vllm_causallms.py:569 _model_generate`。
+
+lm-eval 侧单条样本推荐用 `--samples '{"gsm8k":[0]}'`，不要只依赖 `--limit 1`。CLI 支持 `--samples`，并且它和 `--limit` 互斥：`lm_eval/__main__.py:140 cli_evaluate`、`lm_eval/__main__.py:373 cli_evaluate`、`lm_eval/__main__.py:374 cli_evaluate`、`lm_eval/__main__.py:380 cli_evaluate`。`samples` 会传给 evaluator：`lm_eval/__main__.py:474 cli_evaluate`、`lm_eval/__main__.py:484 cli_evaluate`，再传给 task 构造请求：`lm_eval/evaluator.py:526 evaluate`、`lm_eval/evaluator.py:528 evaluate`。task 的 `doc_iterator()` 会按指定样本索引挑 eval docs：`lm_eval/api/task.py:698 doc_iterator`、`lm_eval/api/task.py:704 doc_iterator`、`lm_eval/api/task.py:706 doc_iterator`、`lm_eval/api/task.py:714 doc_iterator`、`lm_eval/api/task.py:715 doc_iterator`。
+
+GSM8K 默认就是生成任务，并且默认 few-shot 是 5、默认 greedy：`lm_eval/tasks/gsm8k/gsm8k.yaml:6 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:23 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:28 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:29 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:31 task config`。为了让 prompt 稳定，继续固定 `--num_fewshot 5` 和 `--seed 0,1234,1234,1234`；CLI 的 seed 是 python/numpy/torch/fewshot 四元组：`lm_eval/__main__.py:261 cli_evaluate`、`lm_eval/__main__.py:263 cli_evaluate`、`lm_eval/__main__.py:267 cli_evaluate`。evaluator 会设置 python/numpy/torch seed：`lm_eval/evaluator.py:188 evaluate`、`lm_eval/evaluator.py:192 evaluate`、`lm_eval/evaluator.py:196 evaluate`，并把 fewshot seed 设置到 task：`lm_eval/evaluator.py:335 evaluate`；task 内部用 `random.Random(seed)` 固定 few-shot sampler：`lm_eval/api/task.py:682 set_fewshot_seed`、`lm_eval/api/task.py:683 set_fewshot_seed`。
+
+vLLM 侧也要固定 seed 和 decoding 参数。lm_eval 的 vLLM wrapper 默认把 `seed` 写进 `self.model_args`：`lm_eval/models/vllm_causallms.py:142 __init__`、`lm_eval/models/vllm_causallms.py:187 __init__`，vLLM `LLM.__init__()` 支持 `seed` 和 `enforce_eager`，并传入 `EngineArgs`：`vllm/entrypoints/llm.py:230 __init__`、`vllm/entrypoints/llm.py:237 __init__`、`vllm/entrypoints/llm.py:355 __init__`、`vllm/entrypoints/llm.py:363 __init__`。request-level sampling 也支持 `seed`：`vllm/sampling_params.py:215 SamplingParams`、`vllm/sampling_params.py:323 from_optional`、`vllm/sampling_params.py:364 from_optional`。`temperature=0.0` 会进入 greedy sampling：`vllm/sampling_params.py:201 SamplingParams`、`vllm/sampling_params.py:425 __post_init__`、`vllm/sampling_params.py:426 __post_init__`。lm_eval wrapper 会把 `gen_kwargs` 变成 `SamplingParams(max_tokens=..., stop=..., **kwargs)`：`lm_eval/models/vllm_causallms.py:713 generate_until`、`lm_eval/models/vllm_causallms.py:715 generate_until`；`modify_gen_kwargs()` 会保留 `temperature` 并移除 `do_sample`：`lm_eval/models/vllm_causallms.py:893 modify_gen_kwargs`、`lm_eval/models/vllm_causallms.py:895 modify_gen_kwargs`、`lm_eval/models/vllm_causallms.py:896 modify_gen_kwargs`。
+
+推荐命令如下：
+
+```bash
+HF_DATASETS_CACHE=/data/like/huggingface_cache \
+CUDA_VISIBLE_DEVICES=7 \
+lm_eval \
+  --model vllm \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json"}, "tensor_parallel_size": 1, "dtype": "auto", "gpu_memory_utilization": 0.6, "attention_config": {"backend": "TRITON_MLA"}, "seed": 1234, "max_num_seqs": 1, "enforce_eager": true, "debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/vllm-gsm8k-one-request.json"}' \
+  --tasks gsm8k \
+  --samples '{"gsm8k":[0]}' \
+  --num_fewshot 5 \
+  --batch_size 1 \
+  --seed 0,1234,1234,1234 \
+  --gen_kwargs '{"temperature": 0.0, "do_sample": false, "seed": 1234}'
+```
+
+这条命令的关键点：
+
+1. `--samples '{"gsm8k":[0]}'` 固定 GSM8K 第 0 条 eval doc。
+2. `--num_fewshot 5 --seed 0,1234,1234,1234` 固定 few-shot 示例选择。
+3. `--batch_size 1` 加 `"debug_lm_eval_single_request": true` 保证 vLLM wrapper 只收到 1 条 lm-eval request。
+4. `--gen_kwargs '{"temperature": 0.0, "do_sample": false, "seed": 1234}'` 固定 greedy decoding，并且保留 request-level seed。
+5. `--model_args` 里的 `"seed": 1234` 固定 vLLM engine seed，`"max_num_seqs": 1` 限制 engine 一次只调度 1 条 sequence，`"enforce_eager": true` 用于减少 CUDA graph/compile path 对调试复现的干扰。
+6. `debug_lm_eval_dump_request_path` 会写出实际发给 vLLM 的 `context`、`context_token_ids`、`gen_kwargs`、`sampling_params`。如果两次运行这个 JSON 不一致，先查 lm-eval 输入构造；如果 JSON 一致但输出不同，再查 vLLM/simo attention kernel、量化 kernel 或 GPU kernel 非确定性。
+
+不传 `"debug_lm_eval_single_request": true` 时，新增逻辑是 no-op，`lm_eval --model vllm --tasks gsm8k --batch_size auto` 原来的完整 GSM8K 数据集测试仍然可以继续使用。

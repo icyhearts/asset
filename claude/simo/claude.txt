@@ -2049,3 +2049,5 @@ HF_DATASETS_CACHE=/data/like/huggingface_cache lm_eval --model vllm --model_args
 重复运行lm-eval, vllm能够得到稳定可复现的结果, 保证每次运行，vllm的输出是固定的, 最终目的是，多次运行 lm_eval --model vllm, 模型的输入只有一条数据，输出结果是一样的
 lm_eval --model vllm 可以支持"debug_lm_eval_single_request": true, "debug_lm_eval_dump_request_path": "templ/gsm8k-one-request.json", 这样的参数吗?
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+vllm conda环境 的 lm-eval 从 0.4.9.2升级到了 0.4.12, 原来的修改被覆盖了，你要阅读升级后的/data/like/miniconda3/envs/simo_vllm/lib/python3.12/site-packages/lm_eval/models/vllm_causallms.py， 重新做一遍修改
