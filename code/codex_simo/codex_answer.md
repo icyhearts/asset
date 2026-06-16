@@ -8305,3 +8305,91 @@ ss -ltnp 'sport = :34338'
 ```
 
 没有输出再使用。若仍然报同类错误，就换另一个未占用端口，例如 `35338`、`36338`，并确认没有其他 vLLM/SGLang 任务监听该端口。
+
+## 2026-06-16: sglang/vllm 单条 GSM8K request JSON 对比
+
+比较文件：
+
+```text
+templ/sgl-gsm8k-one-request.json
+templ/vllm-gsm8k-one-request.json
+```
+
+结论先说：这两个 JSON 里的实际模型输入已经对齐，`context` 完全相同，`context_token_ids` 也完全相同，都是 1070 个 token。因此，`gsm8k-one-request.json` 暴露出来的输入差异，不是 vllm_simo 和 sglang_simo 在 nvfp4 kv cache 量化上 GSM8K 得分差异巨大的原因。
+
+我实际比较到的结果：
+
+```text
+context_equal = True
+token_ids_equal = True
+context_len_chars = 3187
+token_len = 1070
+first20 = [100000, 23853, 25, 24395, 285, 39448, 418, 62844, 11821, 35213, 91935, 13, 24395, 317, 35213, 254, 18038, 12, 50218, 1477]
+last20 = [9522, 13, 1724, 1266, 279, 11182, 1217, 838, 1099, 1131, 1492, 430, 254, 20291, 6, 2892, 30, 185, 32349, 25]
+```
+
+这说明几个容易怀疑的点可以先排除：
+
+1. few-shot 示例完全相同。
+2. 被测 GSM8K 样本完全相同。
+3. prompt 文本完全相同。
+4. tokenizer 输出 token ids 完全相同。
+5. `add_bos_token` 最终效果一致，两个 token ids 都以 `100000` 开头。
+
+lm-eval 任务配置本身也是一致的。两个 conda 环境里的 GSM8K 都是 `generate_until`，默认 5-shot，并且默认 `do_sample: false`、`temperature: 0.0`：`lm_eval/tasks/gsm8k/gsm8k.yaml:6 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:23 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:28 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:29 task config`、`lm_eval/tasks/gsm8k/gsm8k.yaml:31 task config`。
+
+两个 JSON 的差异主要有两类。
+
+第一类是 `gen_kwargs`。SGLang JSON 是：
+
+```json
+{"until": ["Question:", "</s>", "<|im_end|>"], "do_sample": false, "temperature": 0.0}
+```
+
+vLLM JSON 多了 request-level seed：
+
+```json
+{"until": ["Question:", "</s>", "<|im_end|>"], "do_sample": false, "temperature": 0.0, "seed": 1234}
+```
+
+这个差异不应影响当前 GSM8K 结果，因为两边都是 greedy decode。SGLang 的 `SamplingParams` 在 `temperature` 接近 0 时会转成 greedy：`python/sglang/srt/sampling/sampling_params.py:113 __init__`、`python/sglang/srt/sampling/sampling_params.py:114 __init__`、`python/sglang/srt/sampling/sampling_params.py:116 __init__`。vLLM 的 `SamplingParams` 也明确说明 `temperature=0` 是 greedy，并在 post init 中处理 greedy sampling：`vllm/sampling_params.py:201 SamplingParams`、`vllm/sampling_params.py:425 __post_init__`、`vllm/sampling_params.py:426 __post_init__`。只有非 greedy sampling 时，request-level seed 才可能影响采样路径。
+
+第二类是 `sampling_params` 的 dump 形式不同。SGLang wrapper 传给 engine 的是一个普通 dict，主要字段是：
+
+```json
+{
+  "temperature": 0.0,
+  "skip_special_tokens": false,
+  "spaces_between_special_tokens": false,
+  "max_new_tokens": 256,
+  "stop": ["Question:", "</s>", "<|im_end|>", "<｜end▁of▁sentence｜>"]
+}
+```
+
+vLLM wrapper dump 的是展开后的 `SamplingParams` 对象，字段很多，但关键字段语义对齐：
+
+```text
+temperature = 0.0
+seed = 1234
+stop = ["Question:", "</s>", "<|im_end|>", "<｜end▁of▁sentence｜>"]
+max_tokens = 256
+skip_special_tokens = False
+spaces_between_special_tokens = False
+n = 1
+ignore_eos = False
+```
+
+这里 `max_new_tokens` 和 `max_tokens` 是两个后端 API 的字段名差异，不是生成长度差异。SGLang wrapper 在 `generate_until()` 里把 prompt token ids 和 `sampling_params` dump 出来，然后调用 `_model_generate()`：`lm_eval/models/sglang_causallms.py:304 generate_until`、`lm_eval/models/sglang_causallms.py:309 generate_until`、`lm_eval/models/sglang_causallms.py:311 generate_until`、`lm_eval/models/sglang_causallms.py:316 generate_until`。`_model_generate()` 实际调用 `self.model.generate(input_ids=requests, sampling_params=sampling_params, ...)`：`lm_eval/models/sglang_causallms.py:340 _model_generate`、`lm_eval/models/sglang_causallms.py:361 _model_generate`、`lm_eval/models/sglang_causallms.py:362 _model_generate`、`lm_eval/models/sglang_causallms.py:363 _model_generate`。
+
+vLLM wrapper 则在 `generate_until()` 里把同一组 token ids 包成 `SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)`，再 dump：`lm_eval/models/vllm_causallms.py:639 generate_until`、`lm_eval/models/vllm_causallms.py:666 generate_until`、`lm_eval/models/vllm_causallms.py:667 generate_until`、`lm_eval/models/vllm_causallms.py:673 generate_until`、`lm_eval/models/vllm_causallms.py:678 generate_until`、`lm_eval/models/vllm_causallms.py:680 generate_until`。真正发给 vLLM 的地方是 `_model_generate()` 里的 `self.model.generate([TokensPrompt(prompt_token_ids=request) ...], sampling_params=...)`：`lm_eval/models/vllm_causallms.py:499 _model_generate`、`lm_eval/models/vllm_causallms.py:500 _model_generate`、`lm_eval/models/vllm_causallms.py:501 _model_generate`。
+
+所以，基于这两个 request JSON，不能把 vllm_simo 和 sglang_simo 的 nvfp4 GSM8K 得分差异归因于 lm-eval 的 prompt、few-shot、tokenizer、BOS、输入长度、stop 序列或 max token 配置。它们在这次单条请求上已经对齐。
+
+后续更应该查的是 JSON 没覆盖的部分：
+
+1. SGLang_simo 的 MLA kv cache 写入/读取/attention kernel 是否和 vLLM_simo 的 nvfp4 语义一致。
+2. nvfp4 pack/unpack、scale layout、group_size=16 的分组轴是否一致。
+3. MLA KV cache 中 key/value 或 latent/nope/rope 部分的写入顺序、读取顺序、scale 对齐是否一致。
+4. 两边实际解析出来的 kv cache quant 配置是否一致。
+
+最后这一点尤其要注意：两个命令使用的 quant config 文件不是同一个 schema。SGLang_simo 的配置文件使用 `kv_cache_quant_algo`：`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:23`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:24`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:25`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:26`。vLLM_simo 的配置文件使用 `kv_cache_quant_dtype`：`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:19`、`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:20`、`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:21`、`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:22`。两边都写了 `dtype=nvfp4_e2m1`、`scale_mode=e4m3`、`group_size=16`，但要继续确认运行时解析后的内部对象字段完全一致；这个不在 `gsm8k-one-request.json` 里体现。
