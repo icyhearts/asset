@@ -339,3 +339,25 @@ transform_layout 实现中, 在 examples/cute/tutorial/like_layout.cu 547调用�
 cutlass  位于 /data/like/package/cutlass
 cutlass code base include/cute/numeric/integer_sequence.hpp 定义了 make_range 函数 , 对它的实现原理进行讲解
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
+
+
+
+cutlass  位于 /data/like/package/cutlass
+cutlass code base test/unit/cute/core/swizzle_layout_like.cpp test_swizzle_2d的printf为什么打印不出来?
+cmake build 命令 ：
+cmake --build /data/like/package/cutlass/build-bjh100/  --target cutlass_test_unit_cute_core  --verbose > make.log 2>&1 &
+编译日志 /data/like/package/cutlass/make.log
+
+./build-bjh100/test/unit/cute/core/cutlass_test_unit_cute_core  --gtest_filter=CuTe_core.SwizzleLayout_like
+运行日志位于 /data/like/package/cutlass/run.log
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
+
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
+cutlass  位于 /data/like/package/cutlass
+cmake build 命令 ：
+cmake --build /data/like/package/cutlass/build-bjh100/  --target cutlass_test_unit_cute_core  --verbose > make.log 2>&1 &
+编译日志 /data/like/package/cutlass/make.log
+如何修复编译错误?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
