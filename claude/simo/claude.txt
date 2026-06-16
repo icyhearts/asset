@@ -2080,3 +2080,16 @@ HF_DATASETS_CACHE=/data/like/huggingface_cache lm_eval --model vllm --model_args
 
 最终两个conda 环境导出的 gsm8k-one-request.json 分别是  templ/sgl-gsm8k-one-request.json 和 templ/vllm-gsm8k-one-request.json, 两个gsm8k-one-request.json有什么不同？这会是导致 vllm_simo 和 sglang_simo nvfp4 kv cache 量化 gsm8k 得分差异巨大的原因吗？
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo 代码位于 /data/like/package/simo_conda_sglang
+like-useful/debug_kv_cache_quant_dequant.py 想要实现如下功能：
+构建MLATokenToKVPool, 遍历kv_cache_quant_files, 使用不同量化配置，构建 SIMOMLATokenToKVPool, 分别使用 SIMOMLATokenToKVPool.set_mla_kv_buffer 和 MLATokenToKVPool.set_mla_kv_buffer 进行 kv cache 写入.
+然后对 SIMOMLATokenToKVPool 写入的 kv cache  使用 dequant_simo_kv_cache 进行反量化，注意，只反量化 loc 所在的token.
+再把 loc 所在在的反量化的 kv cache 和 MLATokenToKVPool 的 bf16 kv cache 进行对比，计算 cosine similarity 和 L2 norm.
+
+simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py 里面有 SIMOMLATokenToKVPool.set_mla_kv_buffer 的 triton 实现。
+
+你帮我完成 dequant_simo_kv_cache 函数, 并检查 like-useful/debug_kv_cache_quant_dequant.py 的语法错误。
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，答案追加在 like-useful/answer_codex.md 里面
