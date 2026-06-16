@@ -8393,3 +8393,60 @@ vLLM wrapper 则在 `generate_until()` 里把同一组 token ids 包成 `Samplin
 4. 两边实际解析出来的 kv cache quant 配置是否一致。
 
 最后这一点尤其要注意：两个命令使用的 quant config 文件不是同一个 schema。SGLang_simo 的配置文件使用 `kv_cache_quant_algo`：`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:23`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:24`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:25`、`simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/quant_config_kvquant_nvfp4.json:26`。vLLM_simo 的配置文件使用 `kv_cache_quant_dtype`：`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:19`、`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:20`、`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:21`、`simo/extensions/vllm_simo/example/simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_nvfp4.json:22`。两边都写了 `dtype=nvfp4_e2m1`、`scale_mode=e4m3`、`group_size=16`，但要继续确认运行时解析后的内部对象字段完全一致；这个不在 `gsm8k-one-request.json` 里体现。
+
+## debug_kv_cache_quant_dequant.py 的 dequant_simo_kv_cache 实现和运行结果
+
+已完成 `like-useful/debug_kv_cache_quant_dequant.py` 的 `dequant_simo_kv_cache`，并修复脚本里会阻止运行的语法/runtime 问题。
+
+主要修改如下：
+
+1. 补齐缺失导入：`json`、`SIMOMLATokenToKVPool`、`get_upcast_kernel`、`QuantizeSpecFP/Int/MX`，否则脚本会在读取配置或构造 SIMO pool 时直接失败：`like-useful/debug_kv_cache_quant_dequant.py:1 module`、`like-useful/debug_kv_cache_quant_dequant.py:6 module`、`like-useful/debug_kv_cache_quant_dequant.py:7 module`、`like-useful/debug_kv_cache_quant_dequant.py:12 module`。
+2. 新增 `_get_quant_tile_size()`，按 `QuantizeSpecMX.block_size` 或 per-group `group_size` 选择 tile size，与 SIMO 写入路径一致：`like-useful/debug_kv_cache_quant_dequant.py:34 _get_quant_tile_size`。
+3. 新增 `_dequant_region()`，先按 meta downcast 推导 packed/scale 的 dtype、shape、byte 数，再把 uint8 row bytes `view` 回 upcast kernel 需要的 tensor，最后调用 `get_upcast_kernel()` 恢复到 bf16：`like-useful/debug_kv_cache_quant_dequant.py:46 _dequant_region`、`like-useful/debug_kv_cache_quant_dequant.py:54 _dequant_region`、`like-useful/debug_kv_cache_quant_dequant.py:59 _dequant_region`、`like-useful/debug_kv_cache_quant_dequant.py:64 _dequant_region`、`like-useful/debug_kv_cache_quant_dequant.py:69 _dequant_region`。
+4. `dequant_simo_kv_cache()` 只对 `loc >= 0` 的 token 行做反量化，输出 shape 保持为 `(pool_size + page_size, 1, kv_lora_rank + qk_rope_head_dim)`，未命中的 token 保持 0：`like-useful/debug_kv_cache_quant_dequant.py:72 dequant_simo_kv_cache`、`like-useful/debug_kv_cache_quant_dequant.py:81 dequant_simo_kv_cache`、`like-useful/debug_kv_cache_quant_dequant.py:86 dequant_simo_kv_cache`。
+5. `dequant_simo_kv_cache()` 按写入 kernel 的 layout 切 bytes：`kv_c packed`、`kv_c scale`、`k_pe packed`、`k_pe scale`，然后分别反量化 nope 和 rope 两段并拼回 bf16 cache：`like-useful/debug_kv_cache_quant_dequant.py:98 dequant_simo_kv_cache`、`like-useful/debug_kv_cache_quant_dequant.py:106 dequant_simo_kv_cache`、`like-useful/debug_kv_cache_quant_dequant.py:113 dequant_simo_kv_cache`、`like-useful/debug_kv_cache_quant_dequant.py:114 dequant_simo_kv_cache`、`like-useful/debug_kv_cache_quant_dequant.py:122 dequant_simo_kv_cache`、`like-useful/debug_kv_cache_quant_dequant.py:131 dequant_simo_kv_cache`。
+6. 修正 quant config 读取层级。配置里的 `kv_cache_quant_algo` 在 `quantization_config` 下面，不在 JSON 顶层：`like-useful/debug_kv_cache_quant_dequant.py:158 module`、`like-useful/debug_kv_cache_quant_dequant.py:162 module`、`like-useful/debug_kv_cache_quant_dequant.py:163 module`。
+7. 比较时只比较有效 `loc`，避免 padded/负 slot 进入 cosine/L2：`like-useful/debug_kv_cache_quant_dequant.py:222 module`、`like-useful/debug_kv_cache_quant_dequant.py:223 module`、`like-useful/debug_kv_cache_quant_dequant.py:227 module`。
+
+实现依据：
+
+1. `SIMOMLATokenToKVPool.__init__()` 用 `kv_cache_downcast_kernel(meta_tensor)` 推导每个 token 需要的 packed bytes 和 scale bytes，然后创建 uint8 KV cache，所以反量化也用同一个 downcast meta 结果恢复 dtype/shape：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:259 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:262 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:263 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:264 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:281 _create_buffers`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:294 _create_buffers`。
+2. `SIMOMLATokenToKVPool.set_mla_kv_buffer()` 对 MX 使用 `block_size`，对 per-group FP/INT 使用 `group_size`，并计算 `KV_C_PACKED_BYTES/KV_C_SCALE_BYTES/KV_C_TOTAL_BYTES/K_PE_PACKED_BYTES` 传给 kernel：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:323 set_mla_kv_buffer`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:344 set_mla_kv_buffer`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:348 set_mla_kv_buffer`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:361 set_mla_kv_buffer`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:366 set_mla_kv_buffer`。
+3. `concat_and_cache_mla_kernel()` 的实际写入布局是：nope 的 packed 从 0 开始，nope 的 scale 从 `KV_C_PACKED_BYTES` 开始；rope 的 packed 从 `KV_C_TOTAL_BYTES` 开始，rope 的 scale 从 `KV_C_TOTAL_BYTES + K_PE_PACKED_BYTES` 开始：`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:373 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:375 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:376 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:379 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:380 concat_and_cache_mla_kernel`。
+4. MX path 写 packed data 和 1-byte scale；per-group path 写 quantized bytes 和 float32 scale 的 4 个 bytes，所以反量化必须按 spec 的 dtype/shape 把 bytes view 回去：`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:382 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:393 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:432 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:437 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:452 concat_and_cache_mla_kernel`、`simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py:460 concat_and_cache_mla_kernel`。
+5. `get_downcast_kernel()` 和 `get_upcast_kernel()` 已经封装了 MX、fp8/int8 per-group 的数值转换，所以调试脚本不手写每种格式的数学反量化，只手写 SIMO KV cache 的 byte layout 拆分：`simo/extensions/sglang_simo/quantization/quantization.py:440 get_downcast_kernel`、`simo/extensions/sglang_simo/quantization/quantization.py:452 get_downcast_kernel`、`simo/extensions/sglang_simo/quantization/quantization.py:485 get_downcast_kernel`、`simo/extensions/sglang_simo/quantization/quantization.py:503 get_upcast_kernel`、`simo/extensions/sglang_simo/quantization/quantization.py:507 get_upcast_kernel`、`simo/extensions/sglang_simo/quantization/quantization.py:522 get_upcast_kernel`。
+6. baseline 的 sglang `MLATokenToKVPool` 创建 bf16 KV buffer，并在 `set_mla_kv_buffer()` 中把 `cache_k_nope/cache_k_rope` 直接写入原始 KV cache，所以它适合作为本脚本的 bf16 对照：`python/sglang/srt/mem_cache/memory_pool.py:1692 MLATokenToKVPool`、`python/sglang/srt/mem_cache/memory_pool.py:1737 __init__`、`python/sglang/srt/mem_cache/memory_pool.py:1754 _create_buffers`、`python/sglang/srt/mem_cache/memory_pool.py:1770 _create_buffers`、`python/sglang/srt/mem_cache/memory_pool.py:1896 set_mla_kv_buffer`、`python/sglang/srt/mem_cache/memory_pool.py:1948 set_mla_kv_buffer`。
+
+验证命令：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile like-useful/debug_kv_cache_quant_dequant.py
+/data/like/miniconda3/envs/simo_sglang/bin/python like-useful/debug_kv_cache_quant_dequant.py
+```
+
+运行时出现过一行提示：
+
+```text
+Failed to load JIT set_mla_kv_buffer kernel with nope_bytes=1024 rope_bytes=128: [Errno 2] No such file or directory: 'ninja'
+```
+
+但脚本最终退出码是 0，并完成全部格式测试。这个提示来自 sglang 原始 `set_mla_kv_buffer` 的 JIT kernel 加载路径，当前环境缺少 `ninja`，但没有阻止脚本完成。
+
+运行结果：
+
+| kv cache quant config | cosine similarity | relative L2 error |
+| --- | ---: | ---: |
+| `quant_config_kvquant_fp8_per_group.json` | 0.9998828173 | 0.0153056756 |
+| `quant_config_kvquant_int8_per_group.json` | 0.9998913407 | 0.0147362286 |
+| `quant_config_kvquant_mxfp4.json` | 0.9920253754 | 0.1298195422 |
+| `quant_config_kvquant_mxfp6.json` | 0.9993575811 | 0.0358428545 |
+| `quant_config_kvquant_mxfp8.json` | 0.9996705055 | 0.0256922133 |
+| `quant_config_kvquant_mxint8.json` | 0.9998880029 | 0.0149650332 |
+| `quant_config_kvquant_nvfp4.json` | 0.9961190224 | 0.0881569758 |
+
+结论：
+
+1. `dequant_simo_kv_cache()` 已经能按 SIMO MLA KV cache 的写入布局，只反量化 `loc` 对应 token，并和 sglang bf16 KV cache 做对比。
+2. fp8 per-group、int8 per-group、mxint8 的 relative L2 都在约 1.5% 左右；mxfp8 约 2.6%；mxfp6 约 3.6%；mxfp4 和 nvfp4 误差更大，分别约 13.0% 和 8.8%。这符合低 bit 量化比 8-bit 量化误差更大的直觉。
+3. 这些结果说明：至少对 `templ/set_mla_kv_buffer_args.safetensors` 里的这批 MLA KV 输入，`SIMOMLATokenToKVPool.set_mla_kv_buffer()` 写入后的 byte layout 可以被正确拆分并反量化回接近 bf16 baseline；如果 packed/scale offset 或 nope/rope 顺序明显错误，cosine similarity 通常不会接近 1。
+4. 这个脚本验证的是 SIMO `set_mla_kv_buffer` 写入路径 + 独立反量化恢复，不验证 `decode_attention.py` 或 `extend_attention.py` 里的 attention kernel 读取路径。因此如果 GSM8K 上 nvfp4/mxfp4 仍然异常，下一步应该继续查 attention 读取 kernel 对 MLA KV cache 的 packed/scale offset、group/block size、scale dtype、nope/rope 拼接顺序是否和这里的写入布局完全一致。

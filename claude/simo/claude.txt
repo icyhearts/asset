@@ -2092,4 +2092,5 @@ simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py 里面�
 
 你帮我完成 dequant_simo_kv_cache 函数, 并检查 like-useful/debug_kv_cache_quant_dequant.py 的语法错误。
 
+完成后，在 conda 环境中 运行代码，分析运行结果。
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，答案追加在 like-useful/answer_codex.md 里面
