@@ -2131,3 +2131,8 @@ gsm8k 得分 0.6702.
 sglang_simo fp8 per group 量化的粒度明明比 sglang 自已的 "kv_cache_dtype": "fp8_e4m3" 粒度更细，sglang_simo 是64 个元素共享一个scale, sglang 原生 fp8 kv cache 直接用的 torch type cast: torch.bfloat16 -> torch.float8, 默认scale=1.0,
 为什么sglang_simo fp8 per group 得分会更低?
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+修改  like-useful/debug_kv_cache_quant_dequant.py, 实现你说的方法3:
+3. 用 `like-useful/debug_kv_cache_quant_dequant.py` 增加一组“sglang 原生 fp8 cast -> bf16”和“sglang_simo fp8 per-group -> bf16”的同输入误差比较。
+
+在 for 循环里面， 遇到 quant_config_kvquant_fp8_per_group.json 的时候，和 sglang 原生 fp8 cast 对比
