@@ -8450,3 +8450,59 @@ Failed to load JIT set_mla_kv_buffer kernel with nope_bytes=1024 rope_bytes=128:
 2. fp8 per-group、int8 per-group、mxint8 的 relative L2 都在约 1.5% 左右；mxfp8 约 2.6%；mxfp6 约 3.6%；mxfp4 和 nvfp4 误差更大，分别约 13.0% 和 8.8%。这符合低 bit 量化比 8-bit 量化误差更大的直觉。
 3. 这些结果说明：至少对 `templ/set_mla_kv_buffer_args.safetensors` 里的这批 MLA KV 输入，`SIMOMLATokenToKVPool.set_mla_kv_buffer()` 写入后的 byte layout 可以被正确拆分并反量化回接近 bf16 baseline；如果 packed/scale offset 或 nope/rope 顺序明显错误，cosine similarity 通常不会接近 1。
 4. 这个脚本验证的是 SIMO `set_mla_kv_buffer` 写入路径 + 独立反量化恢复，不验证 `decode_attention.py` 或 `extend_attention.py` 里的 attention kernel 读取路径。因此如果 GSM8K 上 nvfp4/mxfp4 仍然异常，下一步应该继续查 attention 读取 kernel 对 MLA KV cache 的 packed/scale offset、group/block size、scale dtype、nope/rope 拼接顺序是否和这里的写入布局完全一致。
+
+## 2026-06-17 完整 GSM8K mxfp8 illegal memory access 分析和修复
+
+两次完整 GSM8K 日志 `templ/sgl-gsm8k.log.2026_06_17___11_17_15`、`templ/sgl-gsm8k.log.2026_06_17___11_22_26` 都是在 decode 阶段失败。调用链一致：
+
+```text
+DeepseekV2AttentionMLA.forward_absorb_core
+-> RadixAttention.forward
+-> SIMOTritonAttnBackend.forward_decode
+-> decode_attention_fwd
+-> decode_attention_fwd_grouped
+-> _decode_grouped_att_m_fwd
+-> _fwd_grouped_kernel_stage1
+RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered
+```
+
+直接触发点是 SIMO decode stage1 kernel 启动：`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:204 forward_decode`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:831 decode_attention_fwd`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:876 decode_attention_fwd`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:802 decode_attention_fwd_grouped`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:614 _decode_grouped_att_m_fwd`。
+
+根因是 SIMO Triton backend 没有识别 `SIMOMLATokenToKVPool`，导致 decode 中间 buffer `attn_logits` 的最后一维按量化 byte buffer 大小分配，而不是按 DeepSeek MLA 的逻辑 value head dim 分配。
+
+具体说：
+
+1. 原始 sglang `TritonAttnBackend.__init__()` 明确要求 `attn_logits.shape[-1]` 必须等于 layer 的 `v_head_dim`，因为 decode kernel 用 `// Lv` 从 `attn_logits` offset 推导 `attn_lse` offset：`python/sglang/srt/layers/attention/triton_backend.py:127 __init__`、`python/sglang/srt/layers/attention/triton_backend.py:128 __init__`、`python/sglang/srt/layers/attention/triton_backend.py:129 __init__`、`python/sglang/srt/layers/attention/triton_backend.py:147 __init__`。
+2. `init_forward_metadata()` 后续按 `self.v_head_dim` 创建 `attn_logits`：`python/sglang/srt/layers/attention/triton_backend.py:290 init_forward_metadata`、`python/sglang/srt/layers/attention/triton_backend.py:343 init_forward_metadata`、`python/sglang/srt/layers/attention/triton_backend.py:344 init_forward_metadata`。
+3. `SIMOMLATokenToKVPool` 的 `kv_buffer` 是 uint8 量化 byte buffer。mxfp8 下 DeepSeek MLA 一条 token 的实际 byte layout 是 512 packed + 16 scale + 64 packed rope + 2 scale rope = 594 bytes；`get_key_buffer()` 和 `get_value_buffer()` 都返回这个同一个量化 buffer：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:263 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:266 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:267 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:268 __init__`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:298 _create_buffers`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:307 get_key_buffer`、`simo/extensions/sglang_simo/mem_cache/memory_pool.py:310 get_value_buffer`。
+4. 但 DeepSeek MLA 的逻辑 value head dim 是 `kv_lora_rank = 512`，不是 594。`RadixAttention` 里 `attn_mqa` 的 `v_head_dim` 就是 `self.kv_lora_rank`：`python/sglang/srt/models/deepseek_v2.py:1560 __init__`、`python/sglang/srt/models/deepseek_v2.py:1562 __init__`、`python/sglang/srt/models/deepseek_v2.py:1566 __init__`。
+5. SIMO 版本的 `_fwd_grouped_kernel_stage1()` 仍然用 `Lv = layer.v_head_dim` 计算 `Att_Lse` 写地址：`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:528 _decode_grouped_att_m_fwd`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:529 _decode_grouped_att_m_fwd`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:499 _fwd_grouped_kernel_stage1`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:500 _fwd_grouped_kernel_stage1`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:501 _fwd_grouped_kernel_stage1`、`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:503 _fwd_grouped_kernel_stage1`。
+6. 因此如果 `attn_logits.shape[-1] = 594`，但 `Lv = 512`，`offs_mid_o_1 = attn_logits_offset // 512` 会把 `Att_Lse` index 算大，batch/head/split 越靠后越容易越界。完整 GSM8K 的 `--batch_size auto` 会产生几十个 running requests 和很长的 KV 序列，所以比单条请求更容易稳定触发 illegal memory access。
+
+已做代码修复：
+
+1. `SIMOTritonAttnBackend.__init__()` 现在同时识别 `SIMOMHATokenToKVPool` 和 `SIMOMLATokenToKVPool`：`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:45 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:50 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:51 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:52 __init__`。
+2. MHA pool 保持原逻辑；MLA pool 新增 `original_head_dim = kv_lora_rank + qk_rope_head_dim`、`original_v_head_dim = kv_lora_rank`：`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:54 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:69 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:71 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:72 __init__`。
+3. `super().__init__()` 后仍统一把 `self.v_head_dim` 覆盖成逻辑 value dim。对 MLA 来说就是 512，这会让后续 `init_forward_metadata()` 创建 `attn_logits[..., 512]`，从而满足原始 sglang 的 `// Lv` 地址计算约束：`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:80 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:82 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:83 __init__`、`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:84 __init__`。
+
+验证：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py
+```
+
+语法检查通过。完整 GSM8K 还需要重新启动新的 `lm-eval --model sglang` 进程验证；旧进程已经加载旧 backend 代码，不能复用。
+
+建议重新运行你的命令，并额外观察启动日志里是否出现：
+
+```text
+SIMOTritonAttnBackend: quantized MLA KV cache enabled, mx_format=mxfp8_e4m3, original_head_dim=576, original_v_head_dim=512
+```
+
+如果还有 illegal memory access，下一步建议打开 `debug_safetensors_decode_attention_fwd_grouped_dir` 保存失败前的 `q/k_buffer/v_buffer/kv_indptr/kv_indices/attn_logits/attn_lse/num_kv_splits`，重点检查：
+
+1. `attn_logits.shape[-1]` 是否已经变成 512。
+2. `kv_indices.max()` 是否小于 `k_buffer.shape[0]`。
+3. `layer_dict` 中 `packed_head_size=512`、`scale_head_size=16`、`packed_head_size_rope=64`、`scale_head_size_rope=2` 是否都存在。
+
+这次错误不是 lm-eval wrapper 恢复导致的，也不是 mxfp8 本身精度问题；它是 SIMO MLA quantized byte buffer 维度和 sglang Triton decode 中间 buffer 逻辑维度混用导致的地址计算 bug。
