@@ -377,4 +377,24 @@ cutlass code base test/unit/cute/core/swizzle_layout_like.cpp 编译完成，运
 1) test_like_swizzle_2d 会调用 print_tensor(sw_tensor), 解释 print_tensor 是如何调用到include/cute/swizzle.hpp Swizzle::apply函数的？整理出调用链路
 2) run.log 中, print_tensor 的结果看上去没有规律，对 print_tensor 的结果，用Swizzle::apply函数进行解释
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
+对test/unit/cute/core/swizzle_layout_like.cpp剩余两个例子:
+```
+  auto sw_layout = composition(Swizzle<3,0,-3>{},
+                               Layout<Shape <_8,_8>,
+                                      Stride<_8,_1>>{});
 
+  auto sw_layout = composition(Swizzle<2,1,3>{},
+                               Layout<Shape <Shape < _2,_2,_2>,Shape <_2,_2, _2>>,
+                                      Stride<Stride<_32,_2,_8>,Stride<_4,_1,_16>>>{});
+```
+print_tensor 的结果 也进行解释
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+
+
+Swizzle<3,0,3>::apply(offset)
+  = offset ^ ((offset & 0b111000) >> 3)
+  offset=0bmmmnnn
+  = 0bmmmnnn ^ ((0bmmmnnn & 0b111000) >> 3)
+  = 0bmmmnnn ^ (0b000mmm)
+  = 0bmmm(nnn ^ mmm)
+  = 8*m + (nnn ^ mmm)
