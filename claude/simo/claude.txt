@@ -2103,3 +2103,31 @@ rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-sgl/  /data/like/temp/sgl_safe_tens
 日志位于 templ/sgl-gsm8k.log.2026_06_17___11_17_15  templ/sgl-gsm8k.log.2026_06_17___11_22_26, 再次测试都出现 RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered
 分析原因，如何修复
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+simo 代码位于 /data/like/package/simo_conda_sglang
+vllm conda环境位 于 /data/like/miniconda3/envs/simo_vllm/ vllm 源码 位于 /data/like/package/vllm-for-conda-simo
+
+修复 memory 问题后， 分别测试不同数据类型的kv cache 量化, 
+1) sglang_simo 得分低于 vllm_simo, 尤其是 fp8 per group:
+sglang_simo命令:
+MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ DEBUG_add_bos_token=true CUDA_LAUNCH_BLOCKING=0 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=3 DEBUG_LOG_LEVEL=info DEBUG_ID=0 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh > templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.`nowstr.sh` 2>&1 &
+MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ DEBUG_add_bos_token=true CUDA_LAUNCH_BLOCKING=0 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=5 DEBUG_LOG_LEVEL=info DEBUG_ID=1 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh > templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.`nowstr.sh` 2>&1 &
+
+sglang_simo 日志位于templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.2026_06_17___12_59_56 和 templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.2026_06_17___13_00_17,
+sglang_simo fp8 per group gsm8k 得分 0.6429。
+
+vllm_simo 测试命令:
+MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=7 bash simo//extensions/vllm_simo/example/online_quantization/llm_vlm_eval_online_quant.kv-cache-only.sh > templ/llm_vlm_eval_online_quant.kv-cache-only.sh.log.`nowstr.sh` 2>&1
+vllm_simo 日志 templ/llm_vlm_eval_online_quant.kv-cache-only.sh.log.2026_06_11___21_31_50
+vllm_simo fp8 per group gsm8k 得分 0.6732
+
+2) sglang_simo fp8 per group 低于 sglang 原本的 fp8 kv cache:
+sglang fp8 kv cache 命令:
+CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",  "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3"  }' --tasks gsm8k --batch_size auto > templ/lm-eval-gsm8k-dsv2-fp8kv.log.`nowstr.sh` 2>&1 &
+sglang fp8 kv cache 日志: templ/lm-eval-gsm8k-dsv2-fp8kv.log.2026_06_11___14_47_46
+gsm8k 得分 0.6702.
+
+sglang_simo fp8 per group 量化的粒度明明比 sglang 自已的 "kv_cache_dtype": "fp8_e4m3" 粒度更细，sglang_simo 是64 个元素共享一个scale, sglang 原生 fp8 kv cache 直接用的 torch type cast: torch.bfloat16 -> torch.float8, 默认scale=1.0,
+为什么sglang_simo fp8 per group 得分会更低?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
