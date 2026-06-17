@@ -149,3 +149,113 @@ cute::print_tensor(sw_tensor);
 1. 保留 `test_like_swizzle_2d`，继续避免和 `test/unit/cute/core/swizzle_layout.cpp:41 test_swizzle_2d` 的同名模板冲突。
 2. 在 `test/unit/cute/core/swizzle_layout_like.cpp:38 file-scope include` 附近加入 `#include <cute/pointer_flagged.hpp>`，位置放在 `<cute/util/print_tensor.hpp>` 前。
 3. 如果不需要 `print_tensor` 的 pretty-print 输出，最干净的测试修法仍然是删除或注释 `test/unit/cute/core/swizzle_layout_like.cpp:52 test_like_swizzle_2d`，这样也不需要新增 `print_tensor.hpp` 和 `pointer_flagged.hpp` 依赖。
+
+## SwizzleLayout_like 第一个例子中 print_tensor 如何调用到 Swizzle::apply
+
+本节只看 `TEST(CuTe_core_like, SwizzleLayout_like)` 的第一个例子：
+
+```cpp
+auto sw_layout = composition(Swizzle<3,0,3>{},
+                             Layout<Shape <_8,_8>,
+                                    Stride<_8,_1>>{});
+```
+
+当前 `run.log` 中对应的 layout 打印为：
+
+```text
+Sw<3,0,3> o _0 o (_8,_8):(_8,_1)
+```
+
+这表示一个 `ComposedLayout<Swizzle<3,0,3>, _0, Layout<Shape<_8,_8>, Stride<_8,_1>>>`，即先用普通 8x8 row-major layout 把 `(m,n)` 映射成线性下标，再对这个线性下标应用 `Swizzle<3,0,3>`。
+
+调用链路如下：
+
+1. `test/unit/cute/core/swizzle_layout_like.cpp:110 TEST(CuTe_core_like, SwizzleLayout_like)` 到 `test/unit/cute/core/swizzle_layout_like.cpp:112 TEST(CuTe_core_like, SwizzleLayout_like)` 构造 `sw_layout`。
+2. `include/cute/swizzle_layout.hpp:321 composition` 接收 `Swizzle<B,M,S>` 和普通 `Layout`，并在 `include/cute/swizzle_layout.hpp:324 composition` 转成 `composition(sxor, Int<0>{}, layout)`。
+3. `include/cute/layout_composed.hpp:363 composition` 到 `include/cute/layout_composed.hpp:367 composition` 构造 `ComposedLayout<LayoutA, Offset, LayoutB>`，所以这里得到 `Swizzle<3,0,3> o _0 o Layout<Shape<_8,_8>,Stride<_8,_1>>`。
+4. `test/unit/cute/core/swizzle_layout_like.cpp:122 TEST(CuTe_core_like, SwizzleLayout_like)` 调用 `test_like_swizzle_2d(sw_layout)`。
+5. `test/unit/cute/core/swizzle_layout_like.cpp:48 test_like_swizzle_2d` 用 `make_tensor(counting_iterator<int>{0}, sw_layout)` 构造 tensor；`test/unit/cute/core/swizzle_layout_like.cpp:54 test_like_swizzle_2d` 调用 `print_tensor(sw_tensor)`。
+6. `include/cute/tensor_impl.hpp:409 make_tensor` 接收 iterator 和 layout，`include/cute/tensor_impl.hpp:413 make_tensor` 返回对应的 `Tensor`。
+7. `include/cute/util/print_tensor.hpp:104 print_tensor` 进入打印函数。因为这个 tensor 的 layout rank 是 2，走 `include/cute/util/print_tensor.hpp:117 print_tensor` 的 rank-2 分支。
+8. `include/cute/util/print_tensor.hpp:119 print_tensor` 和 `include/cute/util/print_tensor.hpp:120 print_tensor` 双层遍历 `m,n`；`include/cute/util/print_tensor.hpp:121 print_tensor` 调用 `pretty_print(tensor(m,n))`。
+9. `include/cute/tensor_impl.hpp:272 Tensor::operator()` 把 `tensor(m,n)` 转成 `operator()(make_coord(m,n))`；`include/cute/tensor_impl.hpp:255 Tensor::operator()` 返回 `data()[layout()(coord)]`。
+10. `include/cute/layout_composed.hpp:114 ComposedLayout::operator()` 进入 composed layout 的坐标映射；`include/cute/layout_composed.hpp:118 ComposedLayout::operator()` 执行 `layout_a()(offset() + layout_b()(coord))`。
+11. 这里的 `layout_b` 是 `Layout<Shape<_8,_8>,Stride<_8,_1>>`。`include/cute/layout.hpp:167 Layout::operator()` 处理普通 layout 坐标；`include/cute/layout.hpp:171 Layout::operator()` 调用 `crd2idx(coord, shape(), stride())`，所以 `(m,n)` 变成 `8*m + n`。
+12. 这里的 `layout_a` 是 `Swizzle<3,0,3>`。`include/cute/swizzle.hpp:84 Swizzle::operator()` 调用 `include/cute/swizzle.hpp:86 Swizzle::operator()` 的 `apply(offset)`。
+13. `include/cute/swizzle.hpp:76 Swizzle::apply` 是真正的 swizzle 映射；`include/cute/swizzle.hpp:78 Swizzle::apply` 的核心公式是 `offset ^ shiftr(offset & yyy_msk{}, msk_sft{})`。
+14. 最后，因为 data 是 `counting_iterator<int>{0}`，`include/cute/pointer_base.hpp:208 counting_iterator::operator[]` 返回 `n_ + i`。这里 `n_` 是 0，所以 `data()[layout()(coord)]` 的值就是 swizzle 后的线性下标本身。
+
+所以 `print_tensor(sw_tensor)` 打印的不是内存中某个真实矩阵的数据，而是每个逻辑坐标 `(m,n)` 经过 `sw_layout` 映射后的线性 index。
+
+对第一个例子，普通 layout 是 `(_8,_8):(_8,_1)`，因此：
+
+```text
+layout_b(m,n) = 8*m + n
+```
+
+`Swizzle<3,0,3>` 的模板参数含义来自 `include/cute/swizzle.hpp:54 Swizzle`：
+
+- `BBits = 3`
+- `MBase = 0`
+- `SShift = 3`
+
+根据 `include/cute/swizzle.hpp:66 Swizzle` 到 `include/cute/swizzle.hpp:69 Swizzle`：
+
+```text
+bit_msk = (1 << 3) - 1 = 0b111
+yyy_msk = 0b111 << (0 + max(0,3)) = 0b111000
+zzz_msk = 0b111 << (0 - min(0,3)) = 0b000111
+msk_sft = 3
+```
+
+再代入 `include/cute/swizzle.hpp:78 Swizzle::apply`：
+
+```text
+Swizzle<3,0,3>::apply(offset)
+  = offset ^ ((offset & 0b111000) >> 3)
+```
+
+对于 8x8 row-major layout，`offset = 8*m + n`，二进制可以写成：
+
+```text
+offset = 0bmmmnnn
+```
+
+其中 `mmm` 是行号 `m`，`nnn` 是列号 `n`。因此：
+
+```text
+(offset & 0b111000) >> 3 = m
+apply(offset) = 0bmmmnnn ^ 0b000mmm
+              = 0bmmm(nnn xor mmm)
+              = 8*m + (n xor m)
+```
+
+这就是 `run.log` 中第一组 `print_tensor` 输出的规律：每一行的高 3 bit，也就是行块 `8*m`，保持不变；低 3 bit，也就是列号 `n`，被行号 `m` 做了一次 XOR。
+
+逐行展开如下：
+
+```text
+m=0: 8*0 + (n xor 0) =  0  1  2  3  4  5  6  7
+m=1: 8*1 + (n xor 1) =  9  8 11 10 13 12 15 14
+m=2: 8*2 + (n xor 2) = 18 19 16 17 22 23 20 21
+m=3: 8*3 + (n xor 3) = 27 26 25 24 31 30 29 28
+m=4: 8*4 + (n xor 4) = 36 37 38 39 32 33 34 35
+m=5: 8*5 + (n xor 5) = 45 44 47 46 41 40 43 42
+m=6: 8*6 + (n xor 6) = 54 55 52 53 50 51 48 49
+m=7: 8*7 + (n xor 7) = 63 62 61 60 59 58 57 56
+```
+
+这正好对应 `run.log` 第一组 `print_tensor` 的结果：
+
+```text
+    0    1    2    3    4    5    6    7
+    9    8   11   10   13   12   15   14
+   18   19   16   17   22   23   20   21
+   27   26   25   24   31   30   29   28
+   36   37   38   39   32   33   34   35
+   45   44   47   46   41   40   43   42
+   54   55   52   53   50   51   48   49
+   63   62   61   60   59   58   57   56
+```
+
+因此它不是无规律，而是 `Swizzle<3,0,3>` 把 row-major index 的 bit[5:3] 复制到低 3 bit 上做 XOR。直观说：第 `m` 行内部，列号按 `n xor m` 重新排列；不跨行搬移，因为高 3 bit `m` 保持不变。

@@ -361,3 +361,20 @@ cmake --build /data/like/package/cutlass/build-bjh100/  --target cutlass_test_un
 编译日志 /data/like/package/cutlass/make.log
 如何修复编译错误?
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
+
+cutlass  位于 /data/like/package/cutlass
+工作目录位于/data/like/package/cutlass
+cutlass code base test/unit/cute/core/swizzle_layout_like.cpp 编译完成，运行命令:
+./build-bjh100/test/unit/cute/core/cutlass_test_unit_cute_core  --gtest_filter=CuTe_core_like.SwizzleLayout_like > run.log
+日志: /data/like/package/cutlass/run.log
+以 test/unit/cute/core/swizzle_layout_like.cpp中 TEST(CuTe_core_like, SwizzleLayout_like) 第一个例子
+```
+  auto sw_layout = composition(Swizzle<3,0,3>{},
+                               Layout<Shape <_8,_8>,
+                                      Stride<_8,_1>>{});
+```
+为例，
+1) test_like_swizzle_2d 会调用 print_tensor(sw_tensor), 解释 print_tensor 是如何调用到include/cute/swizzle.hpp Swizzle::apply函数的？整理出调用链路
+2) run.log 中, print_tensor 的结果看上去没有规律，对 print_tensor 的结果，用Swizzle::apply函数进行解释
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer.md 里面
+
