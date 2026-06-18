@@ -2136,3 +2136,17 @@ sglang_simo fp8 per group 量化的粒度明明比 sglang 自已的 "kv_cache_dt
 3. 用 `like-useful/debug_kv_cache_quant_dequant.py` 增加一组“sglang 原生 fp8 cast -> bf16”和“sglang_simo fp8 per-group -> bf16”的同输入误差比较。
 
 在 for 循环里面， 遇到 quant_config_kvquant_fp8_per_group.json 的时候，和 sglang 原生 fp8 cast 对比
+
+sglang batch size=1 命令:
+SIMO_SGLANG_REGISTER=1  SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json   HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=3 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_fp8_per_group.json\"}", "tp_size": 1, "dtype": "auto",  "attention_backend": "triton_simo", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true   , "disable_cuda_graph": true, "skip_server_warmup": true, "disable_piecewise_cuda_graph": true,  "watchdog_timeout": 2592000 , "random_seed": 1234 }'  --tasks gsm8k   --batch_size 1 --seed 0,1234,1234,1234  --gen_kwargs temperature=0.0,do_sample=false  > templ/sgl-gsm8k.log.fp8group.`nowstr.sh` 2>&1 &
+日志: templ/sgl-gsm8k.log.fp8group.2026_06_17___16_55_11
+
+sglang 自带 fp8 kv cache
+CUDA_VISIBLE_DEVICES=5 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",  "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" ,    "disable_cuda_graph": true, "skip_server_warmup": true, "disable_piecewise_cuda_graph": true,  "watchdog_timeout": 2592000 , "random_seed": 1234 }' --tasks gsm8k --batch_size 1 --seed 0,1234,1234,1234  --gen_kwargs temperature=0.0,do_sample=false > templ/lm-eval-gsm8k-dsv2-fp8kv.batch_size_1.log.`nowstr.sh` 2>&1 &
+日志 templ/lm-eval-gsm8k-dsv2-fp8kv.batch_size_1.log.2026_06_17___17_11_03
+vllm_simo batch size=1
+HF_DATASETS_CACHE=/data/like/huggingface_cache  CUDA_VISIBLE_DEVICES=4 lm_eval --model vllm --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "hf_overrides": {"quantization_config_file": "/data/like/package/simo_conda_sglang/simo/extensions/vllm_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/kv_only_quant_config_kvquant_fp8_per_group.json"}, "tensor_parallel_size": 1, "dtype": "auto", "gpu_memory_utilization": 0.4, "attention_config": {"backend": "TRITON_MLA"},   "seed": 1234, "max_num_seqs": 1, "enforce_eager": true }' --tasks gsm8k  --batch_size 1 --seed 0,1234,1234,1234  --gen_kwargs temperature=0.0,do_sample=false  > templ/vllm.gsm8k.batch_size1.log.`nowstr.sh` 2>&1 &
+日志 templ/vllm.gsm8k.batch_size1.log.2026_06_17___17_33_34
+全部换成 batch size=1, sglang simo 仍旧在 gsm8k 上得分小于 sglang fp8 cast 和 vllm_simo
+继续分析原因
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
