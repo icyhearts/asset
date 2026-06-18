@@ -2182,4 +2182,5 @@ simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/decode_at
 3) sglang 需要 has_mla use_pdl, sglang_simo 不需要
 4) sglang_simo 需要 layer 参数，因为 sglang_simo decode_attention_fwd_grouped 要从 layer 中提取一些属性，你在调用  sglang_simo 的时候要构建一个 layer， layer 是什么类型不重要，重要的是要有 decode_attention_fwd_grouped 需要的属性
 
-
+写完代码用 sglang conda 环境 运行一下, 分析结果。
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面

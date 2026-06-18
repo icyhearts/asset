@@ -8595,3 +8595,51 @@ vllm_simo 得分接近 sglang 原生 fp8，也不能说明 sglang_simo 的 KV �
 7. `decode_attention_fwd()` 根据 `kv_group_num = q.shape[1] // v_buffer.shape[1]` 决定走 normal 还是 grouped。`attn_mqa` 是多 query heads 对 1 个 KV head，所以 `kv_group_num > 1`，进入 `decode_attention_fwd_grouped()`；`attn_mha` 的 KV heads 等于 query heads，通常 `kv_group_num == 1`，会走 `decode_attention_fwd_normal()`：`python/sglang/srt/layers/attention/triton_ops/decode_attention.py:793 decode_attention_fwd`、`python/sglang/srt/layers/attention/triton_ops/decode_attention.py:817 decode_attention_fwd`、`python/sglang/srt/layers/attention/triton_ops/decode_attention.py:819 decode_attention_fwd`、`python/sglang/srt/layers/attention/triton_ops/decode_attention.py:821 decode_attention_fwd`、`python/sglang/srt/layers/attention/triton_ops/decode_attention.py:838 decode_attention_fwd`、`python/sglang/srt/layers/attention/triton_ops/decode_attention.py:840 decode_attention_fwd`。
 
 补充：`self.attn_mha` 确实会在 MHA forward 分支中使用，例如 pure prefill/extend 的 MHA 路径会调用 `self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)`：`python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:302 DeepseekMHAForwardMixin.forward_normal_core`、`python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:309 DeepseekMHAForwardMixin.forward_normal_core`。但是这不是 DeepSeek-V2-Lite decode 阶段进入 `decode_attention_fwd_grouped()` 的调用链。
+
+## 2026-06-18: 用 decode dump 离线重放对比 sglang native fp8 cast 和 sglang_simo fp8 per-group
+
+我已经修改 `like-useful/debug_kv_cache_quant_dequant.py`，新增了从 `/data/like/temp/sgl_safe_tensor_sgl_decode_attention_fwd_grouped_dir` 读取 `decode_attention_fwd_grouped.<time>.safetensors` 和 `non_tensor_args.<time>.json` 的离线重放逻辑。
+
+修改点：
+
+- `like-useful/debug_kv_cache_quant_dequant.py:96 native_sglang_fp8_cast_decode_cache`：把 dump 出来的 bf16 MLA `k_buffer` cast 成 `torch.float8_e4m3fn`，并用前 `v_head_dim` 维作为 `v_buffer`，模拟 sglang 原生 fp8 KV cache 的 typed-cache 路径。
+- `like-useful/debug_kv_cache_quant_dequant.py:128 build_simo_decode_layer`：构造一个最小 layer 对象，提供 sglang_simo `decode_attention_fwd_grouped` 需要的 `qk_head_dim/v_head_dim/packed_head_size/scale_head_size/packed_head_size_rope/scale_head_size_rope/kv_cache_quant_spec` 等属性。
+- `like-useful/debug_kv_cache_quant_dequant.py:153 build_simo_fp8_per_group_decode_cache`：从 dump 中的 bf16 `k_buffer` 按 `512 noPE + 64 rope` 拆分，只对本次 `kv_indices/kv_indptr` 实际访问到的 loc 调用 `SIMOMLATokenToKVPool.set_mla_kv_buffer`，生成严格符合 SIMOMLATokenToKVPool layout 的 uint8 fp8 per-group KV cache。
+- `like-useful/debug_kv_cache_quant_dequant.py:303 iter_decode_dump_groups`：按相同时间戳匹配 safetensors 和 json。
+- `like-useful/debug_kv_cache_quant_dequant.py:328 replay_one_decode_dump`：同一组参数做三路调用：sglang bf16、sglang native fp8 cast、sglang_simo fp8 per-group，然后比较两条量化路径的 `o` tensor 与 bf16 `o` tensor 的 cosine similarity 和 relative L2。
+- `like-useful/debug_kv_cache_quant_dequant.py:446 run_decode_attention_dump_replay`：遍历 dump 目录并输出逐组与 summary。默认跑 decode replay；旧的 set_mla 对比仍保留在 `like-useful/debug_kv_cache_quant_dequant.py:493 run_set_mla_kv_cache_compare`，需要时用 `DEBUG_RUN_SET_MLA_COMPARE=1` 开启。
+
+参数映射确认：
+
+- sglang 原生入口 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:702 decode_attention_fwd_grouped` 需要 `sm_scale_withk`、`v_scale`、`has_mla`、`use_pdl`；dump 里保存这些字段的位置是 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:739 decode_attention_fwd_grouped` 到 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:747 decode_attention_fwd_grouped`。
+- 当前 dump 中 `v_scale=1.0`，脚本在 `like-useful/debug_kv_cache_quant_dequant.py:347 replay_one_decode_dump` 读取并在 `like-useful/debug_kv_cache_quant_dequant.py:354 replay_one_decode_dump` 校验，不等于 1 会直接报错。
+- sglang 原生 `sm_scale_withk` 在 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:713 decode_attention_fwd_grouped` 传入 `_decode_grouped_att_m_fwd`；sglang_simo 的入口 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:703 decode_attention_fwd_grouped` 使用参数名 `sm_scale`，并在 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:802 decode_attention_fwd_grouped` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:815 decode_attention_fwd_grouped` 传给 `_decode_grouped_att_m_fwd`。在这个测试里直接用 dump 的 `sm_scale_withk` 作为 simo `sm_scale`。
+- sglang 原生 stage1 从 `k_buffer.shape[-1]` 和 `v_buffer.shape[-1]` 推导 `Lk/Lv`，见 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:436 _decode_grouped_att_m_fwd` 到 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:454 _decode_grouped_att_m_fwd`；sglang_simo 从 layer 读取逻辑维度，见 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:511 _decode_grouped_att_m_fwd` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:530 _decode_grouped_att_m_fwd`。
+- sglang_simo stage1 还会从 layer 中读取 packed/scale 参数，见 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:573 _decode_grouped_att_m_fwd` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:593 _decode_grouped_att_m_fwd`，所以脚本必须构造 layer。
+- sglang 原生 stage2 使用传入的 `v_scale`，见 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:604 _decode_softmax_reducev_fwd` 到 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py:635 _decode_softmax_reducev_fwd`；sglang_simo stage2 内部固定 `v_scale=1.0`，见 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:651 _decode_softmax_reducev_fwd` 到 `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:683 _decode_softmax_reducev_fwd`。这和当前 dump 的 `v_scale=1.0` 匹配。
+- SIMOMLATokenToKVPool 的 uint8 cache 行宽来自 downcast 后 packed bytes + scale bytes，见 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:240 SIMOMLATokenToKVPool.__init__` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:268 SIMOMLATokenToKVPool.__init__`；buffer 形状是 `[size + page_size, 1, kv_cache_dim_in_bytes]`，见 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:285 SIMOMLATokenToKVPool._create_buffers` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:305 SIMOMLATokenToKVPool._create_buffers`。
+- SIMOMLATokenToKVPool 写入时按 `kv_lora_rank` 和 `pe_dim` 拆成 noPE/rope 两段并计算 `KV_C_PACKED_BYTES/KV_C_SCALE_BYTES/KV_C_TOTAL_BYTES/K_PE_PACKED_BYTES`，见 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:327 SIMOMLATokenToKVPool.set_mla_kv_buffer` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:448 SIMOMLATokenToKVPool.set_mla_kv_buffer`。
+
+运行命令和结果：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/python -m py_compile like-useful/debug_kv_cache_quant_dequant.py
+DEBUG_DECODE_REPLAY_LIMIT=1 CUDA_VISIBLE_DEVICES=1 /data/like/miniconda3/envs/simo_sglang/bin/python like-useful/debug_kv_cache_quant_dequant.py
+DEBUG_RUN_SET_MLA_COMPARE=0 DEBUG_DECODE_REPLAY_LIMIT=100 CUDA_VISIBLE_DEVICES=1 /data/like/miniconda3/envs/simo_sglang/bin/python like-useful/debug_kv_cache_quant_dequant.py > templ/debug_kv_cache_quant_dequant.decode_replay_100.log 2>&1
+```
+
+`DEBUG_DECODE_REPLAY_LIMIT=1` 的第一组结果：
+
+```text
+decode_replay_summary: count:1, native_fp8_cast_vs_bf16_cos_avg:0.996505260, native_fp8_cast_vs_bf16_l2_avg:0.085497722, simo_fp8_per_group_vs_bf16_cos_avg:0.999357879, simo_fp8_per_group_vs_bf16_l2_avg:0.035876539
+```
+
+前 100 组结果保存在 `templ/debug_kv_cache_quant_dequant.decode_replay_100.log`，summary 是：
+
+```text
+decode_replay_summary: count:100, native_fp8_cast_vs_bf16_cos_avg:0.997460899, native_fp8_cast_vs_bf16_l2_avg:0.070413781, simo_fp8_per_group_vs_bf16_cos_avg:0.998706653, simo_fp8_per_group_vs_bf16_l2_avg:0.050050246
+```
+
+我又统计了这 100 组逐条 L2：sglang_simo fp8 per-group 比 sglang native fp8 cast 更接近 bf16 的有 91 组，native fp8 cast 更接近 bf16 的有 9 组。
+
+结论：在这次 sglang bf16 decode dump 的前 100 组离线重放中，sglang_simo fp8 per-group 的 `decode_attention_fwd_grouped` 输出 `o` 平均上比 sglang native fp8 cast 更接近 bf16 baseline。因此，至少从这批 decode attention 输入看，`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py` 的 fp8 per-group 读取和 attention 计算本身，不像是导致 gsm8k 分数低于 sglang native fp8 cast 的主因。后续应优先比较 prefill/extend 阶段、lm-eval 实际请求序列中的 logits 差异，或者按“最终答错但 native fp8 答对”的样本做 layer-by-layer 输出对齐。
