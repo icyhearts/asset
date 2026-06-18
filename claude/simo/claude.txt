@@ -2154,3 +2154,32 @@ HF_DATASETS_CACHE=/data/like/huggingface_cache  CUDA_VISIBLE_DEVICES=4 lm_eval -
 对于模型 /data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B, sglang  DeepseekV2AttentionMLA 有两个成员 self.attn_mha self.attn_mqa, 
 python/sglang/srt/layers/attention/triton_ops/decode_attention.py decode_attention_fwd_grouped 函数，是通过 self.attn_mha self.attn_mqa 中的哪一个调用的？
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+##  fp8 vs fp8 per group vs bf16
+
+simo 代码位于 /data/like/package/simo_conda_sglang
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+rm -rf /dev/shm/debug_ppl_save_input_ipc_dir-sgl/  /data/like/temp/sgl_safe_tensor_sgl_decode_attention_fwd_grouped_dir ; cp /share/users/like/ipc.sglang.1.json  /dev/shm/like/ipc.sglang.1.json  ; SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json   HF_DATASETS_CACHE=/data/like/huggingface_cache debug_env_file=/dev/shm/like/ipc.sglang.1.json  CUDA_VISIBLE_DEVICES=1 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",  "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "disable_cuda_graph": true, "disable_piecewise_cuda_graph": true, "skip_server_warmup": true, "watchdog_timeout": 2592000 }' --tasks gsm8k --batch_size auto > templ/lm-eval-gsm8k-dsv2-fp8kv.log.`nowstr.sh` 2>&1 &
+日志位于 templ/lm-eval-gsm8k-dsv2-fp8kv.log.2026_06_18___11_41_53
+
+sglang code base 的 python/sglang/srt/layers/attention/triton_ops/decode_attention.py  decode_attention_fwd_grouped save_dir = env_data.get("debug_safetensors_sgl_decode_attention_fwd_grouped_dir", None), save_dir not None时，会把 decode_attention_fwd_grouped 所有参数保存下来。
+保存的safetensors, json, 位于 /data/like/temp/sgl_safe_tensor_sgl_decode_attention_fwd_grouped_dir/, 每次调用 decode_attention_fwd_grouped, safetensors and json 文件名中包含有相同的时间。
+
+你帮我继续修改 like-useful/debug_kv_cache_quant_dequant.py:
+遍历 /data/like/temp/sgl_safe_tensor_sgl_decode_attention_fwd_grouped_dir 所有的safetensor和 json
+时间相同的 safetensor 和 json 作为同一组参数。
+分别做以下3种调用:
+1)直接把 safetensor 和 json里面的参数提取出来，调用 bf16 kv cache 版本的 sglang decode_attention_fwd_grouped
+2) 把 safetensor 和 json里面的参数提取出来， kv cache 通过 sglang 自带的 fp8_e4m3 cast 方式转换成 fp8 kv cache, 调用 sglang decode_attention_fwd_grouped←
+3) 把 safetensor 和 json里面的参数提取出来，kv cache 通过 simo 的 fp8 per group kv cache cast, layout严格按照 SIMOMLATokenToKVPool 的 set_kv_buffer/set_mla_kv_buffer 的layout, 调用 sglang_simo 的 decode_attention_fwd_grouped←
+做以下两种对比:
+1) sglang 自带的 fp8_e4m3 kv cache cast 方式的 o tensor 和 sglang bf16 kv cache 的  o tensor对比 cosine similarity and L2 norm
+2) sglang_simo fp8_e4m3 per group(group size=64) 方式的 o tensor 和 sglang bf16 kv cache 的  o tensor对比 cosine similarity and L2 norm
+需要注意的是:
+simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py decode_attention_fwd_grouped 和 sglang codebase decode_attention_fwd_grouped 需要的参数不一样。
+1) sglang 需要 v_scale，并且在当前配置下， v_scale应该=1, 你最好验证一下, sglang_simo 不需要 v_scale, 
+2) sglang  sm_scale_withk 参数在当前配置下应该和 sglang_simo 需要的 sm_scale 等价，
+3) sglang 需要 has_mla use_pdl, sglang_simo 不需要
+4) sglang_simo 需要 layer 参数，因为 sglang_simo decode_attention_fwd_grouped 要从 layer 中提取一些属性，你在调用  sglang_simo 的时候要构建一个 layer， layer 是什么类型不重要，重要的是要有 decode_attention_fwd_grouped 需要的属性
+
+
