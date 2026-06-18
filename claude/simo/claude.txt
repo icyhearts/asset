@@ -2150,3 +2150,7 @@ HF_DATASETS_CACHE=/data/like/huggingface_cache  CUDA_VISIBLE_DEVICES=4 lm_eval -
 全部换成 batch size=1, sglang simo 仍旧在 gsm8k 上得分小于 sglang fp8 cast 和 vllm_simo
 继续分析原因
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+对于模型 /data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B, sglang  DeepseekV2AttentionMLA 有两个成员 self.attn_mha self.attn_mqa, 
+python/sglang/srt/layers/attention/triton_ops/decode_attention.py decode_attention_fwd_grouped 函数，是通过 self.attn_mha self.attn_mqa 中的哪一个调用的？
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面

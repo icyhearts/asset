@@ -1,0 +1,28 @@
+{
+    "quantization_config": {
+        "algorithm": {
+            "name": "naive"
+        },
+        "excludes": [
+            "lm_head",
+            "re:.*kv_b_proj"
+        ],
+        "module_configs": [
+            {
+                "targets": [
+                    "Linear"
+                ],
+                "weight": {
+                    "dtype": "int4",
+                    "axis": -1,
+                    "group_size": 32
+                }
+            }
+        ],
+        "per_quant_opt": null,
+        "kv_cache_quant_algo": null,
+        "flash_comm": null,
+        "promote_trition_scale_precision_gptq_awq": true,
+        "quant_method": "simo"
+    }
+}

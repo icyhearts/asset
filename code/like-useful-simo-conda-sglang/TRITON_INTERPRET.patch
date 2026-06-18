@@ -1,0 +1,181 @@
+diff --git a/simo/ops/kernels/downcast/_downcast_to_mxfmt.py b/simo/ops/kernels/downcast/_downcast_to_mxfmt.py
+index 09efe79..f362818 100644
+--- a/simo/ops/kernels/downcast/_downcast_to_mxfmt.py
++++ b/simo/ops/kernels/downcast/_downcast_to_mxfmt.py
+@@ -247,81 +247,88 @@ def _compute_and_pack_mxfmt(src_tensor,
+         A tuple containing the packed tensor(s) and the scale tensor.
+ 
+     """
+ 
+     BLOCK_SIZE_OUT_DIM: tl.constexpr = src_tensor.shape[0]
+     BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
+     BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = BLOCK_SIZE_QUANT_DIM // MX_BLOCK_SIZE
+ 
+     # Apply Hadamard transform at the beginning if enabled
+     if HADAMARD_TRANSFORM_SIZE:
+         src_tensor = _apply_hadamard_transform_kernel(src_tensor, HADAMARD_TRANSFORM_SIZE)
+ 
+     f32_tensor = src_tensor.to(tl.float32)
+     # --- Start of original _compute_quant_and_scale logic ---
+     f32_tensor = tl.reshape(f32_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, MX_BLOCK_SIZE])
+ 
+     if OBSERVER_MODE == ABS_MAX_OBSERVER_MODE:
+         max_val = tl.max(tl.abs(f32_tensor), axis=2, keep_dims=True)
+     elif OBSERVER_MODE == STD_DEV_OBSERVER_MODE:
+         assert MX_FORMAT_ID == MXFP4_E2M1 or MX_FORMAT_ID == NVFP4_E2M1, (
+             "STD_DEV_OBSERVER_MODE only supports MXFP4_E2M1 / NVFP4_E2M1"
+         )
+         mean = tl.sum(f32_tensor, axis=-1, keep_dims=True) / MX_BLOCK_SIZE
+         centered = f32_tensor - mean
+         std = tl.sqrt(tl.sum(centered * centered, axis=-1, keep_dims=True) / MX_BLOCK_SIZE)
+         # max_val = 2.92247856 * (2.0 / 3.0) * std + 1e-8
+         max_val = 2.92247856 * std + 1e-8
+     elif OBSERVER_MODE == FOUR_OVER_SIX_OBSERVER_MODE:
+         # Scheme 4: max_val * 1.5 makes dequant_scale = max_val * 1.5 / 6 = max_val / 4
+         # Equivalent to reference code's scale_expansion_factor=1.5
+         max_val = tl.max(tl.abs(f32_tensor), axis=2, keep_dims=True)
+         max_val = max_val * 1.5
+     else:
+         tl.static_assert(False, f"Invalid {OBSERVER_MODE=}")
+ 
+ 
+     if QUANT_SCALE_ROUNDING_MODE == E8M0_FLOOR:
+         # QuantScaleRoundingMode.FLOOR
+         # compute 2 ** (floor(log2(max_abs(v)))-max_exp)
+         # This now matches the Python OCPScaleMode implementation.
+-        scale_e8m0_unbiased = tl.log2(max_val).floor() - _get_mx_format_info(MX_FORMAT_ID)[2]
++        log2_val = tl.log2(tl.maximum(max_val, 1e-30))
++        my_floor =  tl.where(
++            log2_val >= 0,
++            log2_val.to(tl.int32),
++            log2_val.to(tl.int32) - 1  # 负数修正
++            ).to(tl.float32)
++        #scale_e8m0_unbiased = tl.log2(safe_max_val).floor() - _get_mx_format_info(MX_FORMAT_ID)[2]
++        scale_e8m0_unbiased = my_floor - _get_mx_format_info(MX_FORMAT_ID)[2]
+         # Clamp the exponent to be within a safe range for float32
+         scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+         quant_scale_rounded = tl.exp2(scale_e8m0_unbiased)
+ 
+         quant_scale_exponent = quant_scale_rounded.to(tl.uint32, bitcast=True)
+     elif QUANT_SCALE_ROUNDING_MODE == E8M0_CEIL:
+         # QuantScaleRoundingMode.CEIL
+         # compute 2 ** ceil(log2(max_abs(v))-max_exp)
+         dequant_scale = max_val / _get_mx_format_info(MX_FORMAT_ID)[0]
+         quant_scale_exponent = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+     elif QUANT_SCALE_ROUNDING_MODE == E8M0_EVEN:
+         # QuantScaleRoundingMode.EVEN
+         # compute 2 ** (floor(log2(rounding(max_abs(v)))-max_exp))
+         # eps =  tl.where(max_val == 0.0, 2**(-126), 0.0)
+         amax_i = max_val.to(tl.int32, bitcast=True)
+         val_to_add = 1 << (23 - _get_mx_format_info(MX_FORMAT_ID)[4] - 1)  # eq torch
+         amax_i = amax_i + val_to_add
+         mask = 0xFF << 23
+         amax_i = amax_i & mask
+         max_val = amax_i.to(tl.float32, bitcast=True)
+ 
+         scale_e8m0_unbiased = tl.log2(max_val).floor() - _get_mx_format_info(MX_FORMAT_ID)[2]  # no eps
+         scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+         quant_scale_rounded = tl.exp2(scale_e8m0_unbiased)
+         quant_scale_exponent = quant_scale_rounded.to(tl.uint32, bitcast=True)
+     elif QUANT_SCALE_ROUNDING_MODE == E8M0_RCEIL:
+         # TODO: Implement RCEIL
+         raise NotImplementedError("RCEIL is not implemented")
+     elif QUANT_SCALE_ROUNDING_MODE == E8M0_SIPU:
+         # QuantScaleRoundingMode.SIPU
+         shared_exp = tl.log2(max_val).floor() - _get_mx_format_info(MX_FORMAT_ID)[2]
+         amax_int = max_val.to(tl.int32, bitcast=True)
+ 
+         bits_vectorized = amax_int >> 19
+         bits_22_21 = (bits_vectorized >> 2) & 3
+         bits_22_20 = (bits_vectorized >> 1) & 7
+         bits_22_19 = bits_vectorized & 15
+         bits_18_0 = amax_int & 0x7FFFF
+ 
+         if MX_FORMAT_ID == MXFP4_E2M1:  # mxfp4_e2m1
+diff --git a/simo/ops/kernels/upcast/_upcast_from_mxfmt.py b/simo/ops/kernels/upcast/_upcast_from_mxfmt.py
+index 3eb52b0..8e6217c 100644
+--- a/simo/ops/kernels/upcast/_upcast_from_mxfmt.py
++++ b/simo/ops/kernels/upcast/_upcast_from_mxfmt.py
+@@ -147,81 +147,81 @@ def _unpack_and_dequant_mxfmt(
+     else:  # MXINT8
+       mx_tensor = mx_tensor.to(tl.int8, bitcast=True)
+     dst_tensor = mx_tensor.to(out_dtype)
+     # This logic is specific to upcasting from E5M2 to a wider format.
+     if MX_FORMAT_ID == MXFP8_E5M2:
+       from_e_bits, from_m_bits = 5, 2
+       to_e_bits = 8 if out_dtype == tl.bfloat16 else 5
+       to_m_bits = 7 if out_dtype == tl.bfloat16 else 10
+       non_finite_mask_src = ((1 << from_e_bits) - 1) << from_m_bits
+       non_finite_mask_dst = ((1 << to_e_bits) - 1) << to_m_bits
+ 
+       # The result of the bitwise OR is promoted to int32. We must cast it back
+       # to uint16 before the final bitcast to the target float type.
+       upcasted_non_finite = dst_tensor.to(tl.uint16, bitcast=True) | non_finite_mask_dst
+       upcasted_non_finite = upcasted_non_finite.to(tl.uint16)
+       upcasted_non_finite = upcasted_non_finite.to(out_dtype, bitcast=True)
+ 
+       dst_tensor = tl.where(
+         (mx_tensor.to(tl.uint8, bitcast=True) & non_finite_mask_src) == non_finite_mask_src,
+         upcasted_non_finite,
+         dst_tensor,
+       )
+ 
+   # --- Dequantize by Applying Scale ---
+   # Upcast the scale to the destination type.
+   if scale.dtype == tl.uint8:
+     if out_dtype == tl.bfloat16:
+       dst_scale = (scale.to(tl.uint16) << 7).to(out_dtype, bitcast=True)
+     else:
+       dst_scale = (scale.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+       dst_scale = dst_scale.to(tl.float16)
+   elif scale.dtype == tl.float8e4nv:
+     dst_scale = scale.to(out_dtype)
+ 
+   # Reshape for proper broadcasting
+   dst_tensor = dst_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, MX_QUANT_DIM])
+   dst_scale = dst_scale.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 1])
+ 
+   # Apply INT scaling adjustments
+   if MX_FORMAT_ID == MXINT8:
+-    dst_scale = dst_scale * 2 ** (-6.0)
++    dst_scale = dst_scale * tl.cast(2 ** (-6.0), dst_scale.dtype) # dst_scale = dst_scale * 2 ** (-6.0)
+   elif MX_FORMAT_ID == MXINT4:
+     dst_scale = dst_scale * 2 ** (-2.0)
+ 
+   # Apply scale and handle NaNs
+   out_tensor = dst_tensor * dst_scale
+   if out_dtype == tl.float32:
+     out_tensor = out_tensor.to(tl.float32)
+   # out_tensor = tl.where(scale == 0xFF, float("nan"), out_tensor)
+   out_tensor = out_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
+ 
+   return out_tensor
+ 
+ 
+ @triton.jit
+ def _upcast_from_mxfmt(
+   # Pointers
+   mx_tensor_ptr,
+   mx_scale_ptr,
+   out_ptr,
+   # Strides
+   stride_tensor_outer,
+   stride_tensor_quant,
+   stride_scale_outer,
+   stride_scale_quant,
+   stride_o_outer,
+   stride_o_quant,
+   # Dimensions
+   outer_dim,
+   quant_dim,
+   # Block Sizes & Config
+   BLOCK_SIZE_OUT_DIM: tl.constexpr,
+   BLOCK_SIZE_QUANT_DIM: tl.constexpr,
+   MX_FORMAT_ID: tl.constexpr,
+   PACK_MODE: tl.constexpr,
+ ):
+   """
+   Launcher kernel for upcasting MX tensor.
+   This kernel is responsible for loading data from memory, calling the pure
+   computation kernel for dequantization, and storing the final result.
+   """

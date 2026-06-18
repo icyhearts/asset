@@ -1,0 +1,7 @@
+simo/extensions/vllm_simo/v1/attention/ops/triton_reshape_and_cache_flash.py
+reshape_and_cache_kernel_flash函数会调用_compute_and_pack_mxfmt, 假设MX_FORMAT_ID= MXINT8, _compute_and_pack_mxfmt返回的packed_key, key_scale分别是什么shape? 什么data type? 
+
+simo/extensions/vllm_simo/v1/attention/ops/triton_unified_attention.py 的 kernel_unified_attention_3d函数，又是如何加载 key和key_scale的？Q和K的矩阵乘法是如何进行的？是使用triton原生的dot_scaled，还是软件反量化K，再把Q和K进行tl.dot矩阵乘法？
+
+
+
