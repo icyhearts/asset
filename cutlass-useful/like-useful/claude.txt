@@ -399,11 +399,15 @@ Swizzle<3,0,3>::apply(offset)
   = 0bmmm(nnn ^ mmm)
   = 8*m + (nnn ^ mmm)
 
-test/unit/cute/core/swizzle_layout_like.cpp  增加了第4个例子:
+cutlass  位于 /data/like/package/cutlass,
+cutlass code base test/unit/cute/core/swizzle_layout_like.cpp  增加了第4个例子:
 ```
   auto sw_layout = composition(Swizzle<3,3,3>{},
                                Layout<Shape <_8, _32>,
                                       Stride<_32, _1>>{});
   test_like_swizzle_2d(sw_layout);
 ```
+运行日志位于 /data/like/package/cutlass/run.log
 对这个例子的 print_tensor 的结果进行解释
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面

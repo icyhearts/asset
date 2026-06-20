@@ -6419,3 +6419,132 @@ cp.async.wait_group / cp.async.wait_all
 补充一点 PTX 语法细节：NVIDIA PTX 文档中 `.cg` 形式的 `cp.async.cg.shared.global` 语法写的是 16B copy，而 `.ca` 形式的 `cp-size` 支持 4、8、16。这个 CUTLASS wrapper 对 `SM80_CP_ASYNC_CACHEGLOBAL` 和 `SM80_CP_ASYNC_CACHEALWAYS` 使用了同一组 `static_assert`，都允许 4、8、16；实际写 `.cg` 时通常应按 16B copy 使用，否则可能在 ptxas 阶段被拒绝。GEMM 主路径里常见的用法也是每线程 16B 向 shared 搬运，配合 `.L2::128B` 让一个 warp 的连续访问更容易形成有效的 L2 预取。
 
 总结：`cp.async.cg.shared.global.L2::128B` 是 Ampere/SM80 以后用于 global-to-shared 软件流水的核心指令形态。`cg` 控制缓存策略，`shared.global` 控制搬运方向，`L2::128B` 是 L2 预取提示，第三个操作数才是本条指令真正拷贝到 shared 的字节数。CUTLASS/CuTe 把它包装成 `SM80_CP_ASYNC_CACHEGLOBAL`，用于 GEMM 主循环中把下一批 global tile 异步搬进 shared memory，从而和当前 tile 的 MMA 计算重叠。
+
+## SwizzleLayout_like 第 4 个例子：Swizzle<3,3,3> + 8x32 row-major
+
+第 4 个例子的代码位置：
+
+- `test/unit/cute/core/swizzle_layout_like.cpp:144 TEST(CuTe_core_like, SwizzleLayout_like)` 构造 `Swizzle<3,3,3>`。
+- `test/unit/cute/core/swizzle_layout_like.cpp:145 TEST(CuTe_core_like, SwizzleLayout_like)` 到 `test/unit/cute/core/swizzle_layout_like.cpp:146 TEST(CuTe_core_like, SwizzleLayout_like)` 使用 `Layout<Shape<_8,_32>, Stride<_32,_1>>`。
+- `test/unit/cute/core/swizzle_layout_like.cpp:147 TEST(CuTe_core_like, SwizzleLayout_like)` 调用 `test_like_swizzle_2d(sw_layout)`。
+
+`print_tensor` 的调用方式没有变。`include/cute/util/print_tensor.hpp:119 print_tensor` 和 `include/cute/util/print_tensor.hpp:120 print_tensor` 对 rank-2 tensor 遍历 `(m,n)`；`include/cute/util/print_tensor.hpp:121 print_tensor` 打印 `tensor(m,n)`。`tensor(m,n)` 最终走到 `include/cute/layout_composed.hpp:118 ComposedLayout::operator()`，也就是：
+
+```text
+layout_a()(offset() + layout_b()(m,n))
+```
+
+这里 `offset()` 是 `_0`，`layout_a()` 是 `Swizzle<3,3,3>`，`layout_b()` 是 `(_8,_32):(_32,_1)`。普通 layout 的坐标映射来自 `include/cute/layout.hpp:167 Layout::operator()` 到 `include/cute/layout.hpp:171 Layout::operator()`，所以：
+
+```text
+layout_b(m,n) = 32*m + n
+```
+
+`Swizzle` 的参数和掩码规则来自 `include/cute/swizzle.hpp:54 Swizzle` 到 `include/cute/swizzle.hpp:69 Swizzle`，真正执行在 `include/cute/swizzle.hpp:76 Swizzle::apply` 到 `include/cute/swizzle.hpp:78 Swizzle::apply`：
+
+```text
+apply(offset) = offset ^ shiftr(offset & yyy_msk, msk_sft)
+```
+
+对 `Swizzle<3,3,3>`：
+
+```text
+BBits = 3
+MBase = 3
+SShift = 3
+
+bit_msk = 0b111
+yyy_msk = 0b111 << (3 + 3) = 0b111000000   // bit[8:6]
+zzz_msk = 0b111 << 3       = 0b000111000   // bit[5:3]
+msk_sft = 3
+```
+
+因此：
+
+```text
+Swizzle<3,3,3>::apply(offset)
+  = offset ^ ((offset & 0b111000000) >> 3)
+```
+
+这个 swizzle 会把 offset 的 bit[8:6] 右移到 bit[5:3]，然后和原来的 bit[5:3] 做 XOR。对于 8x32 row-major：
+
+```text
+offset = 32*m + n
+```
+
+需要注意，`Swizzle<3,3,3>` 不是直接拿行号 `m` 去 XOR 8-column group 编号，而是严格按线性 `offset` 的 bit 段工作。对任意 `(m,n)`，先令：
+
+```text
+offset = 32*m + n
+y = (offset >> 6) & 0b111   // bit[8:6]
+z = (offset >> 3) & 0b111   // bit[5:3]
+r = offset & 0b111          // bit[2:0]
+z' = z xor y
+apply(offset) = (offset & ~0b111000) | (z' << 3)
+```
+
+其中 `r` 表示 8 个连续元素内的位置，保持不变；`z` 表示 8 元素小块编号，会被 `y` 做 XOR；`y` 来自更高的 bit[8:6]，在这个 8x32 row-major layout 中等价于每 64 个元素一组的段号。也就是说，这个 swizzle 的可见效果是：每 64 个元素为一大段，大段内以 8 个连续元素为小块做 XOR 重排，小块内部顺序保持不变。
+
+对照 `run.log`，第 4 个例子的 `print_tensor` 输出为：
+
+```text
+    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28   29   30   31
+   32   33   34   35   36   37   38   39   40   41   42   43   44   45   46   47   48   49   50   51   52   53   54   55   56   57   58   59   60   61   62   63
+   72   73   74   75   76   77   78   79   64   65   66   67   68   69   70   71   88   89   90   91   92   93   94   95   80   81   82   83   84   85   86   87
+  104  105  106  107  108  109  110  111   96   97   98   99  100  101  102  103  120  121  122  123  124  125  126  127  112  113  114  115  116  117  118  119
+  144  145  146  147  148  149  150  151  152  153  154  155  156  157  158  159  128  129  130  131  132  133  134  135  136  137  138  139  140  141  142  143
+  176  177  178  179  180  181  182  183  184  185  186  187  188  189  190  191  160  161  162  163  164  165  166  167  168  169  170  171  172  173  174  175
+  216  217  218  219  220  221  222  223  208  209  210  211  212  213  214  215  200  201  202  203  204  205  206  207  192  193  194  195  196  197  198  199
+  248  249  250  251  252  253  254  255  240  241  242  243  244  245  246  247  232  233  234  235  236  237  238  239  224  225  226  227  228  229  230  231
+```
+
+可以按 8 个数一组看每一行：
+
+```text
+m=0: [  0][  8][ 16][ 24]    // 不变
+m=1: [ 32][ 40][ 48][ 56]    // 不变
+m=2: [ 72][ 64][ 88][ 80]    // 每 16 列内交换 8 列块
+m=3: [104][ 96][120][112]
+m=4: [144][152][128][136]    // 前后 16 列交换
+m=5: [176][184][160][168]
+m=6: [216][208][200][192]    // 4 个 8 列块按 XOR 后顺序排列
+m=7: [248][240][232][224]
+```
+
+这些块起始值都来自上面的 offset 位段公式。用几个点验证：
+
+```text
+m=2, n=0:
+offset = 64,  y = 1, z = 0, r = 0
+z' = 0 xor 1 = 1
+apply = 64 + 8 = 72
+
+m=4, n=0:
+offset = 128, y = 2, z = 0, r = 0
+z' = 0 xor 2 = 2
+apply = 128 + 16 = 144
+
+m=6, n=0:
+offset = 192, y = 3, z = 0, r = 0
+z' = 0 xor 3 = 3
+apply = 192 + 24 = 216
+
+m=7, n=24:
+offset = 248, y = 3, z = 7, r = 0
+z' = 7 xor 3 = 4
+apply = (248 & ~0b111000) | (4 << 3) = 224
+```
+
+最后一个例子展开一下更直观：
+
+```text
+offset 248 = 0b011_111_000
+y = bit[8:6] = 3
+z = bit[5:3] = 7
+r = bit[2:0] = 0
+z' = 7 xor 3 = 4
+result = bit[8:6] 保持 3，bit[5:3] 改成 4，bit[2:0] 保持 0
+       = 0b011_100_000 = 224
+```
+
+所以第 4 个例子的精确规律是按线性 offset 的 bit 段来 XOR：`Swizzle<3,3,3>` 取 bit[8:6] 作为 YYY，右移 3 位后 XOR 到 bit[5:3] 的 ZZZ。对于 `(_8,_32):(_32,_1)`，这等价于每 64 个元素为一大段，段号 `floor(offset/64)` 控制本段内 8 元素小块的重排；组内 8 个连续元素不变。
