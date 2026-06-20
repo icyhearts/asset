@@ -8643,3 +8643,54 @@ decode_replay_summary: count:100, native_fp8_cast_vs_bf16_cos_avg:0.997460899, n
 我又统计了这 100 组逐条 L2：sglang_simo fp8 per-group 比 sglang native fp8 cast 更接近 bf16 的有 91 组，native fp8 cast 更接近 bf16 的有 9 组。
 
 结论：在这次 sglang bf16 decode dump 的前 100 组离线重放中，sglang_simo fp8 per-group 的 `decode_attention_fwd_grouped` 输出 `o` 平均上比 sglang native fp8 cast 更接近 bf16 baseline。因此，至少从这批 decode attention 输入看，`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py` 的 fp8 per-group 读取和 attention 计算本身，不像是导致 gsm8k 分数低于 sglang native fp8 cast 的主因。后续应优先比较 prefill/extend 阶段、lm-eval 实际请求序列中的 logits 差异，或者按“最终答错但 native fp8 答对”的样本做 layer-by-layer 输出对齐。
+
+## 2026-06-20：GPU 上有其他负载时，为什么 lm-eval --model sglang 的 gsm8k 分数会变
+
+结论：`perf_bench` 这类同卡负载不是把 fp8/bf16 的算术格式“降精度”了，而是同时改变了 sglang 启动时看到的可用显存、KV cache token 容量、动态 batching 的请求组合、cuda graph/eager 执行形态和 kernel 竞争环境。gsm8k 的 `exact_match` 是离散指标，哪怕 logits 只在少量 token 上发生微小差异，也可能让最终答案字符串变化，所以会表现为分数下降。
+
+两份日志的关键差异：
+
+- 无其他负载：`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:255` 显示 `#tokens: 122857, KV size: 1.89 GB`；`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:259` 显示 cuda graph capture 前 `avail mem=45.78 GB`；`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:995` 显示 1319 条请求耗时 `01:49`、吞吐 `12.09 it/s`；`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:1000` 得分 `0.6710`。
+- 有其他负载：`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:255` 显示 `#tokens: 43468, KV size: 0.67 GB`；`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:259` 显示 cuda graph capture 前 `avail mem=43.94 GB`；`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:1365` 显示 1319 条请求耗时 `04:53`、吞吐 `4.50 it/s`；`templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:1370` 得分 `0.6429`。
+
+也就是说，有负载时不是只慢了一点，而是 sglang 初始化出的 KV pool 容量从 `122857` token 降到了 `43468` token，约为无负载时的 35.4%。这会直接改变 scheduler 能同时运行多少请求。日志中也能看到这个现象：无负载时开头很快达到 `#running-req: 78/79/80+`，例如 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:289`；有负载时同一阶段只有 `#running-req: 26/27/28+`，例如 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:285`。
+
+代码路径如下：
+
+- `python/sglang/srt/utils/common.py:545 get_available_gpu_memory`：sglang 通过这个函数查询 GPU 可用显存；CUDA 分支最终调用 `torch.cuda.mem_get_info(gpu_id)`，见 `python/sglang/srt/utils/common.py:588 get_available_gpu_memory`。同一张卡上已有其他 CUDA 进程时，这里读到的 free memory 会变小。
+- `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:62 _profile_available_bytes`：模型加载后再次查询可用显存，并按 `mem_fraction_static` 计算可用于静态池的 `rest_memory`，见 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:63 _profile_available_bytes` 到 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:76 _profile_available_bytes`。
+- `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:875 _resolve_memory_pool_config`：把 `_profile_available_bytes` 的结果交给 configurator 计算 pool size，见 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:883 _resolve_memory_pool_config` 到 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:887 _resolve_memory_pool_config`。
+- `python/sglang/srt/model_executor/pool_configurator.py:125 _compute_cell_size`：对 DeepSeek-V2 MLA backend，每 token 的 KV cache cell size 按 `(kv_lora_rank + qk_rope_head_dim) * num_layers * kv_size` 计算，见 `python/sglang/srt/model_executor/pool_configurator.py:134 _compute_cell_size` 到 `python/sglang/srt/model_executor/pool_configurator.py:139 _compute_cell_size`。
+- `python/sglang/srt/model_executor/pool_configurator.py:182 calculate_pool_sizes`：`max_total_num_tokens = available_bytes // self._cell_size`，见 `python/sglang/srt/model_executor/pool_configurator.py:185 calculate_pool_sizes`。所以其他进程占用显存会线性压低 `max_total_num_tokens`。
+- `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:794 _apply_token_constraints`：只有用户显式传了 `max_total_tokens` 才会进一步限制 token 容量，当前命令里 `max_total_tokens=None`，所以两次运行都直接采用 profile 出来的不同容量。
+- `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:823 _resolve_max_num_reqs`：`max_running_requests` 会从 token capacity 推导，见 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:827 _resolve_max_num_reqs` 到 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:835 _resolve_max_num_reqs`。
+- `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:844 _apply_memory_pool_config`：最终把 `config.max_total_num_tokens` 和 `config.max_running_requests` 写入 model runner，见 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:846 _apply_memory_pool_config` 到 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:847 _apply_memory_pool_config`。
+- `python/sglang/srt/mem_cache/memory_pool.py:778 _finalize_allocation_log`：日志里的 `KV Cache is allocated. ... #tokens` 就是在这里打印的，见 `python/sglang/srt/mem_cache/memory_pool.py:792 _finalize_allocation_log` 到 `python/sglang/srt/mem_cache/memory_pool.py:795 _finalize_allocation_log`。
+
+运行阶段，KV pool 容量继续影响动态 batching：
+
+- `python/sglang/srt/managers/scheduler.py:2422 get_num_allocatable_reqs`：scheduler 可继续接纳多少请求取决于 `req_to_token_pool.available_size()`，见 `python/sglang/srt/managers/scheduler.py:2423 get_num_allocatable_reqs` 到 `python/sglang/srt/managers/scheduler.py:2425 get_num_allocatable_reqs`。
+- `python/sglang/srt/managers/scheduler.py:2447 _get_new_batch_prefill_raw`：构造 `PrefillAdder` 时传入 `token_to_kv_pool_allocator`、`max_prefill_tokens`、`max_running_requests` 等约束，见 `python/sglang/srt/managers/scheduler.py:2500 _get_new_batch_prefill_raw` 到 `python/sglang/srt/managers/scheduler.py:2517 _get_new_batch_prefill_raw`。
+- `python/sglang/srt/managers/scheduler.py:2447 _get_new_batch_prefill_raw`：遍历 waiting queue 时，如果 `can_run_list` 达到 `get_num_allocatable_reqs(running_bs)`，就把 running batch 标记为 full，见 `python/sglang/srt/managers/scheduler.py:2537 _get_new_batch_prefill_raw` 到 `python/sglang/srt/managers/scheduler.py:2556 _get_new_batch_prefill_raw`；随后通过 `adder.add_one_req` 决定哪些请求进入本轮 prefill，见 `python/sglang/srt/managers/scheduler.py:2568 _get_new_batch_prefill_raw` 到 `python/sglang/srt/managers/scheduler.py:2586 _get_new_batch_prefill_raw`。
+- `python/sglang/srt/managers/schedule_batch.py:2271 check_decode_mem`：decode 也会根据下一步需要的新 token 数和 `token_to_kv_pool_allocator.available_size()` 判断内存是否足够。
+- `python/sglang/srt/managers/schedule_batch.py:2392 prepare_for_decode`：每轮 decode 会通过 `alloc_for_decode` 分配新的 KV 位置，见 `python/sglang/srt/managers/schedule_batch.py:2442 prepare_for_decode` 到 `python/sglang/srt/managers/schedule_batch.py:2449 prepare_for_decode`。
+- `python/sglang/srt/managers/scheduler_components/metrics_reporter.py:459 report_prefill_stats`：日志里的 prefill `#running-req`、`#queue-req`、`token usage`、`cuda graph`、`input throughput` 来自这里，见 `python/sglang/srt/managers/scheduler_components/metrics_reporter.py:490 report_prefill_stats` 到 `python/sglang/srt/managers/scheduler_components/metrics_reporter.py:517 report_prefill_stats`。
+- `python/sglang/srt/managers/scheduler_components/metrics_reporter.py:598 report_decode_stats`：日志里的 decode `#running-req`、`token usage`、`cuda graph`、`gen throughput`、`#queue-req` 来自这里，见 `python/sglang/srt/managers/scheduler_components/metrics_reporter.py:660 report_decode_stats` 到 `python/sglang/srt/managers/scheduler_components/metrics_reporter.py:702 report_decode_stats`。
+
+外部负载程序本身也说明它会同时抢显存和算力：
+
+- `/softhome/like/asset/code/perf_bench.cu:26 main`：读取 `MEMG` 和 `SLMS`，当前 `MEMG=1, SLMS=5`。
+- `/softhome/like/asset/code/perf_bench.cu:35 main` 到 `/softhome/like/asset/code/perf_bench.cu:38 main`：先分配并 memset 一个约 1GB 的 dummy buffer。
+- `/softhome/like/asset/code/perf_bench.cu:47 main` 到 `/softhome/like/asset/code/perf_bench.cu:58 main`：再分配 `M=N=K=16384` 的 A/B/C 三个 fp16 矩阵，总计约 1.5GiB。
+- `/softhome/like/asset/code/perf_bench.cu:80 main` 到 `/softhome/like/asset/code/perf_bench.cu:99 main`：死循环调用 `cublasGemmEx(... CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)`，每轮同步后 sleep 5ms。这会持续竞争 Tensor Core/SM/HBM 带宽。
+
+因此，这两次 gsm8k 不是“同一批请求、同一 batch 形状、同一 kernel 执行轨迹，只是 GPU 忙不忙”的对比。当前命令使用 `--batch_size auto`，日志摘要也显示 `batch_size: auto`，见 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:997` 和 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:1367`。同时没有显式传 `max_total_tokens` 和 `max_running_requests`，日志 `server_args` 里都是 `max_running_requests=None, max_total_tokens=None`，见 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:22` 和 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:22`。所以有负载时，sglang 自动得到一个更小的 KV pool，并让 scheduler 产生完全不同的动态 batch 组合。
+
+补充一点：日志里 lm-eval 对 gsm8k 使用的是贪心参数 `do_sample=False, temperature=0.0`，见 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_20___10_29_55:278` 和 `templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35:278`。贪心只消除了采样随机性，不保证 GPU 并行归约、不同 batch shape、不同 cuda graph/eager 路径下的 logits 完全 bitwise 一致。`exact_match` 又只看最终答案字符串，少量样本的 token 分叉就会改变总分。这里 `0.6710 - 0.6429 = 0.0281`，约等于 1319 题里多错 37 题，和这种动态 batching + 非 bitwise deterministic 的差异规模是匹配的。
+
+建议验证和规避方式：
+
+1. 做正式 gsm8k 评分时，使用独占 GPU，先用 `nvidia-smi` 确认同卡没有其他 CUDA 进程。
+2. 如果一定要比较“有负载”和“无负载”，先固定 sglang 的运行形态：在两边都显式设置相同的 `max_total_tokens`，例如取有负载时能稳定启动的 `43468` 或更低；同时设置相同的 `max_running_requests`，例如 32 或 48。这样可以把“启动时 KV pool 容量不同”这个变量拿掉。
+3. 进一步做可复现 debug 时，使用 `--batch_size 1`、固定 `random_seed`、固定 lm-eval `--seed`、显式 `--gen_kwargs temperature=0.0,do_sample=false`，并可临时加 `disable_cuda_graph=true, disable_piecewise_cuda_graph=true`，减少 batch shape 和 cuda graph 路径带来的差异。
+4. 为了拆分原因，可以做两组实验：先无负载启动 sglang，等 KV pool 已固定后再启动 `perf_bench`，观察只剩算力/HBM 竞争时分数是否变化；再无负载但显式 `max_total_tokens=43468,max_running_requests=32/48`，观察只缩小 KV pool 时分数是否接近有负载结果。
