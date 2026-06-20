@@ -2184,3 +2184,9 @@ simo code base simo/extensions/sglang_simo/layers/attention/triton_ops/decode_at
 
 写完代码用 sglang conda 环境 运行一下, 分析结果。
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+现在找到sglang_simo  gsm8k 得到低的原因:
+在执行 lm-eval的时候， GPU上有其他进程，会影响 lm-eval 的精度
+同时执行 
+HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=5 SIMO_SGLANG_REGISTER=1 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_fp8_per_group.json\"}", "tp_size": 1, "dtype": "auto",  "attention_backend": "triton_simo", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true }' --tasks gsm8k --batch_size auto > templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.`nowstr.sh` 2>&1 &
+

@@ -6336,3 +6336,86 @@ m=7, (m0,m1,m2)=(1,1,1): 46 42 47 43 60 56 61 57
 ```
 
 因此第三个例子看起来更乱，是因为乱序来自两层：第一层是嵌套 stride 本身已经把 `m,n` 的 bit 分散到了 offset 的 bit5、bit1、bit3、bit2、bit0、bit4；第二层是 `Swizzle<2,1,3>` 又把 bit4/bit5 右移后 XOR 到 bit1/bit2。`print_tensor` 输出的每个数字就是这两层映射叠加后的最终线性 index。
+
+## SM80_CP_ASYNC_CACHEGLOBAL 中的 cp.async.cg.shared.global.L2::128B
+
+`SM80_CP_ASYNC_CACHEGLOBAL` 位于 cute-gemm 仓库的 CUTLASS 子目录：
+
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:72 SM80_CP_ASYNC_CACHEGLOBAL` 的注释写的是 `Copy via cp.async with caching at global level`。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:74 SM80_CP_ASYNC_CACHEGLOBAL` 定义了这个 copy atom。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:79 SM80_CP_ASYNC_CACHEGLOBAL` 要求源元素和目标元素大小相同。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:80 SM80_CP_ASYNC_CACHEGLOBAL` 限制 `sizeof(TS)` 是 4、8、16 字节之一。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:87 SM80_CP_ASYNC_CACHEGLOBAL::copy` 取 global memory 源地址 `gmem_ptr`。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:88 SM80_CP_ASYNC_CACHEGLOBAL::copy` 把 shared memory 目标地址转换成 32-bit shared 地址。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:89 SM80_CP_ASYNC_CACHEGLOBAL::copy` 发出内联 PTX：`cp.async.cg.shared.global.L2::128B [%0], [%1], %2;`。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:90 SM80_CP_ASYNC_CACHEGLOBAL::copy` 到 `3rd/cutlass/include/cute/arch/copy_sm80.hpp:92 SM80_CP_ASYNC_CACHEGLOBAL::copy` 分别把 shared 目标地址、global 源地址、拷贝字节数传给 PTX。
+
+这条 PTX 可以拆成几部分看：
+
+```ptx
+cp.async.cg.shared.global.L2::128B [dst_smem], [src_gmem], cp_size;
+```
+
+含义是：由当前线程发起一条从 global memory 到 shared memory 的异步拷贝。它不先把数据 load 到普通寄存器再 store 到 shared memory，而是使用硬件异步 copy 路径把 global 数据搬到 shared。线程发出指令后可以继续执行后续指令；要等数据真正可用，需要后续的 commit/wait 同步。
+
+各字段解释：
+
+- `cp.async`：异步 copy 指令。官方 PTX 语义是发起 non-blocking copy，从 `src` 指定的 global 地址复制到 `dst` 指定的 shared 地址。
+- `.cg`：cache global。这里表示只在 global/L2 层面缓存，通常理解为绕过 L1、使用 L2。这和 `3rd/cutlass/include/cute/arch/copy_sm80.hpp:62 SM80_CP_ASYNC_CACHEALWAYS::copy` 里的 `.ca` 不同；`.ca` 是 cache always，也就是 cache at all levels。
+- `.shared.global`：目标 state space 是 shared，源 state space 是 global。顺序是 `dst.src`，所以不是 shared 到 global。
+- `.L2::128B`：L2 prefetch size hint，提示硬件向 L2 额外预取 128B 粒度的数据。它是 cache hint / prefetch hint，不改变程序语义。
+- `[dst_smem]`：shared memory 目标地址。CUTLASS 用 `3rd/cutlass/include/cute/arch/util.hpp:94 cast_smem_ptr_to_uint` 把 C++ shared 指针转换成 PTX shared-memory instruction 需要的 32-bit 地址；`3rd/cutlass/include/cute/arch/util.hpp:100 cast_smem_ptr_to_uint` 到 `3rd/cutlass/include/cute/arch/util.hpp:102 cast_smem_ptr_to_uint` 的注释也说明这是为了传给 shared memory instructions。
+- `[src_gmem]`：global memory 源地址，内联 asm 里用 `"l"(gmem_ptr)` 传入 64-bit 地址。
+- `cp_size`：本条指令实际写入 shared memory 的字节数。CUTLASS 这里用 `"n"(sizeof(TS))` 传入编译期立即数。
+
+最容易误解的是 `.L2::128B`。它不表示这条指令会复制 128B 到 shared memory。真正复制到 shared 的字节数是第三个操作数 `%2`，也就是 `3rd/cutlass/include/cute/arch/copy_sm80.hpp:92 SM80_CP_ASYNC_CACHEGLOBAL::copy` 的 `sizeof(TS)`。例如 `TS` 是 16B 类型时，本线程本条 `cp.async` 只把 16B 写入 shared；`.L2::128B` 只是提示 L2 预取 128B，方便相邻线程或后续访问命中 L2。
+
+`SM80_CP_ASYNC_CACHEGLOBAL` 的执行流程可以写成：
+
+```cpp
+TS const* gmem_ptr    = &gmem_src;
+uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_dst);
+asm volatile(
+  "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+  :: "r"(smem_int_ptr), "l"(gmem_ptr), "n"(sizeof(TS)));
+```
+
+也就是：
+
+1. C++ 层拿到 global 源对象地址。
+2. C++ 层把 shared 目标对象地址转成 PTX shared 地址。
+3. 发出一条 `cp.async.cg.shared.global.L2::128B`。
+4. 当前线程继续执行；这条 copy 后续由异步 copy 机制完成。
+
+同步机制在同一个文件后面：
+
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:164 cp_async_fence` 包装 `cp.async.commit_group`。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:167 cp_async_fence` 提交当前线程此前发出的、尚未提交的 `cp.async` 到一个 async group。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:177 cp_async_wait` 包装等待。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:181 cp_async_wait` 在 `N == 0` 时发出 `cp.async.wait_all`。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:183 cp_async_wait` 在 `N != 0` 时发出 `cp.async.wait_group N`。
+
+所以正确使用时，一般不是发一条 `cp.async` 后马上读 shared，而是：
+
+```text
+发出若干 cp.async
+cp.async.commit_group
+做一些独立计算或继续发下一 stage 的 cp.async
+cp.async.wait_group / cp.async.wait_all
+必要时做 CTA/warp 同步
+再读取 shared memory
+```
+
+注意 `cp.async.wait_group` / `wait_all` 只等待当前线程发出的 async copy group 完成。若 shared memory 中的数据会被其它线程读取，还需要结合算法里的 CTA barrier、warp 同步或 CUTLASS pipeline/barrier 机制，保证跨线程可见性和使用顺序。
+
+和 `_ZFILL` 版本的关系：
+
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:131 SM80_CP_ASYNC_CACHEGLOBAL_ZFILL` 是带 predicate 的版本。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:147 SM80_CP_ASYNC_CACHEGLOBAL_ZFILL::copy` 根据 `pred` 计算 `src_size`。
+- `3rd/cutlass/include/cute/arch/copy_sm80.hpp:148 SM80_CP_ASYNC_CACHEGLOBAL_ZFILL::copy` 发出四操作数形式：`cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;`。
+
+四操作数形式里的第四个操作数是 `src-size`。当边界 predicate 为 false 时，CUTLASS 传 0；语义上就是本条 copy 的有效源字节数为 0，目标 shared 中本应拷贝的剩余部分由硬件做 zero-fill。这常用于 GEMM tile 边界：越界的 global load 不真的访问 global memory，但 shared tile 中对应位置补 0。
+
+补充一点 PTX 语法细节：NVIDIA PTX 文档中 `.cg` 形式的 `cp.async.cg.shared.global` 语法写的是 16B copy，而 `.ca` 形式的 `cp-size` 支持 4、8、16。这个 CUTLASS wrapper 对 `SM80_CP_ASYNC_CACHEGLOBAL` 和 `SM80_CP_ASYNC_CACHEALWAYS` 使用了同一组 `static_assert`，都允许 4、8、16；实际写 `.cg` 时通常应按 16B copy 使用，否则可能在 ptxas 阶段被拒绝。GEMM 主路径里常见的用法也是每线程 16B 向 shared 搬运，配合 `.L2::128B` 让一个 warp 的连续访问更容易形成有效的 L2 预取。
+
+总结：`cp.async.cg.shared.global.L2::128B` 是 Ampere/SM80 以后用于 global-to-shared 软件流水的核心指令形态。`cg` 控制缓存策略，`shared.global` 控制搬运方向，`L2::128B` 是 L2 预取提示，第三个操作数才是本条指令真正拷贝到 shared 的字节数。CUTLASS/CuTe 把它包装成 `SM80_CP_ASYNC_CACHEGLOBAL`，用于 GEMM 主循环中把下一批 global tile 异步搬进 shared memory，从而和当前 tile 的 MMA 计算重叠。
