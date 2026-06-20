@@ -13,3 +13,9 @@ cutlass作为一个通用矩阵乘法库，应该有能力处理任意形状的�
 /data/like/package/cute-gemm/gemm-simple-like.cu 90行 传给  make_tiled_mma permutations参数= make_layout(Shape<_1, _2, _1>{}),  (1,2,1) 作为  permutations参数是否有实际作用？是否会影响 TiledMMA 能处理的 矩阵乘法的形状？
 mma_op 本身用的是SM80_16x8x16_F16F16F16F16_TN, 能处理 16x8x16, 加上 89 行的make_layout(Shape<_2, _2, _1>{})作为make_tiled_mma 的MMAThrLayout参数，已经让 TiledMMA 的能力扩展到了 32x16x16, 90行的make_layout(Shape<_1, _2, _1>{}))起到了什么作用？
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
+
+
+cute-gemm 仓库位于 /data/like/package/cute-gemm
+cute-gemm code base 3rd/cutlass/include/cute/arch/copy_sm80.hpp SM80_CP_ASYNC_CACHEGLOBAL 使用了cp.async.cg.shared.global.L2::128B, 对 cp.async.cg.shared.global.L2::128B 进行讲解
+
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
