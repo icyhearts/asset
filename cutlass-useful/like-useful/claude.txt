@@ -398,3 +398,12 @@ Swizzle<3,0,3>::apply(offset)
   = 0bmmmnnn ^ (0b000mmm)
   = 0bmmm(nnn ^ mmm)
   = 8*m + (nnn ^ mmm)
+
+test/unit/cute/core/swizzle_layout_like.cpp  增加了第4个例子:
+```
+  auto sw_layout = composition(Swizzle<3,3,3>{},
+                               Layout<Shape <_8, _32>,
+                                      Stride<_32, _1>>{});
+  test_like_swizzle_2d(sw_layout);
+```
+对这个例子的 print_tensor 的结果进行解释
