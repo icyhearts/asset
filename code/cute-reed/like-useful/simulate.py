@@ -34,6 +34,8 @@ for m in range(4):
     line = ""
     for n in range(8):
             offset = m ^  n
-            swizzle = offset
+            swizzle = m * 8 + offset
             line += f"{swizzle:3d} "
+            if (n+1) % 4 == 0:
+                line += f"\n"
     print(line)
