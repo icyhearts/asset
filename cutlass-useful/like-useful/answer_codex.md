@@ -6548,3 +6548,157 @@ result = bit[8:6] 保持 3，bit[5:3] 改成 4，bit[2:0] 保持 0
 ```
 
 所以第 4 个例子的精确规律是按线性 offset 的 bit 段来 XOR：`Swizzle<3,3,3>` 取 bit[8:6] 作为 YYY，右移 3 位后 XOR 到 bit[5:3] 的 ZZZ。对于 `(_8,_32):(_32,_1)`，这等价于每 64 个元素为一大段，段号 `floor(offset/64)` 控制本段内 8 元素小块的重排；组内 8 个连续元素不变。
+
+## gemm-multi-stage-like.cu 中 SmemLayoutA 类型如何由 tile_to_shape 得到
+
+问题代码在 cute-gemm 仓库的 `gemm-multi-stage-like.cu`：
+
+- `gemm-multi-stage-like.cu:219 GemmConfig` 定义模板参数，默认 `kTileM=128`、`kTileN=128`、`kTileK=32`。
+- `gemm-multi-stage-like.cu:220 GemmConfig` 默认 `kStage=5`，但实际使用处 `gemm-multi-stage-like.cu:389 launch` 实例化的是 `config::GemmConfig<T, 128, 128, 32, 3>`，所以这里的 `kStage=3`。
+- `gemm-multi-stage-like.cu:232 GemmConfig` 到 `gemm-multi-stage-like.cu:234 GemmConfig` 定义 shared memory swizzle 参数 `B=3, M=3, S=3`。
+- `gemm-multi-stage-like.cu:236 GemmConfig` 到 `gemm-multi-stage-like.cu:239 GemmConfig` 定义 `SmemLayoutAtom`。
+- `gemm-multi-stage-like.cu:240 GemmConfig` 到 `gemm-multi-stage-like.cu:242 GemmConfig` 用 `tile_to_shape(SmemLayoutAtom{}, make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{}))` 得到 `SmemLayoutA`。
+- `gemm-multi-stage-like.cu:411 launch` 到 `gemm-multi-stage-like.cu:417 launch` 的注释写出了期望类型：`ComposedLayout<Swizzle<3,3,3>, _0, Layout<Shape<_128,_32,_3>, Stride<_32,_1,_4096>>>`。
+
+先看 `SmemLayoutAtom`。源码是：
+
+```cpp
+using SmemLayoutAtom = decltype(composition(
+    Swizzle<kShmLoadSwizzleB, kShmLoadSwizzleM, kShmLoadSwizzleS>{},
+    make_layout(make_shape(Int<8>{}, Int<kTileK>{}),
+                make_stride(Int<kTileK>{}, Int<1>{}))));
+```
+
+代入本实例参数 `kTileK=32`、`kShmLoadSwizzleB=3`、`kShmLoadSwizzleM=3`、`kShmLoadSwizzleS=3`：
+
+```text
+SmemLayoutAtom
+= decltype(composition(
+    Swizzle<3,3,3>{},
+    Layout<Shape<_8,_32>, Stride<_32,_1>>{}))
+```
+
+`composition(Swizzle, Layout)` 的调用链路是：
+
+1. `gemm-multi-stage-like.cu:236 GemmConfig` 到 `gemm-multi-stage-like.cu:239 GemmConfig` 调用 `composition(Swizzle<3,3,3>{}, Layout<Shape<_8,_32>,Stride<_32,_1>>{})`。
+2. `3rd/cutlass/include/cute/swizzle_layout.hpp:314 composition` 匹配 `composition(Swizzle<B,M,S>, Layout<Shape,Stride>)`。
+3. `3rd/cutlass/include/cute/swizzle_layout.hpp:317 composition` 把它改写成 `composition(sxor, Int<0>{}, layout)`。
+4. `3rd/cutlass/include/cute/layout_composed.hpp:353 composition` 到 `3rd/cutlass/include/cute/layout_composed.hpp:357 composition` 构造 `ComposedLayout<LayoutA, Offset, LayoutB>`。
+
+所以：
+
+```text
+SmemLayoutAtom
+= ComposedLayout<
+    Swizzle<3,3,3>,
+    _0,
+    Layout<Shape<_8,_32>, Stride<_32,_1>>
+  >
+```
+
+我用同样的类型在本地编译打印验证过，`print(SmemLayoutAtom{})` 输出：
+
+```text
+Sw<3,3,3> o _0 o (_8,_32):(_32,_1)
+```
+
+接着看 `SmemLayoutA`：
+
+```cpp
+using SmemLayoutA = decltype(
+    tile_to_shape(SmemLayoutAtom{},
+                  make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
+```
+
+代入 `kTileM=128`、`kTileK=32`、`kStage=3`：
+
+```text
+SmemLayoutA
+= decltype(tile_to_shape(
+    ComposedLayout<Swizzle<3,3,3>, _0, Layout<Shape<_8,_32>,Stride<_32,_1>>>{},
+    Shape<_128,_32,_3>{}))
+```
+
+`tile_to_shape` 的调用链路如下：
+
+1. `gemm-multi-stage-like.cu:240 GemmConfig` 到 `gemm-multi-stage-like.cu:242 GemmConfig` 调用 `tile_to_shape(SmemLayoutAtom{}, Shape<_128,_32,_3>{})`。
+2. 因为 `SmemLayoutAtom` 是 `ComposedLayout`，匹配 `3rd/cutlass/include/cute/layout_composed.hpp:538 tile_to_shape`。
+3. `3rd/cutlass/include/cute/layout_composed.hpp:542 tile_to_shape` 保留 `layout.layout_a()` 和 `layout.offset()`，只对内部 `layout.layout_b()` 递归调用 `tile_to_shape`：
+
+```cpp
+return composition(layout.layout_a(),
+                   layout.offset(),
+                   tile_to_shape(layout.layout_b(), trg_shape, ord_shape));
+```
+
+因此关键变成：
+
+```text
+tile_to_shape(Layout<Shape<_8,_32>,Stride<_32,_1>>{},
+              Shape<_128,_32,_3>{})
+```
+
+普通 `Layout` 版本的调用链路是：
+
+1. `3rd/cutlass/include/cute/layout.hpp:1558 tile_to_shape` 匹配 `Layout<Shape,Stride>` 版本。
+2. `3rd/cutlass/include/cute/layout.hpp:1562 tile_to_shape` 检查 `rank(block) <= rank(trg_shape)`。这里 block 是 rank-2，target 是 rank-3，满足。
+3. `3rd/cutlass/include/cute/layout.hpp:1565 tile_to_shape` 做 `padded_block = append<R>(block)`，这里 `R=3`。
+4. `3rd/cutlass/include/cute/layout.hpp:1567 tile_to_shape` 计算 `block_shape = product_each(shape(padded_block))`。
+5. `3rd/cutlass/include/cute/layout.hpp:1568 tile_to_shape` 计算 `target_shape = product_each(shape(trg_shape))`。
+6. `3rd/cutlass/include/cute/layout.hpp:1576 tile_to_shape` 计算 `product_shape = ceil_div(target_shape, block_shape)`。
+7. `3rd/cutlass/include/cute/layout.hpp:1578 tile_to_shape` 返回 `coalesce(blocked_product(padded_block, make_ordered_layout(product_shape, ord_shape)), product_shape)`。
+
+把具体值代进去：
+
+```text
+block       = (_8,_32):(_32,_1)
+trg_shape   = (_128,_32,_3)
+R           = 3
+padded_block= (_8,_32,_1):(_32,_1,_0)
+block_shape = (_8,_32,_1)
+target_shape= (_128,_32,_3)
+product_shape = ceil_div((_128,_32,_3), (_8,_32,_1))
+              = (_16,_1,_3)
+```
+
+`product_shape=(_16,_1,_3)` 的意思是：原始 `8x32` atom 需要在 M 维重复 16 次，在 K 维重复 1 次，在 stage 维重复 3 次，才能覆盖目标 `(128,32,3)`。
+
+`blocked_product` 的语义来自 `3rd/cutlass/include/cute/layout.hpp:1514 blocked_product` 到 `3rd/cutlass/include/cute/layout.hpp:1521 blocked_product`：把 block layout 按 tiler 重复，并把 block 内部维度放在外层结构的前面。这里的 block 是 `(_8,_32,_1):(_32,_1,_0)`，tiler 是 `make_ordered_layout((_16,_1,_3), LayoutLeft{})`。默认 `ModeOrder` 是 `LayoutLeft`，这个默认来自 `3rd/cutlass/include/cute/layout.hpp:1555 tile_to_shape`；`LayoutLeft`/`GenColMajor` 对应 col-major 生成顺序，见 `3rd/cutlass/include/cute/stride.hpp:359 LayoutLeft` 到 `3rd/cutlass/include/cute/stride.hpp:361 LayoutLeft`。
+
+最后 `coalesce(..., product_shape)` 会把重复后的结构折叠成和目标 shape 兼容的 3D layout。结果的普通 layout 是：
+
+```text
+Layout<Shape<_128,_32,_3>, Stride<_32,_1,_4096>>
+```
+
+其中：
+
+```text
+stride_M     = 32
+stride_K     = 1
+stride_stage = 128 * 32 = 4096
+```
+
+这很符合 shared memory staging 的直觉：每个 stage 存一个完整的 A tile，A tile 大小是 `kTileM * kTileK = 128 * 32 = 4096` 个元素，所以 stage 维 stride 是 4096。
+
+因为 `ComposedLayout` 版本的 `tile_to_shape` 只改变内部普通 layout，不改变外层 swizzle 和 offset，所以最终：
+
+```text
+SmemLayoutA
+= ComposedLayout<
+    Swizzle<3,3,3>,
+    _0,
+    Layout<
+      Shape<_128,_32,_3>,
+      Stride<_32,_1,_4096>
+    >
+  >
+```
+
+也就是 `gemm-multi-stage-like.cu:411 launch` 到 `gemm-multi-stage-like.cu:417 launch` 注释里的类型。打印验证结果也是：
+
+```text
+Sw<3,3,3> o _0 o (_128,_32,_3):(_32,_1,_4096)
+```
+
+总结：`SmemLayoutA` 的类型不是手写出来的，而是两步推导出来的。第一步，`SmemLayoutAtom` 用 `composition(Swizzle<3,3,3>, Layout<_8,_32>)` 得到一个带 swizzle 的 8x32 atom；第二步，`tile_to_shape` 对这个 `ComposedLayout` 的内部 `Layout<_8,_32>` 做平铺，把它扩展到目标 shape `(128,32,3)`，得到普通 layout `(_128,_32,_3):(_32,_1,_4096)`，再把原来的 `Swizzle<3,3,3> o _0` 套回去。
