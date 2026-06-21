@@ -30,3 +30,18 @@ cute-gemm code base gemm-multi-stage-like.cu 411~417行注释，gemm_config_type
 ```
 把 tile_to_shape 的调用链路整理出来
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
+
+
+
+cute-gemm 仓库位于 /data/like/package/cute-gemm
+cute-gemm code base gemm-multi-stage-like.cu 运行日志位于
+cute-gemm code base run.gemm-multi-stage-like.log
+gemm-multi-stage-like.cu 433行print(g2s_copy_atom_ins);
+```
+  ValLayoutSrc: (_1,_8):(_0,_1)
+```
+从 gemm-multi-stage-like.cu 424 print(g2s_copy_traits_SrcLayout) 结果看,
+gemm_config_type::g2s_copy_traits::SrcLayout的类型是 (_1,_128):(_0,_1)
+Copy_Traits<g2s_copy_op> 的 SrcLayout (_1,_128):(_0,_1) 是如何变成 Copy_Atom<g2s_copy_traits, T>的 ValLayoutSrc (_1,_8):(_0,_1)?
+Copy_Traits 里面有 using ValLayoutSrc = decltype(recast_layout<uint1_t, ValType>(BitLayoutSrc{})), 对这一行代码进行讲解.
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md

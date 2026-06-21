@@ -6702,3 +6702,132 @@ Sw<3,3,3> o _0 o (_128,_32,_3):(_32,_1,_4096)
 ```
 
 总结：`SmemLayoutA` 的类型不是手写出来的，而是两步推导出来的。第一步，`SmemLayoutAtom` 用 `composition(Swizzle<3,3,3>, Layout<_8,_32>)` 得到一个带 swizzle 的 8x32 atom；第二步，`tile_to_shape` 对这个 `ComposedLayout` 的内部 `Layout<_8,_32>` 做平铺，把它扩展到目标 shape `(128,32,3)`，得到普通 layout `(_128,_32,_3):(_32,_1,_4096)`，再把原来的 `Swizzle<3,3,3> o _0` 套回去。
+
+## Copy_Traits 的 SrcLayout 为什么变成 Copy_Atom 的 ValLayoutSrc
+
+日志中的现象是：
+
+```text
+gemm_config_type::g2s_copy_traits::SrcLayout
+(_1,_128):(_0,_1)
+
+Copy_Atom
+  ValLayoutSrc: (_1,_8):(_0,_1)
+  ValueType:    16b
+```
+
+对应源码位置：
+
+- `gemm-multi-stage-like.cu:267 GemmConfig` 定义 `g2s_copy_op = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>`。
+- `gemm-multi-stage-like.cu:268 GemmConfig` 定义 `g2s_copy_traits = Copy_Traits<g2s_copy_op>`。
+- `gemm-multi-stage-like.cu:269 GemmConfig` 定义 `g2s_copy_atom = Copy_Atom<g2s_copy_traits, T>`。
+- `gemm-multi-stage-like.cu:422 launch` 到 `gemm-multi-stage-like.cu:424 launch` 打印 `g2s_copy_traits::SrcLayout`。
+- `gemm-multi-stage-like.cu:431 launch` 到 `gemm-multi-stage-like.cu:433 launch` 打印 `g2s_copy_atom`。
+
+先看 `Copy_Traits<g2s_copy_op>` 为什么是 `(_1,_128):(_0,_1)`。
+
+`g2s_copy_op` 是 `SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>`，所以匹配 `3rd/cutlass/include/cute/atom/copy_traits_sm80.hpp:64 Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL<S,D>>`。这里 `S = cute::uint128_t`，默认 `D = S`。
+
+在这个 specialization 中：
+
+- `3rd/cutlass/include/cute/atom/copy_traits_sm80.hpp:67 Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL<S,D>>` 定义 `ThrID = Layout<_1>`，表示这个 copy atom 只有 1 个逻辑线程。
+- `3rd/cutlass/include/cute/atom/copy_traits_sm80.hpp:70 Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL<S,D>>` 定义 `SrcLayout = Layout<Shape<_1, Int<sizeof_bits<S>::value>>>`。
+- `3rd/cutlass/include/cute/atom/copy_traits_sm80.hpp:72 Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL<S,D>>` 同理定义 `DstLayout`。
+
+因为 `S = cute::uint128_t`，所以：
+
+```text
+sizeof_bits<S>::value = 128
+SrcLayout = Layout<Shape<_1,_128>>
+```
+
+默认 stride 是 compact col-major。对 shape `(_1,_128)`，打印出来就是：
+
+```text
+(_1,_128):(_0,_1)
+```
+
+这里的重点是：`Copy_Traits::SrcLayout` 是 bit layout。注释也说明了这一点：`3rd/cutlass/include/cute/atom/copy_traits.hpp:45 Copy_Traits` 把 `SrcLayout` 描述为 `(Logical src thread id, Logical src value id) -> bit`。也就是说，第二维 `_128` 不是 128 个 `T` 元素，而是 128 个 bit。
+
+接着看 `Copy_Atom<g2s_copy_traits, T>` 为什么打印 `ValLayoutSrc: (_1,_8):(_0,_1)`。
+
+`Copy_Atom` 的定义在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:55 Copy_Atom<Copy_Traits<Args...>, CopyInternalType>`。它继承 `Copy_Traits`，但又把 bit layout 转成 value layout：
+
+- `3rd/cutlass/include/cute/atom/copy_atom.hpp:62 Copy_Atom<Copy_Traits<Args...>, CopyInternalType>` 定义 `BitLayoutSrc = typename Traits::SrcLayout`。
+- `3rd/cutlass/include/cute/atom/copy_atom.hpp:66 Copy_Atom<Copy_Traits<Args...>, CopyInternalType>` 定义 `ValType = CopyInternalType`。
+- `3rd/cutlass/include/cute/atom/copy_atom.hpp:68 Copy_Atom<Copy_Traits<Args...>, CopyInternalType>` 定义：
+
+```cpp
+using ValLayoutSrc = decltype(recast_layout<uint1_t, ValType>(BitLayoutSrc{}));
+```
+
+这行的含义是：把 `BitLayoutSrc` 从“以 1-bit 为元素单位”的 layout，重解释为“以 `ValType` 为元素单位”的 layout。这里 `ValType` 就是 `Copy_Atom<g2s_copy_traits, T>` 里的 `T`。从运行日志 `ValueType: 16b` 可以看出，本次 `T` 是 16-bit 类型，也就是 half 类的元素。
+
+因此：
+
+```text
+OldType = uint1_t        // 1 bit
+NewType = ValType = T    // 16 bit
+BitLayoutSrc = (_1,_128):(_0,_1)
+```
+
+`recast_layout` 的普通 `Layout` 版本在 `3rd/cutlass/include/cute/layout.hpp:1653 recast_layout`。它先在 `3rd/cutlass/include/cute/layout.hpp:1655 recast_layout` 计算：
+
+```cpp
+using scale = decltype(trait_ratio(sizeof_bits<NewType>{}, sizeof_bits<OldType>{}));
+```
+
+`trait_ratio` 的实现见 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:241 trait_ratio` 到 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:242 trait_ratio`，这里得到：
+
+```text
+scale = sizeof_bits<ValType> / sizeof_bits<uint1_t>
+      = 16 / 1
+```
+
+因为 `scale::den == 1`，所以走 `3rd/cutlass/include/cute/layout.hpp:1662 recast_layout` 到 `3rd/cutlass/include/cute/layout.hpp:1663 recast_layout`：
+
+```cpp
+return upcast<scale::num>(layout);
+```
+
+也就是：
+
+```text
+recast_layout<uint1_t, T>((_1,_128):(_0,_1))
+= upcast<16>((_1,_128):(_0,_1))
+```
+
+`upcast` 的语义写在 `3rd/cutlass/include/cute/layout.hpp:1582 upcast` 到 `3rd/cutlass/include/cute/layout.hpp:1584 upcast` 的注释中：对于 stride-1 mode，把 size 除以 `N`；其它 stride 除以 `N`。具体实现是 `3rd/cutlass/include/cute/layout.hpp:1589 upcast` 到 `3rd/cutlass/include/cute/layout.hpp:1601 upcast`。
+
+对 `(_1,_128):(_0,_1)` 来说：
+
+```text
+mode0: shape=1,   stride=0
+mode1: shape=128, stride=1
+```
+
+`mode1` 是连续 bit mode，stride 是 1。`upcast<16>` 把 16 个连续 bit 合成 1 个 16-bit value，所以：
+
+```text
+shape mode1: 128 / 16 = 8
+stride mode1: 1
+```
+
+`mode0` 是 thread mode，stride 为 0，保持 1 个逻辑线程。因此：
+
+```text
+ValLayoutSrc = (_1,_8):(_0,_1)
+```
+
+这正是 `gemm-multi-stage-like.cu:433 launch` 打印 `g2s_copy_atom_ins` 时看到的：
+
+```text
+Copy_Atom
+  ThrID:        _1:_0
+  ValLayoutSrc: (_1,_8):(_0,_1)
+  ValLayoutDst: (_1,_8):(_0,_1)
+  ValLayoutRef: (_1,_8):(_0,_1)
+  ValueType:    16b
+```
+
+一句话总结：`Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>>::SrcLayout` 描述的是 cp.async 这条指令一次搬 128 bit 的 bit 级布局，所以是 `(_1,_128):(_0,_1)`；`Copy_Atom<g2s_copy_traits, T>` 需要知道以用户元素类型 `T` 来看一次 copy 有多少个 value，于是用 `recast_layout<uint1_t, ValType>` 把 128 个 1-bit 单位重解释成 8 个 16-bit value，得到 `ValLayoutSrc = (_1,_8):(_0,_1)`。
