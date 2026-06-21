@@ -19,3 +19,14 @@ cute-gemm 仓库位于 /data/like/package/cute-gemm
 cute-gemm code base 3rd/cutlass/include/cute/arch/copy_sm80.hpp SM80_CP_ASYNC_CACHEGLOBAL 使用了cp.async.cg.shared.global.L2::128B, 对 cp.async.cg.shared.global.L2::128B 进行讲解
 
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
+
+
+cute-gemm 仓库位于 /data/like/package/cute-gemm
+cute-gemm code base gemm-multi-stage-like.cu 411~417行注释，gemm_config_type::SmemLayoutA的类型，分析这个类型是如何得到的？
+240 行显示```
+  using SmemLayoutA = decltype(
+      tile_to_shape(SmemLayoutAtom{},
+                    make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
+```
+把 tile_to_shape 的调用链路整理出来
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
