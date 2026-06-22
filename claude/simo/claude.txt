@@ -2218,3 +2218,8 @@ sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境�
 如果 decoder 的结构不同， 则需要每种结构都至少保留一个decoder.
 要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
 2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+
+deepseek v3.2 模型位于 /data_gpu/modelzoo/weights/llm/deepseek/DeepSeekV3.2/DeepSeek-V3.2/safetensor_weights/
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+deepseek v3.2 的权重是 fp8数据类型，sglang 推理 不指定kv cache数据类型时，kv cache 是什么数据类型的？
