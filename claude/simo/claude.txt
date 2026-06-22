@@ -2227,4 +2227,15 @@ deepseek v3.2 的权重是 fp8数据类型，sglang 推理 不指定kv cache数�
 要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
 2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
 
-DeepSeek-V3.2 的一个副本位于 /share/users/like/package/hf-models/DeepSeek-V3.2/
+
+
+deepseek-v4-flash 模型位于 /share/users/like/package/hf-models/deepseek-v4-flash
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+8张H100 80GB的 GPU不能放下 deepseek-v4-flash 所有的权重。 deepseek-v4-flash 的整个模型是由多个 decoder 组成的，所有的decoder 结构完全相同吗？
+出于学习模型的结构的目的，不考虑模型完整性，有没有办法减少 decoder 的数量，让8张H100 80GB的 GPU能够使用 sglang 推理？
+如果 decoder 的结构不同， 则需要每种结构都至少保留一个decoder.
+
+sglang 推理 不指定kv cache数据类型时， 使用 trition attention backend, deepseek-v4-flash  kv cache 是什么数据类型的？
+
+要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
+2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
