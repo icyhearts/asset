@@ -2226,3 +2226,5 @@ deepseek v3.2 的权重是 fp8数据类型，sglang 推理 不指定kv cache数�
 
 要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
 2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+DeepSeek-V3.2 的一个副本位于 /share/users/like/package/hf-models/DeepSeek-V3.2/
