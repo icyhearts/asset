@@ -2198,3 +2198,14 @@ templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_
 templ/lm-eval-gsm8k-dsv2-quant_config_kvquant_fp8_per_group.json.log.gpu-5.2026_06_19___16_50_35 是有其他负载的日志, 负载运行的代码是 /softhome/like/asset/code/perf_bench.cu /softhome/like/asset/code/perf_bench.cu编译的二进制位于/share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench, 负载的命令是:  CUDA_VISIBLE_DEVICES=5 SLMS=5 MEMG=1 /share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench &
 分析有其他负载和没有其他负载的日志，为什么有没有负载会影响 lm-eval --model sglang 的 gsm8k 得分?
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+
+simo 代码位于 /data/like/package/simo_conda_sglang
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+tp = 2的测试lm-eval命令如下:
+MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ DEBUG_add_bos_token=true HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=2,3 DEBUG_LOG_LEVEL=info DEBUG_ID=2  TP_SIZE=2  TASKS=gsm8k bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh  > templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.`nowstr.sh` 2>&1 &
+
+日志位于
+templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05
+日志中有 CUDA out of memory,  lm-eval已经传了参数 "mem_fraction_static": 0.3,, 为什么还是会oom?如何解决?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面

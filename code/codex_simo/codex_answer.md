@@ -8694,3 +8694,88 @@ decode_replay_summary: count:100, native_fp8_cast_vs_bf16_cos_avg:0.997460899, n
 2. 如果一定要比较“有负载”和“无负载”，先固定 sglang 的运行形态：在两边都显式设置相同的 `max_total_tokens`，例如取有负载时能稳定启动的 `43468` 或更低；同时设置相同的 `max_running_requests`，例如 32 或 48。这样可以把“启动时 KV pool 容量不同”这个变量拿掉。
 3. 进一步做可复现 debug 时，使用 `--batch_size 1`、固定 `random_seed`、固定 lm-eval `--seed`、显式 `--gen_kwargs temperature=0.0,do_sample=false`，并可临时加 `disable_cuda_graph=true, disable_piecewise_cuda_graph=true`，减少 batch shape 和 cuda graph 路径带来的差异。
 4. 为了拆分原因，可以做两组实验：先无负载启动 sglang，等 KV pool 已固定后再启动 `perf_bench`，观察只剩算力/HBM 竞争时分数是否变化；再无负载但显式 `max_total_tokens=43468,max_running_requests=32/48`，观察只缩小 KV pool 时分数是否接近有负载结果。
+
+## 2026-06-22：TP=2 + sglang_simo KV cache 量化时 mem_fraction_static=0.3 仍然 OOM 的原因
+
+结论：这次 OOM 不是因为 `mem_fraction_static=0.3` 没有生效，而是因为它只控制静态内存池，即模型权重 + KV cache pool；OOM 发生在 decode 阶段为 Triton attention 分配临时 metadata tensor `attn_logits`。sglang_simo 的 KV cache 压缩后，每 token KV cache 变小，`max_total_num_tokens` 和自动推导的 `max_running_requests` 变得很大；TP=2 又降低了每卡权重占用，进一步放大了可用 KV token 容量。最后 `--batch_size auto` 把并发推到 600+ running requests，decode 临时张量一次需要 2.59GiB，但当时 GPU 只剩 549MiB free，所以 OOM。
+
+日志证据：
+
+- 脚本确实传了 `mem_fraction_static=0.3`：`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh:6` 固定 `MEM_FRACTION_STATIC=0.3`，`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh:145 run_simo_config_list` 把它写入 `model_args`；总日志 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:64` 和 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:87` 也显示 `mem_fraction_static=0.3`。
+- OOM 不是权重加载阶段。mxfp6 配置里，权重加载结束后每个 TP rank 还有 `avail mem=62.84 GB`，见 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:1993` 到 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:1994`。
+- mxfp6 的 SIMO KV pool 被分配到 `#tokens: 749962, KV size: 8.49 GB`，见 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:1997` 到 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:2000`。scheduler 随后打印 `max_total_num_tokens=749962`、`max_running_requests=2343`，见 `logs/DeepSeek-V2-Lite-Chat-16B_A2.4B_tp2_quant-simo_kvquant_mxfp6.task_gsm8k.log:487`。
+- OOM 前实际运行并发已经到 `#running-req: 661`，见 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:2218` 附近的 prefill/decode 日志。
+- OOM 的直接栈在 `python/sglang/srt/layers/attention/triton_backend.py:343 init_forward_metadata` 分配 `attn_logits = torch.empty(...)`。日志显示 `torch.OutOfMemoryError: Tried to allocate 2.59 GiB ... only 549.06 MiB is free`，见 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:2219` 到 `templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05:2249`。
+
+为什么 `mem_fraction_static=0.3` 仍然会这样：
+
+- `python/sglang/srt/server_args.py:1395 _handle_gpu_memory_settings` 的注释定义了 GPU 显存组成：`model weights + KV cache pool + activations + cuda graph buffers`，并且说明 `mem_fraction_static` 是 `(model weights + KV cache pool) / GPU memory capacity`，见 `python/sglang/srt/server_args.py:1406 _handle_gpu_memory_settings` 到 `python/sglang/srt/server_args.py:1415 _handle_gpu_memory_settings`。所以它不是 decode 临时张量的硬上限。
+- 实际 KV pool 可用字节在 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:62 _profile_available_bytes` 中计算：`rest_memory = post_model_load_memory - pre_model_load_memory * (1 - self.mem_fraction_static)`，见 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:63 _profile_available_bytes` 到 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:76 _profile_available_bytes`。
+- SIMO patch 会用压缩后的 KV cache cell size 替换 sglang 原始 cell size。MLA 分支里按 `packed_head_size + scale_head_size + packed_head_size_rope + scale_head_size_rope` 乘 layer 数计算，见 `simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:174 _compute_cell_size` 到 `simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:207 _compute_cell_size`。这会让同样的静态 KV pool bytes 对应更多 token。
+- SIMO MLA pool 本身也确实按压缩后的 byte 宽度分配 uint8 buffer：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:240 SIMOMLATokenToKVPool.__init__` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:268 SIMOMLATokenToKVPool.__init__` 通过 meta downcast 计算 `kv_cache_dim_in_bytes`；`simo/extensions/sglang_simo/mem_cache/memory_pool.py:285 SIMOMLATokenToKVPool._create_buffers` 到 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:305 SIMOMLATokenToKVPool._create_buffers` 分配形状为 `(size + page_size, 1, kv_cache_dim_in_bytes)` 的 uint8 cache。
+- sglang 再根据 token capacity 自动推导并发上限。`python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:823 _resolve_max_num_reqs` 中 `estimated = int(token_capacity / context_len * 512)`，未显式传 `max_running_requests` 时取 `min(estimated, token_capacity // 2)`，见 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:827 _resolve_max_num_reqs` 到 `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:835 _resolve_max_num_reqs`。mxfp6 日志中 `749962 / 163840 * 512 = 2343`，正好对应 `max_running_requests=2343`。
+- decode metadata 的 `attn_logits` 形状是 `(bs, self.num_head, self.max_kv_splits, self.v_head_dim)`，dtype 是 fp32，见 `python/sglang/srt/layers/attention/triton_backend.py:290 init_forward_metadata` 到 `python/sglang/srt/layers/attention/triton_backend.py:360 init_forward_metadata`。这里的 `bs` 就是当前 decode batch size，也就是 running requests 的规模。
+- `self.num_head` 来自 `model_config.num_attention_heads // get_attention_tp_size()`，见 `python/sglang/srt/layers/attention/triton_backend.py:121 TritonAttnBackend.__init__` 到 `python/sglang/srt/layers/attention/triton_backend.py:126 TritonAttnBackend.__init__`；MLA 场景还会把 `max_kv_splits` 从默认值扩到更适合长上下文的值，见 `python/sglang/srt/layers/attention/triton_backend.py:157 TritonAttnBackend.__init__` 到 `python/sglang/srt/layers/attention/triton_backend.py:163 TritonAttnBackend.__init__` 和 `python/sglang/srt/layers/attention/triton_backend.py:40 _mla_decode_kv_splits_cap` 到 `python/sglang/srt/layers/attention/triton_backend.py:47 _mla_decode_kv_splits_cap`。
+- sglang_simo 对压缩 KV cache 读取时，把 backend 的 `v_head_dim` 改回原始 MLA V 维度，避免用压缩 byte 宽度当输出维度；DeepSeek-V2-Lite 这里是 `original_v_head_dim=512`，见 `simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:69 SIMOTritonAttnBackend.__init__` 到 `simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:84 SIMOTritonAttnBackend.__init__`。所以 OOM 不是因为 `v_head_dim` 错用压缩 layout，而是因为 `bs` 太大。
+
+修复建议按优先级：
+
+1. 显式限制 server 并发，不要让压缩 KV cache 自动推导出 2000+ `max_running_requests`。例如先用：
+
+```bash
+"max_running_requests": 256, "max_total_tokens": 200000
+```
+
+如果还 OOM，就降到 `max_running_requests=128`。这比继续盲目降低 `mem_fraction_static` 更直接，因为 OOM 发生在 `bs` 线性相关的 decode 临时 tensor 上。
+
+2. 对 debug/验证命令，建议同时降低 CUDA graph 的 batch 上限或直接关闭 graph，减少 graph capture 与 allocator reserved memory：
+
+```bash
+"cuda_graph_max_bs": 128, "disable_piecewise_cuda_graph": true
+```
+
+如果只是排查正确性，直接用：
+
+```bash
+"disable_cuda_graph": true, "disable_piecewise_cuda_graph": true, "max_running_requests": 128
+```
+
+`cuda_graph_max_bs` 的默认在 H100 + TP<4 场景会设到 256，见 `python/sglang/srt/server_args.py:1450 _handle_gpu_memory_settings` 到 `python/sglang/srt/server_args.py:1458 _handle_gpu_memory_settings`；capture batch list 由 `python/sglang/srt/server_args.py:1600 _generate_cuda_graph_batch_sizes` 到 `python/sglang/srt/server_args.py:1629 _generate_cuda_graph_batch_sizes` 生成。日志中也确实 capture 了 `[1, 2, 4, ..., 256]`。
+
+3. lm-eval 层面可以把 `--batch_size auto` 改小，例如先用 `--batch_size 1` 或固定小 batch 验证稳定性。但只改 lm-eval batch size 不一定完全等价于限制 sglang server 并发；更稳的是同时传 `max_running_requests`。
+
+4. 可以加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 缓解日志里 `reserved by PyTorch but unallocated` 很大的碎片问题，但这只能作为辅助。根因仍然是 `max_running_requests` 过大导致 decode metadata 峰值过高。
+
+推荐的直接 lm-eval 参数形态如下：
+
+```bash
+lm-eval --model sglang \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "quantization": "simo", "json_model_override_args": "{\"quantization_config_file\": \"/data/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/online_quantization/../simo_quantization_config/kv_cache_quant/quant_config_kvquant_mxfp6.json\"}", "tp_size": 2, "dtype": "auto", "attention_backend": "triton_simo", "mem_fraction_static": 0.3, "max_running_requests": 256, "max_total_tokens": 200000, "cuda_graph_max_bs": 128, "disable_piecewise_cuda_graph": true, "log_level": "info", "add_bos_token": true}' \
+  --tasks gsm8k --batch_size auto
+```
+
+如果仍然 OOM，把 `max_running_requests` 改成 `128`，或者加 `"disable_cuda_graph": true`。
+
+脚本层面的一个小问题：`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh:119 run_simo_config_list` 有 `extra_args` 参数，但 SIMO 分支构造 `model_args` 时没有把 `extra_args` 拼进去，见 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh:128 run_simo_config_list` 到 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh:149 run_simo_config_list`。所以现在不能方便地通过这个脚本给 SIMO kv quant 测试追加 `"max_running_requests": 256`。建议把脚本改成：
+
+```bash
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.3}
+EXTRA_MODEL_ARGS=${EXTRA_MODEL_ARGS:-}
+...
+if [ -n "${extra_args}" ]; then
+  model_args="${model_args}, ${extra_args}"
+fi
+if [ -n "${EXTRA_MODEL_ARGS}" ]; then
+  model_args="${model_args}, ${EXTRA_MODEL_ARGS}"
+fi
+```
+
+然后用：
+
+```bash
+EXTRA_MODEL_ARGS='"max_running_requests": 256, "max_total_tokens": 200000, "cuda_graph_max_bs": 128, "disable_piecewise_cuda_graph": true' \
+MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ \
+DEBUG_add_bos_token=true HF_DATASETS_CACHE=/data/like/huggingface_cache \
+CUDA_VISIBLE_DEVICES=2,3 DEBUG_LOG_LEVEL=info DEBUG_ID=2 TP_SIZE=2 TASKS=gsm8k \
+bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh
+```
