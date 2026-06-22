@@ -8779,3 +8779,31 @@ DEBUG_add_bos_token=true HF_DATASETS_CACHE=/data/like/huggingface_cache \
 CUDA_VISIBLE_DEVICES=2,3 DEBUG_LOG_LEVEL=info DEBUG_ID=2 TP_SIZE=2 TASKS=gsm8k \
 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.dsv2-debug-memory.sh
 ```
+
+## 2026-06-22 DeepSeek V3.2 decoder 结构与裁剪 decoder 的可行性
+
+结论：DeepSeek V3.2 的普通 decoder 层不是“完全相同结构”。sglang 中 `DeepseekV32ForCausalLM` 直接继承 `DeepseekV2ForCausalLM`，见 `python/sglang/srt/models/deepseek_v2.py:2745 DeepseekV32ForCausalLM`；`DeepseekV2ForCausalLM.__init__` 构造 `DeepseekV2Model`，见 `python/sglang/srt/models/deepseek_v2.py:2513 DeepseekV2ForCausalLM.__init__`；`DeepseekV2Model.__init__` 按 `config.num_hidden_layers` 构造 `DeepseekV2DecoderLayer`，见 `python/sglang/srt/models/deepseek_v2.py:2213 DeepseekV2Model.__init__` 到 `python/sglang/srt/models/deepseek_v2.py:2223 DeepseekV2Model.__init__`。
+
+这个模型的配置里 `num_hidden_layers=61`，`first_k_dense_replace=3`，`moe_layer_freq=1`，`n_routed_experts=256`，`n_shared_experts=1`，`num_nextn_predict_layers=1`。因此 61 个普通 decoder 中：
+
+1. `model.layers.0/1/2` 是 dense MLP 层。
+2. `model.layers.3` 到 `model.layers.60` 是 MoE 层。
+3. `model.layers.61` 是 nextn/MTP 相关层，不属于普通 61 层主干。
+
+代码依据是：每个 `DeepseekV2DecoderLayer` 都构造 MLA attention，见 `python/sglang/srt/models/deepseek_v2.py:1891 DeepseekV2DecoderLayer.__init__`；然后通过 `_is_layer_sparse` 判断当前层是否 MoE，见 `python/sglang/srt/models/deepseek_v2.py:1919 DeepseekV2DecoderLayer.__init__`。如果是 sparse，就实例化 `DeepseekV2MoE`，见 `python/sglang/srt/models/deepseek_v2.py:1931 DeepseekV2DecoderLayer.__init__`；否则实例化 `DeepseekV2MLP`，见 `python/sglang/srt/models/deepseek_v2.py:1947 DeepseekV2DecoderLayer.__init__`。判断规则在 `python/sglang/srt/models/deepseek_v2.py:2005 DeepseekV2DecoderLayer._is_layer_sparse` 到 `python/sglang/srt/models/deepseek_v2.py:2010 DeepseekV2DecoderLayer._is_layer_sparse`：`is_nextn` 一定是 sparse；普通层则要求 `n_routed_experts is not None`、`layer_id >= first_k_dense_replace`、并且 `layer_id % moe_layer_freq == 0`。
+
+attention 部分对普通层来说是同一类 MLA/DSA 结构。V3.2 会被识别为 DSA 模型，因为 `is_deepseek_dsa` 包含 `DeepseekV32ForCausalLM` 且要求 `index_topk` 存在，见 `python/sglang/srt/configs/model_config.py:102 is_deepseek_dsa` 到 `python/sglang/srt/configs/model_config.py:114 is_deepseek_dsa`；在 `DeepseekV2AttentionMLA.__init__` 中，如果 `self.use_dsa` 为真，会构造 `Indexer`，见 `python/sglang/srt/models/deepseek_v2.py:1479 DeepseekV2AttentionMLA.__init__` 到 `python/sglang/srt/models/deepseek_v2.py:1498 DeepseekV2AttentionMLA.__init__`。所以普通 decoder 的主要结构差异不是 attention，而是 dense MLP vs MoE MLP。
+
+为了学习结构而不要求模型完整性，可以做一个“截断 checkpoint 副本”让 8 张 H100 80GB 能启动 sglang 推理，但不能只删 safetensors 文件。原因是 sglang 会按照 `config.num_hidden_layers` 创建层，并在 `DeepseekV2Model.forward` 中遍历 `self.start_layer .. self.end_layer` 执行这些层，见 `python/sglang/srt/models/deepseek_v2.py:2406 DeepseekV2Model.forward` 到 `python/sglang/srt/models/deepseek_v2.py:2432 DeepseekV2Model.forward`。如果 config 仍然写 61 层，运行时仍会认为有 61 个普通 decoder。
+
+最简单的普通主干裁剪方案是保留前缀层：
+
+1. 只想覆盖 dense 和 MoE 两种普通 decoder 结构：把副本的 `config.json` 中 `num_hidden_layers` 改成 `4`，保留 `model.layers.0/1/2/3`、`model.embed_tokens.weight`、`model.norm.weight`、`lm_head.weight`，并重写 `model.safetensors.index.json` 让它只引用这些张量。`model.norm` 在 `python/sglang/srt/models/deepseek_v2.py:2252 DeepseekV2Model.__init__` 构造，`lm_head` 在 `python/sglang/srt/models/deepseek_v2.py:2520 DeepseekV2ForCausalLM.__init__` 到 `python/sglang/srt/models/deepseek_v2.py:2530 DeepseekV2ForCausalLM.__init__` 构造。
+2. 如果还想覆盖边界行为，更建议 `num_hidden_layers=6`，保留 `model.layers.0..5`。这样包含 dense 层、dense 到 MoE 的边界层、普通 MoE 层、最后一层。边界信息会进入 `LayerScatterModes`，见 `python/sglang/srt/models/deepseek_v2.py:1920 DeepseekV2DecoderLayer.__init__` 到 `python/sglang/srt/models/deepseek_v2.py:1929 DeepseekV2DecoderLayer.__init__`；最后一层也有 `is_last_layer` 判断，见 `python/sglang/srt/models/deepseek_v2.py:1974 DeepseekV2DecoderLayer.__init__` 到 `python/sglang/srt/models/deepseek_v2.py:1987 DeepseekV2DecoderLayer.__init__`。
+3. 不建议直接保留非连续的 `layer0/layer3/layer60`。sglang 的普通模型按 `0..num_hidden_layers-1` 构造和运行层；如果要保留非连续层，必须把权重名重编号成连续层号，并同步修改 index 和 config。前缀截断是最少出错的方式。
+
+nextn/MTP 层要单独看。普通非 speculative 推理时，MTP 层不是主干必须层：`ModelRunner` 注释说明 MTP 层作为 speculative decoding 的 draft model 使用，见 `python/sglang/srt/model_executor/model_runner.py:679 ModelRunner.__init__` 到 `python/sglang/srt/model_executor/model_runner.py:685 ModelRunner.__init__`；普通加载时，如果权重名是 `model.layers.*` 且 layer id 大于等于 `config.num_hidden_layers`，会被跳过，见 `python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py:203 do_load_weights` 到 `python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py:212 do_load_weights`。所以只做普通 causal LM 推理时，可以不保留 `model.layers.61`。
+
+如果学习目标包含 nextn/MTP 结构，则需要额外保留一个 nextn 层。当前完整 checkpoint 中 nextn 是 `model.layers.61`；但如果把普通层截断成 `N` 层，nextn loader 期望的 nextn layer id 会变成 `N`，因为 `_initialize_nextn_conf` 用 `config.num_hidden_layers` 作为 nextn layer id，见 `python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py:411 _initialize_nextn_conf` 到 `python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py:419 _initialize_nextn_conf`。因此截断副本若还要保留 MTP，需要把原 `model.layers.61.*` 重命名为 `model.layers.N.*`，并同步 index。
+
+因此，可行方案是：不要改原模型目录，另建一个 toy checkpoint 副本；优先用 `num_hidden_layers=4` 或 `6` 的前缀截断；保留 embedding、norm、lm_head 和对应前缀层权重；重写 safetensors index；普通推理不保留 MTP，除非专门研究 speculative/nextn。这个 toy 模型的输出没有完整模型意义，但足够让 sglang 启动并观察 DeepSeek V3.2 的 MLA/DSA、dense MLP、MoE decoder 结构。
