@@ -2209,3 +2209,12 @@ MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ DEBUG_add_bos_t
 templ/llm_eval_online_quant.dsv2-debug-memory.sh.log.retry-06-20-debugid-2.2026_06_22___14_13_05
 日志中有 CUDA out of memory,  lm-eval已经传了参数 "mem_fraction_static": 0.3,, 为什么还是会oom?如何解决?
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+
+deepseek v3.2 模型位于 /data_gpu/modelzoo/weights/llm/deepseek/DeepSeekV3.2/DeepSeek-V3.2/safetensor_weights/
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+8张H100 80GB的 GPU不能放下 deepseek v3.2 所有的权重。 deepseek v3.2 的整个模型是由多个 decoder 组成的，所有的decoder 结构完全相同吗？
+出于学习模型的结构的目的，不考虑模型完整性，有没有办法减少 decoder 的数量，让8张H100 80GB的 GPU能够使用 sglang 推理？
+如果 decoder 的结构不同， 则需要每种结构都至少保留一个decoder.
+要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
+2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
