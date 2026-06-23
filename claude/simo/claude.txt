@@ -2265,5 +2265,11 @@ max_running_requests=512的命令是 MAX_RUNNING_REQUESTS=512 CUDA_GRAPH_MAX_BS=
 deepseek v3.2 模型位于 /data_gpu/modelzoo/weights/llm/deepseek/DeepSeekV3.2/DeepSeek-V3.2/safetensor_weights/
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 simo 代码位于 /data/like/package/simo_conda_sglang
-simo code base 的 simo/extensions/sglang_simo/mem_cache/memory_pool.py SIMOMLATokenToKVPool 实现了 kv cache 的量化写入
-simo code base 的 simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 和  simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py
+simo code base 的 simo/extensions/sglang_simo/mem_cache/memory_pool.py SIMOMLATokenToKVPool 实现了 kv cache 的量化写入, 支持的格式包括 mxfp8,mxfp4,mxfp6,mxint8, fp8 per group, int8 per group, nvfp4.
+simo code base 的  simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py 实现了 trition attention  backend, 会调用  simo/extensions/sglang_simo/layers/attention/triton_ops/ 里面的 triton kernel.
+simo code base 的 simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 和  simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 实现了 decode/prefill 阶段的 attention kernel, 支持读取 simo 量化的 kv cache.
+分析 sglang_simo 当前的实现是否支持 /data_gpu/modelzoo/weights/llm/deepseek/DeepSeekV3.2/DeepSeek-V3.2/safetensor_weights.
+如果不支持，需要做哪些修改，让它能够支持 /data_gpu/modelzoo/weights/llm/deepseek/DeepSeekV3.2/DeepSeek-V3.2/safetensor_weights kv cache 量化 ？
+
+要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
+2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
