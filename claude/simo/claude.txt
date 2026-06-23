@@ -2286,3 +2286,7 @@ cp /share/users/like/ipc.sglang.1.json  /dev/shm/like/ipc.sglang.1.json; debug_e
 2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md
 
 # sglang 自己的实现中，/data_gpu/modelzoo/weights/llm/deepseek/DeepSeekV3.2/DeepSeek-V3.2/safetensor_weights 可以使用哪些 attention backend? 有 triton 的实现吗？
+如果 sglang serve 命令行参数显式指定  --attention-backend triton, 会使用 trition attention kernel吗?
+sglang 自己的 python/sglang/srt/layers/attention/triton_backend.py 支持 deepseek v3.2 吗 ?
+要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
+2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
