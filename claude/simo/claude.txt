@@ -2243,4 +2243,7 @@ sglang 推理 不指定kv cache数据类型时， 使用 trition attention backe
 
 max_running_requests=128的命令是 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=5 TASKS=gsm8k bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh  > templ/llm_eval_online_quant.sh.`nowstr.sh` 2>&1 &  
 日志位于templ/llm_eval_online_quant.sh.2026_06_22___17_07_31 日志中的 gsm8k flexible-extract 结果经过提取， 保存在 tests/sglang_simo/references_accuracy/gsm8k.yaml
-templ/llm_eval_online_quant.sh.2026_06_22___23_08_58 是
+分成 Llama-3.1-8B-Instruct 和 DeepSeek-V2-Lite-Chat-16B_A2.4B 两个模型， quant_algo 的 accuracy 是权重或者激活量化的gsm8k 得分， kv_cache_quant_algo 的 accuracy 是仅 kv cache 量化的 gsm8k flexible-extract 得分, 只有 accuracy的字段是 没有任何量化的 gsm8k flexible-extract baseline 得分。
+max_running_requests=256的命令是 MAX_RUNNING_REQUESTS=256 CUDA_GRAPH_MAX_BS=256 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=5 TASKS=gsm8k bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh  > templ/llm_eval_online_quant.sh.`nowstr.sh` 2>&1 &
+日志位于 templ/llm_eval_online_quant.sh.2026_06_22___23_08_58
+ 你帮我从 templ/llm_eval_online_quant.sh.2026_06_22___23_08_58 中提取每个 gsm8k flexible-extract  得分，参考 tests/sglang_simo/references_accuracy/gsm8k.yaml，结果写入 tests/sglang_simo/references_accuracy/gsm8k-256.yaml, 字段顺序 保持和 tests/sglang_simo/references_accuracy/gsm8k.yaml 的顺序一致。
