@@ -2290,3 +2290,13 @@ cp /share/users/like/ipc.sglang.1.json  /dev/shm/like/ipc.sglang.1.json; debug_e
 sglang 自己的 python/sglang/srt/layers/attention/triton_backend.py 支持 deepseek v3.2 吗 ?
 要求：1) 只写答案, 不要真的修改任何模型文件和代码 。
 2) 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
+
+# sglang DSATokenToKVPool 特有的函数为什么没有被调用？
+lm-eval对 deepseek v3.2 使用 trition backend 进行gsm8k 任务测试的命令是:
+cp /share/users/like/ipc.sglang.1.json  /dev/shm/like/ipc.sglang.1.json; debug_env_file=/dev/shm/like/ipc.sglang.1.json  SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json   HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{"pretrained": "/share/users/like/package/hf-models/DeepSeek-V3.2/",  "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.6, "log_level": "info", "add_bos_token": true, "disable_cuda_graph": true, "disable_piecewise_cuda_graph": true, "skip_server_warmup": true, "watchdog_timeout": 2592000 , "max_running_requests": 32, "cuda_graph_max_bs": 32 }' --tasks gsm8k --batch_size auto > templ/lm-eval-gsm8k-dsv3.2-part.bs128.log.`nowstr.sh` 2>&1 &
+日志: templ/lm-eval-gsm8k-dsv3.2-part.bs128.log.2026_06_23___15_37_55
+
+分析日志, python/sglang/srt/mem_cache/memory_pool.py在DSATokenToKVPool 的所有函数和MLATokenToKVPool的所有函数里面加了 logger.info("MLATokenToKVPool called")，
+MLATokenToKVPool的很多函数被调用了，但是，为什么对于DSATokenToKVPool ，只有 __init__ 被调用了，DSATokenToKVPool 的其他函数都没有被调用？DSATokenToKVPool 的其他函数调用条件是什么？为什么调用条件没有被触发？
+
+要求： 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
