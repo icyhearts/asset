@@ -2247,3 +2247,5 @@ max_running_requests=128的命令是 HF_DATASETS_CACHE=/data/like/huggingface_ca
 max_running_requests=256的命令是 MAX_RUNNING_REQUESTS=256 CUDA_GRAPH_MAX_BS=256 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=5 TASKS=gsm8k bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh  > templ/llm_eval_online_quant.sh.`nowstr.sh` 2>&1 &
 日志位于 templ/llm_eval_online_quant.sh.2026_06_22___23_08_58
  你帮我从 templ/llm_eval_online_quant.sh.2026_06_22___23_08_58 中提取每个 gsm8k flexible-extract  得分，参考 tests/sglang_simo/references_accuracy/gsm8k.yaml，结果写入 tests/sglang_simo/references_accuracy/gsm8k-256.yaml, 字段顺序 保持和 tests/sglang_simo/references_accuracy/gsm8k.yaml 的顺序一致。
+
+ /softhome/like//asset/code/like-useful-simo-conda-sglang/sha256-deepseek-v4-flash.py 只打印 .safetensors 结尾的文件的 sha256, 把固定值 .safetensors 结尾，改成从命令行参数读取，对应的，注释，函数名，解释说明也要修改。
