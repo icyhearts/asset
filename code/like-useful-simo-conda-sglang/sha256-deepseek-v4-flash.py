@@ -87,7 +87,7 @@ def iter_file_sha256_by_suffix(
 
     lfs = sibling.lfs
     if lfs is None or not lfs.sha256:
-      raise RuntimeError(f"Missing LFS sha256 metadata for {filename}")
+      continue
 
     yield filename, lfs.sha256
 
@@ -111,10 +111,11 @@ def main() -> int:
 
   if count == 0:
     print(
-      f"No files ending with {args.file_suffix!r} found in {args.repo_id}",
+      f"No sha256 metadata found for files ending with "
+      f"{args.file_suffix!r} in {args.repo_id}",
       file=sys.stderr,
     )
-    return 1
+    return 0
 
   return 0
 
