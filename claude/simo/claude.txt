@@ -2253,3 +2253,10 @@ max_running_requests=256的命令是 MAX_RUNNING_REQUESTS=256 CUDA_GRAPH_MAX_BS=
  python3 ~/asset/code/like-useful-simo-conda-sglang/sha256-deepseek-v4-flash.py  --repo-id  deepseek-ai/DeepSeek-V3.2   --with-filenames --file-suffix ".json" > /tmp//sha256.DeepSeek-V3.2.json.txt 2>&1 &
  日志 /tmp//sha256.DeepSeek-V3.2.json.txt
  修改代码，找不到 sha256 的，跳过，不要耽误后面的循环
+
+
+ templ/llm_eval_online_quant.sh.2026_06_23___10_19_24
+
+max_running_requests=512的命令是 MAX_RUNNING_REQUESTS=512 CUDA_GRAPH_MAX_BS=512 HF_DATASETS_CACHE=/data/like/huggingface_cache CUDA_VISIBLE_DEVICES=5 TASKS=gsm8k bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh  > templ/llm_eval_online_quant.sh.`nowstr.sh` 2>&1 &
+日志位于 templ/llm_eval_online_quant.sh.2026_06_23___10_19_24
+ 你帮我从 templ/llm_eval_online_quant.sh.2026_06_23___10_19_24 中提取每个 gsm8k flexible-extract  得分，参考 tests/sglang_simo/references_accuracy/gsm8k.yaml，结果写入 tests/sglang_simo/references_accuracy/gsm8k-512.yaml, 字段顺序 保持和 tests/sglang_simo/references_accuracy/gsm8k.yaml 的顺序一致。
