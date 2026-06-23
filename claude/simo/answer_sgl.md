@@ -9097,3 +9097,174 @@ v_buffer = kv_buffer[..., :self.simo_pool.kv_c_cache_size]
 
 **最可能的根因**：SGLang 对 mxfp4 使用 `tl.dot_scaled("e2m1")` 在 MLA decode 路径下产生错误的 QK 值。nvfp4 和 mxfp6 虽然走软件解量，但 SGLang 中可能存在额外的 buffer layout 差异或 Triton 编译器优化差异导致解量结果仍有数值误差。方案 A+B 是最直接的修复方向。
 
+### 10. `_maybe_compile_deep_gemm_one_type_all` 耗时优化（DeepSeek-V3.2）
+
+#### 10.1 问题描述
+
+启动 SGLang 服务时，日志中出现大量 `_maybe_compile_deep_gemm_one_type_all` 调用，每次耗时较长（单次可达数分钟，全部完成可能需要 10-20 分钟）。该函数在 DeepGEMM 首次遇到新的 `(kernel_type, N, K, num_groups)` 组合时，为该组合预编译**所有可能的 M 值**的 CUDA kernel。
+
+参考日志：`templ/lm-eval-gsm8k-dsv3.2-part.bs128.log.2026_06_23___15_37_55`
+
+#### 10.2 函数位置和逻辑
+
+**文件**: `python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py`
+
+**`_maybe_compile_deep_gemm_one_type_all`** (line 110-151)：
+```python
+def _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups):
+    query_key = (kernel_type, n, k, num_groups)
+    if (
+        _ENABLE_JIT_DEEPGEMM_PRECOMPILE   # env: SGLANG_JIT_DEEPGEMM_PRECOMPILE
+        and _DO_COMPILE_ALL               # True only for first GPU rank per node
+        and _INITIALIZATION_DICT.get(query_key) is None  # 每种 shape 只编译一次
+    ):
+        _INITIALIZATION_DICT[query_key] = True
+        _compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups,
+                                        m_list=_BUILTIN_M_LIST)
+```
+
+**`_compile_deep_gemm_one_type_all`** (line 155-223)：遍历 `m_list` 中所有 M 值，逐一执行 warmup GEMM 触发 JIT 编译。
+
+**`_BUILTIN_M_LIST` 计算** (line 27, `update_deep_gemm_config` line 58-88)：
+- 正常模式：M = 1 ~ min(chunked_prefill_size * 2, 1024 * 128) = 1 ~ 131072（约 13 万个值）
+- Fast warmup 模式：稀疏采样，约 3072 个值
+
+**关于编译缓存**：DeepGEMM 自身的 JIT 缓存机制（`DG_JIT_CACHE_DIR`，默认 `~/.cache/deep_gemm`）会将编译好的 CUDA kernel 缓存到磁盘。如果之前运行过 `sglang.compile_deep_gemm`，后续服务启动时 **编译循环会命中缓存**，每个 shape 只需约 1 秒（而不是首次编译的数分钟）。
+
+#### 10.3 六种被编译的 kernel 类型
+
+`python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py:97-103`，`DeepGemmKernelType`：
+
+| 类型 | 用途 |
+|------|------|
+| `GROUPED_GEMM_NT_F8F8BF16_MASKED` | MoE FP8 masked forward |
+| `GROUPED_GEMM_NT_F8F8BF16_CONTIG` | MoE FP8 contiguous forward |
+| `GROUPED_GEMM_NT_BF16_MASKED` | MoE BF16 masked forward |
+| `GROUPED_GEMM_NT_BF16_CONTIG` | MoE BF16 contiguous forward |
+| `GEMM_NT_F8F8BF16` | 普通 FP8 GEMM (KV projection, attention 等) |
+| `GEMM_NT_BF16BF16F32` | 普通 BF16 GEMM |
+
+#### 10.4 触发编译的调用链
+
+1. `ModelRunner.__init__` (`python/sglang/srt/model_executor/model_runner.py:537-538`) 调用 `update_deep_gemm_config`
+2. 首次 forward 时，MoE layer / attention layer 调用 `entrypoint.py` 中的 wrapper 函数（`grouped_gemm_nt_f8f8bf16_masked` 等）
+3. wrapper 函数进入 `_deep_gemm_execution_hook` context manager (`compile_utils.py:399-413`)
+4. hook 中调用 `_maybe_compile_deep_gemm_one_type_all`，首次遇到新 shape 时触发全 M 列表编译
+
+#### 10.5 优化方案（按推荐程度排序）
+
+##### 方案 A（推荐：precompile 一次，后续秒级启动）
+
+离线预编译，将 kernel 缓存到磁盘：
+
+```bash
+python3 -m sglang.compile_deep_gemm \
+    --model /share/users/like/package/hf-models/DeepSeek-V3.2/ \
+    --tp 1 \
+    --trust-remote-code
+```
+
+这会启动一个临时服务、发送一次 warmup 请求触发所有 DeepGEMM kernel 编译、编译结果缓存到 `~/.cache/deep_gemm/`，然后服务退出。**之后正常启动服务时，编译循环命中缓存，每个 shape 仅需约 1 秒**，总耗时从 10-20 分钟降至 ~1 分钟。
+
+注意：如果更换模型、修改 TP size、或修改 `chunked_prefill_size` 导致新的 shape 组合出现，可能需要重新 precompile。
+
+##### 方案 B（跳过预编译 list，仅按需 JIT）
+
+设置环境变量关闭预编译：
+
+```bash
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+```
+
+**效果**：跳过 `_BUILTIN_M_LIST` 的遍历编译，只在首次真实推理遇到某个 M 值时 JIT 编译。首次请求会有额外延迟（但后续相同 M 值的请求不受影响）。
+
+lm-eval gsm8k 测试中，请求的 M 值范围有限（decode 阶段 M=1，prefill 阶段 M 也较小），实际需要编译的 M 值数量远少于 13 万个。
+
+##### 方案 C（fast warmup：减少 M 列表）
+
+```bash
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+```
+
+**效果**：M 列表从 1~131072 (全量) 减少到约 3072 个（稀疏采样），编译时间从 10-20 分钟降至约 1-2 分钟。
+
+采样策略（`compile_utils.py:58-88`，`update_deep_gemm_config`）：
+- M=1~1024：步长 1（覆盖 decode 小 batch）
+- M=1024~2048：步长 2
+- M=2048~4096：步长 4
+- M=4096~8192：步长 8
+- M=8192~max_prefill_bs：步长 16
+
+##### 方案 D（完全禁用 DeepGEMM JIT，回退到其他 kernel）
+
+```bash
+export SGLANG_ENABLE_JIT_DEEPGEMM=0
+```
+
+**效果**：完全不使用 DeepGEMM，MoE/Attention 使用替代 kernel（如 Triton 实现）。这是最快启动但可能影响推理性能。
+
+##### 方案 E（已运行的命令可直接追加的优化）
+
+由于你当前的命令已经包含了 `"attention_backend": "triton"` 和 `"disable_cuda_graph": true`，且 DeepSeek-V3.2 主要耗时在 MoE 层的 DeepGEMM 编译，**追加以下环境变量到命令开头**即可：
+
+**推荐组合**（方案 A + B 的组合思路）：
+
+```bash
+# 首次运行：先 precompile（一次性）
+python3 -m sglang.compile_deep_gemm \
+    --model /share/users/like/package/hf-models/DeepSeek-V3.2/ \
+    --tp 1 --trust-remote-code
+
+# 后续每次运行：直接启动，编译命中缓存几乎不耗时
+cp /share/users/like/ipc.sglang.1.json /dev/shm/like/ipc.sglang.1.json; \
+debug_env_file=/dev/shm/like/ipc.sglang.1.json \
+SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json \
+HF_DATASETS_CACHE=/data/like/huggingface_cache \
+CUDA_VISIBLE_DEVICES=7 \
+SGLANG_WARMUP_TIMEOUT=2592000 \
+lm-eval --model sglang --model_args '...' --tasks gsm8k ...
+```
+
+注意：你原来的 `"watchdog_timeout": 2592000` 增加了超时时间，但如果编译本身太慢，增加 `SGLANG_WARMUP_TIMEOUT` 也能防止 warmup 阶段因编译超时而崩溃。
+
+**快速方案**（如果不能跑 precompile，想直接跳过编译）：
+
+```bash
+# 在现有命令前加上：
+SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
+```
+
+或者：
+
+```bash
+# 更激进的跳过：
+SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1 \
+```
+
+##### 方案 F（增加 warmup 超时，防止编译中途 crash）
+
+```bash
+export SGLANG_WARMUP_TIMEOUT=2592000  # 等同于 watchdog_timeout
+```
+
+如果编译耗时很长，默认的 warmup timeout 可能导致进程被 kill。增加此超时可以防止 crash。你的命令中已有 `"watchdog_timeout": 2592000`，但 `SGLANG_WARMUP_TIMEOUT` 可能仍需单独设置。
+
+#### 10.6 环境变量汇总
+
+所有 DeepGEMM 相关环境变量定义在 `python/sglang/srt/environ.py:438-447`：
+
+| 变量 | 默认值 | 作用 |
+|------|--------|------|
+| `SGLANG_ENABLE_JIT_DEEPGEMM` | `True` | 主开关，设 `0` 完全禁用 |
+| `SGLANG_JIT_DEEPGEMM_PRECOMPILE` | `True` | 控制 `_maybe_compile_deep_gemm_one_type_all` 是否执行全 M 列表编译 |
+| `SGLANG_JIT_DEEPGEMM_FAST_WARMUP` | `False` | 减少 M 列表到 ~3K |
+| `SGLANG_DG_CACHE_DIR` | `~/.cache/deep_gemm` | JIT 缓存目录 |
+| `SGLANG_WARMUP_TIMEOUT` | `-1` (无限) | warmup 超时秒数 |
+| `SGLANG_IS_FIRST_RANK_ON_NODE` | 动态设置 | 仅第一个 GPU rank 做编译（multi-TP 场景） |
+
+#### 10.7 一句话总结
+
+DeepSeek-V3.2 启动慢是因为 DeepGEMM 为每种 `(kernel_type, N, K, num_groups)` 组合预编译所有 M 值的 CUDA kernel（最多 13 万个/组合）。**最佳方案是 `python3 -m sglang.compile_deep_gemm` 预编译一次缓存到磁盘，后续启动接近秒级。如果不能预编译，设置 `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` 跳过全 M 列表编译，只在首次请求时按需 JIT。**
+
+
+
