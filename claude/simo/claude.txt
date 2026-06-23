@@ -2265,3 +2265,5 @@ max_running_requests=512的命令是 MAX_RUNNING_REQUESTS=512 CUDA_GRAPH_MAX_BS=
 deepseek v3.2 模型位于 /data_gpu/modelzoo/weights/llm/deepseek/DeepSeekV3.2/DeepSeek-V3.2/safetensor_weights/
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 simo 代码位于 /data/like/package/simo_conda_sglang
+simo code base 的 simo/extensions/sglang_simo/mem_cache/memory_pool.py SIMOMLATokenToKVPool 实现了 kv cache 的量化写入
+simo code base 的 simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 和  simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py
