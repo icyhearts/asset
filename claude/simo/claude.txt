@@ -2306,3 +2306,20 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 pip install fast-hadamard-transform
 日志位于 templ/fast.log
 为什么安装失败了？ 把答案追加在 like-useful/answer_claude.md
+
+帮我用 python 实现 /softhome/like/asset/code/query-sh-gold.py
+命令行参数如下:
+--start-date 开始日期
+--end-date 结束日期
+--save-path 保存路径
+代码功能: 查询 从 开始日期到结束日期, 每天的上海黄金的最低价格，最高价格，开盘价格，收盘价格,保存到 保存路径，保存格式是 csv. 每行csv的数据顺序是:日期，最低价格，最高价格, 开盘价格，收盘价格
+
+再实现  /softhome/like/asset/code/simulate-sh-gold-trade.py
+命令行参数如下:
+--start-date 模拟交易开始日期
+--end-date 模拟交易结束日期
+--read-path csv文件读取路径, csv数据顺序和 /softhome/like/asset/code/query-sh-gold.py保存的顺序一致。
+--buy-prev-interval int类型，取前几天的最低价格作为目标买入价格
+--sell-profit 目标
+
+
