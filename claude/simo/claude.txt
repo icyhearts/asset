@@ -2301,3 +2301,8 @@ MLATokenToKVPool的很多函数被调用了，但是，为什么对于DSATokenTo
 
 要求： 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex.md 里面
 
+
+conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+pip install fast-hadamard-transform
+日志位于 templ/fast.log
+为什么安装失败了？ 把答案追加在 like-useful/answer_claude.md

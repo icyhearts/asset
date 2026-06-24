@@ -9266,5 +9266,27 @@ export SGLANG_WARMUP_TIMEOUT=2592000  # 等同于 watchdog_timeout
 
 DeepSeek-V3.2 启动慢是因为 DeepGEMM 为每种 `(kernel_type, N, K, num_groups)` 组合预编译所有 M 值的 CUDA kernel（最多 13 万个/组合）。**最佳方案是 `python3 -m sglang.compile_deep_gemm` 预编译一次缓存到磁盘，后续启动接近秒级。如果不能预编译，设置 `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` 跳过全 M 列表编译，只在首次请求时按需 JIT。**
 
+### 11. `pip install fast-hadamard-transform` 安装失败分析
+
+#### 11.1 错误日志（`templ/fast.log:32`）
+
+```
+ModuleNotFoundError: No module named 'torch'
+```
+
+#### 11.2 根因
+
+`fast-hadamard-transform` 的 `setup.py` 在构建过程中（`get_requires_for_build_wheel` 阶段）调用 `import torch`，但 `torch` 在构建环境中不存在。
+
+`pip install` 默认使用 **isolated build environment**（隔离构建环境）：pip 会创建一个临时的干净 venv，只安装 `pyproject.toml` `[build-system].requires` 中声明的构建依赖。`fast-hadamard-transform==1.1.0` 没有在其构建依赖中声明 `torch`，因此隔离环境中缺少 `torch`，导致 `setup.py:18` 的 `import torch` 失败。
+
+#### 11.3 解决方案
+
+使用 `--no-build-isolation` 让 pip 在当前 conda 环境（已安装 `torch`）中直接构建：
+
+```bash
+pip install fast-hadamard-transform --no-build-isolation
+```
+
 
 
