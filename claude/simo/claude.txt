@@ -2307,6 +2307,8 @@ pip install fast-hadamard-transform
 日志位于 templ/fast.log
 为什么安装失败了？ 把答案追加在 like-useful/answer_claude.md
 
+#
+conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 帮我用 python 实现 /softhome/like/asset/code/query-sh-gold.py
 命令行参数如下:
 --start-date 开始日期
@@ -2319,7 +2321,14 @@ pip install fast-hadamard-transform
 --start-date 模拟交易开始日期
 --end-date 模拟交易结束日期
 --read-path csv文件读取路径, csv数据顺序和 /softhome/like/asset/code/query-sh-gold.py保存的顺序一致。
---buy-prev-interval int类型，取前几天的最低价格作为目标买入价格
---sell-profit 目标
+--buy-prev-interval 向历史看价格的交易日天数， int类型
+--sell-profit 目标利润
+
+功能如下: 从csv文件读取路径读取历史上的上海黄金价格。
+从模拟交易开始日期 开始，到模拟交易结束日期结束，对于每天的上海黄金价格，如果今天的价格出现历史上的最低价格，执行一次买入，历史长度是--buy-prev-interval 向历史看价格的交易日天数。
+如果当前有库存，并且今天价格卖出能够获取的利润达到 --sell-profit 目标利润, 执行一次利润。
+每执行一次买入打印一次买入价格，当天的最低价格最高价格。
+每执行一次卖出打印一次卖出价格，当天的最低价格最高价格。
+最后打印获取的总利润。
 
 
