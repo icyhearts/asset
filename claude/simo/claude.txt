@@ -2332,3 +2332,11 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 最后打印获取的总利润。
 
 
+conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+先执行 /softhome/like/asset/code/query-sh-gold.py  --start-date 2026-01-01 --end-date 2026-06-23  --save-path /data/like/temp/sh-gold.csv
+再执行 /softhome/like/asset/code/simulate-sh-gold-trade.py  --start-date 2026-01-01 --end-date 2026-06-23  --read-path /data/like/temp/sh-gold.csv  --buy-prev-interval 5  --sell-profit 30
+日志位于 /data/like/temp/simulate.log
+
+BUY date=2026-06-11 buy_price=883.81 day_low=883.81 day_high=915.00
+2026-06-11 买入的价格是过去5个交易日的最低价格吗？是不是有bug? --buy-prev-interval 向历史看价格的交易日天，表示的是不包含当天的交易日天数，我们只能看历史数据，无法预测当天的最低价格。
+修复bug

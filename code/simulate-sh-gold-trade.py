@@ -25,6 +25,12 @@ class InventoryLot:
     buy_price: Decimal
 
 
+@dataclass(frozen=True)
+class BuySignal:
+    buy_price: Decimal
+    trigger_price: Decimal
+
+
 def parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -109,12 +115,23 @@ def maybe_sell_one(
     return sell_profit
 
 
-def should_buy(rows: list[PriceRow], index: int, buy_prev_interval: int) -> bool:
+def get_buy_signal(
+    rows: list[PriceRow], index: int, buy_prev_interval: int
+) -> BuySignal | None:
     if index < buy_prev_interval:
-        return False
+        return None
+
     previous_rows = rows[index - buy_prev_interval : index]
-    previous_low = min(row.low for row in previous_rows)
-    return rows[index].low <= previous_low
+    trigger_price = min(row.low for row in previous_rows)
+    current = rows[index]
+
+    if current.low > trigger_price:
+        return None
+
+    # The trigger price is computed only from previous trading days. If the
+    # market opens below it, the open is the first executable daily price.
+    buy_price = current.open if current.open <= trigger_price else trigger_price
+    return BuySignal(buy_price=buy_price, trigger_price=trigger_price)
 
 
 def simulate(
@@ -133,12 +150,14 @@ def simulate(
 
         total_profit += maybe_sell_one(current, inventory, sell_profit)
 
-        if should_buy(rows, index, buy_prev_interval):
-            inventory.append(InventoryLot(current.trade_date, current.low))
+        buy_signal = get_buy_signal(rows, index, buy_prev_interval)
+        if buy_signal is not None:
+            inventory.append(InventoryLot(current.trade_date, buy_signal.buy_price))
             print(
                 "BUY "
                 f"date={current.trade_date.isoformat()} "
-                f"buy_price={format_decimal(current.low)} "
+                f"buy_price={format_decimal(buy_signal.buy_price)} "
+                f"trigger_price={format_decimal(buy_signal.trigger_price)} "
                 f"day_low={format_decimal(current.low)} "
                 f"day_high={format_decimal(current.high)}"
             )
