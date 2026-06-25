@@ -9509,23 +9509,35 @@ sgl-kernel/cmake/flashmla.cmake
 
 #### 13.6 解决方案
 
-1. **从 flashmla 仓库 pip install Python 包**：
+系统上已存在 `flash_mla` Python 包源码，位于：
+```
+/data_gpu/zhuangl/FlashMLA/flash_mla/
+├── __init__.py              ← 导出 get_mla_metadata, flash_mla_with_kvcache 等
+└── flash_mla_interface.py   ← 定义 FlashMLASchedMeta
+```
+
+具体方案（按推荐顺序）：
+
+1. **pip install flashmla Python 包**（推荐）：
    ```bash
-   cd <flashmla_repo_path>
+   cd /data_gpu/zhuangl/FlashMLA/
    pip install .  # 或 pip install -e .
    ```
+   这会安装 `flash_mla` 到 site-packages，`import flash_mla` 即可正常工作。
 
-2. **或者检查 sglang 是否有自己的 flash_mla shim**：如果 sglang 项目中有 `python/sglang/srt/flash_mla/` 或类似的 Python wrapper，确保它在 `PYTHONPATH` 中。
+2. **或者通过 PYTHONPATH 指向**（临时方案）：
+   ```bash
+   export PYTHONPATH="/data_gpu/zhuangl/FlashMLA:$PYTHONPATH"
+   ```
 
-3. **在 cmake 中同时安装 Python 包**（修改 `flashmla.cmake`）：
-   在 `flashmla.cmake` 末尾添加类似以下逻辑：
+3. **修改 cmake 同时安装 Python 包**（`sgl-kernel/cmake/flashmla.cmake` 末尾添加）：
    ```cmake
    install(
      DIRECTORY ${repo-flashmla_SOURCE_DIR}/flash_mla/
      DESTINATION "flash_mla"
    )
    ```
-   但需要注意安装路径必须能被 Python import 解析到（即需要在 site-packages 下或 `PYTHONPATH` 中）。
+   需要注意安装路径必须能被 Python import 解析到（即需要在 site-packages 下）。
 
 
 
