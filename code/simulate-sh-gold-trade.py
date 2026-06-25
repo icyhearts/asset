@@ -61,6 +61,10 @@ def format_decimal(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.01")), "f")
 
 
+def format_percent(value: Decimal) -> str:
+    return format((value * Decimal("100")).quantize(Decimal("0.01")), "f") + "%"
+
+
 def read_price_rows(read_path: Path) -> list[PriceRow]:
     rows_by_date: dict[date, PriceRow] = {}
     with read_path.open("r", newline="", encoding="utf-8") as input_file:
@@ -102,15 +106,23 @@ def maybe_sell_one(
     index, lot = min(candidates, key=lambda item: item[1].buy_price)
     sell_price = lot.buy_price + sell_profit
     inventory.pop(index)
+    holding_days = max((current.trade_date - lot.buy_date).days, 1)
+    profit_rate = sell_profit / lot.buy_price
+    annualized_return = Decimal(
+        str((float(Decimal("1") + profit_rate) ** (365.0 / holding_days)) - 1.0)
+    )
     print(
         "SELL "
         f"date={current.trade_date.isoformat()} "
         f"sell_price={format_decimal(sell_price)} "
         f"buy_date={lot.buy_date.isoformat()} "
         f"buy_price={format_decimal(lot.buy_price)} "
+        f"holding_days={holding_days} "
         f"day_low={format_decimal(current.low)} "
         f"day_high={format_decimal(current.high)} "
-        f"profit={format_decimal(sell_profit)}"
+        f"profit={format_decimal(sell_profit)} "
+        f"profit_percent={format_percent(profit_rate)} "
+        f"annualized_return_percent={format_percent(annualized_return)}"
     )
     return sell_profit
 

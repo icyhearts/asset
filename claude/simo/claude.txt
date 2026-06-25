@@ -2340,3 +2340,7 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 BUY date=2026-06-11 buy_price=883.81 day_low=883.81 day_high=915.00
 2026-06-11 买入的价格是过去5个交易日的最低价格吗？是不是有bug? --buy-prev-interval 向历史看价格的交易日天，表示的是不包含当天的交易日天数，我们只能看历史数据，无法预测当天的最低价格。
 修复bug
+
+/softhome/like/asset/code/simulate-sh-gold-trade.py, 你需要维护一个买入库存的状态。
+对于每次买入，记录买入的日期，买入的价格。
+卖出时，额外打印该库存的买入日期、买入价格、收益百分比、年化收益率。
