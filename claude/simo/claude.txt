@@ -2366,3 +2366,7 @@ sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境�
 先启动其他 负载，再启动lm-eval的日志:  temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_33_55
 先启动 lm-eval，等sglang server启动完成，lm-eval开始发 请求，再启动其他负载，lm-eval日志：temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___14_17_13
 
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+sglang serve启动脚本位于 like-useful//dsv4-flash-run.sh
