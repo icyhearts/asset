@@ -2381,3 +2381,37 @@ sglang 使用的 flashmla 仓库 /share/users/like/package/h100/package/sgl-proj
 会重新编译 csrc里面的代码吗？
 pip install . 编译出来的csrc的代码会和 /data/like/miniconda3//envs/simo_sglang/lib/python3.12/site-packages/sgl_kernel/flashmla_ops.abi3.so 冲突吗?
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+lm-eval的时候，加上"enable_deterministic_inference":true，kv cache 的#tokens不会影响 gsm8k 分数了，说明kv cache 的token个数并不是真正影响 gsm8k得分的原因。
+下面是日志和命令.
+命令 :CUDA_VISIBLE_DEVICES=7  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3", "enable_deterministic_inference":true }' --tasks gsm8k --batch_size auto
+
+没有负载时候，多次测试，日志位于temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___16_12_43和temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.enable_deterministic_inference.2026_06_25___17_03_44
+启动lm-eval前，加上负载，多次测试，日志位于temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.enable_deterministic_inference.2026_06_25___16_38_03和temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.enable_deterministic_inference.2026_06_25___16_52_56
+4份日志gsm8k分数一样的。
+为什么加上"enable_deterministic_inference":true后，有负载和没有负载的日志中#tokens仍旧有很大差距，但是gsm8k分数一样，说明 kv cache容量不是根本原因。
+"enable_deterministic_inference":true是如何影响 sglang的行为的？
+没有"enable_deterministic_inference":true的时候，gsm8k得分不同的根本原因是什么？肯定不是kv cache容量，这在"enable_deterministic_inference":true的时候已经验证过。
+
+其他负载实现如下：
+负载运行的代码是 /softhome/like/asset/code/perf_bench.cu /softhome/like/asset/code/perf_bench.cu编译的二进制位于/share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench, 负载的命令是:
+CUDA_VISIBLE_DEVICES=7 SLMS=20 MEMG=1 /share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench  &
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+在执行 lm-eval的时候， GPU上有其他进程，会影响 lm-eval  gsm8k 的精度.
+例子:
+同样的命令：CUDA_VISIBLE_DEVICES=6  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" }' --tasks gsm8k --batch_size auto > temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu6.`nowstr.sh` 2>&1 &
+没有其他负载的日志： temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_26_52
+先启动其他 负载，再启动lm-eval的日志:  temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_33_55
+先启动 lm-eval，等sglang server启动完成，lm-eval开始发 请求，再启动其他负载，lm-eval日志：temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___14_17_13
+其他负载实现如下：
+负载运行的代码是 /softhome/like/asset/code/perf_bench.cu /softhome/like/asset/code/perf_bench.cu编译的二进制位于/share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench, 负载的命令是:
+CUDA_VISIBLE_DEVICES=7 SLMS=20 MEMG=1 /share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench  &
+分析3份日志，为什么有没有负载会影响 lm-eval --model sglang 的 gsm8k 得分?
+有其他日志的时候，sglang的 moe, attention，会使用不同的kernel吗？
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
