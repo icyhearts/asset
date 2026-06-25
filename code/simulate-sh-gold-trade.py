@@ -68,24 +68,30 @@ def format_percent(value: Decimal) -> str:
 def read_price_rows(read_path: Path) -> list[PriceRow]:
     rows_by_date: dict[date, PriceRow] = {}
     with read_path.open("r", newline="", encoding="utf-8") as input_file:
-        reader = csv.reader(input_file)
-        for line_no, fields in enumerate(reader, start=1):
-            if not fields or all(not field.strip() for field in fields):
+        reader = csv.DictReader(input_file)
+        if not reader.fieldnames or reader.fieldnames != [
+            "trade_date",
+            "low",
+            "high",
+            "open",
+            "close",
+        ]:
+            raise ValueError(f"{read_path}: expected csv header: {['trade_date', 'low', 'high', 'open', 'close']}")
+        for line_no, row in enumerate(reader, start=2):
+            if not row:
                 continue
-            if len(fields) < 5:
-                raise ValueError(f"{read_path}:{line_no}: expected 5 columns")
             try:
-                trade_date = date.fromisoformat(fields[0].strip())
-            except ValueError:
-                if line_no == 1 and fields[0].strip().lower() in {"date", "日期"}:
-                    continue
-                raise
+                trade_date = date.fromisoformat(row["trade_date"].strip())
+            except ValueError as exc:
+                raise ValueError(
+                    f"{read_path}:{line_no}: invalid trade_date {row['trade_date']!r}"
+                ) from exc
             rows_by_date[trade_date] = PriceRow(
                 trade_date=trade_date,
-                low=parse_decimal(fields[1]),
-                high=parse_decimal(fields[2]),
-                open=parse_decimal(fields[3]),
-                close=parse_decimal(fields[4]),
+                low=parse_decimal(row["low"]),
+                high=parse_decimal(row["high"]),
+                open=parse_decimal(row["open"]),
+                close=parse_decimal(row["close"]),
             )
     return [rows_by_date[key] for key in sorted(rows_by_date)]
 
@@ -176,6 +182,12 @@ def simulate(
 
     print(f"TOTAL_PROFIT {format_decimal(total_profit)}")
     print(f"INVENTORY_LEFT {len(inventory)}")
+    for lot in inventory:
+        print(
+            "INVENTORY "
+            f"buy_date={lot.buy_date.isoformat()} "
+            f"buy_price={format_decimal(lot.buy_price)}"
+        )
     return total_profit
 
 

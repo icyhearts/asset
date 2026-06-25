@@ -2332,7 +2332,7 @@ conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 最后打印获取的总利润。
 
 
-conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+conda 环境位于 /data/like/miniconda3/envs/simo_sglang/
 先执行 /softhome/like/asset/code/query-sh-gold.py  --start-date 2026-01-01 --end-date 2026-06-23  --save-path /data/like/temp/sh-gold.csv
 再执行 /softhome/like/asset/code/simulate-sh-gold-trade.py  --start-date 2026-01-01 --end-date 2026-06-23  --read-path /data/like/temp/sh-gold.csv  --buy-prev-interval 5  --sell-profit 30
 日志位于 /data/like/temp/simulate.log
@@ -2345,16 +2345,5 @@ BUY date=2026-06-11 buy_price=883.81 day_low=883.81 day_high=915.00
 对于每次买入，记录买入的日期，买入的价格。
 卖出时，额外打印该库存的买入日期、买入价格、收益百分比、年化收益率。
 
-保存csv，保存
-
-
-
-
-
-
-
-
-
-
-
-
+修改 /softhome/like/asset/code/query-sh-gold.py /softhome/like/asset/code/simulate-sh-gold-trade.py
+保存csv时候，把表格列的标题保存下来。读csv的时候，如果需要，根据标题访问数据

@@ -142,10 +142,14 @@ def query_gold_rows(start: date, end: date) -> list[GoldRow]:
     return [rows_by_date[key] for key in sorted(rows_by_date)]
 
 
+CSV_HEADERS = ["trade_date", "low", "high", "open", "close"]
+
+
 def save_csv(rows: list[GoldRow], save_path: Path) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     with save_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
+        writer.writerow(CSV_HEADERS)
         for row in rows:
             writer.writerow(
                 [
