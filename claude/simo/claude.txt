@@ -2370,3 +2370,7 @@ sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境�
 
 sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 sglang serve启动脚本位于 like-useful//dsv4-flash-run.sh
+日志位于 temp/sgl.dsv4-flash.log.2026_06_25___15_19_24
+sglang code base sgl-kernel/cmake/flashmla.cmake, FetchContent_Declare, repo-flashmla 已经有 flashmla了。
+为什么还会报错
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
