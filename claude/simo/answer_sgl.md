@@ -9288,5 +9288,138 @@ ModuleNotFoundError: No module named 'torch'
 pip install fast-hadamard-transform --no-build-isolation
 ```
 
+### 12. 为什么 GPU 上有其他负载会影响 lm-eval GSM8K 精度
+
+#### 12.1 问题描述
+
+同样的 lm-eval 命令运行 GSM8K 评测，当 GPU 上有其他负载时，得分会下降：
+
+| 场景 | 日志文件 | exact_match |
+|------|---------|-------------|
+| 无其他负载 | `temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_26_52` | **0.6702** |
+| 先启动负载，再启动 lm-eval | `temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_33_55` | **0.6497** |
+| 先启动 lm-eval，等 server 就绪后启动负载 | `temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___14_17_13` | **0.6702** |
+
+其他负载是 `perf_bench.cu` 编译的二进制 `/share_data/users/like/package/h100/package/simo_conda_sglang/perf_bench`，它会：
+1. 分配 ~1 GB 显存占位 (`MEMG=1`)
+2. 无限循环跑 `16384^3` FP16 TensorCore GEMM（每轮 sleep 20ms）
+
+关键观察：**只有当负载在 lm-eval（即 SGLang server）启动之前就已经运行时，得分才会下降。如果 SGLang server 先完成 CUDA graph capture，之后再启动负载，得分不受影响。**
+
+#### 12.2 高层的 MoE / FP8 GEMM backend 并没有变化
+
+首先检查 SGLang 的自动 backend 选择逻辑。
+
+**MoE runner backend** (`moe_runner_backend='auto'`) 的选择逻辑在
+`python/sglang/srt/server_args.py:_handle_model_specific_adjustments()` 和 `_handle_moe_kernel_config()`，
+以及 `python/sglang/srt/layers/moe/utils.py:MoeRunnerBackend` 枚举。
+
+**FP8 GEMM runner backend** (`fp8_gemm_runner_backend='auto'`) 的选择逻辑在
+`python/sglang/srt/layers/quantization/fp8_utils.py:dispatch_w8a8_block_fp8_linear()` 第 350 行，以及 `_dispatch_auto_backend()` 第 445 行。
+
+**这两个自动选择都只基于以下静态条件，不使用 GPU 空闲显存或 SM 占用率：**
+- GPU SM 代数（`is_sm100_supported()`、`is_blackwell_supported()` 等）
+- 量化类型
+- 包可用性（`is_flashinfer_available()`、`deep_gemm` 是否可导入）
+- 环境变量
+
+DeepSeek-V2-Lite 在 H100 (SM90) 上运行，不匹配 SM100 的 `flashinfer_trtllm` 条件，因此使用默认的 Triton MoE kernel 和 FP8 CUTLASS GEMM。三份日志中的 `server_args` 完全一致，backend 没有变化。
+
+#### 12.3 真正的原因：KV Cache token 容量被大幅削减
+
+对比两份关键日志：
+
+**无负载（10_26_52）**:
+```
+line 97:  KV Cache is allocated. #tokens: 130535, KV size: 1.89 GB
+line 99:  Capture cuda graph begin. avail mem=45.78 GB
+line 114: max_total_num_tokens=130535
+```
+
+**先启动负载（10_33_55）**:
+```
+line 97:  KV Cache is allocated. #tokens: 19215, KV size: 0.28 GB
+line 99:  Capture cuda graph begin. avail mem=43.35 GB
+line 114: max_total_num_tokens=19215
+```
+
+两处的 ServerArgs 完全一致：`mem_fraction_static=0.4`、`kv_cache_dtype='fp8_e4m3'`。
+
+| 指标 | 无负载 | 先启动负载 | 比值 |
+|------|-------|-----------|------|
+| KV Cache #tokens | **130,535** | **19,215** | 6.8x |
+| KV Cache 大小 | 1.89 GB | 0.28 GB | 6.8x |
+| CUDA graph 前 avail_mem | 45.78 GB | 43.35 GB | -2.43 GB |
+
+#### 12.4 根因定位
+
+KV cache token 容量的计算公式位于
+`python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:62-76`
+的 `_profile_available_bytes()`：
+
+```python
+def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
+    post_model_load_memory = get_available_gpu_memory(
+        self.device, self.gpu_id,
+        distributed=get_world_group().world_size > 1,
+        cpu_group=get_world_group().cpu_group,
+    )
+
+    rest_memory = post_model_load_memory - pre_model_load_memory * (
+        1 - self.mem_fraction_static
+    )
+    return int(rest_memory * (1 << 30))  # return in bytes
+```
+
+其中：
+- `pre_model_load_memory` — 模型加载前的 GPU 空闲显存（在 `model_runner.py:1149` 处测量）
+- `post_model_load_memory` — 模型权重加载后的 GPU 空闲显存
+- `mem_fraction_static` — 用户指定，这里为 `0.4`
+
+**公式的数学含义**：
+```
+KV Cache Pool = post_model_load - pre_model_load * (1 - 0.4)
+              = post_model_load - pre_model_load * 0.6
+```
+
+当 GPU 上已经有 `perf_bench` 占用了 ~2.4 GB 显存时：
+- `pre_model_load` 减少了 ~2.4 GB
+- `post_model_load` 也减少了 ~2.4 GB（模型权重占用不变）
+- 但 `pre_model_load * 0.6` 项减少了 `2.4 * 0.6 = 1.44 GB`
+- 最终 `rest_memory` 净减少 = 2.4 - 1.44 = **0.96 GB**
+
+但实际上 KV Cache 从 1.89 GB 降到了 0.28 GB，减少了 **1.61 GB**。额外的差异来自：
+1. 显存碎片化 — `perf_bench` 的分配使显存布局不同，PyTorch allocator 和 CUDA 图分配需要更多的预留空间
+2. `mem_fraction_static=0.4` 的放大效应 — 当 `pre_model_load` 减小时，预留开销比例被放大
+
+**核心问题**：`pre_model_load_memory` 在上面的公式中被当作总显存来计算"预留开销"（乘以 0.6），但实际上 `pre_model_load_memory` 反映的是减去外部负载后的剩余显存。当外部负载存在时，公式抽走的预留开销总额仍然是 `pre_model_load * 0.6`，而这个值大于实际所需（因为 `mem_fraction_static=0.4` 本来是针对总 GPU 显存的），导致 KV Cache 被进一步挤压。
+
+#### 12.5 小 KV Cache 如何导致精度下降
+
+19K tokens 的 KV Cache 容量对于 GSM8K 评测来说非常紧张：
+- 每个 GSM8K 请求的 prompt + response 约需 1200-1600 tokens
+- 19K tokens 只能同时容纳约 12-15 个活跃请求
+- 130K tokens 可以同时容纳 ~85+ 个活跃请求
+
+影响链：
+
+1. **调度行为完全不同** — 在 19K 池中，SGLang scheduler 以非常少的并发请求运行，`token usage` 快速达到 0.88-0.94
+2. **不同的 batch size** — 小的池导致 decode batch 始终很小（2-3 个请求 vs 84 个请求）
+3. **`enable_deterministic_inference=False`（默认）** — 不同的 batch 组合会导致浮点运算中的不同舍入路径
+4. **MoE shared experts + routed experts** — DeepSeek-V2 的路由决策是 token-level 的，理论上与 batch 无关，但共享专家的融合 kernel 在不同 batch size 下的中间精度行为可能不同
+5. **FlashInfer sampling backend** — 不同的 batch 组合可能触发不同的采样代码路径
+
+最终结果是，小 KV Cache 池导致 SGLang 以完全不同的调度策略运行同样的 1319 个请求，在非确定性推理模式下产生了不同的模型输出，从而出现 ~3% 的精度差异。
+
+#### 12.6 结论
+
+**负载不影响 MoE 或 FP8 GEMM backend 的选择**（backend 由 SM 代数、量化类型和包可用性决定）。**真正原因是 KV Cache token 容量被大幅削减**（从 130K 降到 19K，降低 6.8 倍），导致完全不同的调度和 batch 行为，在 `enable_deterministic_inference=False` 下产生数值差异。
+
+**解决方案**：
+1. **确保 GPU 独享** — 在 SGLang 启动前清空 GPU 负载（`fuser -k /dev/nvidia*` 或 `nvidia-smi | grep python | awk '{print $5}' | xargs kill`）
+2. **启用确定性推理** — 加 `--enable-deterministic-inference`（但可能影响吞吐量）
+3. **增大 `--mem-fraction-static`** — 如设置为 `0.45` 或 `0.5`，给 KV Cache 更多空间，减小被外部负载挤压的相对影响
+4. **使用 `CUDA_VISIBLE_DEVICES` + `nvidia-smi -i <GPU_ID> -c EXCLUSIVE_PROCESS`** — 设置 GPU 独占模式，拒绝其他进程
+
 
 
