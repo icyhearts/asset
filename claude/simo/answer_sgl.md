@@ -9539,5 +9539,105 @@ sgl-kernel/cmake/flashmla.cmake
    ```
    需要注意安装路径必须能被 Python import 解析到（即需要在 site-packages 下）。
 
+### 13.6 方案1补充分析：`pip install .` 是否会重新编译？是否会与 `flashmla_ops.abi3.so` 冲突？
+
+**结论：会重新编译 C++/CUDA 源码，但不会与已有的 `flashmla_ops.abi3.so` 冲突。**
+
+---
+
+#### 13.6.1 是否会重新编译 C++/CUDA 代码？
+
+**是的，会重新编译。**
+
+FlashMLA 的 `setup.py:62-64` 定义了 `CUDAExtension`，这是 PyTorch 的 C++/CUDA 扩展编译机制：
+
+```python
+# setup.py:62-64
+ext_modules.append(
+    CUDAExtension(
+        name="flash_mla.cuda",
+        sources=[
+            # API
+            "csrc/api/api.cpp",
+
+            # Misc kernels for decoding
+            "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+            ...
+        ],
+        ...
+    )
+)
+```
+
+`setup.py:150` 使用 `BuildExtension`（继承自 `torch.utils.cpp_extension.BuildExtension`）：
+```python
+setup(
+    name="flash_mla",
+    version="1.0.0" + rev,
+    packages=find_packages(include=['flash_mla']),
+    ext_modules=ext_modules,
+    cmdclass={"build_ext": BuildExtension},
+)
+```
+
+执行 `pip install .` 时，`BuildExtension` 会调用 `nvcc` 编译器编译 `sources` 列表中的所有 `.cu` 和 `.cpp` 文件，生成一个名为 `flash_mla.cuda` 的动态链接库（`.so` 文件），安装到 site-packages 下。
+
+---
+
+#### 13.6.2 会与 `flashmla_ops.abi3.so` 冲突吗？
+
+**不会冲突。** 两者是完全独立的模块，互不干扰。
+
+核心原因：**编译产物是位于不同路径的不同 Python 模块。**
+
+| 对比项 | `pip install .` (setup.py) | cmake (sgl-kernel) |
+|--------|---------------------------|-------------------|
+| **模块名** | `flash_mla.cuda` | `flashmla_ops` |
+| **安装路径** | `site-packages/flash_mla/cuda.abi3.so`（或 `.so`） | `site-packages/sgl_kernel/flashmla_ops.abi3.so` |
+| **入口 C++ 文件** | `csrc/api/api.cpp`（setup.py:67） | `csrc/python_api.cpp`（flashmla.cmake:98） + `sgl-kernel/csrc/flashmla_extension.cc` |
+| **PyTorch 绑定方式** | pybind11 `PYBIND11_MODULE`（api.cpp:8） | pybind11 `PYBIND11_MODULE` + `TORCH_LIBRARY` torch.ops 注册 |
+| **编译框架** | `torch.utils.cpp_extension.CUDAExtension` + `BuildExtension` | cmake `Python_add_library` |
+| **Python import 方式** | `import flash_mla.cuda`（flash_mla_interface.py:6） | sgl_kernel 内部 import，不通过 SGLang 的 flash_mla 路径 import |
+
+具体分析：
+
+**a) 文件层面不冲突**
+- `pip install .` 产物路径：`<site-packages>/flash_mla/cuda.*.so`
+- cmake 产物路径：`<site-packages>/sgl_kernel/flashmla_ops.abi3.so`（flashmla.cmake:166）
+- 完全不同的目录，不会互相覆盖。
+
+**b) 入口 C++ 文件不同**
+- `setup.py:67` 的入口是 `csrc/api/api.cpp`，这是一个 pybind11 模块，使用 `TORCH_EXTENSION_NAME` 宏作为模块名（即 `flash_mla.cuda`）。
+- cmake 入口有两个：`sgl-kernel/csrc/flashmla_extension.cc`（flashmla.cmake:95）注册 torch.ops API，以及 `csrc/python_api.cpp`（flashmla.cmake:98）提供 pybind11 接口。编译后的模块名为 `flashmla_ops`（flashmla.cmake:146 `Python_add_library(flashmla_ops ...)`）。
+
+**c) 内核 `.cu` 文件相同但独立编译**
+- 两个构建系统编译了同一组内核 `.cu` 文件（如 `get_decoding_sched_meta.cu`、`combine.cu`、sm90/sm100 的各种 decode/prefill kernel）。
+- 但这些 `.cu` 文件的函数符号链接到各自的 `.so` 中，互不干扰。
+- 运行时，SGLang 的 `deepseek_v4_backend.py` 只 import `flash_mla`，不会加载 `sgl_kernel.flashmla_ops`；反之 sgl_kernel 的 torch.ops 路径也不会加载 `flash_mla.cuda`。
+
+**d) 只加载一份**
+- SGLang 执行路径从 `deepseek_v4_backend.py:85` 的 `import flash_mla` 开始，chain 为：
+  - `flash_mla/__init__.py:3` → `from flash_mla.flash_mla_interface import get_mla_metadata, ...`
+  - `flash_mla_interface.py:6` → `import flash_mla.cuda as flash_mla_cuda`
+- 这条路径只加载 `flash_mla.cuda.*.so`，不会加载 `sgl_kernel/flashmla_ops.abi3.so`。
+
+---
+
+#### 13.6.3 更新后的推荐方案
+
+**方案1（`pip install .`）完整步骤**：
+
+```bash
+# 注意：使用 sglang 实际引用的 FlashMLA 仓库路径
+cd /share/users/like/package/h100/package/sgl-project/FlashMLA
+pip install .
+```
+
+这会：
+1. 编译 `setup.py:64-132` 列出的所有 C++/CUDA 源码，生成 `flash_mla.cuda.*.so`
+2. 安装 `flash_mla` Python 包到 site-packages（`setup.py:148` 通过 `find_packages(include=['flash_mla'])` 打包）
+3. **不会**覆盖或影响已有的 `sgl_kernel/flashmla_ops.abi3.so`
+
+这可以解决 `sglang/srt/layers/attention/deepseek_v4_backend.py:85` 中 `import flash_mla` 的 `ModuleNotFoundError`。
 
 

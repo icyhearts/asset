@@ -2374,3 +2374,10 @@ sglang serve启动脚本位于 like-useful//dsv4-flash-run.sh
 sglang code base sgl-kernel/cmake/flashmla.cmake, FetchContent_Declare, repo-flashmla 已经有 flashmla了。
 为什么还会报错
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
+
+
+sglang 使用的 flashmla 仓库 /share/users/like/package/h100/package/sgl-project/FlashMLA.
+如果使用方案1 pip install . ,
+会重新编译 csrc里面的代码吗？
+pip install . 编译出来的csrc的代码会和 /data/like/miniconda3//envs/simo_sglang/lib/python3.12/site-packages/sgl_kernel/flashmla_ops.abi3.so 冲突吗?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
