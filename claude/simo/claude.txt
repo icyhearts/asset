@@ -2347,3 +2347,7 @@ BUY date=2026-06-11 buy_price=883.81 day_low=883.81 day_high=915.00
 
 修改 /softhome/like/asset/code/query-sh-gold.py /softhome/like/asset/code/simulate-sh-gold-trade.py
 保存csv时候，把表格列的标题保存下来。读csv的时候，如果需要，根据标题访问数据
+
+
+conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+修改 /softhome/like/asset/code/simulate-sh-gold-trade.py, 
