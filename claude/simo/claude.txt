@@ -2352,3 +2352,17 @@ BUY date=2026-06-11 buy_price=883.81 day_low=883.81 day_high=915.00
 conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 修改 /softhome/like/asset/code/simulate-sh-gold-trade.py, 年化收益率计算公式参考 /data/like/bash-bin/bin/yearRate.py.
 模拟交易结束，额外 打印库存的价格总和。
+
+
+CUDA_VISIBLE_DEVICES=7  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" }' --tasks gsm8k --batch_size auto > temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.`nowstr.sh` 2>&1 &
+
+ temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_26_52
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+在执行 lm-eval的时候， GPU上有其他进程，会影响 lm-eval  gsm8k 的精度.
+例子:
+同样的命令：CUDA_VISIBLE_DEVICES=6  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" }' --tasks gsm8k --batch_size auto > temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu6.`nowstr.sh` 2>&1 &
+没有其他负载的日志： temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_26_52
+先启动其他 负载，再启动lm-eval的日志:  temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___10_33_55
+先启动 lm-eval，等sglang server启动完成，lm-eval开始发 请求，再启动其他负载，lm-eval日志：temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_25___14_17_13
+
