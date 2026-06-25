@@ -2415,3 +2415,10 @@ CUDA_VISIBLE_DEVICES=7 SLMS=20 MEMG=1 /share_data/users/like/package/h100/packag
 分析3份日志，为什么有没有负载会影响 lm-eval --model sglang 的 gsm8k 得分?
 有其他日志的时候，sglang的 moe, attention，会使用不同的kernel吗？
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude.md 里面
+
+
+/share_data/users/like/miniconda3/envs/simo_sglang_pip/bin/python3.12 /share_data/users/like/miniconda3/envs/simo_sglang_pip/bin/sglang serve --trust-remote-code --model-path /data/like/hf-models/deepseek-v4-flash/ --mem-fraction-static 0.7 --cuda-graph-max-bs 16 --log-level debug --tp 4 --moe-runner-backend marlin --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --host 0.0.0.0 --port 30121
+sglang for deepseek-v4-flash 已经启动
+如何使用 lm-eval 对 端口 30121 进行 gsm8k 测试?
+把答案追加在 like-useful/answer_claude.md 里面
+

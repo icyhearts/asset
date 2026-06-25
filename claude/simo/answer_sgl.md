@@ -9893,3 +9893,95 @@ gsm8k 是数学推理任务，要求模型生成精确的计算过程和最终�
 | 真正的根因是什么？ | **batch-dependent 的浮点非确定性**。相同的输入在不同 batch 中计算，由于 batch 大小/组成不同，cuBLAS 等底层库选择了不同的内部实现路径，导致浮点累加顺序不同，产生微小的数值差异。这些差异在 27 层 transformer 中逐层累积，最终的 logit 差异足以改变 greedy decoding 的 argmax 选择。 |
 | `enable_deterministic_inference=true` 如何解决问题？ | 通过以下机制全面消除 batch-dependent 非确定性：(1) 用固定 tile 的 Triton persistent kernel 替换 `torch.mm`/`torch.bmm`/`log_softmax`/`rms_norm`；(2) 用 seq_len 决定 KV split 而非 batch 布局；(3) 用 `F.linear` 替代优化的 router_gemm；(4) 固定 MoE kernel 配置；(5) 固定 sampling seed；(6) 禁用 CUDA graph 和 allreduce fusion。 |
 
+
+
+## 15. 对已运行的 SGLang 服务器进行 lm-eval gsm8k 测试
+
+### 15.0 场景
+
+deepseek-v4-flash 的 SGLang serve 已在端口 30121 运行：
+```bash
+/share_data/users/like/miniconda3/envs/simo_sglang_pip/bin/sglang serve \
+  --model-path /data/like/hf-models/deepseek-v4-flash/ \
+  --tp 4 --moe-runner-backend marlin \
+  --speculative-algorithm EAGLE --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --host 0.0.0.0 --port 30121
+```
+
+需要对这个**已运行的 server** 执行 lm-eval gsm8k 测试（不重新启动 server）。
+
+### 15.1 两种方式对比
+
+lm-eval 连接 SGLang server 有两种模式：
+
+| 模式 | `--model` 参数 | server 生命周期 | `model_args` 关键参数 |
+|------|---------------|----------------|---------------------|
+| **模式 A：lm-eval 自动启动 server** | `sglang` | lm-eval 内部启动和销毁 server | `pretrained`, `tp_size`, `mem_fraction_static` 等 server 配置 |
+| **模式 B：连接已运行的 server** | `local-completions` | server 已存在，lm-eval 只做推理 | `model`（任意名称）, `base_url`（指向 server 的 OpenAI completions 端点） |
+
+当前场景下应使用**模式 B**。
+
+### 15.2 原理
+
+lm-eval 的 `local-completions` backend 通过 OpenAI-compatible `/v1/completions` API 与 SGLang server 通信。
+
+SGLang codebase 的 test 工具也采用同样方式，参见 `sglang/test/kits/lm_eval_kit.py` 的 `launch_lm_eval()` 方法：
+
+```python
+model_args = {
+    "model": eval_config["model_name"],
+    "base_url": self.base_url + "/v1/completions",
+    "num_concurrent": num_concurrent,
+}
+results = lm_eval.simple_evaluate(
+    model="local-completions",
+    model_args=model_args,
+    tasks=[task["name"] for task in eval_config["tasks"]],
+    ...
+)
+```
+
+### 15.3 命令
+
+```bash
+conda activate simo_sglang_pip
+
+lm-eval \
+  --model local-completions \
+  --model_args '{"model": "default", "base_url": "http://127.0.0.1:30121/v1/completions", "num_concurrent": 1}' \
+  --tasks gsm8k \
+  --batch_size auto
+```
+
+参数说明：
+- `--model local-completions`：使用 lm-eval 内置的 OpenAI-compatible completions backend
+- `model: "default"`：SGLang 的 completions API 中的 model 名称，server 上只有一个模型时不敏感，可填任意值
+- `base_url: "http://127.0.0.1:30121/v1/completions"`：指向 server 的 `/v1/completions` 端点
+- `num_concurrent: 1`：并发请求数设为 1，与模式 A 下 lm-eval 内部管理 server 时的默认行为一致
+- `--batch_size auto`：让 lm-eval 自动选择 batch size
+
+### 15.4 验证 server 是否正常
+
+在运行 lm-eval 前，可先验证 server 的 completions 端点是否可用：
+
+```bash
+curl -s http://127.0.0.1:30121/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default",
+    "prompt": "Hello, world!",
+    "max_tokens": 10
+  }' | python3 -m json.tool
+```
+
+### 15.5 保存日志
+
+```bash
+lm-eval \
+  --model local-completions \
+  --model_args '{"model": "default", "base_url": "http://127.0.0.1:30121/v1/completions", "num_concurrent": 1}' \
+  --tasks gsm8k \
+  --batch_size auto \
+  > temp/lm-eval-gsm8k-dsv4-flash.sglang-serve-api.`nowstr.sh`.log 2>&1
+```
