@@ -114,9 +114,7 @@ def maybe_sell_one(
     inventory.pop(index)
     holding_days = max((current.trade_date - lot.buy_date).days, 1)
     profit_rate = sell_profit / lot.buy_price
-    annualized_return = Decimal(
-        str((float(Decimal("1") + profit_rate) ** (365.0 / holding_days)) - 1.0)
-    )
+    annualized_return = profit_rate * Decimal("365") / Decimal(str(holding_days))
     print(
         "SELL "
         f"date={current.trade_date.isoformat()} "
@@ -188,6 +186,8 @@ def simulate(
             f"buy_date={lot.buy_date.isoformat()} "
             f"buy_price={format_decimal(lot.buy_price)}"
         )
+    inventory_total = sum((lot.buy_price for lot in inventory), Decimal("0"))
+    print(f"INVENTORY_TOTAL {format_decimal(inventory_total)}")
     return total_profit
 
 

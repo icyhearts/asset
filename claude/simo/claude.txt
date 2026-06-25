@@ -2350,4 +2350,5 @@ BUY date=2026-06-11 buy_price=883.81 day_low=883.81 day_high=915.00
 
 
 conda 环境位于/data/like/miniconda3/envs/simo_sglang/
-修改 /softhome/like/asset/code/simulate-sh-gold-trade.py, 
+修改 /softhome/like/asset/code/simulate-sh-gold-trade.py, 年化收益率计算公式参考 /data/like/bash-bin/bin/yearRate.py.
+模拟交易结束，额外 打印库存的价格总和。
