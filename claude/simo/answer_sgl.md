@@ -9641,3 +9641,255 @@ pip install .
 这可以解决 `sglang/srt/layers/attention/deepseek_v4_backend.py:85` 中 `import flash_mla` 的 `ModuleNotFoundError`。
 
 
+## 14. enable_deterministic_inference 如何消除 KV Cache 容量差异对 gsm8k 分数的影响
+
+### 14.0 背景与日志数据
+
+**测试模型**：`DeepSeek-V2-Lite-Chat-16B_A2.4B`（MoE 架构，每层 27 层）
+
+**测试命令**：
+```bash
+CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{
+  "pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",
+  "tp_size": 1, "dtype": "auto", "attention_backend": "triton",
+  "mem_fraction_static": 0.4, "log_level": "info",
+  "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3",
+  "enable_deterministic_inference": true
+}' --tasks gsm8k --batch_size auto
+```
+
+**4 份日志对比**：
+
+| # | 日志文件 | GPU 负载 | KV Cache #tokens | 行数 | gsm8k 分数 (flex/strict) |
+|---|---------|---------|-----------------|------|--------------------------|
+| 1 | `...16_12_43` | **无** | **130,534** | 856 | 0.6566 / 0.6490 |
+| 2 | `...enable_deterministic_inference...16_38_03` | **有** | **46,185** | 1190 | 0.6566 / 0.6490 |
+| 3 | `...enable_deterministic_inference...16_52_56` | **有** | **46,185** | 1190 | 0.6566 / 0.6490 |
+| 4 | `...enable_deterministic_inference...17_03_44` | **无** | **130,534** | 856 | 0.6566 / 0.6490 |
+
+**关键发现**：
+- KV Cache #tokens 差距巨大（130K vs 46K），但 gsm8k 4 次分数完全相同
+- 有负载的日志（#2, #3）比无负载的（#1, #4）多了 334 行 = 更多的调度批次（小 KV cache 需要更多轮次处理同样的请求）
+- 这说明 **KV cache 容量本身不是影响 gsm8k 分数的原因**
+
+---
+
+### 14.1 `enable_deterministic_inference=true` 对 SGLang 的完整影响链
+
+`enable_deterministic_inference=true` 的核心目标是：**让相同的输入在任何 batch 组合下都产生完全相同的输出**。它从多个层面消除了浮点计算的不确定性。入口在 `sglang/srt/server_args.py:4017` `_handle_deterministic_inference()`。
+
+#### 14.1.1 全局算子替换：batch-invariant ops
+
+这是最关键的机制。在 `sglang/srt/model_executor/model_runner.py:740-743`：
+
+```python
+if server_args.enable_deterministic_inference:
+    from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+    enable_batch_invariant_mode()
+```
+
+`enable_batch_invariant_mode()`（`sglang/srt/batch_invariant_ops/batch_invariant_ops.py:975-999`）通过 `torch.library.Library("aten", "IMPL")` 替换了 PyTorch 的 ATen 算子注册：
+
+```python
+def enable_batch_invariant_mode(enable_bmm: bool = True):
+    _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)       # 矩阵乘法
+    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key) # 矩阵乘加
+    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)  # log softmax
+    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)  # 均值归约
+    _batch_invariant_LIB.impl("aten::rms_norm", _rms_norm_aten_compat, dispatch_key)  # RMS norm
+    _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
+    if enable_bmm:
+        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
+        torch.bmm = bmm_batch_invariant   # 直接替换 torch.bmm
+```
+
+这些替换使用固定 tile 配置的 Triton persistent kernel，消除了 cuBLAS 因输入维度不同而选择不同内部算法/tile 大小导致的浮点累积顺序差异。
+
+#### 14.1.2 Attention 层面的确定性
+
+**Triton backend 确定性配置**（`sglang/srt/layers/attention/triton_backend.py:180-186`）：
+
+```python
+if self.enable_deterministic:
+    self.split_tile_size = get_int_env_var("SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256)
+    self.static_kv_splits = False   # 使用确定性逻辑而非动态逻辑
+else:
+    self.split_tile_size = model_runner.server_args.triton_attention_split_tile_size
+```
+
+`get_num_kv_splits()` 方法（`sglang/srt/layers/attention/triton_backend.py:238-287`）有 3 条路径：
+
+```python
+# 路径1（无确定性 + static_kv_splits=True）：全部填 max_kv_splits
+if self.static_kv_splits and not self.enable_deterministic:
+    num_kv_splits.fill_(self.max_kv_splits)           # line 257
+
+# 路径2（确定性）：基于 seq_len 和 split_tile_size 计算，与 batch 无关
+if self.split_tile_size is not None and self.enable_deterministic:  # line 261
+    num_kv_splits[:] = (expanded_seq_lens + self.split_tile_size - 1) // self.split_tile_size
+
+# 路径3（无确定性 + static_kv_splits=False）：动态 Triton kernel，与 batch 布局相关
+get_num_kv_splits_triton[(1,)](                       # line 278
+    num_kv_splits, seq_lens, num_seq, num_group,
+    self.num_head, self.num_kv_head, self.max_kv_splits,
+    self.device_core_count, ...
+)
+```
+
+- **非确定性路径**（路径3）：KV split 数量由 `get_num_kv_splits_triton` 动态计算，考虑当前的 `num_seq`、`num_group`、`device_core_count` 等 batch 相关参数。同一请求在不同 batch 中可能被分配到不同数量的 KV split → 不同数量的 partial sum → 不同的浮点累积顺序 → 不同的结果。
+- **确定性路径**（路径2）：KV split 数量完全由 `(seq_len / split_tile_size)` 决定，与 batch 中其他请求无关。
+
+**DeepSeek 模型的 attention dispatch 变化**（`sglang/srt/models/deepseek_common/attention_backend_handler.py:111-114`）：
+
+```python
+def handle_attention_fa3(attn, forward_batch):
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)  # 固定使用 MLA 路径
+    else:
+        return _handle_attention_backend(attn, forward_batch, "fa3")  # 动态选择 MHA/MLA
+```
+
+Triton backend 同理（`attention_backend_handler.py:176-178`）：确定性模式下强制使用 MLA dispatch。
+
+**num_splits 刚性限制**（多个 backend）：
+- FlashAttention（`flashattention_backend.py:209-217`）：`num_splits = 1`
+- DSA backend（`dsa_backend.py:317-319`）：`num_splits = 1`
+
+这防止了 FlashAttention 内部根据 batch 大小自动选择不同的 split 数量。
+
+#### 14.1.3 DeepSeek Router Gate 确定性
+
+`deepseek_v2.py:440-441`：
+
+```python
+if get_global_server_args().enable_deterministic_inference:
+    return F.linear(hidden_states, self.weight, None)  # 标准 matmul，不再使用优化路径
+```
+
+非确定性模式下，DeepSeek router gate 可能根据 batch size 和 hidden_dim 形状使用特殊的 `router_gemm` 优化路径（`deepseek_v2.py:454-459` 的 tensorcore-optimized kernel）。这些优化路径内部 tile 选择同样 batch-dependent。
+
+#### 14.1.4 MoE 层面
+
+**MoE Router kernel 选择**（`sglang/srt/layers/moe/router.py:364-389`）：
+
+```python
+if (bs >= 512 or num_experts > 8) and not enable_deterministic_inference:
+    return fused_moe_router_tensorcore(...)   # 优化路径
+else:
+    return fused_moe_router_cudacore(...)      # 确定性路径
+```
+
+**MoE fused Triton config**（`sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_config.py:55-59`）：
+
+```python
+if get_global_server_args().enable_deterministic_inference:
+    return None  # 跳过自动调优
+```
+
+回落使用固定 kernel config（`BLOCK_SIZE_M=64, N=64, K=32, GROUP_SIZE_M=8`，`fused_moe_triton_config.py:160-163`）。
+
+#### 14.1.5 Sampling 确定性
+
+`server_args.py:4042-4046`：
+
+```python
+self.sampling_backend = "pytorch"  # flashinfer 的 sampling 是不确定的
+```
+
+`sampling_batch_info.py:94-109`：为每个请求组装 `sampling_seed`（默认 42），传递给 sampler 实现可复现的 token 采样。
+
+#### 14.1.6 CUDA Graph 和 Allreduce
+
+- **Piecewise CUDA Graph 禁用**（`server_args.py:1342-1343`）：`torch.cuda.CUDAGraph` 的捕获/重放可能引入不确定性
+- **Allreduce fusion 禁用**（`server_args.py:4030-4040`）：AITER 和 FlashInfer 的 allreduce fusion 计算顺序不确定
+
+---
+
+### 14.2 为什么 `enable_deterministic_inference=true` 后 #tokens 差距很大但分数一致
+
+核心原因：**`enable_deterministic_inference=true` 消除了所有 batch-dependent 的浮点计算差异。**
+
+在不启用确定性推理时：
+
+```
+请求A在batch_X（大batch）中的计算结果 ≠ 请求A在batch_Y（小batch）中的计算结果
+```
+
+因为 `torch.mm`/`torch.bmm` 被 cuBLAS 根据矩阵维度自动选择了不同的内部 tile 配置，attention KV split 数量也因 batch 布局而异。
+
+在启用确定性推理后：
+
+```
+请求A在batch_X（大batch）中的计算结果 == 请求A在batch_Y（小batch）中的计算结果
+```
+
+因为所有 batch-dependent 的算子被替换为：
+1. 固定 tile 的 Triton persistent kernel（`torch.mm`/`torch.bmm`/`log_softmax`/`rms_norm`）
+2. 纯 seq_len 决定的 KV split（与 batch 中其他请求无关）
+3. 固定的 `F.linear` 路由（不根据 batch size 切换优化路径）
+4. 固定的 MoE kernel 配置（不自动调优）
+
+KV cache #tokens 差异（130K vs 46K）仍然导致**batch 组成完全不同**（更多的小 batch vs 更少的大 batch），但这只是改变了调度效率，不影响每个单独请求的计算结果。
+
+---
+
+### 14.3 没有 `enable_deterministic_inference` 时 gsm8k 分数不同的根本原因
+
+**根因不是 KV cache 容量本身，而是 batch-dependent 的浮点非确定性（floating-point nondeterminism）。**
+
+#### 完整的因果链
+
+```
+GPU 负载存在
+  → 可用显存减少（38.27 GB vs 40.12 GB）
+    → KV cache #tokens 缩减（46K vs 130K）
+      → 调度器必须把同样多的请求拆成更多的小 batch
+        → 每个 batch 包含的请求数不同（batch size 不同）
+          → 矩阵运算的 shape 不同（如 [bs, hidden_dim] 不同）
+            → cuBLAS 内部选择了不同的 tile 配置/算法
+              → 浮点累加顺序不同 → 微小数值差异（~1e-7 量级）
+                → 27 层 transformer 逐层放大
+                  → 最终 logits 差异可能导致 argmax 选择的 token 不同
+                    → 不同的 token → 完全不同的续写路径
+                      → 最终答案不同 → gsm8k 分数不同
+```
+
+#### 具体涉及的 batch-dependent 非确定性来源
+
+| 来源 | 位置（相对路径） | 机制 |
+|------|-----------------|------|
+| `torch.mm` / `torch.bmm` | 所有 linear 层 | cuBLAS 根据 (M,N,K) 形状选择内部 tile 大小和算法（如 GEMM 的不同 variant），浮点累加顺序不同 |
+| `torch._log_softmax` | softmax 层 | cuDNN/cuBLAS 根据张量形状选择不同归约策略 |
+| `torch.mean` / `F.rms_norm` | LayerNorm/RMSNorm | 归约操作的内部并行分解策略依赖张量大小 |
+| Triton attention KV splits | `triton_backend.py:278-287` | `get_num_kv_splits_triton` 根据 `num_seq`、`num_group`、`device_core_count` 动态分配 split 数 → 同一请求在不同 batch 中 partial sum 组合方式不同 |
+| DeepSeek router_gemm | `deepseek_v2.py:454-459` | 根据 batch size 是否 ≤16 和 hidden_dim 形状选择优化路径 |
+| MoE router kernel | `router.py:368-373` | 根据 batch size 是否 ≥512 选择 tensorcore 或 cudacore kernel |
+| MoE triton config | `fused_moe_triton_config.py:55-59` | auto-tune 根据当前 batch 选择最优 kernel 配置 |
+| FlashAttention num_splits | `flashattention_backend.py:209-217` | 非确定性模式下自动 split，与 batch 上下文相关 |
+
+#### 为什么微小的浮点差异会影响 gsm8k 分数
+
+DeepSeek-V2-Lite 有 27 层 transformer。每层产生 ~1e-7 量级的浮点差异，经过 27 层累积后可以达到 ~1e-5 到 ~1e-6 量级。
+
+在 greedy decoding 中，top-1 token 和 top-2 token 的概率差通常只在小数点后几位。当累积的浮点差异使 top-1 和 top-2 的 logit 排序发生变化时：
+
+```
+无差异：token_A (logit=3.14159) > token_B (logit=3.14158) → 选 token_A
+有差异：token_A (logit=3.14158) < token_B (logit=3.14159) → 选 token_B  ← 逆转！
+```
+
+一旦选择了一个不同的 token，后续所有 token 的生成路径就完全改变了。这导致最终答案不同。
+
+gsm8k 是数学推理任务，要求模型生成精确的计算过程和最终数字。一个 token 的差异就能导致整条推理链走向不同的结论 → 得分不同。
+
+---
+
+### 14.4 总结
+
+| 问题 | 答案 |
+|------|------|
+| KV cache 容量差异是根因吗？ | **不是**。`enable_deterministic_inference=true` 的实验中，KV cache 130K vs 46K 但分数完全一致，直接证明容量差异不影响分数。 |
+| 真正的根因是什么？ | **batch-dependent 的浮点非确定性**。相同的输入在不同 batch 中计算，由于 batch 大小/组成不同，cuBLAS 等底层库选择了不同的内部实现路径，导致浮点累加顺序不同，产生微小的数值差异。这些差异在 27 层 transformer 中逐层累积，最终的 logit 差异足以改变 greedy decoding 的 argmax 选择。 |
+| `enable_deterministic_inference=true` 如何解决问题？ | 通过以下机制全面消除 batch-dependent 非确定性：(1) 用固定 tile 的 Triton persistent kernel 替换 `torch.mm`/`torch.bmm`/`log_softmax`/`rms_norm`；(2) 用 seq_len 决定 KV split 而非 batch 布局；(3) 用 `F.linear` 替代优化的 router_gemm；(4) 固定 MoE kernel 配置；(5) 固定 sampling seed；(6) 禁用 CUDA graph 和 allreduce fusion。 |
+
