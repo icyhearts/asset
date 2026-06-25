@@ -9421,5 +9421,111 @@ KV Cache Pool = post_model_load - pre_model_load * (1 - 0.4)
 3. **增大 `--mem-fraction-static`** — 如设置为 `0.45` 或 `0.5`，给 KV Cache 更多空间，减小被外部负载挤压的相对影响
 4. **使用 `CUDA_VISIBLE_DEVICES` + `nvidia-smi -i <GPU_ID> -c EXCLUSIVE_PROCESS`** — 设置 GPU 独占模式，拒绝其他进程
 
+### 13. sglang serve DeepSeek-V4 flashmla `ModuleNotFoundError` 分析
+
+#### 13.1 错误日志
+
+```
+log line 1913-1919:
+core_attn_metadata.init_flashmla_related()
+File ".../sglang/srt/layers/attention/deepseek_v4_backend.py", line 262, in init_flashmla_related
+    self.c1_flashmla_metadata = _create_flashmla_metadata()
+File ".../sglang/srt/layers/attention/deepseek_v4_backend.py", line 85, in _create_flashmla_metadata
+    import flash_mla
+ModuleNotFoundError: No module named 'flash_mla'
+```
+
+#### 13.2 调用链分析
+
+`deepseek_v4_backend.py` 在多处依赖 `flash_mla` Python 包：
+
+| 行号 | 导入/调用 | 说明 |
+|------|----------|------|
+| `deepseek_v4_backend.py:61` | `from flash_mla.flash_mla_interface import FlashMLASchedMeta` | 类型注解 |
+| `deepseek_v4_backend.py:85` | `import flash_mla` | 在 `_create_flashmla_metadata()` 中 |
+| `deepseek_v4_backend.py:87` | `flash_mla.get_mla_metadata()` | 获取 MLA 元数据 |
+| `deepseek_v4_backend.py:262-264` | `_create_flashmla_metadata()` | `init_flashmla_related()` 调用 |
+| `deepseek_v4_backend.py:1048-1050` | `import flash_mla`; `flash_mla.flash_mla_with_kvcache()` | decode 时实际的 MLA 计算 |
+
+**`flash_mla` 是一个 Python wrapper 包**，它提供了 Python API：
+- `flash_mla.get_mla_metadata()` — 返回 MLA 调度元数据
+- `flash_mla.flash_mla_with_kvcache()` — 执行带 KV cache 的 MLA decode
+- `flash_mla.flash_mla_interface.FlashMLASchedMeta` — 调度元数据类型
+
+#### 13.3 cmake 只构建了 C++ 扩展，没有安装 Python wrapper
+
+`sgl-kernel/CMakeLists.txt:511` 通过 `include(cmake/flashmla.cmake)` 引入了 flashmla 构建。
+
+`sgl-kernel/cmake/flashmla.cmake:6-12` 使用 `FetchContent_Declare` 从 git 仓库获取 flashmla 源码：
+
+```cmake
+FetchContent_Declare(
+    repo-flashmla
+    GIT_REPOSITORY git@gitlabsoft.siorigin.com:xtubk/sgl-project-flashmla.git
+    GIT_TAG 5674ae59250493e583cb7fc9bc5d253e9a9d34f0
+    GIT_SHALLOW OFF
+)
+FetchContent_Populate(repo-flashmla)
+```
+
+然后 `flashmla.cmake:94-166` 只做了以下事情：
+1. 列出 C++ 源文件（`.cu`, `.cpp`, `.cc`）
+2. 通过 `Python_add_library(flashmla_ops ...)`（第 146 行）编译成 shared library
+3. 通过 `install(TARGETS flashmla_ops LIBRARY DESTINATION "sgl_kernel")`（第 166 行）安装到 `sgl_kernel/` 目录
+
+**结果**：编译产物 `flashmla_ops.abi3.so` 被安装到 conda 环境的
+`lib/python3.12/site-packages/sgl_kernel/flashmla_ops.abi3.so`。
+
+但 `flash_mla` Python 包（包含 `__init__.py`、`flash_mla_interface.py` 等）**没有被安装**。
+flashmla 仓库中虽然有 Python wrapper 源码（`flash_mla/` 目录），但 sgl-kernel 的 cmake **只构建 C++ 扩展**，不负责安装 Python 包。
+
+#### 13.4 架构图：cmake 构建 vs Python 层
+
+```
+flashmla Git 仓库
+├── csrc/                          ← cmake 编译（flashmla.cmake）
+│   ├── flashmla_extension.cc
+│   ├── sm90/decode/dense/...
+│   └── ...
+├── flash_mla/                     ← Python 包（cmake 不处理！）
+│   ├── __init__.py                ← 定义 get_mla_metadata(), flash_mla_with_kvcache()
+│   └── flash_mla_interface.py     ← 定义 FlashMLASchedMeta
+└── setup.py / pyproject.toml      ← 可能的 pip 安装入口
+```
+
+**sgl-kernel 的 cmake 只覆盖了 `csrc/` 部分**：
+```
+sgl-kernel/cmake/flashmla.cmake
+  → FetchContent 下载 flashmla 源码
+  → 编译 csrc/*.cu, csrc/*.cpp
+  → 输出 flashmla_ops.abi3.so → 安装到 sgl_kernel/
+```
+
+**`flash_mla` Python 包需要单独安装**（通过 flashmla 仓库自己的 `pip install`）。
+
+#### 13.5 结论
+
+**cmake 已经正确处理了 C++ native extension 的编译和安装**（`flashmla_ops.abi3.so` 已在 site-packages 中），但 **Python 包 `flash_mla` 没有被安装**。`flash_mla` 是 flashmla 仓库中的独立 Python 包，它为 C++ 扩展提供了 Python API wrapper，需要单独通过 pip 安装。
+
+#### 13.6 解决方案
+
+1. **从 flashmla 仓库 pip install Python 包**：
+   ```bash
+   cd <flashmla_repo_path>
+   pip install .  # 或 pip install -e .
+   ```
+
+2. **或者检查 sglang 是否有自己的 flash_mla shim**：如果 sglang 项目中有 `python/sglang/srt/flash_mla/` 或类似的 Python wrapper，确保它在 `PYTHONPATH` 中。
+
+3. **在 cmake 中同时安装 Python 包**（修改 `flashmla.cmake`）：
+   在 `flashmla.cmake` 末尾添加类似以下逻辑：
+   ```cmake
+   install(
+     DIRECTORY ${repo-flashmla_SOURCE_DIR}/flash_mla/
+     DESTINATION "flash_mla"
+   )
+   ```
+   但需要注意安装路径必须能被 Python import 解析到（即需要在 site-packages 下或 `PYTHONPATH` 中）。
+
 
 
