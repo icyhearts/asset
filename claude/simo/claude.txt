@@ -2422,3 +2422,7 @@ sglang for deepseek-v4-flash 已经启动
 如何使用 lm-eval 对 端口 30121 进行 gsm8k 测试?
 把答案追加在 like-useful/answer_claude.md 里面
 
+
+
+sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+enable_batch_invariant_mode()（sglang/srt/batch_invariant_ops/batch_invariant_ops.py:975-999）通过 torch.library.Library("aten", "IMPL") 替换了 PyTorch 的 ATen 算子注册：
