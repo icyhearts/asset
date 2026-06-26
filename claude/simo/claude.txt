@@ -2424,5 +2424,7 @@ sglang for deepseek-v4-flash 已经启动
 
 
 
-sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+#sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
 enable_batch_invariant_mode()（sglang/srt/batch_invariant_ops/batch_invariant_ops.py:975-999）通过 torch.library.Library("aten", "IMPL") 替换了 PyTorch 的 ATen 算子注册：
+以 矩阵乘法 为例，对比 pytorch的矩阵乘法 和 sglang batch invarient 矩阵乘法，看看  sglang batch invarient 矩阵乘法是否真的和 pytorch 矩阵乘法有区别。
+要求: 代码写到 like-useful/validate_batch_invariant_ops.py, 矩阵乘法的数据类型是bf16, 你在写完后还要进行用指定 conda 环境测试, 把测试结论写到like-useful/answer_claude.md 里面
