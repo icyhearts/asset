@@ -7035,7 +7035,7 @@ product_each(shape(layout_mn)) = (_32,_32)
 这就是 `Tiler_MN` 的来源。`make_tiled_copy` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:489 make_tiled_copy` 调用 `product_each(shape(layout_mn))`，`product_each` 的定义在 `3rd/cutlass/include/cute/int_tuple.hpp:249 product_each` 到 `3rd/cutlass/include/cute/int_tuple.hpp:251 product_each`，逐个 mode 求乘积。因为 `layout_mn` 的第二个 mode 是层级 shape `(_8,_4)`，乘积是 32，所以：
 
 ```text
-Tiler_MN = product_each((_32,_32)) = (_32,_32)
+Tiler_MN = product_each((_32,(_8,_4))) = (_32,_32)
 ```
 
 如果把 `layout_mn` 写成“目标 tile 坐标 -> linear id”的等价形式，可以得到：
