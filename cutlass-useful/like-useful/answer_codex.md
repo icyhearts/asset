@@ -6924,3 +6924,308 @@ else if constexpr (scale::den == 1) {
 本例 `scale = R<16,1>`，所以 `scale::den == 1` 成立，进入 `upcast<16>(layout)`。这就是 `trait_ratio -> nratio -> R<16,1> -> scale::num/scale::den -> upcast<16>` 的完整路径。
 
 一句话总结：`trait_ratio` 先把 `sizeof_bits<ValType>` 和 `sizeof_bits<uint1_t>` 的 `value` 转成 `C<16>` 和 `C<1>`，然后调用的是 `nratio(C<a>, C<b>)` 这个重载，返回 `R<16,1>`；`nratio` 所谓的“除法”是类型级比例 `R<分子,分母>`，真正被后续代码使用的是 `R::num` 和 `R::den`，本例最终触发 `recast_layout` 的 `upcast<16>`。
+
+## G2SCopyA 的 Tiler_MN 和 TiledLayout_TV 是如何算出来的？
+
+`G2SCopyA` 的类型定义在 `gemm-multi-stage-like.cu:271 GemmConfig::G2SCopyA` 到 `gemm-multi-stage-like.cu:275 GemmConfig::G2SCopyA`：
+
+```cpp
+using G2SCopyA =
+    decltype(make_tiled_copy(g2s_copy_atom{},
+                             make_layout(make_shape(Int<32>{}, Int<4>{}),
+                                         make_stride(Int<4>{}, Int<1>{})),
+                             make_layout(make_shape(Int<1>{}, Int<8>{}))));
+```
+
+也就是给 `make_tiled_copy` 传了三个东西：
+
+```text
+copy_atom  = g2s_copy_atom
+thr_layout = (_32,_4):(_4,_1)
+val_layout = (_1,_8):(_0,_1)
+```
+
+其中 `val_layout` 没有显式 stride，走 `3rd/cutlass/include/cute/layout.hpp:333 make_layout` 到 `3rd/cutlass/include/cute/layout.hpp:335 make_layout` 的默认 compact col-major 规则。`(_1,_8)` 的第一维 size 是 1，所以 stride 被压成 0，第二维 stride 是 1，因此打印成 `(_1,_8):(_0,_1)`。
+
+`make_tiled_copy` 的关键实现是 `3rd/cutlass/include/cute/atom/copy_atom.hpp:478 make_tiled_copy` 到 `3rd/cutlass/include/cute/atom/copy_atom.hpp:499 make_tiled_copy`：
+
+```cpp
+auto layout_mn = raked_product(thr_layout, val_layout);
+auto layout_tv = right_inverse(layout_mn).with_shape(make_shape(size(thr_layout), size(val_layout)));
+auto tiler = product_each(shape(layout_mn));
+return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
+```
+
+`TiledCopy` 只是把这两个结果保存为类型成员。`3rd/cutlass/include/cute/atom/copy_atom.hpp:153 TiledCopy` 到 `3rd/cutlass/include/cute/atom/copy_atom.hpp:154 TiledCopy`：
+
+```cpp
+using Tiler_MN       = ShapeTiler_MN;
+using TiledLayout_TV = LayoutCopy_TV;
+```
+
+最后 `print(G2SCopyA_ins)` 在 `gemm-multi-stage-like.cu:437 main` 到 `gemm-multi-stage-like.cu:439 main` 被调用；打印函数在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:635 print(TiledCopy)` 到 `3rd/cutlass/include/cute/atom/copy_atom.hpp:640 print(TiledCopy)`，所以日志里的：
+
+```text
+Tiler_MN:       (_32,_32)
+TiledLayout_TV: ((_4,_32),_8):((_256,_1),_32)
+```
+
+就是 `tiler` 和 `layout_tv` 的类型打印。
+
+### 第一步：计算 layout_mn
+
+`raked_product` 的定义在 `3rd/cutlass/include/cute/layout.hpp:1532 raked_product` 到 `3rd/cutlass/include/cute/layout.hpp:1539 raked_product`：
+
+```cpp
+auto result = logical_product(append<R>(block), append<R>(tiler));
+return coalesce(zip(get<1>(result), get<0>(result)), tuple_repeat<R>(Int<1>{}));
+```
+
+这里的 `block` 是 `thr_layout`，`tiler` 是 `val_layout`。`raked_product` 的含义是：每个 value layout 元素都放置一个 thread layout block，并且 value 维插在 thread block 的内层，也就是“raked/interleaved”。
+
+先把两个输入写成坐标公式：
+
+```text
+thr_layout = (_32,_4):(_4,_1)
+thr_layout(t_m, t_k) = 4 * t_m + t_k
+
+val_layout = (_1,_8):(_0,_1)
+val_layout(v_m, v_k) = v_k
+```
+
+`thr_layout` 有 128 个线程，因为：
+
+```text
+size(thr_layout) = 32 * 4 = 128
+```
+
+`val_layout` 有 8 个 value，因为：
+
+```text
+size(val_layout) = 1 * 8 = 8
+```
+
+`raked_product(thr_layout, val_layout)` 后，逻辑坐标可以看成：
+
+```text
+m = t_m                         // v_m 只有 1，不扩展 M
+k = v_k + 8 * t_k               // 每个线程沿 K 搬 8 个连续 half
+```
+
+坐标范围是：
+
+```text
+t_m in [0, 31]
+t_k in [0,  3]
+v_k in [0,  7]
+
+m in [0, 31]
+k in [0, 31]
+```
+
+因此 `layout_mn` 覆盖的 tensor tile 形状是：
+
+```text
+M 方向: 32
+K 方向: 4 * 8 = 32
+shape(layout_mn) = (_32,(_8,_4))
+product_each(shape(layout_mn)) = (_32,_32)
+```
+
+这就是 `Tiler_MN` 的来源。`make_tiled_copy` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:489 make_tiled_copy` 调用 `product_each(shape(layout_mn))`，`product_each` 的定义在 `3rd/cutlass/include/cute/int_tuple.hpp:249 product_each` 到 `3rd/cutlass/include/cute/int_tuple.hpp:251 product_each`，逐个 mode 求乘积。因为 `layout_mn` 的第二个 mode 是层级 shape `(_8,_4)`，乘积是 32，所以：
+
+```text
+Tiler_MN = product_each((_32,_32)) = (_32,_32)
+```
+
+如果把 `layout_mn` 写成“目标 tile 坐标 -> linear id”的等价形式，可以得到：
+
+```text
+k = v_k + 8 * t_k
+t_k = floor(k / 8)
+v_k = k % 8
+
+layout_mn(m,k) = 4 * m + t_k + 128 * v_k
+               = 4 * m + floor(k / 8) + 128 * (k % 8)
+```
+
+等价 layout 可以写成：
+
+```text
+layout_mn = (_32,(_8,_4)):(_4,(_128,_1))
+```
+
+这也是直接用 CuTe 打印 `raked_product(thr_layout, val_layout)` 会看到的中间结果：
+
+```text
+thr: (_32,_4):(_4,_1)
+val: (_1,_8):(_0,_1)
+mn : (_32,(_8,_4)):(_4,(_128,_1))
+```
+
+这里 K 维的层级 shape `(_8,_4)` 分别对应 `v_k` 和 `t_k`：`v_k` 的 stride 是 128，`t_k` 的 stride 是 1。后续 `right_inverse` 会按 stride 从 1 开始反推，所以它先看到 stride 为 1 的 `t_k` 子维，再看到 stride 为 4 的 `m` 子维，最后看到 stride 为 128 的 `v_k` 子维。
+
+### 第二步：计算 TiledLayout_TV
+
+`TiledLayout_TV` 来自 `3rd/cutlass/include/cute/atom/copy_atom.hpp:486 make_tiled_copy`：
+
+```cpp
+auto layout_tv = right_inverse(layout_mn).with_shape(make_shape(size(thr_layout), size(val_layout)));
+```
+
+对上面的中间 layout：
+
+```text
+layout_mn = (_32,(_8,_4)):(_4,(_128,_1))
+```
+
+CuTe 得到的直接右逆是：
+
+```text
+right_inverse(layout_mn) = (_4,_256):(_256,_1)
+```
+
+先看 shape：
+
+```text
+make_shape(size(thr_layout), size(val_layout))
+= make_shape(128, 8)
+```
+
+所以 `layout_tv` 的输入坐标是：
+
+```text
+(tid, vid)
+tid in [0,127]
+vid in [0,7]
+```
+
+`right_inverse` 的定义在 `3rd/cutlass/include/cute/layout.hpp:1143 right_inverse` 到 `3rd/cutlass/include/cute/layout.hpp:1157 right_inverse`。它会对 `layout_mn` 做反变换，使得：
+
+```text
+layout_mn(layout_tv(tid, vid)) = make_layout((128,8))(tid,vid)
+```
+
+`make_layout((128,8))` 默认 col-major，所以：
+
+```text
+make_layout((128,8))(tid,vid) = tid + 128 * vid
+```
+
+把上面的 `layout_mn(m,k)` 代入，要求：
+
+```text
+4 * m + floor(k / 8) + 128 * (k % 8) = tid + 128 * vid
+```
+
+令：
+
+```text
+tid = 4 * t_m + t_k
+vid = v_k
+```
+
+则：
+
+```text
+t_k = tid % 4
+t_m = floor(tid / 4)
+v_k = vid
+
+m = t_m = floor(tid / 4)
+k = v_k + 8 * t_k = vid + 8 * (tid % 4)
+```
+
+因此 `layout_tv(tid,vid)` 返回的目标 tile 坐标是：
+
+```text
+(m,k) = (floor(tid / 4), vid + 8 * (tid % 4))
+```
+
+CuTe 的 layout 打印不是直接打印二元坐标函数，而是打印从 `(tid,vid)` 到 `layout_mn` 线性坐标空间的 layout。把 `tid` 拆成：
+
+```text
+tid = tid_k + 4 * tid_m
+tid_k in [0,3]
+tid_m in [0,31]
+```
+
+则：
+
+```text
+layout_tv(tid_k, tid_m, vid)
+= tid_k * 256 + tid_m * 1 + vid * 32
+```
+
+所以它打印为：
+
+```text
+TiledLayout_TV = ((_4,_32),_8):((_256,_1),_32)
+```
+
+这可以理解为把 `right_inverse(layout_mn)` 的第二个 mode `_256:_1` 按 `with_shape((128,8))` 重新解释为 `(_32,_8):(_1,_32)`，于是：
+
+```text
+(_4,_256):(_256,_1)
+  with_shape (128,8)
+= ((_4,_32),_8):((_256,_1),_32)
+```
+
+这三个 stride 的含义分别是：
+
+```text
+tid_k 维 stride = 256
+tid_m 维 stride = 1
+vid   维 stride = 32
+```
+
+把它和上面的 `(m,k)` 公式对应起来：
+
+```text
+tid_m = floor(tid / 4)     -> 控制 M 坐标，每加 1 对应 linear coord +1
+tid_k = tid % 4            -> 控制 K 的 8 元素分组，每加 1 对应跨过 8*32 = 256 个 linear coord
+vid                         -> 控制组内连续 K 元素，每加 1 对应 linear coord +32
+```
+
+更直观地说：
+
+```text
+tid = 4 * m + k_group
+vid = k_inner
+
+m = tid / 4
+k = 8 * k_group + k_inner
+```
+
+所以 128 个线程被组织成 `32 x 4`：
+
+```text
+32 行 M
+4 组 K
+```
+
+每个线程搬 8 个 half：
+
+```text
+1 行 M
+8 个连续 K
+```
+
+合起来一次 collective copy 覆盖：
+
+```text
+M: 32
+K: 4 * 8 = 32
+Tiler_MN = (_32,_32)
+```
+
+需要注意，`G2SCopyA` 的 `Tiler_MN = (_32,_32)` 不是整个 CTA 的 A tile 大小。当前配置 `GemmConfig<T, 128, 128, 32, 3>` 的 A tile 是 `128 x 32`，而这个 `G2SCopyA` 一次 collective copy 的基础 tiler 是 `32 x 32`。在 kernel 里，`gemm-multi-stage-like.cu:93 gemm_device` 到 `gemm-multi-stage-like.cu:97 gemm_device` 调用：
+
+```cpp
+auto tAgA_copy = g2s_thr_copy_a.partition_S(gA);
+auto tAsA_copy = g2s_thr_copy_a.partition_D(sA);
+```
+
+`partition_S`/`partition_D` 后会在剩余维度上继续分块，所以 `128 x 32` 的 A tile 会被拆成 4 个 `32 x 32` copy tile 来覆盖。
+
+一句话总结：`Tiler_MN: (_32,_32)` 来自 `raked_product((_32,_4):(_4,_1), (_1,_8):(_0,_1))` 后的 tile shape，即 `32 x (4*8)`；`TiledLayout_TV: ((_4,_32),_8):((_256,_1),_32)` 是这个 `layout_mn` 的 `right_inverse`，它表达的是 `tid = 4*m + k_group`、`vid = k_inner`，最终每个线程搬同一行上的 8 个连续 half，128 个线程一次覆盖 A 的 `32 x 32` 子 tile。
