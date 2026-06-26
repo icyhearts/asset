@@ -2431,3 +2431,16 @@ enable_batch_invariant_mode()（sglang/srt/batch_invariant_ops/batch_invariant_o
 
 like-useful/answer_claude.md 14.1.2 Attention 层面的确定性，这个如何验证？你写一个like-useful/validate_batch_invariant_attention.py，对比有没有enable_deterministic_inference的时候，Attention 层面的确定性。验证 gsm8k得分确定性是不是 主要受 Attention 层面的确定性 影响。
 把测试结论写到 like-useful/answer_claude.md 里面
+
+
+# sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+换成 llama模型测试,完全没有负载的命令是CUDA_VISIBLE_DEVICES=7  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/Llama3.1-8B-Instruct/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" }' --tasks gsm8k --batch_size auto > temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.`nowstr.sh` 2>&1 &
+日志是temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_15_46 and temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_57_14
+
+在lm-eval前，加上负载，日志位于
+temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_19_53,temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_25_24,temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_32_32,temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_38_38,temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_44_44.
+llama模型测试gsm8k没有开启 enable_deterministic_inference, 特别地，temp/lm-eval-gsm8k-llama8b-sgl-kvfp8.gpu7.2026_06_26___14_44_44里面， kv cache只有#tokens: 6078, gsmk得分和没有负载的时候，差距只有 0.7801-0.7718 =0.008, 小于 deepseek v2 lite模型 在 不同 kv pool size下的差距。attention 可能不是最大原因。
+llama 和 deepseek 结构不同，MoE是一个巨大差距。对 
+like-useful/answer_claude.md 14.1.3 DeepSeek Router Gate 确定性,14.1.4 MoE 层面 进行进一步排查。
+在like-useful/validate_batch_invariant_moe.py 离线验证 14.1.3 DeepSeek Router Gate 确定性,14.1.4 MoE 层面，对比有没有 enable_deterministic_inference 的时候，是否有区别.
+把测试结论写到 like-useful/answer_claude.md 里面
