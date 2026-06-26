@@ -9985,3 +9985,208 @@ lm-eval \
   --batch_size auto \
   > temp/lm-eval-gsm8k-dsv4-flash.sglang-serve-api.`nowstr.sh`.log 2>&1
 ```
+
+
+## 16. 验证 batch-invariant 矩阵乘法是否真的与 PyTorch 有区别
+
+### 16.0 测试目的
+
+在之前的分析（Section 14）中，我们提出 `enable_deterministic_inference=true` 通过 `enable_batch_invariant_mode()` 替换了 `torch.mm`、`torch.bmm`、`log_softmax`、`rms_norm`、`mean` 等算子，消除了 batch-dependent 的浮点非确定性。
+
+现在直接验证：**SGLang 的 batch-invariant 矩阵乘法（matmul_persistent）与 PyTorch 原生的矩阵乘法（torch.mm/cuBLAS）在 bf16 下是否真的有结果差异？**
+
+测试脚本：`like-useful/validate_batch_invariant_ops.py`
+
+测试 conda 环境：`/data/like/miniconda3/envs/simo_sglang/`（Python 3.12, PyTorch 2.9, CUDA 12.x, H100 SM90）
+
+### 16.1 测试项及结果
+
+#### Test 1: 直接数值对比 — torch.mm vs matmul_persistent（29 种形状，bf16）
+
+测试了从 M=1 到 M=16384 的 29 种矩阵形状，覆盖 decode batch（1-16 tokens）、medium batch（64-512）、large batch（1024-16384）、router gate（N=64-256）、square matmul 等多种场景。
+
+**结果：所有 29 种形状下，torch.mm 和 matmul_persistent 的输出完全一致（max_abs_diff = 0.0，exact_match = True）。**
+
+```
+M=     1 K= 2048 N=  512  exact=True  max_abs=0.0000e+00
+M=     1 K= 2048 N= 4096  exact=True  max_abs=0.0000e+00
+...
+M= 16384 K= 2048 N=  128  exact=True  max_abs=0.0000e+00
+Any difference found: False
+```
+
+#### Test 2: 并发 CUDA stream 干扰
+
+在另一个 CUDA stream 上运行大矩阵乘法（4096×4096×50 次迭代）的同时，在默认 stream 上执行 torch.mm，看 cuBLAS 是否因 GPU 资源竞争而选择不同的内部算法产生不同结果。
+
+**结果：所有测试形状下，有干扰和无干扰的 torch.mm 输出完全一致。**
+
+```
+M=   256 K= 2048 N= 2048  baseline==concurrent: True
+M=   512 K= 2048 N= 4096  baseline==concurrent: True
+...
+Any difference from concurrent stream: False
+```
+
+#### Test 3: addmm（矩阵乘+偏置）对比
+
+**结果：torch.addmm 和 matmul_persistent(a,b,bias) 输出完全一致。**
+
+#### Test 4 + Test 8: 非连续内存输入
+
+非连续内存下 torch.mm 和 matmul_persistent 的结果对比。深入调查（Test 8）确认：**两者对非连续输入的处理也完全一致**（torch 内部先拷贝为连续再计算）。
+
+#### Test 5: torch.mm 的 batch 不变性
+
+将矩阵按 M 维度拆分为 3 段分别计算再 cat，对比一次性计算全矩阵。
+
+**结果：torch.mm(cuBLAS) 对连续输入是 batch-invariant 的 — 拆分计算和全量计算结果完全一致。**
+
+#### Test 6: matmul_persistent 的 batch 不变性
+
+**结果：matmul_persistent 也是 batch-invariant 的 — 拆分计算和全量计算结果完全一致。**
+
+#### Test 9-12: 其他算子
+
+| 算子 | 测试方法 | 结果 |
+|------|---------|------|
+| `torch.bmm` | full vs split batch，5 种 batch size | **完全一致** — batch-invariant |
+| `torch.log_softmax` | full vs split rows，6 种 M | **完全一致** — batch-invariant |
+| `F.rms_norm` | full vs split rows，6 种 M | **完全一致** — batch-invariant |
+| `torch.mean` | full vs split rows，6 种 M | **完全一致** — batch-invariant |
+
+### 16.2 结论
+
+**核心发现：对于 bf16 连续输入，PyTorch 原生的 `torch.mm`（cuBLAS）和 SGLang 的 `matmul_persistent`（Triton persistent kernel）在所有测试场景下都输出完全一致的结果。其他算子（bmm, log_softmax, rms_norm, mean）的 native PyTorch 实现也都是 batch-invariant 的。**
+
+这意味着：
+
+1. **SGLang 的 batch-invariant matmul 替换本身不是解决 gsm8k 分数差异的关键** — native cuBLAS 对 bf16 连续输入已经产生了 batch-invariant 的结果。
+
+2. **`enable_deterministic_inference` 中替换单个算子的效果，至少对于 bf16 矩阵乘法而言，native PyTorch 已经是确定性的。**
+
+3. **gsm8k 分数差异的根本原因必须来自其他机制**，最可能的是：
+   - **Attention KV split 的非确定性** — `sglang/srt/layers/attention/triton_backend.py:238-287` 的 `get_num_kv_splits()` 函数在没有确定性模式时，根据 batch 大小、`num_seq`、`device_core_count` 动态决定每个序列的 KV split 数量。同一请求在不同 batch 中获得不同数量的 split → 不同的 partial sum 组合顺序 → 不同的浮点结果。
+   - **多算子累积效应** — 虽然单个算子在单独测试中是 batch-invariant 的，但在 **27 层 transformer 中交互执行**时，微小的精度差异（即使 < 1e-6）可能通过非线性和归一化层放大。例如：
+     - rms_norm 的输入是上一个 mm 的输出
+     - softmax 的输入是 attention QK^T（由多次 mm 组成）
+     - residual add 可能改变数值分布
+     - 这些交互在单独测试单个算子时无法体现
+
+4. **`enable_deterministic_inference=true` 的真正价值**在于：
+   - 固定 attention KV split（`split_tile_size=256`，`static_kv_splits=False`）
+   - 禁用 piecewise CUDA graph
+   - 固定 MoE routing kernel
+   - 固定 sampling seed
+   - 而不是替换 matmul kernel 本身
+
+### 16.3 补充说明
+
+本测试验证的是**单个算子的独立行为**，无法完全模拟 transformer 模型中多层交互的累积效应。要真正验证 batch-dependent 的浮点差异来源，需要：
+1. 对完整 transformer 层做 forward 对比（full batch vs split batch）
+2. 逐层对比中间输出，定位差异首次出现的层
+3. 对 attention 模块单独隔离测试（特别是确认 KV split 的影响）
+
+
+## 16. 验证 batch-invariant 矩阵乘法是否真的与 PyTorch 有区别
+
+### 16.0 测试目的
+
+在之前的分析（Section 14）中，我们提出 `enable_deterministic_inference=true` 通过 `enable_batch_invariant_mode()` 替换了 `torch.mm`、`torch.bmm`、`log_softmax`、`rms_norm`、`mean` 等算子，消除了 batch-dependent 的浮点非确定性。
+
+现在直接验证：**SGLang 的 batch-invariant 矩阵乘法（matmul_persistent）与 PyTorch 原生的矩阵乘法（torch.mm/cuBLAS）在 bf16 下是否真的有结果差异？**
+
+测试脚本：`like-useful/validate_batch_invariant_ops.py`
+测试 conda 环境：`/data/like/miniconda3/envs/simo_sglang/`（Python 3.12, PyTorch 2.9, CUDA 12.x, H100 SM90）
+
+### 16.1 测试项及结果
+
+#### Test 1: 直接数值对比 — torch.mm vs matmul_persistent（29 种形状，bf16）
+
+测试了从 M=1 到 M=16384 的 29 种矩阵形状，覆盖 decode batch（1-16 tokens）、medium batch（64-512）、large batch（1024-16384）、router gate（N=64-256）、square matmul 等多种场景。
+
+**结果：所有 29 种形状下，torch.mm 和 matmul_persistent 的输出完全一致（max_abs_diff = 0.0，exact_match = True）。**
+
+```
+M=     1 K= 2048 N=  512  exact=True  max_abs=0.0000e+00
+M=     1 K= 2048 N= 4096  exact=True  max_abs=0.0000e+00
+...
+M= 16384 K= 2048 N=  128  exact=True  max_abs=0.0000e+00
+Any difference found: False
+```
+
+#### Test 2: 并发 CUDA stream 干扰
+
+在另一个 CUDA stream 上运行大矩阵乘法（4096x4096x50 次迭代）的同时，在默认 stream 上执行 torch.mm，看 cuBLAS 是否因 GPU 资源竞争而选择不同的内部算法产生不同结果。
+
+**结果：所有测试形状下，有干扰和无干扰的 torch.mm 输出完全一致。**
+
+```
+M=   256 K= 2048 N= 2048  baseline==concurrent: True
+M=   512 K= 2048 N= 4096  baseline==concurrent: True
+...
+Any difference from concurrent stream: False
+```
+
+#### Test 3: addmm（矩阵乘+偏置）对比
+
+**结果：torch.addmm 和 matmul_persistent(a,b,bias) 输出完全一致。**
+
+#### Test 4 + Test 8: 非连续内存输入
+
+非连续内存下 torch.mm 和 matmul_persistent 的结果对比。深入调查（Test 8）确认：**两者对非连续输入的处理也完全一致**（torch 内部先拷贝为连续再计算，SGLang Triton kernel 也能正确处理 strides）。
+
+#### Test 5: torch.mm 的 batch 不变性
+
+将矩阵按 M 维度拆分为 3 段分别计算再 cat，对比一次性计算全矩阵。
+
+**结果：torch.mm(cuBLAS) 对连续输入是 batch-invariant 的 — 拆分计算和全量计算结果完全一致。**
+
+#### Test 6: matmul_persistent 的 batch 不变性
+
+**结果：matmul_persistent 也是 batch-invariant 的 — 拆分计算和全量计算结果完全一致。**
+
+#### Test 7: enable_batch_invariant_mode 拦截生效
+
+**结果：启用后 torch.mm 的输出 == matmul_persistent 的输出，确认拦截机制正常工作。**
+
+#### Test 9-12: 其他算子
+
+| 算子 | 测试方法 | 结果 |
+|------|---------|------|
+| `torch.bmm` | full vs split batch，5 种 batch size | **完全一致** — batch-invariant |
+| `torch.log_softmax` | full vs split rows，6 种 M | **完全一致** — batch-invariant |
+| `F.rms_norm` | full vs split rows，6 种 M | **完全一致** — batch-invariant |
+| `torch.mean` | full vs split rows，6 种 M | **完全一致** — batch-invariant |
+
+### 16.2 结论
+
+**核心发现：对于 bf16 连续输入，PyTorch 原生的 `torch.mm`（cuBLAS）和 SGLang 的 `matmul_persistent`（Triton persistent kernel）在所有测试场景下都输出完全一致的结果。其他算子（bmm, log_softmax, rms_norm, mean）的 native PyTorch 实现也都是 batch-invariant 的。**
+
+这意味着：
+
+1. **SGLang 的 batch-invariant matmul 替换本身不是解决 gsm8k 分数差异的关键** — native cuBLAS 对 bf16 连续输入已经产生了 batch-invariant 的结果。
+
+2. **`enable_deterministic_inference` 中替换单个算子的效果，至少对于 bf16 矩阵乘法而言，native PyTorch 已经是确定性的。**
+
+3. **gsm8k 分数差异的根本原因必须来自其他机制**，最可能的是：
+   - **Attention KV split 的非确定性** — `sglang/srt/layers/attention/triton_backend.py:238-287` 的 `get_num_kv_splits()` 函数在没有确定性模式时，根据 batch 大小、`num_seq`、`device_core_count` 动态决定每个序列的 KV split 数量。同一请求在不同 batch 中获得不同数量的 split → 不同的 partial sum 组合顺序 → 不同的浮点结果。
+   - **多算子累积效应** — 虽然单个算子在单独测试中是 batch-invariant 的，但在 **27 层 transformer 中交互执行**时，微小的精度差异（即使 < 1e-6）可能通过非线性和归一化层放大。例如：
+     - rms_norm 的输入是上一个 mm 的输出
+     - softmax 的输入是 attention QK^T（由多次 mm 组成）
+     - residual add 可能改变数值分布
+     - 这些交互在单独测试单个算子时无法体现
+
+4. **`enable_deterministic_inference=true` 的真正价值**在于：
+   - 固定 attention KV split（`split_tile_size=256`，`static_kv_splits=False`）
+   - 禁用 piecewise CUDA graph
+   - 固定 MoE routing kernel
+   - 固定 sampling seed
+   - 而不是替换 matmul kernel 本身
+
+### 16.3 补充说明
+
+本测试验证的是**单个算子的独立行为**，无法完全模拟 transformer 模型中多层交互的累积效应。要真正验证 batch-dependent 的浮点差异来源，需要：
+1. 对完整 transformer 层做 forward 对比（full batch vs split batch）
+2. 逐层对比中间输出，定位差异首次出现的层
+3. 对 attention 模块单独隔离测试（特别是确认 KV split 的影响）
