@@ -52,8 +52,9 @@ print("  Does the deterministic F.linear path produce different logits from")
 print("  the optimized router_gemm path for the same hidden_states and weight?")
 print("=" * 80)
 
+HAS_FLASHINFER_ROUTER = False  # init
 try:
-    from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
+    from sgl_kernel import dsv3_router_gemm
     HAS_DSV3_ROUTER = True
 except ImportError:
     print("  dsv3_router_gemm not available, trying flashinfer variant...")
@@ -80,37 +81,48 @@ def test_router_gemm(batch_sizes, hidden_dim, num_experts, label=""):
         logits_float32 = logits_linear.float()
 
         if HAS_DSV3_ROUTER:
-            logits_gemm = dsv3_router_gemm(x, W, out_dtype=torch.float32)
+            # Note: dsv3_router_gemm is hardcoded for hidden_dim=7168 (V3 only)
+            if hidden_dim == 7168:
+                logits_gemm = dsv3_router_gemm(x, W, out_dtype=torch.float32)
+            else:
+                logits_gemm = None  # skip comparison for non-V3 dims
         elif HAS_FLASHINFER_ROUTER:
             logits_gemm = torch.empty(bs, num_experts, device=device, dtype=torch.float32)
             flashinfer_dsv3_router_gemm(logits_gemm, x, W)
         else:
-            logits_gemm = logits_linear.float()
+            logits_gemm = None
 
-        mad = max_abs_diff(logits_float32, logits_gemm)
-        exact = torch.equal(logits_float32, logits_gemm)
-
-        # Check if argmax (top-1 expert selection) differs
-        top1_linear = logits_float32.argmax(dim=-1)
-        top1_gemm = logits_gemm.argmax(dim=-1)
-        topk_match = torch.equal(top1_linear, top1_gemm)
-
-        # Check how many sequences have different top-1
-        n_diff = (top1_linear != top1_gemm).sum().item()
-
-        # For top-2 (if used), check match
-        _, top2_linear = logits_float32.topk(2, dim=-1)
-        _, top2_gemm = logits_gemm.topk(2, dim=-1)
-
+        mad = 0.0
+        exact = True
+        topk_match = True
+        n_diff = 0
         n_top2_partial = 0
-        for i in range(bs):
-            if set(top2_linear[i].tolist()) != set(top2_gemm[i].tolist()):
-                n_top2_partial += 1
+        if logits_gemm is not None:
+            mad = max_abs_diff(logits_float32, logits_gemm)
+            exact = torch.equal(logits_float32, logits_gemm)
+
+            # Check if argmax (top-1 expert selection) differs
+            top1_linear = logits_float32.argmax(dim=-1)
+            top1_gemm = logits_gemm.argmax(dim=-1)
+            topk_match = torch.equal(top1_linear, top1_gemm)
+
+            # Check how many sequences have different top-1
+            n_diff = (top1_linear != top1_gemm).sum().item()
+
+            # For top-2 (if used), check match
+            _, top2_linear = logits_float32.topk(2, dim=-1)
+            _, top2_gemm = logits_gemm.topk(2, dim=-1)
+
+            for i in range(bs):
+                if set(top2_linear[i].tolist()) != set(top2_gemm[i].tolist()):
+                    n_top2_partial += 1
 
         status = ""
-        if not exact:
+        if logits_gemm is None:
+            status = " [skip: kernel not available]"
+        elif not exact:
             status += f" max_diff={mad:.6e}"
-        if not topk_match:
+        if not topk_match and logits_gemm is not None:
             status += f" top1_diff={n_diff}/{bs}"
         if n_top2_partial > 0:
             status += f" top2_diff={n_top2_partial}/{bs}"
@@ -122,8 +134,8 @@ def test_router_gemm(batch_sizes, hidden_dim, num_experts, label=""):
 # Test with DeepSeek-V2-Lite dimensions
 test_router_gemm([1, 4, 8, 16, 32, 64, 128, 256], HIDDEN_DIM, NUM_EXPERTS, "DSV2-Lite")
 
-# Test with larger expert counts (V3)
-test_router_gemm([1, 4, 8, 16, 32, 64, 128, 256], 2048, 256, "DSV3-like")
+# Test with larger expert counts (V3 — hidden_dim must be 7168, max batch=16 for the kernel)
+test_router_gemm([1, 4, 8, 16], 7168, 256, "DSV3 (hidden=7168)")
 
 # ============================================================
 # TEST B: MoE Router — tensorcore vs cudacore
@@ -161,7 +173,7 @@ if HAS_ROUTER_KERNELS:
                 # tensorcore path (non-deterministic)
                 if bs >= 512 or num_experts > 8:
                     logits_tc = fused_moe_router_tensorcore(
-                        x=x, router_weight=W, topk=2, moe_softcapping=None,
+                        x=x, router_weight=W, topk=2, moe_softcapping=0.0,
                         BLOCK_SIZE_M=32, BLOCK_SIZE_N=max(num_experts, 16),
                         BLOCK_SIZE_K=256 if num_experts < 256 else 64,
                     )
@@ -170,28 +182,27 @@ if HAS_ROUTER_KERNELS:
 
                 # cudacore path (deterministic, always available)
                 logits_cc = fused_moe_router_cudacore(
-                    x=x, router_weight=W, topk=2, moe_softcapping=None,
+                    x=x, router_weight=W, topk=2, moe_softcapping=0.0,
                 )
 
                 if logits_tc is not None:
-                    mad = max_abs_diff(logits_tc, logits_cc)
-                    exact = torch.equal(logits_tc, logits_cc)
-                    _, top2_tc = logits_tc.topk(2, dim=-1)
-                    _, top2_cc = logits_cc.topk(2, dim=-1)
-                    top1_diff = (logits_tc.argmax(-1) != logits_cc.argmax(-1)).sum().item()
+                    # tensorcore returns (topk_weights, topk_ids), same as cudacore
+                    tc_weights, tc_ids = logits_tc
+                    cc_weights, cc_ids = logits_cc
+                    mad_ids = (tc_ids != cc_ids).sum().item()
+                    mad_w = max_abs_diff(tc_weights, cc_weights)
+                    top1_diff = (tc_ids[:, 0] != cc_ids[:, 0]).sum().item()
 
                     n_top2 = 0
                     for i in range(bs):
-                        if set(top2_tc[i].tolist()) != set(top2_cc[i].tolist()):
+                        if set(tc_ids[i].tolist()) != set(cc_ids[i].tolist()):
                             n_top2 += 1
 
                     status = ""
-                    if not exact:
-                        status += f" mad={mad:.6e}"
-                    if top1_diff > 0:
-                        status += f" top1_diff={top1_diff}/{bs}"
-                    if n_top2 > 0:
-                        status += f" top2_diff={n_top2}/{bs}"
+                    if mad_ids > 0:
+                        status += f" topk_id_diff={mad_ids}/{bs*tc_ids.shape[1]}"
+                    if mad_w > 0:
+                        status += f" weight_max_diff={mad_w:.6e}"
                     if not status:
                         status = " identical"
 
@@ -245,7 +256,6 @@ print("=" * 80)
 
 try:
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
-        get_fused_moe_config,
         get_default_config,
     )
     HAS_MOE_CONFIG = True
@@ -256,15 +266,20 @@ except ImportError as e:
 if HAS_MOE_CONFIG:
     deterministic_config = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64,
                             "BLOCK_SIZE_K": 32, "GROUP_SIZE_M": 8}
-    print(f"  Deterministic config: {deterministic_config}")
-    for bs in [1, 4, 16, 64, 128, 256]:
-        default_cfg = get_default_config(M=bs, E=64, N=2048, K=2048, topk=2,
-                                         dtype="fp8_w8a8", is_marlin=False)
-        print(f"    bs={bs:4d}  default_config={default_cfg}")
-        if default_cfg == deterministic_config:
-            print(f"             ** same as deterministic")
-    print(f"  ** Different configs → different kernel tile sizes → potentially")
-    print(f"     different floating-point accumulation order in MoE GEMM **")
+    print(f"  Deterministic config (enable_deterministic_inference=True): {deterministic_config}")
+    # Show non-deterministic configs from the source code (fused_moe_triton_config.py:164-208)
+    non_det_configs = {
+        "fp8_w8a8 (M<=E)": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1},
+        "fp8_w8a8 (M>E)": {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32},
+        "other (M<=E)": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+        "other default": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "GROUP_SIZE_M": 8},
+    }
+    print(f"  Non-deterministic configs (by batch size):")
+    for label, cfg in non_det_configs.items():
+        same = "**same**" if cfg == deterministic_config else "DIFFERENT"
+        print(f"    {label:25s}: {cfg}  {same}")
+    print(f"  ** The \"other default\" non-det config matches the deterministic one.")
+    print(f"  ** fp8 configs show LARGER tile sizes → different accumulation order.")
 else:
     print("  Skipping — MoE config not importable")
 
@@ -294,7 +309,10 @@ other_tokens = rbf((63, HIDDEN_DIM), seed=hash((64, 300)))
 x_batch = torch.cat([x_target, other_tokens], dim=0)
 
 # The router operates on the full batch
-if HAS_DSV3_ROUTER:
+# NOTE: dsv3_router_gemm requires hidden_dim=7168 (hardcoded for V3).
+# For DSV2-Lite (hidden_dim=2048), only F.linear is available.
+HAS_ROUTER_GEMM_FOR_THIS_DIM = HAS_DSV3_ROUTER and HIDDEN_DIM == 7168
+if HAS_ROUTER_GEMM_FOR_THIS_DIM:
     logits_all_gemm = dsv3_router_gemm(x_batch, W, out_dtype=torch.float32)
 elif HAS_FLASHINFER_ROUTER:
     logits_all_gemm = torch.empty(64, NUM_EXPERTS, device=device, dtype=torch.float32)
@@ -314,7 +332,7 @@ print(f"    top-2 experts:       {top2_alone[0].tolist()}")
 print(f"\n  Target token in batch of 64:")
 print(f"    F.linear logits:     {logits_target_linear_in_batch[0, :6].tolist()}...")
 
-if HAS_DSV3_ROUTER or HAS_FLASHINFER_ROUTER:
+if HAS_ROUTER_GEMM_FOR_THIS_DIM or HAS_FLASHINFER_ROUTER:
     print(f"    router_gemm logits:  {logits_target_in_batch[0, :6].tolist()}...")
 
     # Compare F.linear alone vs F.linear in batch (should be identical — same input)
