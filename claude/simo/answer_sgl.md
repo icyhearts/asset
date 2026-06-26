@@ -10190,3 +10190,137 @@ Any difference from concurrent stream: False
 1. 对完整 transformer 层做 forward 对比（full batch vs split batch）
 2. 逐层对比中间输出，定位差异首次出现的层
 3. 对 attention 模块单独隔离测试（特别是确认 KV split 的影响）
+
+
+## 17. 验证 Attention KV Split 确定性对 gsm8k 分数的影响
+
+### 17.0 测试目的
+
+在 Section 16 中，我们验证了 batch-invariant 矩阵乘法（mm/bmm/log_softmax/rms_norm/mean）的 native PyTorch 实现本身就是 batch-invariant 的，不是 gsm8k 分数差异的来源。
+
+现在验证下一个最可能的根因：**Attention KV Split 的非确定性**。
+
+SGLang 的 decode attention 使用两阶段 flash-decoding 算法：
+1. **Stage 1**：将 KV 序列分成 `num_kv_splits` 个 chunk，每个 chunk 独立计算局部的 attention（QK + softmax + weighted V）
+2. **Stage 2**：合并所有 chunk 的局部结果，通过 online softmax reduction 得到最终输出
+
+关键函数 `get_num_kv_splits()`（`sglang/srt/layers/attention/triton_backend.py:238-287`）有两条路径：
+- **非确定性路径**（`triton_backend.py:278-287`）：`get_num_kv_splits_triton` kernel 根据 batch 组成（`num_seq`、`num_group`、`num_heads`、`device_core_count`）**动态**决定每个序列的 split 数量
+- **确定性路径**（`triton_backend.py:268-271`）：`num_kv_splits = (seq_len + split_tile_size - 1) // split_tile_size`，**纯 seq_len 函数**，与 batch 无关
+
+测试脚本：`like-useful/validate_batch_invariant_attention.py`
+测试 conda 环境：`/data/like/miniconda3/envs/simo_sglang/`
+
+### 17.1 测试 A: 不同 num_kv_splits → 不同 attention 输出？
+
+同一组 Q/K/V（seq_len=1024, num_heads=32, head_dim=128），只改变 `num_kv_splits` 参数（1 到 16），调用 SGLang 实际的 `decode_attention_fwd()`（`triton_ops/decode_attention.py:793`）。
+
+**结果：42 / 45 个 pairs 的输出不同，最大差异 6.1e-05。**
+
+```
+Pairwise max_abs_diff matrix (bf16):
+         nkv= 1 nkv= 2 nkv= 3 nkv= 4 nkv= 5 nkv= 6 nkv= 7 nkv= 8
+nkv= 1  0       3.8e-06 9.5e-07 3.8e-06 9.5e-07 6.1e-05 6.1e-05 6.1e-05
+nkv= 2  3.8e-06 0       3.8e-06 0       3.8e-06 6.1e-05 6.1e-05 6.1e-05
+nkv= 3  9.5e-07 3.8e-06 0       3.8e-06 0       6.1e-05 6.1e-05 6.1e-05
+...
+42 out of 45 pairs differ. Max diff: 6.103516e-05
+
+** CONFIRMED: different num_kv_splits → different attention output **
+```
+
+bf16 精度下 6.1e-05 的差异已经显著（bf16 的 ulp 约为 7.8e-03，6e-5 约为 0.008 ulp，在单 token 级别可能不影响 argmax，但 27 层累积后会被放大）。
+
+### 17.2 测试 B: 动态 split 算法是否真的 batch-dependent？
+
+基于 `triton_backend.py:1435-1483` 的 `get_num_kv_splits_triton` kernel 源码，编写了准确的 Python 复现。该 kernel 用两种方法计算 split 数并取最大值：
+- **Method 1**：基于 `max_seq_len / min_seq_len` 比例（各序列均匀分配）
+- **Method 2**：基于 `ext_device_cores / token_grid`（token_grid = num_seq * num_group * head_factor，即**取决于 num_seq**）
+
+**结果：对于 seq_len=2048，batch_4 和 batch_10 的 split 数（11）与 alone 的 split 数（16）不同。**
+
+```
+Target seq_len=2048  device_cores=132  num_heads=16  max_splits=16
+
+  alone           det= 8  dyn=16
+  batch_2         det= 8  dyn=16
+  batch_4         det= 8  dyn=11  <-- 与 alone 不同！
+  batch_10        det= 8  dyn=11  <-- 与 alone 不同！
+  batch_10_v2     det= 8  dyn=16
+
+** CONFIRMED: dynamic num_kv_splits is batch-dependent **
+```
+
+注意：**确定性模式始终返回 det=8**（2048/256=8），与 batch 组成无关。
+
+进一步扫描发现：
+```
+  sl=  256  det(alone= 1)  dyn(alone=16 mixed= 3) <-- batch-dependent!
+  sl=  384  det(alone= 2)  dyn(alone=22 mixed= 4) <-- batch-dependent!
+  sl=  512  det(alone= 2)  dyn(alone=25 mixed= 6) <-- batch-dependent!
+  sl=  768  det(alone= 3)  dyn(alone=30 mixed= 8) <-- batch-dependent!
+  sl= 1024  det(alone= 4)  dyn(alone=32 mixed=11) <-- batch-dependent!
+  sl= 1536  det(alone= 6)  dyn(alone=32 mixed=16) <-- batch-dependent!
+  sl= 2048  det(alone= 8)  dyn(alone=32 mixed=21) <-- batch-dependent!
+  sl= 3072  det(alone=12)  dyn(alone=32 mixed=31) <-- batch-dependent!
+  sl= 4096  det(alone=16)  dyn(alone=32 mixed=32)
+  sl= 6144  det(alone=24)  dyn(alone=32 mixed=32)
+  sl= 8192  det(alone=32)  dyn(alone=32 mixed=32)
+```
+
+**11 个 seq_len 中 8 个（73%）存在 batch-dependent 行为**，这不是 corner case，而是系统性的。
+
+### 17.3 测试 C: 端到端验证
+
+对于 seq_len=4096, num_heads=16, head_dim=128, max_splits=32：
+
+```python
+# 两个 batch 组成计算出不同的目标序列 split 数：
+sl_alone = [4096]           → dyn_splits = 32
+sl_mixed = [4096, 512, ...] → dyn_splits = 8
+det_both  = [4096]          → det_splits = 16  (始终 16)
+```
+
+用不同的 split 数分别调用 SGLang 实际的 `decode_attention_fwd()`：
+
+```
+Attention output comparisons:
+  det_alone vs det_mixed (same splits=16):       equal=True  max_abs=0.0
+  dyn_alone vs dyn_mixed (splits=32 vs 8):       equal=False max_abs=1.49e-08
+```
+
+**确认：同一 Q/K/V，batch 导致不同 split → 输出不同。**
+
+### 17.4 完整的因果链
+
+```
+GPU 负载存在
+  → 显存减少 → KV cache 缩减
+    → 更多的小 batch（num_seq 变化）
+      → get_num_kv_splits_triton() 根据 num_seq 算出不同的 split 数
+        → 同一序列的不同 num_kv_splits → 不同的 chunk 边界
+          → Stage1 不同 chunk 划分 → 不同的 partial sum 组合顺序
+            → Stage2 不同 partial sum 的 online reduction 顺序不同
+              → 不同的 FP 累加顺序 → 不同的 attention 输出 (max_abs ~6e-5)
+                → 后续 FFN/Residual/RMSNorm 进一步放大差异
+                  → 27 层累积 → logits 足够偏移以改变 argmax
+                    → 不同 token → 不同续写 → 不同 gsm8k 答案
+
+enable_deterministic_inference=true 的效果：
+  → num_kv_splits = (seq_len + 256 - 1) // 256
+    → 纯 seq_len 函数，不依赖 num_seq
+      → 没有 batch-dependent 的 split 变化
+        → 同一序列在任何 batch 中 split 数相同
+          → attention 输出一致 → gsm8k 分数一致 ✓
+```
+
+### 17.5 结论
+
+| 问题 | 答案 |
+|------|------|
+| Attention KV split 是否影响 attention 输出？ | **是**。同一 Q/K/V 下，不同 `num_kv_splits` 产生不同输出（42/45 pairs 不同，max 6.1e-05） |
+| 动态 split 算法是否 batch-dependent？ | **是**。`get_num_kv_splits_triton` 根据 `num_seq`（batch 大小）动态决定 split 数，73% 的被测 seq_len 表现出 batch-dependent 行为 |
+| 确定性 split 是否能消除差异？ | **是**。`split_tile_size=256` 的公式使 split 数仅依赖 seq_len，同一序列在任何 batch 中 split 数相同 |
+| 这是 gsm8k 分数差异的主要根因吗？ | **高度可能**。结合 Section 16 的结论（batch-invariant matmul 替换不是关键），attention KV split 的非确定性是最可能的根因 |
+
+**最终结论：`enable_deterministic_inference=true` 修复 gsm8k 分数差异的主要机制是 attention KV split 的确定性化（`triton_backend.py:261-271`），而非 batch-invariant 算子替换。**

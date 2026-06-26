@@ -2428,3 +2428,6 @@ sglang for deepseek-v4-flash 已经启动
 enable_batch_invariant_mode()（sglang/srt/batch_invariant_ops/batch_invariant_ops.py:975-999）通过 torch.library.Library("aten", "IMPL") 替换了 PyTorch 的 ATen 算子注册：
 以 矩阵乘法 为例，对比 pytorch的矩阵乘法 和 sglang batch invarient 矩阵乘法，看看  sglang batch invarient 矩阵乘法是否真的和 pytorch 矩阵乘法有区别。
 要求: 代码写到 like-useful/validate_batch_invariant_ops.py, 矩阵乘法的数据类型是bf16, 你在写完后还要进行用指定 conda 环境测试, 把测试结论写到like-useful/answer_claude.md 里面
+
+like-useful/answer_claude.md 14.1.2 Attention 层面的确定性，这个如何验证？你写一个like-useful/validate_batch_invariant_attention.py，对比有没有enable_deterministic_inference的时候，Attention 层面的确定性。验证 gsm8k得分确定性是不是 主要受 Attention 层面的确定性 影响。
+把测试结论写到 like-useful/answer_claude.md 里面

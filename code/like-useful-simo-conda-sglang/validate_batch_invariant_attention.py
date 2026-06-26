@@ -3,446 +3,364 @@
 Validate whether attention KV split determinism is the primary source of
 gsm8k score differences with vs without enable_deterministic_inference.
 
-Key hypothesis:
-  Without deterministic inference, get_num_kv_splits() (triton_backend.py:238-287)
-  uses a batch-dependent dynamic Triton kernel that can assign DIFFERENT numbers
-  of KV splits to the same sequence length depending on batch composition.
-  Different split counts → different chunk boundaries → different FP accumulation
-  order in the two-stage flash-decoding → different attention output.
+Core mechanism:
+  The decode attention uses a two-stage flash-decoding algorithm:
+    Stage 1: Split KV sequence into num_kv_splits chunks, compute partial attn per chunk
+    Stage 2: Merge all partial results via online softmax reduction
+
+  Without deterministic inference (triton_backend.py:278-287):
+    get_num_kv_splits_triton kernel dynamically computes num_kv_splits based on
+    batch composition (num_seq, num_group, num_heads, device_core_count).
+    Same seq_len in different batches → different num_kv_splits.
+
+  With deterministic inference (triton_backend.py:268-271):
+    num_kv_splits = (seq_len + split_tile_size - 1) // split_tile_size
+    Pure function of seq_len only, independent of batch composition.
 
 Tests:
-  A: Does different num_kv_splits (same Q/K/V) produce different output?
-  B: Does get_num_kv_splits produce batch-dependent results without deterministic mode?
-  C: End-to-end: same request in different batches → different output?
-  D: End-to-end with deterministic: same request in different batches → same output?
+  A: Different num_kv_splits for same Q/K/V → different output?
+  B: Accurate simulation of dynamic vs deterministic split assignment
+  C: End-to-end: same request in different batches → attention output differs?
 """
 
-import os, sys
+import math, os, sys
 import torch
 
-# Setup
 SGLANG_SRC = "/data/like/package/sglang_kernel_src/python"
 if SGLANG_SRC not in sys.path:
     sys.path.insert(0, SGLANG_SRC)
+from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
-    decode_attention_fwd,
-)
+device = "cuda"
 
-# ---------- helpers ----------
 def max_abs_diff(a, b):
     return (torch.abs(a - b)).max().item()
-
-def describe(a, b, tag=""):
-    exact = torch.equal(a, b)
-    mad = max_abs_diff(a, b)
-    print(f"  [{tag}] exact={exact}  max_abs_diff={mad:.6e}")
 
 def rbf(shape, seed=42, scale=1.0):
     g = torch.Generator(device="cuda").manual_seed(seed)
     return (torch.randn(shape, device="cuda", generator=g, dtype=torch.float32)*scale).bfloat16()
 
 # ============================================================
-# Configuration
+# Accurate Python reimplementation of get_num_kv_splits_triton
+# (matching triton_backend.py:1435-1483)
 # ============================================================
-device = "cuda"
-num_heads = 8
-head_dim = 128
-seq_len = 512        # representative decode sequence length
-bs = 4               # batch size for multi-seq tests
+def get_num_kv_splits_dynamic(seq_lens, num_heads, num_kv_heads, max_kv_splits,
+                                device_core_count=132, num_group=1):
+    """
+    Accurate reimplementation of the Triton kernel get_num_kv_splits_triton
+    (triton_backend.py:1435-1483).
+
+    The kernel uses TWO methods to compute split counts and takes the max:
+      Method 1: based on max_seq_len / min_seq_len ratio (uniform across seqs)
+      Method 2: based on device_cores / token_grid (depends on num_seq)
+    """
+    bs = len(seq_lens)
+    max_seq_len = max(seq_lens)
+    min_seq_len = min(seq_lens)
+
+    # Method 1: uniform based on length ratios
+    if max_seq_len * 8 < min_seq_len * 10:  # within 80% ratio
+        min_seq_len = max_seq_len
+    max_kv_splits_1 = min(math.ceil(max_seq_len / min_seq_len), max_kv_splits)
+    kv_chunk_size_1 = math.ceil(max_seq_len / max_kv_splits_1)
+
+    # Method 2: based on device core count / token grid
+    ext_seq_len = max_seq_len / 64.0
+    ext_device_cores = int(device_core_count * max(math.log2(ext_seq_len), 1.0))
+
+    num_kv_group = num_heads // num_kv_heads
+    if num_kv_group == 1:
+        token_grid = bs * num_group * num_heads
+    else:
+        block_h = min(16, num_kv_group)
+        token_grid = bs * num_group * math.ceil(num_heads / block_h)
+
+    max_kv_splits_2 = min(math.ceil(ext_device_cores / max(token_grid, 1)), max_kv_splits)
+    kv_chunk_size_2 = math.ceil(max_seq_len / max(max_kv_splits_2, 1))
+
+    # For each sequence: max of both methods
+    result = []
+    for sl in seq_lens:
+        s1 = math.ceil(sl / kv_chunk_size_1)
+        s2 = math.ceil(sl / kv_chunk_size_2) if kv_chunk_size_2 > 0 else 1
+        result.append(max(1, min(max(s1, s2), max_kv_splits)))
+    return result
+
+def get_num_kv_splits_deterministic(seq_lens, split_tile_size=256):
+    return [max(1, (sl + split_tile_size - 1) // split_tile_size) for sl in seq_lens]
 
 # ============================================================
 # TEST A: Same Q/K/V, different num_kv_splits → different output?
 # ============================================================
 print("=" * 80)
-print("TEST A: Same Q/K/V with different num_kv_splits → different output?")
+print("TEST A: Same Q/K/V with different num_kv_splits → different attention output?")
+print("  This isolates the KV-split mechanism from batch composition effects.")
 print("=" * 80)
 
-max_kv_splits = 8
-Q = rbf((bs, num_heads, head_dim), seed=1)
-K = rbf((bs * seq_len, num_heads, head_dim), seed=2)
-V = rbf((bs * seq_len, num_heads, head_dim), seed=3)
+num_heads, head_dim = 32, 128
+seq_len = 1024  # typical decode length
+max_splits = 16
+nks_values = [1, 2, 3, 4, 5, 6, 7, 8, 12, 16]
 
-kv_indptr = torch.tensor([0, seq_len, 2*seq_len, 3*seq_len, 4*seq_len],
-                          dtype=torch.int32, device=device)
-kv_indices = torch.arange(bs * seq_len, dtype=torch.int64, device=device)
-
-o = torch.empty(bs, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-attn_logits = torch.empty(bs, num_heads, max_kv_splits, head_dim,
-                           dtype=torch.float32, device=device)
-attn_lse = torch.empty(bs, num_heads, max_kv_splits,
-                        dtype=torch.float32, device=device)
+Q = rbf((1, num_heads, head_dim), seed=100)
+K = rbf((seq_len, num_heads, head_dim), seed=200)
+V = rbf((seq_len, num_heads, head_dim), seed=300)
+kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+kv_indices = torch.arange(seq_len, dtype=torch.int64, device=device)
 
 results = {}
-for num_splits_val in [1, 2, 4, 8]:
-    num_kv_splits = torch.full((bs,), num_splits_val, dtype=torch.int32, device=device)
-    o.zero_()
-    attn_logits.zero_()
-    attn_lse.zero_()
+for nkv in nks_values:
+    o = torch.empty(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    al = torch.empty(1, num_heads, max_splits, head_dim, dtype=torch.float32, device=device)
+    lse = torch.empty(1, num_heads, max_splits, dtype=torch.float32, device=device)
+    nks = torch.full((1,), nkv, dtype=torch.int32, device=device)
 
-    decode_attention_fwd(
-        Q, K, V, o, kv_indptr, kv_indices,
-        attn_logits, attn_lse, num_kv_splits, max_kv_splits,
-        sm_scale=head_dim ** -0.5, k_scale=1.0, v_scale=1.0,
-        logit_cap=0, sinks=None, xai_temperature_len=0,
-        has_mla=False, use_pdl=False,
-    )
-    results[num_splits_val] = o.clone()
-    torch.cuda.synchronize()
+    decode_attention_fwd(Q, K, V, o, kv_indptr, kv_indices,
+                         al, lse, nks, max_splits,
+                         sm_scale=head_dim**-0.5, k_scale=1.0, v_scale=1.0,
+                         logit_cap=0, sinks=None, xai_temperature_len=0,
+                         has_mla=False, use_pdl=False)
+    results[nkv] = o.clone()
 
-print("Comparing outputs with different num_kv_splits (same Q/K/V):")
-for s1 in [1, 2, 4, 8]:
-    for s2 in [1, 2, 4, 8]:
-        if s1 >= s2:
-            continue
-        describe(results[s1], results[s2], f"splits={s1} vs splits={s2}")
+torch.cuda.synchronize()
 
-# Also show diff magnitude for each pair
+print(f"seq_len={seq_len} num_heads={num_heads} head_dim={head_dim} max_splits={max_splits}")
 print("\nPairwise max_abs_diff matrix:")
-pairs = [1, 2, 4, 8]
-header = "        " + " ".join(f"splits={s:1d}" for s in pairs)
+header = "        " + "".join(f" nkv={n:2d}" for n in nks_values)
 print(header)
-for s1 in pairs:
-    row = f"splits={s1:1d}  "
-    for s2 in pairs:
-        row += f"{max_abs_diff(results[s1], results[s2]):11.3e} "
+for n1 in nks_values:
+    row = f"nkv={n1:2d}"
+    for n2 in nks_values:
+        row += f"  {max_abs_diff(results[n1], results[n2]):8.2e}"
     print(row)
 
-# ============================================================
-# TEST B: Non-deterministic vs deterministic num_kv_splits
-#   Compare get_num_kv_splits behavior to understand the mechanism.
-#   We simulate what the Triton kernel does: compute splits based
-#   on batch layout (device_core_count, num_heads, num_seq) vs
-#   fixed split_tile_size.
-# ============================================================
-print("\n" + "=" * 80)
-print("TEST B: Simulated num_kv_splits — deterministic vs dynamic")
-print("=" * 80)
-
-# Deterministic formula (triton_backend.py:268-271)
-def get_splits_deterministic(seq_lens, split_tile_size=256):
-    return (seq_lens + split_tile_size - 1) // split_tile_size
-
-# Dynamic formula simulates what get_num_kv_splits_triton roughly does:
-# It considers device_core_count and divides work across available SMs.
-# A simplified proxy: split count ≈ device_cores / (num_seq * num_heads_factor)
-# For SM90 (H100) with 132 SMs, the actual logic is more complex but the
-# key point is it's batch-dependent.
-def get_splits_dynamic_sim(seq_lens, num_seq, num_heads, max_splits, device_cores=132):
-    """Simplified simulation of the dynamic Triton kernel logic.
-
-    The real kernel (triton_backend.py:1434) computes:
-      kv_chunk_size_1 = max_seq_len / max_kv_splits
-      total_kv_tasks = per-head kv tasks across all sequences
-      num_kv_chunks = maximum chunks that can be allocated
-      kv_chunk_size_2 = total_kv_len / num_kv_chunks
-      For each seq: splits = max(seq_len/kv_chunk_size_1, seq_len/kv_chunk_size_2)
-    """
-    bs = len(seq_lens)
-    max_seq_len = seq_lens.max().item()
-    total_kv_len = seq_lens.sum().item()
-
-    # chunk_size_1: uniform distribution
-    kv_chunk_size_1 = max_seq_len / max_splits
-
-    # chunk_size_2: based on device core count
-    # grid = num_heads * num_seq  (each head per sequence is a task)
-    token_grid = num_heads * num_seq
-    # available_sms factor: device_cores - reserved_for_other_work
-    available_kv_sms = max(1, device_cores - 8)  # reserve ~8 SMs
-    # how many KV chunks total
-    num_kv_chunks = max(1, min(max_splits * token_grid,
-                               (available_kv_sms // min(token_grid, 8)) * max_splits))
-    kv_chunk_size_2 = total_kv_len / num_kv_chunks
-
-    splits = torch.zeros(bs, dtype=torch.int32)
-    for i in range(bs):
-        s1 = max(1, int(seq_lens[i].item() / kv_chunk_size_1))
-        s2 = max(1, int(seq_lens[i].item() / kv_chunk_size_2)) if kv_chunk_size_2 > 0 else 1
-        splits[i] = min(max_splits, max(s1, s2))
-    return splits
-
-# Test: show that different batch compositions can give different splits
-# for the SAME sequence length
-test_seq_len = 2048
-print(f"\nTarget seq_len = {test_seq_len}, max_splits = 16")
-
-# Scenario 1: Small batch (e.g., large KV cache, few concurrent requests)
-seq_lens_small = torch.tensor([test_seq_len, 1024], dtype=torch.int32)
-det_small = get_splits_deterministic(seq_lens_small, 256)
-dyn_small = get_splits_dynamic_sim(seq_lens_small, len(seq_lens_small), num_heads, 16)
-print(f"  Small batch (2 seqs): seq_lens={seq_lens_small.tolist()}")
-print(f"    deterministic splits: {det_small.tolist()}")
-print(f"    dynamic     splits: {dyn_small.tolist()}")
-
-# Scenario 2: Large batch (e.g., small KV cache, many concurrent requests)
-seq_lens_large = torch.tensor([test_seq_len, 1024, 1500, 800, 600, 1200, 1800, 2048],
-                               dtype=torch.int32)
-det_large = get_splits_deterministic(seq_lens_large, 256)
-dyn_large = get_splits_dynamic_sim(seq_lens_large, len(seq_lens_large), num_heads, 16)
-print(f"\n  Large batch (8 seqs): seq_lens={seq_lens_large.tolist()}")
-print(f"    deterministic splits: {det_large.tolist()}")
-print(f"    dynamic     splits: {dyn_large.tolist()}")
-
-# Key comparison: same seq_len in different batch → different splits?
-if dyn_small[0] != dyn_large[0]:
-    print(f"\n  ** seq_len={test_seq_len} gets different splits: {dyn_small[0].item()} vs {dyn_large[0].item()}")
-    print(f"  ** This confirms batch-dependent KV split assignment!")
-    print(f"  ** Deterministic always gives: {det_small[0].item()} (seq_len only)")
+n_different = sum(1 for n1 in nks_values for n2 in nks_values
+                  if n1 < n2 and not torch.equal(results[n1], results[n2]))
+print(f"\n{n_different} out of {len(nks_values)*(len(nks_values)-1)//2} pairs differ")
+if n_different > 0:
+    max_diff = max(max_abs_diff(results[n1], results[n2])
+                   for n1 in nks_values for n2 in nks_values if n1 < n2)
+    print(f"Max difference across all pairs: {max_diff:.6e}")
+    print("** CONFIRMED: different num_kv_splits → different attention output **")
 else:
-    print(f"\n  seq_len={test_seq_len} same splits in both: {dyn_small[0].item()}")
+    print("All pairs identical for this config")
 
 # ============================================================
-# TEST C: End-to-end — same request in different batches
-#   A sequence with length L is processed:
-#     Once alone (batch of 1)
-#     Once mixed with other sequences (batch of N)
-#   Does its attention output differ?
+# TEST B: Accurate simulation — dynamic vs deterministic splits
 # ============================================================
 print("\n" + "=" * 80)
-print("TEST C: End-to-end — same sequence in different batch compositions")
+print("TEST B: Accurate simulation of get_num_kv_splits — dynamic vs deterministic")
+print("  Reimplementation matching triton_backend.py:1435-1483")
 print("=" * 80)
 
-target_seq_len = 2048
-companion_lens = [512, 1024, 1500]  # other sequences mixed in
-max_splits = 16
+# Use realistic DeepSeek-V2-Lite numbers
+num_heads_test = 16
+num_kv_heads_test = 16  # 1:1 for Lite (non-GQA)
+device_cores = 132  # H100
 
-# Setup: single sequence's Q/K/V
-Q_single = rbf((1, num_heads, head_dim), seed=100)
-K_single = rbf((target_seq_len, num_heads, head_dim), seed=200)
-V_single = rbf((target_seq_len, num_heads, head_dim), seed=300)
-
-# Shared buffer: Q, K, V for all sequences together
-Q_all = torch.cat([Q_single] + [rbf((1, num_heads, head_dim), seed=400+i) for i in range(len(companion_lens))], dim=0)
-K_all = torch.cat([K_single] + [rbf((cl, num_heads, head_dim), seed=500+i) for i, cl in enumerate(companion_lens)], dim=0)
-V_all = torch.cat([V_single] + [rbf((cl, num_heads, head_dim), seed=600+i) for i, cl in enumerate(companion_lens)], dim=0)
-
-total_bs = 1 + len(companion_lens)
-seq_lens_all = [target_seq_len] + companion_lens
-cumsum = [0]
-for sl in seq_lens_all:
-    cumsum.append(cumsum[-1] + sl)
-kv_indptr_all = torch.tensor(cumsum, dtype=torch.int32, device=device)
-kv_indices_all = torch.arange(cumsum[-1], dtype=torch.int64, device=device)
-
-# --- Run alone (batch=1) ---
-kv_indptr_alone = torch.tensor([0, target_seq_len], dtype=torch.int32, device=device)
-kv_indices_alone = torch.arange(target_seq_len, dtype=torch.int64, device=device)
-
-o_alone = torch.empty(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-al_alone = torch.empty(1, num_heads, max_splits, head_dim, dtype=torch.float32, device=device)
-lse_alone = torch.empty(1, num_heads, max_splits, dtype=torch.float32, device=device)
-
-# Non-deterministic simulation: use dynamic split for alone case
-dyn_split_alone = get_splits_dynamic_sim(
-    torch.tensor([target_seq_len], dtype=torch.int32), 1, num_heads, max_splits
-)
-det_split_alone = get_splits_deterministic(
-    torch.tensor([target_seq_len], dtype=torch.int32), 256
-)
-
-# --- Run in full batch ---
-o_full = torch.empty(total_bs, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-al_full = torch.empty(total_bs, num_heads, max_splits, head_dim, dtype=torch.float32, device=device)
-lse_full = torch.empty(total_bs, num_heads, max_splits, dtype=torch.float32, device=device)
-
-dyn_split_full = get_splits_dynamic_sim(
-    torch.tensor(seq_lens_all, dtype=torch.int32), total_bs, num_heads, max_splits
-)
-det_split_full = get_splits_deterministic(
-    torch.tensor(seq_lens_all, dtype=torch.int32), 256
-)
-
-print(f"seq_lens: {seq_lens_all}")
-print(f"Deterministic splits:  alone={det_split_alone.tolist()}  full_batch={det_split_full.tolist()}")
-print(f"Dynamic splits:        alone={dyn_split_alone.tolist()}  full_batch={dyn_split_full.tolist()}")
-print(f"Target seq_len={target_seq_len}: det_split={det_split_alone[0].item()} dyn_alone={dyn_split_alone[0].item()} dyn_full={dyn_split_full[0].item()}")
-
-# --- Run with dynamic splits (non-deterministic simulation) ---
-print("\n--- With DYNAMIC splits (simulating non-deterministic mode) ---")
-nks_alone = torch.tensor(dyn_split_alone, dtype=torch.int32, device=device)
-decode_attention_fwd(
-    Q_single, K_single, V_single, o_alone,
-    kv_indptr_alone, kv_indices_alone,
-    al_alone, lse_alone, nks_alone, max_splits,
-    sm_scale=head_dim**-0.5, k_scale=1.0, v_scale=1.0,
-    logit_cap=0, sinks=None, xai_temperature_len=0,
-    has_mla=False, use_pdl=False,
-)
-
-nks_full = torch.tensor(dyn_split_full, dtype=torch.int32, device=device)
-decode_attention_fwd(
-    Q_all, K_all, V_all, o_full,
-    kv_indptr_all, kv_indices_all,
-    al_full, lse_full, nks_full, max_splits,
-    sm_scale=head_dim**-0.5, k_scale=1.0, v_scale=1.0,
-    logit_cap=0, sinks=None, xai_temperature_len=0,
-    has_mla=False, use_pdl=False,
-)
-
-torch.cuda.synchronize()
-
-# Extract the target sequence's output from the full batch
-o_target_from_full = o_full[0:1]  # first sequence is our target
-describe(o_alone, o_target_from_full, "dynamic: alone vs in-batch")
-
-# --- Run with deterministic splits ---
-print("\n--- With DETERMINISTIC splits (simulating deterministic mode) ---")
-o_alone_det = torch.empty(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-nks_alone = torch.tensor(det_split_alone, dtype=torch.int32, device=device)
-decode_attention_fwd(
-    Q_single, K_single, V_single, o_alone_det,
-    kv_indptr_alone, kv_indices_alone,
-    al_alone, lse_alone, nks_alone, max_splits,
-    sm_scale=head_dim**-0.5, k_scale=1.0, v_scale=1.0,
-    logit_cap=0, sinks=None, xai_temperature_len=0,
-    has_mla=False, use_pdl=False,
-)
-
-o_full_det = torch.empty(total_bs, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-nks_full = torch.tensor(det_split_full, dtype=torch.int32, device=device)
-decode_attention_fwd(
-    Q_all, K_all, V_all, o_full_det,
-    kv_indptr_all, kv_indices_all,
-    al_full, lse_full, nks_full, max_splits,
-    sm_scale=head_dim**-0.5, k_scale=1.0, v_scale=1.0,
-    logit_cap=0, sinks=None, xai_temperature_len=0,
-    has_mla=False, use_pdl=False,
-)
-
-torch.cuda.synchronize()
-
-o_target_det = o_full_det[0:1]
-describe(o_alone_det, o_target_det, "deterministic: alone vs in-batch")
-
-# --- Cross-compare: dynamic alone vs deterministic alone ---
-print("\n--- Cross-comparison ---")
-describe(o_alone, o_alone_det, "alone: dynamic vs deterministic splits")
-
-# ============================================================
-# TEST D: Repeated runs with dynamic splits vs fixed splits
-#   Show that with dynamic splits, the same request's output
-#   depends on batch companions, while with fixed splits it doesn't.
-# ============================================================
-print("\n" + "=" * 80)
-print("TEST D: Batch-companion-dependent output (dynamic) vs independent (deterministic)")
-print("=" * 80)
-
-# Create 3 different batch compositions, all containing our target sequence
-target_sl = 2048
-batch_configs = [
-    ([target_sl], "alone"),
-    ([target_sl, 512], "+short"),
-    ([target_sl, 512, 1024, 1500, 800], "+4 companions"),
+test_target_sl = 2048
+scenarios = [
+    ([test_target_sl], "alone"),
+    ([test_target_sl, 1024], "batch_2"),
+    ([test_target_sl, 512, 1024, 1500], "batch_4"),
+    ([test_target_sl, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800], "batch_10"),
+    ([test_target_sl, 1800, 1600, 1400, 800, 600, 400, 200, 120, 80], "batch_10_v2"),
 ]
 
-# Target sequence's fixed Q/K/V
-Q_tgt = rbf((1, num_heads, head_dim), seed=700)
-K_tgt = rbf((target_sl, num_heads, head_dim), seed=800)
-V_tgt = rbf((target_sl, num_heads, head_dim), seed=900)
+print(f"Target seq_len={test_target_sl}  device_cores={device_cores}")
+print(f"num_heads={num_heads_test}  num_kv_heads={num_kv_heads_test}  max_splits=16\n")
 
-outputs_dynamic = []
-outputs_deterministic = []
+any_batch_dep = False
+for seq_lens, label in scenarios:
+    det = get_num_kv_splits_deterministic(seq_lens, 256)
+    dyn = get_num_kv_splits_dynamic(seq_lens, num_heads_test, num_kv_heads_test, 16, device_cores)
+    target_det = det[0]
+    target_dyn = dyn[0]
+    diff_mark = ""
+    # Check if the same seq_len gets different splits in different batches
+    if scenarios[0][0] != seq_lens:  # not the alone case
+        first_dyn = get_num_kv_splits_dynamic(scenarios[0][0], num_heads_test, num_kv_heads_test, 16, device_cores)[0]
+        if first_dyn != target_dyn:
+            diff_mark = f" <-- DIFFERENT from alone case ({first_dyn})!"
+            any_batch_dep = True
+    print(f"  {label:15s} det={target_det:2d}  dyn={target_dyn:2d}{diff_mark}")
 
-for seq_lens, label in batch_configs:
-    bs_cfg = len(seq_lens)
-    total_kv = sum(seq_lens)
+if any_batch_dep:
+    print(f"\n** CONFIRMED: dynamic num_kv_splits is batch-dependent for seq_len={test_target_sl}")
+else:
+    print(f"\nseq_len={test_target_sl}: dynamic splits same across all test batches")
 
-    # Build Q, K, V with target as first sequence
-    Q_cfg = [Q_tgt] + [rbf((1, num_heads, head_dim), seed=1000+hash((label, i)))
-                        for i in range(bs_cfg-1)]
-    K_cfg = [K_tgt] + [rbf((sl, num_heads, head_dim), seed=1100+hash((label, i)))
-                        for i, sl in enumerate(seq_lens[1:])]
-    V_cfg = [V_tgt] + [rbf((sl, num_heads, head_dim), seed=1200+hash((label, i)))
-                        for i, sl in enumerate(seq_lens[1:])]
+# Try wider range of seq_lens to find batch-dependent cases
+print(f"\nSearching for batch-dependent cases across more configurations...")
+found_any = False
+for target_sl in [512, 1024, 2048, 4096, 8192]:
+    for bs in [1, 2, 4, 8, 16]:
+        companion_lens = [max(32, target_sl - i*128) for i in range(1, bs)]
+        seq_lens = [target_sl] + companion_lens
+        if bs == 1:
+            alone_dyn = get_num_kv_splits_dynamic(seq_lens, num_heads_test, num_kv_heads_test, 16, device_cores)[0]
+            continue
+        batch_dyn = get_num_kv_splits_dynamic(seq_lens, num_heads_test, num_kv_heads_test, 16, device_cores)[0]
+        if alone_dyn != batch_dyn:
+            if not found_any:
+                print(f"  target_sl={'alone':>5s}  {'batch N':>5s}  {'seq_lens':>40s}")
+                found_any = True
+            print(f"  target_sl={alone_dyn:5d}  {batch_dyn:5d}  {str(seq_lens[:5]):>40s}")
+            break  # one example per target_sl is enough
+    if bs == 1:
+        # reset for next target_sl
+        pass
 
-    Q_all = torch.cat(Q_cfg, dim=0)
-    K_all = torch.cat(K_cfg, dim=0)
-    V_all = torch.cat(V_cfg, dim=0)
-
-    cum = [0]
-    for sl in seq_lens:
-        cum.append(cum[-1]+sl)
-    kv_indptr = torch.tensor(cum, dtype=torch.int32, device=device)
-    kv_indices = torch.arange(total_kv, dtype=torch.int64, device=device)
-
-    # Dynamic splits
-    dyn = get_splits_dynamic_sim(torch.tensor(seq_lens, dtype=torch.int32), bs_cfg, num_heads, 16)
-    det = get_splits_deterministic(torch.tensor(seq_lens, dtype=torch.int32), 256)
-
-    o_dyn = torch.empty(bs_cfg, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-    al = torch.empty(bs_cfg, num_heads, 16, head_dim, dtype=torch.float32, device=device)
-    lse = torch.empty(bs_cfg, num_heads, 16, dtype=torch.float32, device=device)
-
-    nks = torch.tensor(dyn, dtype=torch.int32, device=device)
-    decode_attention_fwd(Q_all, K_all, V_all, o_dyn, kv_indptr, kv_indices,
-                         al, lse, nks, 16,
-                         sm_scale=head_dim**-0.5, k_scale=1.0, v_scale=1.0,
-                         logit_cap=0, sinks=None, xai_temperature_len=0,
-                         has_mla=False, use_pdl=False)
-    outputs_dynamic.append((label, o_dyn[0:1].clone(), dyn[0].item()))
-
-    o_det = torch.empty(bs_cfg, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-    nks = torch.tensor(det, dtype=torch.int32, device=device)
-    decode_attention_fwd(Q_all, K_all, V_all, o_det, kv_indptr, kv_indices,
-                         al, lse, nks, 16,
-                         sm_scale=head_dim**-0.5, k_scale=1.0, v_scale=1.0,
-                         logit_cap=0, sinks=None, xai_temperature_len=0,
-                         has_mla=False, use_pdl=False)
-    outputs_deterministic.append((label, o_det[0:1].clone(), det[0].item()))
-
-    torch.cuda.synchronize()
-
-# Show results: dynamic mode
-print("\nDynamic splits (non-deterministic simulation):")
-for label, out, splits in outputs_dynamic:
-    print(f"  {label:15s} num_splits_for_target={splits}")
-for i in range(len(outputs_dynamic)):
-    for j in range(i+1, len(outputs_dynamic)):
-        l1, o1, s1 = outputs_dynamic[i]
-        l2, o2, s2 = outputs_dynamic[j]
-        describe(o1, o2, f"dynamic: {l1} vs {l2}")
-        if not torch.equal(o1, o2):
-            print(f"    ** BATCH-DEPENDENT! {l1}(splits={s1}) != {l2}(splits={s2}) **")
-
-# Show results: deterministic mode
-print("\nDeterministic splits:")
-for label, out, splits in outputs_deterministic:
-    print(f"  {label:15s} num_splits_for_target={splits}")
-for i in range(len(outputs_deterministic)):
-    for j in range(i+1, len(outputs_deterministic)):
-        l1, o1, s1 = outputs_deterministic[i]
-        l2, o2, s2 = outputs_deterministic[j]
-        describe(o1, o2, f"deterministic: {l1} vs {l2}")
+if not found_any:
+    print("  No batch-dependent cases found with these parameters.")
+    print("  The dynamic Triton kernel is quite stable for moderate batch sizes.")
+    print("  But the PRINCIPLE holds: it IS batch-dependent by design.")
 
 # ============================================================
-# TEST E: Magnitude analysis — how much does the difference matter?
+# TEST C: End-to-end — construct a scenario where splits differ
 # ============================================================
 print("\n" + "=" * 80)
-print("TEST E: Can single-token attention difference flip the argmax?")
+print("TEST C: Prove that different num_kv_splits changes attention output")
+print("  End-to-end: run decode_attention_fwd with deliberately different splits")
 print("=" * 80)
 
-# For one of the differing cases, check if the max element differs
-for i in range(len(outputs_dynamic)):
-    for j in range(i+1, len(outputs_dynamic)):
-        l1, o1, s1 = outputs_dynamic[i]
-        l2, o2, s2 = outputs_dynamic[j]
-        if not torch.equal(o1, o2):
-            diff = o1.float() - o2.float()
-            max_diff_idx = diff.abs().argmax()
-            flat_idx = max_diff_idx.item()
-            print(f"\n  {l1} vs {l2}:")
-            print(f"    max element diff: {diff.abs().max().item():.6e}")
-            print(f"    at index {flat_idx}: val1={o1.float().flatten()[flat_idx].item():.6f}  val2={o2.float().flatten()[flat_idx].item():.6f}")
+# We know from TEST A that for seq_len=1024 with 32 heads, different splits
+# produce different outputs. Let's verify this for a larger, more realistic config
+# that matches typical decode scenarios.
 
-            # Check if the argmax position differs
-            am1 = o1.float().reshape(-1).argmax()
-            am2 = o2.float().reshape(-1).argmax()
-            if am1 != am2:
-                print(f"    ** ARGMAX DIFFERS! argmax1={am1.item()} argmax2={am2.item()} **")
-                print(f"    This proves KV split non-determinism can change model output tokens.")
-            else:
-                print(f"    argmax same: {am1.item()}")
+num_heads_c = 16
+head_dim_c = 128
+seq_len_c = 4096
+max_splits_c = 32
+
+# Simulate two scenarios where the same request could get different splits:
+# Scenario 1: small batch (num_seq=1), more splits per sequence
+# Scenario 2: large batch (num_seq=8), fewer splits per sequence
+
+# Compute realistic split counts for both
+sl_alone = [seq_len_c]
+sl_mixed = [seq_len_c, 512, 1024, 1500, 800, 600, 1200, 1800]
+
+dyn_alone = get_num_kv_splits_dynamic(sl_alone, num_heads_c, num_heads_c, max_splits_c, 132)
+dyn_mixed = get_num_kv_splits_dynamic(sl_mixed, num_heads_c, num_heads_c, max_splits_c, 132)
+
+det_alone = get_num_kv_splits_deterministic(sl_alone, 256)
+det_mixed = get_num_kv_splits_deterministic(sl_mixed, 256)
+
+print(f"seq_len={seq_len_c} num_heads={num_heads_c} head_dim={head_dim_c} max_splits={max_splits_c}")
+print(f"  Deterministic splits: alone={det_alone[0]} mixed={det_mixed[0]}  (same: {det_alone[0]==det_mixed[0]})")
+print(f"  Dynamic splits:      alone={dyn_alone[0]} mixed={dyn_mixed[0]}  (same: {dyn_alone[0]==dyn_mixed[0]})")
+
+# Run attention with the split counts we got
+Q_c = rbf((1, num_heads_c, head_dim_c), seed=500)
+K_c = rbf((seq_len_c, num_heads_c, head_dim_c), seed=600)
+V_c = rbf((seq_len_c, num_heads_c, head_dim_c), seed=700)
+kv_indptr_c = torch.tensor([0, seq_len_c], dtype=torch.int32, device=device)
+kv_indices_c = torch.arange(seq_len_c, dtype=torch.int64, device=device)
+
+results_c = {}
+for mode, splits_val in [("det_alone", det_alone[0]), ("det_mixed", det_mixed[0]),
+                          ("dyn_alone", dyn_alone[0]), ("dyn_mixed", dyn_mixed[0])]:
+    o = torch.empty(1, num_heads_c, head_dim_c, dtype=torch.bfloat16, device=device)
+    al = torch.empty(1, num_heads_c, max_splits_c, head_dim_c, dtype=torch.float32, device=device)
+    lse = torch.empty(1, num_heads_c, max_splits_c, dtype=torch.float32, device=device)
+    nks = torch.full((1,), splits_val, dtype=torch.int32, device=device)
+
+    decode_attention_fwd(Q_c, K_c, V_c, o, kv_indptr_c, kv_indices_c,
+                         al, lse, nks, max_splits_c,
+                         sm_scale=head_dim_c**-0.5, k_scale=1.0, v_scale=1.0,
+                         logit_cap=0, sinks=None, xai_temperature_len=0,
+                         has_mla=False, use_pdl=False)
+    results_c[mode] = o.clone()
+
+torch.cuda.synchronize()
+
+print(f"\nAttention output comparisons:")
+print(f"  det_alone vs det_mixed (same splits={det_alone[0]}):  "
+      f"equal={torch.equal(results_c['det_alone'], results_c['det_mixed'])}  "
+      f"max_abs={max_abs_diff(results_c['det_alone'], results_c['det_mixed']):.6e}")
+
+dyn_same = dyn_alone[0] == dyn_mixed[0]
+print(f"  dyn_alone vs dyn_mixed (splits={dyn_alone[0]} vs {dyn_mixed[0]}, same={dyn_same}):  "
+      f"equal={torch.equal(results_c['dyn_alone'], results_c['dyn_mixed'])}  "
+      f"max_abs={max_abs_diff(results_c['dyn_alone'], results_c['dyn_mixed']):.6e}")
+
+print(f"  det_alone vs dyn_alone (splits={det_alone[0]} vs {dyn_alone[0]}):  "
+      f"equal={torch.equal(results_c['det_alone'], results_c['dyn_alone'])}  "
+      f"max_abs={max_abs_diff(results_c['det_alone'], results_c['dyn_alone']):.6e}")
+
+# Check if argmax differs
+for label1, label2 in [("det_alone", "dyn_alone"), ("dyn_alone", "dyn_mixed")]:
+    if not torch.equal(results_c[label1], results_c[label2]):
+        o1 = results_c[label1].float()
+        o2 = results_c[label2].float()
+        am1 = o1.reshape(-1).argmax()
+        am2 = o2.reshape(-1).argmax()
+        diff = o1 - o2
+        print(f"\n  {label1} vs {label2}:")
+        print(f"    max element diff: {diff.abs().max().item():.6e}")
+        print(f"    argmax1={am1.item()} argmax2={am2.item()} {'DIFFERS!' if am1 != am2 else 'same'}")
+
+# ============================================================
+# TEST D: Multi-layer cumulative effect — attention output fed to next layer
+# ============================================================
+print("\n" + "=" * 80)
+print("TEST D: Cumulative effect — attention diff amplified through 2 layers")
+print("  Simulate attention output fed to next layer's matmul to show amplification")
+print("=" * 80)
+
+# If attention outputs differ, feed both through a typical FFN projection
+# to see if differences amplify
+if not torch.equal(results_c['det_alone'], results_c['dyn_alone']):
+    attn_det = results_c['det_alone'].float()    # [1, 16, 128]
+    attn_dyn = results_c['dyn_alone'].float()
+
+    # Simulate next-layer projection: attn_out @ W_proj.T
+    W_proj = rbf((head_dim_c, 2048), seed=900).float()  # projects to hidden_dim=2048
+
+    # Compute projection
+    proj_det = attn_det.reshape(1, -1) @ W_proj   # [1, 2048]
+    proj_dyn = attn_dyn.reshape(1, -1) @ W_proj
+
+    print(f"  Attention output difference: max_abs={max_abs_diff(attn_det, attn_dyn):.6e}")
+    print(f"  After FFN projection:        max_abs={max_abs_diff(proj_det, proj_dyn):.6e}")
+
+    # Simulate rms_norm
+    w_norm = rbf((2048,), seed=950).float()
+    norm_det = torch.nn.functional.rms_norm(proj_det, [2048], weight=w_norm)
+    norm_dyn = torch.nn.functional.rms_norm(proj_dyn, [2048], weight=w_norm)
+    print(f"  After RMS norm:              max_abs={max_abs_diff(norm_det, norm_dyn):.6e}")
+    print(f"  Amplification factor:        {max_abs_diff(norm_det, norm_dyn)/max(1e-12, max_abs_diff(attn_det, attn_dyn)):.2f}x")
+
+    # Argmax check after 1 layer of processing
+    am_norm_det = norm_det.reshape(-1).argmax()
+    am_norm_dyn = norm_dyn.reshape(-1).argmax()
+    print(f"  After 1 more layer argmax:   det={am_norm_det.item()} dyn={am_norm_dyn.item()} "
+          f"{'DIFFERS!' if am_norm_det != am_norm_dyn else 'same'}")
+
+# ============================================================
+# TEST E: Sweep across many seq_lens to find where splits differ
+# ============================================================
+print("\n" + "=" * 80)
+print("TEST E: Sweep — which seq_lens cause split-count divergence?")
+print("=" * 80)
+
+diverged = []
+for sl in [256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]:
+    alone_sl = [sl]
+    mixed_sl = [sl, 256, 512, 1024, 2048, 100, 300, 700, 1500]
+    dyn_a = get_num_kv_splits_dynamic(alone_sl, 16, 16, 32, 132)[0]
+    dyn_m = get_num_kv_splits_dynamic(mixed_sl, 16, 16, 32, 132)[0]
+    det_a = get_num_kv_splits_deterministic(alone_sl, 256)[0]
+    det_m = get_num_kv_splits_deterministic(mixed_sl, 256)[0]
+    mark = ""
+    if dyn_a != dyn_m:
+        mark = " <-- batch-dependent!"
+        diverged.append(sl)
+    print(f"  sl={sl:5d}  det(alone={det_a:2d} mixed={det_m:2d})  dyn(alone={dyn_a:2d} mixed={dyn_m:2d}){mark}")
+
+print(f"\n  Batch-dependent seq_lens: {diverged if diverged else 'none'}")
+print(f"  Deterministic: ALWAYS same (seq_len-based)")
 
 # ============================================================
 # CONCLUSION
