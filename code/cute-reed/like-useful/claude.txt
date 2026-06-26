@@ -45,3 +45,6 @@ gemm_config_type::g2s_copy_traits::SrcLayout的类型是 (_1,_128):(_0,_1)
 Copy_Traits<g2s_copy_op> 的 SrcLayout (_1,_128):(_0,_1) 是如何变成 Copy_Atom<g2s_copy_traits, T>的 ValLayoutSrc (_1,_8):(_0,_1)?
 Copy_Traits 里面有 using ValLayoutSrc = decltype(recast_layout<uint1_t, ValType>(BitLayoutSrc{})), 对这一行代码进行讲解.
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
+
+trait_ratio 会调用 nratio, nratio是如何变成除法的？ nratio 的哪个重载版本被调用?
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md

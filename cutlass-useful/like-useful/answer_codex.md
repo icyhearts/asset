@@ -6831,3 +6831,96 @@ Copy_Atom
 ```
 
 一句话总结：`Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>>::SrcLayout` 描述的是 cp.async 这条指令一次搬 128 bit 的 bit 级布局，所以是 `(_1,_128):(_0,_1)`；`Copy_Atom<g2s_copy_traits, T>` 需要知道以用户元素类型 `T` 来看一次 copy 有多少个 value，于是用 `recast_layout<uint1_t, ValType>` 把 128 个 1-bit 单位重解释成 8 个 16-bit value，得到 `ValLayoutSrc = (_1,_8):(_0,_1)`。
+
+## trait_ratio 调用 nratio 后，nratio 是如何表达除法的？
+
+以前面 `recast_layout<uint1_t, ValType>(BitLayoutSrc{})` 为上下文，调用入口在 `3rd/cutlass/include/cute/layout.hpp:1653 recast_layout`。它在 `3rd/cutlass/include/cute/layout.hpp:1655 recast_layout` 计算：
+
+```cpp
+using scale = decltype(trait_ratio(sizeof_bits<NewType>{}, sizeof_bits<OldType>{}));
+```
+
+这里的 `sizeof_bits` 是一个 trait。普通类型版本在 `3rd/cutlass/include/cute/numeric/int.hpp:121 sizeof_bits` 到 `3rd/cutlass/include/cute/numeric/int.hpp:122 sizeof_bits`，其 `value = sizeof(T) * 8`；subbyte 类型版本在 `3rd/cutlass/include/cute/numeric/int.hpp:139 sizeof_bits<integer_subbyte<Bits,Signed>>` 到 `3rd/cutlass/include/cute/numeric/int.hpp:140 sizeof_bits<integer_subbyte<Bits,Signed>>`，其 `value = Bits`。
+
+`trait_ratio` 的实现很短，在 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:241 trait_ratio` 到 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:242 trait_ratio`：
+
+```cpp
+return nratio(static_value<Trait0>(), static_value<Trait1>());
+```
+
+也就是说，`trait_ratio(Trait0, Trait1)` 先用 `static_value` 把 trait 的 `Trait::value` 转成 CuTe 的静态整数类型，再调用 `nratio`。`static_value` 在 `3rd/cutlass/include/cute/numeric/integral_constant.hpp:419 static_value` 到 `3rd/cutlass/include/cute/numeric/integral_constant.hpp:424 static_value`：
+
+```cpp
+if constexpr (is_std_integral<decltype(Trait::value)>::value) {
+  return Int<Trait::value>{};
+} else {
+  return Trait::value;
+}
+```
+
+因此本例中：
+
+```text
+Trait0 = sizeof_bits<ValType>   // ValType 是 16-bit half 类元素
+Trait1 = sizeof_bits<uint1_t>   // uint1_t 是 1-bit 类型
+
+static_value<Trait0>() -> Int<16>{}，也就是 C<16>{}
+static_value<Trait1>() -> Int<1>{}，也就是 C<1>{}
+```
+
+所以 `trait_ratio(sizeof_bits<ValType>{}, sizeof_bits<uint1_t>{})` 实际调用的是：
+
+```cpp
+nratio(C<16>{}, C<1>{})
+```
+
+匹配的 `nratio` 重载是 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:105 nratio(C<a>, C<b>)` 到 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:109 nratio(C<a>, C<b>)`：
+
+```cpp
+template <auto a, auto b>
+CUTE_HOST_DEVICE constexpr
+R<a,b>
+nratio(C<a>, C<b>) {
+  return {};
+}
+```
+
+也就是 `a=16, b=1`，返回类型是：
+
+```text
+R<16,1>
+```
+
+这里要注意：`nratio` 不返回 `typename R<a,b>::type`，而是直接返回 `R<a,b>`。`3rd/cutlass/include/cute/numeric/integral_ratio.hpp:101 nratio` 到 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:103 nratio` 的注释也说明这一组是 `Non-reduced ratio implementations`。对比 `ratio(C<a>, C<b>)` 在 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:73 ratio(C<a>, C<b>)` 到 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:77 ratio(C<a>, C<b>)` 返回的是 `typename R<a,b>::type`，`nratio` 保留了非规约的 `R<a,b>` 类型。
+
+`nratio` 是如何“变成除法”的？答案是：它没有生成运行期除法表达式，而是把除法编码成类型级分数 `R<分子, 分母>`。`R` 的定义在 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:54 R` 到 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:66 R`。其中 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:62 R` 和 `3rd/cutlass/include/cute/numeric/integral_ratio.hpp:63 R` 计算规约后的分子分母：
+
+```cpp
+static constexpr auto num = signum(n) * signum(d) * an / g;
+static constexpr auto den =                         ad / g;
+```
+
+也就是说，`R<16,1>` 这个类型代表编译期比例 `16 / 1`，并暴露：
+
+```text
+R<16,1>::num = 16
+R<16,1>::den = 1
+```
+
+后续 `recast_layout` 并不需要真的执行 `16 / 1` 这个表达式，而是直接检查这个类型级比例的分子和分母。`3rd/cutlass/include/cute/layout.hpp:1656 recast_layout` 到 `3rd/cutlass/include/cute/layout.hpp:1663 recast_layout` 的逻辑是：
+
+```cpp
+if constexpr (scale::num == 1 && scale::den == 1) {
+  return layout;
+}
+else if constexpr (scale::num == 1) {
+  return downcast<scale::den>(layout);
+}
+else if constexpr (scale::den == 1) {
+  return upcast<scale::num>(layout);
+}
+```
+
+本例 `scale = R<16,1>`，所以 `scale::den == 1` 成立，进入 `upcast<16>(layout)`。这就是 `trait_ratio -> nratio -> R<16,1> -> scale::num/scale::den -> upcast<16>` 的完整路径。
+
+一句话总结：`trait_ratio` 先把 `sizeof_bits<ValType>` 和 `sizeof_bits<uint1_t>` 的 `value` 转成 `C<16>` 和 `C<1>`，然后调用的是 `nratio(C<a>, C<b>)` 这个重载，返回 `R<16,1>`；`nratio` 所谓的“除法”是类型级比例 `R<分子,分母>`，真正被后续代码使用的是 `R::num` 和 `R::den`，本例最终触发 `recast_layout` 的 `upcast<16>`。
