@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <thread>
 #include <unordered_map>
@@ -10,12 +12,45 @@
 using std::size_t;
 using std::vector;
 
+unsigned int worker_count_for(size_t n) {
+  if (n == 0) {
+    return 0;
+  }
+
+  unsigned int thread_count = std::thread::hardware_concurrency();
+  if (thread_count == 0) {
+    thread_count = 2;
+  }
+  return std::min<unsigned int>(thread_count, static_cast<unsigned int>(n));
+}
+
+size_t bucket_index(int value, size_t bucket_count) {
+  return std::hash<int>{}(value) % bucket_count;
+}
+
+bool checked_complement(int x, int target, int& y) {
+  const long long value = static_cast<long long>(target) - x;
+  if (value < std::numeric_limits<int>::min() ||
+      value > std::numeric_limits<int>::max()) {
+    return false;
+  }
+
+  y = static_cast<int>(value);
+  return true;
+}
+
 bool single_thread_contain_target(const vector<int>& arr, int target) {
   std::unordered_map<int, int> seen;
   seen.reserve(arr.size() * 2);
 
   for (int x : arr) {
-    auto it = seen.find(target - x);
+    int y = 0;
+    if (!checked_complement(x, target, y)) {
+      ++seen[x];
+      continue;
+    }
+
+    auto it = seen.find(y);
     if (it != seen.end() && it->second > 0) {
       return true;
     }
@@ -30,24 +65,16 @@ bool parallel_contain_target(const vector<int>& arr, int target) {
     return false;
   }
 
-  std::unordered_map<int, int> counts;
-  counts.reserve(n * 2);
-  for (int x : arr) {
-    ++counts[x];
-  }
-
-  unsigned int thread_count = std::thread::hardware_concurrency();
-  if (thread_count == 0) {
-    thread_count = 2;
-  }
-  thread_count = std::min<unsigned int>(thread_count, static_cast<unsigned int>(n));
-
-  std::atomic<bool> found{false};
+  const unsigned int thread_count = worker_count_for(n);
+  const size_t bucket_count = thread_count;
+  const size_t chunk = (n + thread_count - 1) / thread_count;
   vector<std::thread> workers;
   workers.reserve(thread_count);
 
-  const size_t chunk = (n + thread_count - 1) / thread_count;
+  vector<vector<vector<int>>> local_buckets(
+      thread_count, vector<vector<int>>(bucket_count));
 
+  // Phase 1: each worker scans N/T elements and writes only to its own buckets.
   for (unsigned int tid = 0; tid < thread_count; ++tid) {
     const size_t begin = tid * chunk;
     const size_t end = std::min(n, begin + chunk);
@@ -55,10 +82,69 @@ bool parallel_contain_target(const vector<int>& arr, int target) {
       break;
     }
 
-    workers.emplace_back([&arr, &counts, &found, target, begin, end]() {
+    workers.emplace_back([&arr, &local_buckets, bucket_count, tid, begin, end, chunk]() {
+      const size_t reserve_per_bucket = chunk / bucket_count + 1;
+      for (size_t b = 0; b < bucket_count; ++b) {
+        local_buckets[tid][b].reserve(reserve_per_bucket);
+      }
+
+      for (size_t i = begin; i < end; ++i) {
+        const int x = arr[i];
+        local_buckets[tid][bucket_index(x, bucket_count)].push_back(x);
+      }
+    });
+  }
+
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  workers.clear();
+
+  vector<std::unordered_map<int, int>> bucket_counts(bucket_count);
+
+  // Phase 2: each bucket is owned by one worker, so no locks are needed.
+  for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
+    workers.emplace_back([&local_buckets, &bucket_counts, thread_count, bucket]() {
+      size_t total = 0;
+      for (unsigned int tid = 0; tid < thread_count; ++tid) {
+        total += local_buckets[tid][bucket].size();
+      }
+
+      auto& counts = bucket_counts[bucket];
+      counts.reserve(total * 2 + 1);
+      for (unsigned int tid = 0; tid < thread_count; ++tid) {
+        for (int x : local_buckets[tid][bucket]) {
+          ++counts[x];
+        }
+      }
+    });
+  }
+
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  workers.clear();
+
+  std::atomic<bool> found{false};
+
+  // Phase 3: scan arr in parallel. bucket_counts is read-only in this phase.
+  for (unsigned int tid = 0; tid < thread_count; ++tid) {
+    const size_t begin = tid * chunk;
+    const size_t end = std::min(n, begin + chunk);
+    if (begin >= end) {
+      break;
+    }
+
+    workers.emplace_back([&arr, &bucket_counts, &found, target, bucket_count, begin, end]() {
       for (size_t i = begin; i < end && !found.load(std::memory_order_relaxed); ++i) {
         const int x = arr[i];
-        const int y = target - x;
+
+        int y = 0;
+        if (!checked_complement(x, target, y)) {
+          continue;
+        }
+
+        const auto& counts = bucket_counts[bucket_index(y, bucket_count)];
         auto it = counts.find(y);
         if (it == counts.end()) {
           continue;
@@ -97,6 +183,10 @@ int main() {
   run_case({3, 3}, 6, true, "same value twice");
   run_case({3}, 6, false, "same value once");
   run_case({-10, 5, 20, 7, -3}, 2, true, "negative numbers");
+  run_case({std::numeric_limits<int>::max(), -1}, std::numeric_limits<int>::max() - 1,
+           true, "int max true");
+  run_case({std::numeric_limits<int>::min(), 1}, std::numeric_limits<int>::max(),
+           false, "overflow complement false");
 
   vector<int> large(1'000'000);
   std::mt19937 rng(12345);
