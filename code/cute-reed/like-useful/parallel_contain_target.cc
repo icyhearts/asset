@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -165,13 +167,30 @@ bool parallel_contain_target(const vector<int>& arr, int target) {
   return found.load(std::memory_order_relaxed);
 }
 
-void run_case(const vector<int>& arr, int target, bool expected, const char* name) {
-  const bool single = single_thread_contain_target(arr, target);
-  const bool parallel = parallel_contain_target(arr, target);
+template <class Func>
+std::pair<bool, double> timed_call(Func&& func) {
+  const auto start = std::chrono::steady_clock::now();
+  const bool result = func();
+  const auto stop = std::chrono::steady_clock::now();
+  const std::chrono::duration<double, std::milli> elapsed = stop - start;
+  return {result, elapsed.count()};
+}
 
-  std::cout << name << ": target=" << target
+void run_case(const vector<int>& arr, int target, bool expected, const char* name) {
+  const auto [single, single_ms] =
+      timed_call([&]() { return single_thread_contain_target(arr, target); });
+  const auto [parallel, parallel_ms] =
+      timed_call([&]() { return parallel_contain_target(arr, target); });
+  const double speedup = parallel_ms > 0.0 ? single_ms / parallel_ms : 0.0;
+
+  std::cout << name << ": size=" << arr.size()
+            << ", target=" << target
             << ", single=" << std::boolalpha << single
-            << ", parallel=" << parallel << '\n';
+            << ", parallel=" << parallel
+            << std::fixed << std::setprecision(3)
+            << ", single_ms=" << single_ms
+            << ", parallel_ms=" << parallel_ms
+            << ", speedup=" << speedup << "x\n";
 
   assert(single == expected);
   assert(parallel == single);
