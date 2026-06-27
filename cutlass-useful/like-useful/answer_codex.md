@@ -7229,3 +7229,380 @@ auto tAsA_copy = g2s_thr_copy_a.partition_D(sA);
 `partition_S`/`partition_D` 后会在剩余维度上继续分块，所以 `128 x 32` 的 A tile 会被拆成 4 个 `32 x 32` copy tile 来覆盖。
 
 一句话总结：`Tiler_MN: (_32,_32)` 来自 `raked_product((_32,_4):(_4,_1), (_1,_8):(_0,_1))` 后的 tile shape，即 `32 x (4*8)`；`TiledLayout_TV: ((_4,_32),_8):((_256,_1),_32)` 是这个 `layout_mn` 的 `right_inverse`，它表达的是 `tid = 4*m + k_group`、`vid = k_inner`，最终每个线程搬同一行上的 8 个连续 half，128 个线程一次覆盖 A 的 `32 x 32` 子 tile。
+
+## parallel_contain_target.cc 多线程 two-sum 实现讲解
+
+代码位置是 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc`。
+
+这个程序解决的问题是：给定数组 `arr` 和整数 `target`，判断是否存在两个不同位置的元素 `arr[i] + arr[j] == target`。实现里保留了一个单线程版本作为基准，再实现多线程版本，最后在 `main` 里逐个测试并比较两者结果。
+
+整体结构如下：
+
+```text
+parallel_contain_target.cc
+
+  single_thread_contain_target   // 单线程基准，行 13-25
+  parallel_contain_target        // 多线程实现，行 27-80
+  run_case                       // 对比 single / parallel，行 82-92
+  main                           // 测试用例，行 94-119
+```
+
+### 单线程版本
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:13 single_thread_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:25 single_thread_contain_target` 是单线程基准实现。
+
+核心逻辑是边扫描边维护 `seen` 哈希表：
+
+```text
+for x in arr:
+    y = target - x
+    如果 y 已经在 seen 中，说明 y + x == target
+    否则把 x 放入 seen
+```
+
+ASCII 图示：
+
+```text
+arr = [2, 7, 11, 15], target = 9
+
+step 0:
+  x = 2
+  y = 9 - 2 = 7
+  seen = {}
+  7 不在 seen，插入 2
+
+step 1:
+  x = 7
+  y = 9 - 7 = 2
+  seen = {2}
+  2 在 seen 中 => 2 + 7 == 9 => true
+```
+
+这个版本的作用主要是作为正确性参考。后面的多线程结果必须和它一致。
+
+### 多线程版本的核心思路
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:27 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:80 parallel_contain_target` 是多线程实现。
+
+它分成 4 步：
+
+```text
+1. 如果数组长度小于 2，直接 false
+2. 构建全局只读频次表 counts
+3. 把 arr 的索引范围切成多个 chunk，分配给多个线程
+4. 每个线程检查自己负责的元素 x，查询 target - x 是否存在
+```
+
+流程图：
+
+```text
+                 arr + target
+                     |
+                     v
+          +---------------------+
+          | build counts table  |
+          | value -> frequency  |
+          +---------------------+
+                     |
+                     v
+      +--------------------------------+
+      | split arr index range by chunk |
+      +--------------------------------+
+          |          |          |
+          v          v          v
+      Thread 0   Thread 1   Thread 2  ...
+      scan chunk scan chunk scan chunk
+          |          |          |
+          +----------+----------+
+                     |
+                     v
+             atomic<bool> found
+                     |
+                     v
+              true or false
+```
+
+### 为什么先构建 counts 表？
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:33 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:37 parallel_contain_target` 构建了：
+
+```cpp
+std::unordered_map<int, int> counts;
+for (int x : arr) {
+  ++counts[x];
+}
+```
+
+`counts` 保存每个数出现了多少次：
+
+```text
+arr = [3, 1, 4, 3, 8]
+
+counts:
+  1 -> 1
+  3 -> 2
+  4 -> 1
+  8 -> 1
+```
+
+这样每个线程处理某个 `x` 时，只需要查：
+
+```text
+y = target - x
+counts 是否包含 y
+```
+
+因为 `counts` 构建完成后不再修改，所以多个线程可以并发读取它。代码里所有 worker 线程只调用 `counts.find(y)` 和读取 `it->second`，没有写入 `counts`。
+
+### 如何分配线程？
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:39 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:43 parallel_contain_target` 使用：
+
+```cpp
+std::thread::hardware_concurrency()
+```
+
+获取机器可用的硬件并发线程数。如果返回 0，就用 2 作为兜底值。然后限制线程数不超过数组长度：
+
+```text
+thread_count = min(hardware_concurrency, arr.size())
+```
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:49 parallel_contain_target` 计算每个线程负责的 chunk 大小：
+
+```cpp
+const size_t chunk = (n + thread_count - 1) / thread_count;
+```
+
+这是向上取整，保证所有元素都被覆盖。
+
+假设：
+
+```text
+n = 16
+thread_count = 4
+chunk = 4
+```
+
+分片如下：
+
+```text
+arr index:
+  0  1  2  3 | 4  5  6  7 | 8  9 10 11 | 12 13 14 15
+  -----------+------------+------------+-------------
+   Thread 0     Thread 1     Thread 2      Thread 3
+```
+
+如果：
+
+```text
+n = 10
+thread_count = 4
+chunk = ceil(10 / 4) = 3
+```
+
+分片如下：
+
+```text
+arr index:
+  0  1  2 | 3  4  5 | 6  7  8 | 9
+  --------+---------+---------+-----
+  Thread0  Thread1   Thread2   Thread3
+```
+
+对应代码在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:51 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:56 parallel_contain_target`：
+
+```cpp
+const size_t begin = tid * chunk;
+const size_t end = std::min(n, begin + chunk);
+```
+
+### 每个线程做什么？
+
+worker 线程的逻辑在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:58 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:72 parallel_contain_target`。
+
+每个线程只扫描 `[begin, end)`：
+
+```text
+for i in [begin, end):
+    x = arr[i]
+    y = target - x
+    if counts contains y:
+        if y != x or counts[x] >= 2:
+            found = true
+```
+
+为什么要判断 `y != x || it->second >= 2`？
+
+因为题目要求是“两个数”，也就是两个不同位置的元素。假设：
+
+```text
+arr = [3]
+target = 6
+```
+
+如果只判断 `counts[3]` 存在，会误判成 true。但数组里只有一个 3，不能用同一个元素两次。因此：
+
+```text
+x = 3
+y = 3
+counts[3] = 1
+
+y == x 且 counts[3] < 2 => false
+```
+
+如果：
+
+```text
+arr = [3, 3]
+target = 6
+```
+
+则：
+
+```text
+x = 3
+y = 3
+counts[3] = 2
+
+y == x 且 counts[3] >= 2 => true
+```
+
+ASCII 图示：
+
+```text
+case A: arr = [3], target = 6
+
+  index:   0
+  value:   3
+
+  3 + 3 需要两个 3
+  但 counts[3] = 1
+  => false
+
+case B: arr = [3, 3], target = 6
+
+  index:   0   1
+  value:   3   3
+
+  可以选择 index 0 和 index 1
+  counts[3] = 2
+  => true
+```
+
+### found 原子变量的作用
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:45 parallel_contain_target` 定义了：
+
+```cpp
+std::atomic<bool> found{false};
+```
+
+它有两个作用：
+
+```text
+1. 多个线程可以安全地同时读写 found
+2. 任意一个线程找到答案后，其他线程可以尽快停止
+```
+
+线程循环条件在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:59 parallel_contain_target`：
+
+```cpp
+for (size_t i = begin; i < end && !found.load(std::memory_order_relaxed); ++i)
+```
+
+当某个线程找到匹配时，在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:68 parallel_contain_target` 写入：
+
+```cpp
+found.store(true, std::memory_order_relaxed);
+```
+
+图示：
+
+```text
+Thread 0: scanning ... no match
+Thread 1: scanning ... found x + y == target
+                         |
+                         v
+                    found = true
+                         |
+          +--------------+--------------+
+          v                             v
+Thread 0 sees found=true        Thread 2 sees found=true
+stop early                      stop early
+```
+
+这里使用 `memory_order_relaxed` 是足够的，因为 `found` 只表达“是否已经找到答案”这个布尔状态，不依赖它同步其它内存数据。`counts` 和 `arr` 在线程启动前已经构建好，worker 线程只读它们。
+
+### 等待线程结束
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:75 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:77 parallel_contain_target`：
+
+```cpp
+for (auto& worker : workers) {
+  worker.join();
+}
+```
+
+主线程必须 `join` 所有 worker，确保线程全部退出后再返回最终结果：
+
+```text
+main thread
+    |
+    +-- start worker 0
+    +-- start worker 1
+    +-- start worker 2
+    |
+    +-- join worker 0
+    +-- join worker 1
+    +-- join worker 2
+    |
+    v
+return found
+```
+
+### 正确性验证
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:82 run_case` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:92 run_case` 同时调用单线程和多线程版本：
+
+```cpp
+const bool single = single_thread_contain_target(arr, target);
+const bool parallel = parallel_contain_target(arr, target);
+
+assert(single == expected);
+assert(parallel == single);
+```
+
+因此测试要求是：
+
+```text
+parallel result == single-thread baseline
+single result   == expected answer
+```
+
+`main` 在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:94 main` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:119 main` 包含了这些测试：
+
+```text
+basic true        [2,7,11,15], target=9
+basic false       [1,2,3,4], target=8
+same value twice  [3,3], target=6
+same value once   [3], target=6
+negative numbers  [-10,5,20,7,-3], target=2
+large true        1,000,000 个元素，手动放入一对匹配值
+large false       200,000 个偶数，target=-1，不可能匹配
+```
+
+编译和测试命令是：
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -pthread /softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc -o /tmp/parallel_contain_target
+/tmp/parallel_contain_target
+```
+
+测试输出显示所有单线程和多线程结果一致，并最终打印：
+
+```text
+All tests passed.
+```
+
+一句话总结：这个多线程版本先用单线程构建一个只读 `counts` 哈希表，然后把数组索引区间切成多个 chunk 给多个 CPU 线程并行扫描；每个线程只读 `arr/counts`，用 `atomic<bool> found` 协调提前退出，最后用单线程基准和 `assert` 验证多线程结果正确。
