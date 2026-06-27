@@ -224,5 +224,7 @@ int main() {
   run_case(no_match, -1, false, "large false");
 
   std::cout << "All tests passed.\n";
+  unsigned int thread_count = std::thread::hardware_concurrency();
+  std::cout << "thread_count:" << thread_count << "\n";
   return 0;
 }

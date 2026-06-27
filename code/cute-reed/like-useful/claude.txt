@@ -69,3 +69,8 @@ Tiler_MN:       (_32,_32) 和TiledLayout_TV: ((_4,_32),_8):((_256,_1),_32)，这
 
 对新的实现进行讲解, 最好加上ascii 图讲解
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
+
+在 /softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc 实现如下功能:
+测量DDR内存的带宽，必须剔除cache的影响，测量单纯的访问DDR内存的带宽。
+需要修改内核参数吗？工作原理是什么？
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
