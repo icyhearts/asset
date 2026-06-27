@@ -8072,3 +8072,357 @@ large false
 其中 `int max true` 和 `overflow complement false` 是新版加入的边界测试，用来验证 `checked_complement` 不会因为 `target - x` 溢出而误判。
 
 一句话总结：新版实现把全局哈希表构建拆成“本地分桶 + 每桶独立建表”，避免多个线程同时写一个 `unordered_map`；查询阶段再按 `hash(target - x)` 定位到唯一 bucket，只读查表，并用 `atomic<bool> found` 做提前退出。在 hash 均匀时，三个阶段的 wall-clock 都接近 `O(N / num_thread)`。
+
+## bench_ddr_bandwidth.cc：测量 DDR 内存带宽并尽量剔除 cache 影响
+
+实现文件是 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc`。这个程序的目标不是测 L1/L2/L3 cache 带宽，而是让被计时的访问尽量来自 DDR 内存。
+
+先说结论：普通用户态程序一般不能真正“关闭 CPU cache”。本实现采用工程上常用的方法尽量剔除 cache 影响：
+
+```text
+1. 使用远大于 LLC 的 buffer，默认 max(512MiB, 4*LLC)
+2. 计时前对 buffer 做 clflush，主动把 cache line 从 cache 中驱逐
+3. 计时区间内做一次性流式访问，避免反复访问同一小块数据
+4. 写带宽使用 non-temporal store，尽量绕过 cache 的 write-allocate 污染
+5. 初始化和预触碰页面不计入正式测试时间，避免 page fault 混进带宽结果
+```
+
+整体结构如下：
+
+```text
+bench_ddr_bandwidth.cc
+
+  Buffer                // 64B 对齐分配，行 32-53
+  detect_llc_bytes      // 读取 Linux sysfs LLC 大小，行 107-115
+  parallel_for          // 多线程分片执行，行 117-137
+  initialize_buffer     // 初始化并预触碰内存页，行 139-150
+  flush_cache_lines     // clflush 驱逐 cache line，行 152-164
+  stream_store_u64      // non-temporal store，行 166-172
+  best_read_seconds     // 读带宽测试，行 185-209
+  best_write_seconds    // 写带宽测试，行 211-233
+  best_copy_seconds     // 读+写拷贝带宽测试，行 235-258
+  main                  // 参数解析、运行测试、打印结果，行 278-347
+```
+
+### 使用方法
+
+编译命令：
+
+```bash
+g++ -std=c++17 -O3 -march=native -Wall -Wextra -pthread \
+  /softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc \
+  -o /tmp/bench_ddr_bandwidth
+```
+
+运行命令：
+
+```bash
+/tmp/bench_ddr_bandwidth [size] [threads] [iterations]
+```
+
+参数含义由 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:269 print_usage` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:274 print_usage` 打印：
+
+```text
+size       : 例如 512M、2G、1024M；默认 max(512M, 4*LLC)
+threads    : 0 表示 std::thread::hardware_concurrency()
+iterations : 重复次数，默认 3，最后取 best time
+```
+
+我已经编译并用较小配置验证过：
+
+```bash
+/tmp/bench_ddr_bandwidth 256M 8 2
+```
+
+输出示例：
+
+```text
+DDR bandwidth benchmark
+  buffer_size = 256 MiB
+  threads     = 8
+  iterations  = 2
+  detected LLC= 105 MiB
+  cache flush = clflush before each timed pass
+  write path  = non-temporal stores
+read               bytes=   268435456 best_s=0.002983 bandwidth=83.80 GiB/s
+nt_write           bytes=   268435456 best_s=0.002168 bandwidth=115.29 GiB/s
+read+nt_write      bytes=   536870912 best_s=0.005534 bandwidth=90.36 GiB/s
+sink=0
+```
+
+### 为什么要让 buffer 大于 LLC？
+
+`/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:107 detect_llc_bytes` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:115 detect_llc_bytes` 从 Linux sysfs 读取：
+
+```text
+/sys/devices/system/cpu/cpu0/cache/index3/size
+```
+
+`main` 在 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:285 main` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:286 main` 设置默认 buffer：
+
+```cpp
+const size_t llc_bytes = detect_llc_bytes();
+size_t bytes = std::max<size_t>(512ull * kMiB, llc_bytes * 4);
+```
+
+也就是：
+
+```text
+buffer_size = max(512 MiB, 4 * LLC)
+```
+
+原因是如果 buffer 太小，数据可能常驻 L3 cache，测到的就是 cache 带宽，不是 DDR 带宽。
+
+ASCII 图：
+
+```text
+错误方式：buffer 太小
+
+  CPU core
+     |
+     v
+  L1/L2/L3 cache  <--- 数据反复命中 cache
+     |
+     v
+  DDR 很少被访问
+
+  测出来更像 cache bandwidth
+```
+
+```text
+本实现：buffer 远大于 LLC
+
+  CPU core
+     |
+     v
+  L1/L2/L3 cache  <--- 装不下整个工作集
+     |
+     v
+  DDR 持续提供 cache line
+
+  测出来更接近 DDR streaming bandwidth
+```
+
+### 为什么要 clflush？
+
+`/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:152 flush_cache_lines` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:164 flush_cache_lines` 对 buffer 每 64B 调用一次：
+
+```cpp
+_mm_clflush(p);
+```
+
+然后用：
+
+```cpp
+_mm_mfence();
+```
+
+确保 flush 完成。
+
+图示：
+
+```text
+before timed pass:
+
+  buffer cache lines
+      |
+      v
+  clflush each 64B line
+      |
+      v
+  cache 中不再保留这些 line
+      |
+      v
+  计时区间第一次读必须重新从内存层级取数据
+```
+
+需要注意：`clflush` 不是关闭 cache，而是把指定 cache line 从 cache hierarchy 中驱逐。计时过程中 CPU 读入的数据仍然会进入 cache，但因为访问是大数组单次流式扫描，后面不会反复命中同一批 cache line。
+
+### 为什么写带宽用 non-temporal store？
+
+普通写入可能触发 write-allocate：
+
+```text
+store 某个 cache line
+  如果 cache line 不在 cache
+  CPU 可能先把该 cache line 从内存读入 cache
+  再修改 cache line
+```
+
+这会让“写带宽测试”掺入额外读流量。
+
+所以 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:166 stream_store_u64` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:172 stream_store_u64` 在 x86 上使用：
+
+```cpp
+_mm_stream_si64(...)
+```
+
+这是一种 non-temporal store，意图是直接写到内存层级，尽量避免把数据带入 cache。
+
+写完后 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:174 stream_store_fence` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:178 stream_store_fence` 使用：
+
+```cpp
+_mm_sfence();
+```
+
+确保 streaming store 完成。
+
+ASCII 图：
+
+```text
+普通 store:
+
+  CPU store
+     |
+     v
+  cache line 可能先被读入 cache
+     |
+     v
+  修改 cache
+     |
+     v
+  最后写回 DDR
+
+non-temporal store:
+
+  CPU streaming store
+     |
+     v
+  write-combining buffer
+     |
+     v
+  DDR
+
+  尽量减少 cache 污染和 write-allocate 影响
+```
+
+### 三个测试项的含义
+
+读带宽测试在 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:185 best_read_seconds` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:209 best_read_seconds`。
+
+核心循环：
+
+```cpp
+sum += ptr[i];
+```
+
+它统计的字节数是：
+
+```text
+bytes = buffer_size
+```
+
+写带宽测试在 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:211 best_write_seconds` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:233 best_write_seconds`。
+
+核心循环：
+
+```cpp
+stream_store_u64(ptr + i, value + i);
+```
+
+它统计的字节数也是：
+
+```text
+bytes = buffer_size
+```
+
+拷贝测试在 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:235 best_copy_seconds` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:258 best_copy_seconds`。
+
+核心循环：
+
+```cpp
+stream_store_u64(dst_ptr + i, src_ptr[i]);
+```
+
+它同时读 `src`、写 `dst`，所以 `main` 在 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:332 main` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:334 main` 统计为：
+
+```text
+bytes = 2 * buffer_size
+```
+
+也就是输出项：
+
+```text
+read+nt_write
+```
+
+### 为什么需要 g_sink？
+
+`/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:30 g_sink` 定义为：
+
+```cpp
+volatile uint64_t g_sink = 0;
+```
+
+读测试会把每个线程的 `sum` 合并到 `g_sink`，见 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:193 best_read_seconds` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:205 best_read_seconds`。
+
+目的：防止编译器发现读出来的数据没有被使用，然后把整个读循环优化掉。
+
+### 是否需要修改内核参数？
+
+不必须修改内核参数。这个程序可以直接在普通用户态运行，核心依赖是：
+
+```text
+posix_memalign
+std::thread
+clflush
+non-temporal store
+sysfs 读取 LLC 大小
+```
+
+不过如果想得到更稳定、更接近硬件峰值的结果，可以考虑调整运行环境，而不是必须改内核参数：
+
+```text
+1. 固定 CPU 频率，避免 turbo / powersave 波动
+2. 绑定 NUMA 节点，例如 numactl --cpunodebind=0 --membind=0
+3. 绑定 CPU core，避免线程迁移
+4. 使用足够大的 buffer，例如 2G 或更大
+5. 减少系统后台负载
+```
+
+示例：
+
+```bash
+numactl --cpunodebind=0 --membind=0 /tmp/bench_ddr_bandwidth 2G 48 5
+```
+
+这些不是程序正确运行的必要条件，只是 benchmark 稳定性建议。
+
+是否需要清系统 page cache？
+
+```text
+不需要。
+```
+
+`drop_caches` 影响的是文件系统 page cache；本程序测试的是匿名内存中的数组访问，不是读文件。因此不需要执行：
+
+```bash
+echo 3 > /proc/sys/vm/drop_caches
+```
+
+而且这类命令需要 root，还会影响整机其它进程，不建议作为本测试的必要步骤。
+
+### 工作原理总结
+
+可以把程序理解成下面这条流水线：
+
+```text
+allocate large aligned buffers
+          |
+          v
+initialize buffers and touch pages
+          |
+          v
+flush cache lines before each timed pass
+          |
+          v
+run streaming read / non-temporal write / copy loop
+          |
+          v
+time only the streaming memory access region
+          |
+          v
+bandwidth = transferred_bytes / elapsed_seconds
+```
+
+一句话总结：这个 benchmark 不能从硬件上关闭 cache，但通过“大于 LLC 的工作集 + 计时前 clflush + 流式单次访问 + non-temporal store”，让被计时的内存流量主要来自 DDR；不需要修改内核参数，想要更稳定结果时再用 CPU/NUMA 绑定和固定频率等运行环境设置。
