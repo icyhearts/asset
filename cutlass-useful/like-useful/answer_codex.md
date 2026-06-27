@@ -7606,3 +7606,469 @@ All tests passed.
 ```
 
 一句话总结：这个多线程版本先用单线程构建一个只读 `counts` 哈希表，然后把数组索引区间切成多个 chunk 给多个 CPU 线程并行扫描；每个线程只读 `arr/counts`，用 `atomic<bool> found` 协调提前退出，最后用单线程基准和 `assert` 验证多线程结果正确。
+
+## parallel_contain_target.cc 新版：hash 分桶 + 每桶独立建表 + 并行查询
+
+新版代码位置仍然是 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc`。相比前一个版本，新版把“构建全局 counts 哈希表”也并行化了。核心函数是 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:62 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:166 parallel_contain_target`。
+
+整体思路是三阶段：
+
+```text
+Phase 1: 并行分桶
+  每个线程扫描 arr 的一段，把元素按 hash(x) % bucket_count 放进自己的 local bucket
+
+Phase 2: 每桶独立建表
+  每个 bucket 由一个线程负责，把所有线程的 local bucket 合并成一个 unordered_map
+
+Phase 3: 并行查询
+  每个线程扫描 arr 的一段，对 x 查询 y = target - x 是否在对应 bucket_counts 中
+```
+
+整体 ASCII 图：
+
+```text
+arr size = N, thread_count = T, bucket_count = T
+
+             arr
+              |
+              v
+  +-------------------------+
+  | Phase 1: parallel split |
+  +-------------------------+
+      |        |        |
+      v        v        v
+   thread0  thread1  thread2 ... thread(T-1)
+      |        |        |
+      v        v        v
+ local_buckets[tid][bucket]
+      |        |        |
+      +--------+--------+
+               |
+               v
+  +-------------------------------+
+  | Phase 2: one worker per bucket |
+  +-------------------------------+
+      |        |        |
+      v        v        v
+ bucket0    bucket1    bucket2 ... bucket(T-1)
+ counts0    counts1    counts2     counts(T-1)
+      |        |        |
+      +--------+--------+
+               |
+               v
+  +-------------------------+
+  | Phase 3: parallel query |
+  +-------------------------+
+               |
+               v
+          atomic found
+```
+
+### 辅助函数
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:15 worker_count_for` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:25 worker_count_for` 用来决定线程数：
+
+```text
+thread_count = hardware_concurrency()
+如果 hardware_concurrency() 返回 0，则使用 2
+最后限制 thread_count <= N
+```
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:27 bucket_index` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:29 bucket_index` 计算元素属于哪个 bucket：
+
+```cpp
+return std::hash<int>{}(value) % bucket_count;
+```
+
+图示：
+
+```text
+bucket_count = 4
+
+x = 10  -> hash(10) % 4 -> bucket 2
+x = 21  -> hash(21) % 4 -> bucket 1
+x = -3  -> hash(-3) % 4 -> bucket 0
+```
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:31 checked_complement` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:40 checked_complement` 安全计算：
+
+```text
+y = target - x
+```
+
+它先用 `long long` 计算，再检查结果是否还在 `int` 范围内。这样可以避免 `int` 溢出导致错误判断。例如：
+
+```text
+target = INT_MAX
+x      = INT_MIN
+
+target - x 超出 int 范围
+=> checked_complement 返回 false
+=> 不继续查 y
+```
+
+### Phase 1：并行分桶
+
+Phase 1 的数据结构在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:74 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:75 parallel_contain_target`：
+
+```cpp
+vector<vector<vector<int>>> local_buckets(
+    thread_count, vector<vector<int>>(bucket_count));
+```
+
+它的形状是：
+
+```text
+local_buckets[tid][bucket] -> vector<int>
+```
+
+也就是每个线程都有自己的一组 bucket：
+
+```text
+thread_count = 3
+bucket_count = 3
+
+                 bucket0       bucket1       bucket2
+thread 0     local[0][0]   local[0][1]   local[0][2]
+thread 1     local[1][0]   local[1][1]   local[1][2]
+thread 2     local[2][0]   local[2][1]   local[2][2]
+```
+
+Phase 1 的线程创建在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:78 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:96 parallel_contain_target`。每个线程只负责数组的一段：
+
+```cpp
+const size_t begin = tid * chunk;
+const size_t end = std::min(n, begin + chunk);
+```
+
+然后对自己这一段做：
+
+```cpp
+local_buckets[tid][bucket_index(x, bucket_count)].push_back(x);
+```
+
+关键点是：线程 `tid` 只写 `local_buckets[tid][...]`，不会写其它线程的行。因此 Phase 1 不需要锁。
+
+ASCII 图：
+
+```text
+arr index:
+  0  1  2  3 | 4  5  6  7 | 8  9 10 11
+  -----------+------------+------------
+   thread 0     thread 1     thread 2
+
+thread 0:
+  x0 -> bucket 1 -> local_buckets[0][1]
+  x1 -> bucket 0 -> local_buckets[0][0]
+  x2 -> bucket 2 -> local_buckets[0][2]
+
+thread 1:
+  x4 -> bucket 2 -> local_buckets[1][2]
+  x5 -> bucket 1 -> local_buckets[1][1]
+
+thread 2:
+  x8 -> bucket 0 -> local_buckets[2][0]
+```
+
+Phase 1 完成后，主线程在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:98 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:101 parallel_contain_target` 对所有 worker 做 `join`，确保分桶全部结束。
+
+### Phase 2：每桶独立建表
+
+Phase 2 的目标数据结构在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:103 parallel_contain_target`：
+
+```cpp
+vector<std::unordered_map<int, int>> bucket_counts(bucket_count);
+```
+
+含义是：
+
+```text
+bucket_counts[bucket][value] = value 在该 bucket 中出现的次数
+```
+
+Phase 2 的线程创建在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:106 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:121 parallel_contain_target`。这里不是按数组区间分工，而是按 bucket 分工：
+
+```text
+worker for bucket 0 -> 只写 bucket_counts[0]
+worker for bucket 1 -> 只写 bucket_counts[1]
+worker for bucket 2 -> 只写 bucket_counts[2]
+...
+```
+
+每个 bucket worker 会遍历所有线程在 Phase 1 生成的对应 local bucket：
+
+```text
+bucket b:
+  local_buckets[0][b]
+  local_buckets[1][b]
+  local_buckets[2][b]
+  ...
+  local_buckets[T-1][b]
+```
+
+并合并成一个频次表：
+
+```text
+bucket_counts[b]
+```
+
+ASCII 图：
+
+```text
+Phase 1 output:
+
+              bucket0        bucket1        bucket2
+thread0     [a0, a3]       [a1]          [a2]
+thread1     [b4]           [b1, b5]      [b2]
+thread2     [c0, c9]       []            [c7]
+
+Phase 2:
+
+worker bucket0:
+  merge [a0,a3] + [b4] + [c0,c9]
+  -> bucket_counts[0]
+
+worker bucket1:
+  merge [a1] + [b1,b5] + []
+  -> bucket_counts[1]
+
+worker bucket2:
+  merge [a2] + [b2] + [c7]
+  -> bucket_counts[2]
+```
+
+为什么 Phase 2 也不需要锁？
+
+```text
+bucket worker 0 只写 bucket_counts[0]
+bucket worker 1 只写 bucket_counts[1]
+bucket worker 2 只写 bucket_counts[2]
+...
+```
+
+不同线程写不同的 `unordered_map` 对象，没有多个线程同时写同一个 map。
+
+Phase 2 完成后，主线程在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:123 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:126 parallel_contain_target` 再次 `join` 所有 worker。之后 `bucket_counts` 就变成只读数据。
+
+### Phase 3：并行查询
+
+Phase 3 在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:128 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:165 parallel_contain_target`。
+
+先定义全局结果标志：
+
+```cpp
+std::atomic<bool> found{false};
+```
+
+每个线程再次扫描自己负责的数组区间：
+
+```text
+thread tid scans [begin, end)
+```
+
+对每个元素 `x`：
+
+```text
+y = target - x
+b = bucket_index(y, bucket_count)
+在 bucket_counts[b] 中查找 y
+```
+
+对应代码在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:142 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:148 parallel_contain_target`：
+
+```cpp
+int y = 0;
+if (!checked_complement(x, target, y)) {
+  continue;
+}
+
+const auto& counts = bucket_counts[bucket_index(y, bucket_count)];
+auto it = counts.find(y);
+```
+
+查询图示：
+
+```text
+target = 9
+x = 2
+y = 9 - 2 = 7
+
+bucket of y:
+  b = hash(7) % bucket_count
+
+lookup:
+  bucket_counts[b].find(7)
+```
+
+为什么查 `y` 的 bucket，而不是查 `x` 的 bucket？
+
+因为 Phase 1/2 是按元素自己的 hash 分桶的。任意值 `v` 一定被放入：
+
+```text
+bucket_index(v, bucket_count)
+```
+
+所以要找补数 `y`，必须去：
+
+```text
+bucket_counts[bucket_index(y, bucket_count)]
+```
+
+而不是 `bucket_counts[bucket_index(x, bucket_count)]`。
+
+### x == y 的特殊处理
+
+如果 `x + y == target` 且 `x != y`，只要 `y` 存在就可以返回 true。
+
+但如果：
+
+```text
+x == y
+```
+
+则需要数组中至少有两个 `x`，否则不能把同一个元素用两次。
+
+对应代码在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:153 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:156 parallel_contain_target`：
+
+```cpp
+if (y != x || it->second >= 2) {
+  found.store(true, std::memory_order_relaxed);
+  return;
+}
+```
+
+图示：
+
+```text
+arr = [3], target = 6
+
+x = 3
+y = 3
+bucket_counts[hash(3)%T][3] = 1
+
+只有一个 3，不能用同一个元素两次
+=> false
+
+arr = [3, 3], target = 6
+
+x = 3
+y = 3
+bucket_counts[hash(3)%T][3] = 2
+
+可以使用两个不同位置的 3
+=> true
+```
+
+### found 的提前退出
+
+Phase 3 的 worker 循环条件在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:139 parallel_contain_target`：
+
+```cpp
+i < end && !found.load(std::memory_order_relaxed)
+```
+
+只要任意线程找到答案，就执行：
+
+```cpp
+found.store(true, std::memory_order_relaxed);
+```
+
+其它线程下一次检查 `found` 时会尽快退出。
+
+ASCII 图：
+
+```text
+thread0: scanning chunk 0 ...
+thread1: scanning chunk 1 ... found pair
+                              |
+                              v
+                         found = true
+                              |
+              +---------------+---------------+
+              v                               v
+thread0 sees found=true          thread2 sees found=true
+stop                             stop
+```
+
+这里 `memory_order_relaxed` 足够，因为 `found` 只用来传递“是否已找到”这个布尔状态，不用来保护其它数据。`bucket_counts` 在 Phase 2 完成并 `join` 后才进入 Phase 3，Phase 3 中它只读。
+
+### 为什么这个版本更接近 O(N / num_thread)？
+
+旧版本的问题是：`counts` 哈希表由主线程单线程构建，所以这一步是 `O(N)` wall-clock。
+
+新版把它拆成：
+
+```text
+Phase 1 并行分桶:       平均 O(N / T)
+Phase 2 每桶独立建表:   平均 O(N / T)
+Phase 3 并行查询:       平均 O(N / T)
+```
+
+如果 hash 分布比较均匀，且 `T = num_thread`：
+
+```text
+总体 wall-clock 平均复杂度:
+  O(N/T) + O(N/T) + O(N/T)
+  = O(N/T)
+```
+
+总 work 仍然是：
+
+```text
+O(N)
+```
+
+因为所有线程合起来仍然处理了全部元素。
+
+最坏情况是所有元素都 hash 到同一个 bucket：
+
+```text
+bucket0: N 个元素
+bucket1: 0 个元素
+bucket2: 0 个元素
+...
+```
+
+这时 Phase 2 会退化成一个线程处理 N 个元素：
+
+```text
+最坏 wall-clock: O(N)
+```
+
+因此更准确的结论是：
+
+```text
+hash 均匀时的平均 wall-clock: O(N / num_thread)
+总 work:                    O(N)
+hash 极端倾斜时最坏情况:     O(N)
+```
+
+### 测试覆盖
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:168 run_case` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:178 run_case` 同时调用单线程和新版多线程实现：
+
+```cpp
+const bool single = single_thread_contain_target(arr, target);
+const bool parallel = parallel_contain_target(arr, target);
+
+assert(single == expected);
+assert(parallel == single);
+```
+
+`/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:180 main` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:209 main` 覆盖了：
+
+```text
+basic true
+basic false
+same value twice
+same value once
+negative numbers
+int max true
+overflow complement false
+large true
+large false
+```
+
+其中 `int max true` 和 `overflow complement false` 是新版加入的边界测试，用来验证 `checked_complement` 不会因为 `target - x` 溢出而误判。
+
+一句话总结：新版实现把全局哈希表构建拆成“本地分桶 + 每桶独立建表”，避免多个线程同时写一个 `unordered_map`；查询阶段再按 `hash(target - x)` 定位到唯一 bucket，只读查表，并用 `atomic<bool> found` 做提前退出。在 hash 均匀时，三个阶段的 wall-clock 都接近 `O(N / num_thread)`。
