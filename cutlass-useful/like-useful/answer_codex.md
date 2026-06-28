@@ -8426,3 +8426,557 @@ bandwidth = transferred_bytes / elapsed_seconds
 ```
 
 一句话总结：这个 benchmark 不能从硬件上关闭 cache，但通过“大于 LLC 的工作集 + 计时前 clflush + 流式单次访问 + non-temporal store”，让被计时的内存流量主要来自 DDR；不需要修改内核参数，想要更稳定结果时再用 CPU/NUMA 绑定和固定频率等运行环境设置。
+
+## TiledMMA_ins.get_layoutA_TV() 为什么打印成这个 layout？
+
+问题中的打印来自 `gemm-multi-stage-like.cu:473 main` 到 `gemm-multi-stage-like.cu:474 main`：
+
+```cpp
+printf("mma.get_layoutA_TV():\n");
+print(TiledMMA_ins.get_layoutA_TV());
+```
+
+日志中结果是：
+
+```text
+mma.get_layoutA_TV():
+((_4,_8,_2,_2),((_2,_2,_2),(_1,_1))):((_64,_1,_16,_0),((_32,_8,_256),(_0,_0)))
+```
+
+这个 layout 是 `TiledMMA` 的 A 操作数 layout，语义是：
+
+```text
+(thr_idx, val_idx) -> A tile 中的 flat MK 坐标
+```
+
+也就是给 `make_tiled_copy_A` 使用的 `TiledLayout_TV`。`make_tiled_copy_A` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:407 make_tiled_copy_A` 到 `3rd/cutlass/include/cute/atom/copy_atom.hpp:410 make_tiled_copy_A` 中直接调用：
+
+```cpp
+return make_tiled_copy_impl(copy_atom,
+                            mma.get_layoutA_TV(),
+                            make_shape(tile_size<0>(mma), tile_size<2>(mma)));
+```
+
+所以日志中的 `TiledCopy`：
+
+```text
+Tiler_MN:       (_32,_16)
+TiledLayout_TV: ((_4,_8,_2,_2),((_2,_2,_2),(_1,_1))):((_64,_1,_16,_0),((_32,_8,_256),(_0,_0)))
+```
+
+其 `TiledLayout_TV` 就是 `mma.get_layoutA_TV()` 的返回值。
+
+### 1. TiledMMA 的构造参数
+
+`gemm-multi-stage-like.cu:247 GemmConfig` 到 `gemm-multi-stage-like.cu:265 GemmConfig` 定义：
+
+```cpp
+using mma_op = SM80_16x8x16_F16F16F16F16_TN;
+using mma_traits = MMA_Traits<mma_op>;
+using mma_atom = MMA_Atom<mma_traits>;
+
+static constexpr int kMmaEURepeatM = 2;
+static constexpr int kMmaEURepeatN = 2;
+static constexpr int kMmaEURepeatK = 1;
+
+using MMA_EU_RepeatT = decltype(make_layout(make_shape(
+    Int<kMmaEURepeatM>{}, Int<kMmaEURepeatN>{}, Int<kMmaEURepeatK>{})));
+
+using MMA_P_T = Tile<Int<kMmaPM>, Int<kMmaPN>, Int<kMmaPK>>;
+
+using MMA = decltype(make_tiled_mma(mma_atom{}, MMA_EU_RepeatT{}, MMA_P_T{}));
+```
+
+对 `SM80_16x8x16_F16F16F16F16_TN`，atom traits 在 `3rd/cutlass/include/cute/atom/mma_traits_sm80.hpp:82 MMA_Traits<SM80_16x8x16_F16F16F16F16_TN>` 到 `3rd/cutlass/include/cute/atom/mma_traits_sm80.hpp:96 MMA_Traits<SM80_16x8x16_F16F16F16F16_TN>`：
+
+```cpp
+using Shape_MNK = Shape<_16,_8,_16>;
+using ThrID   = Layout<_32>;
+using ALayout = Layout<Shape <Shape < _4,_8>,Shape < _2,_2,  _2>>,
+                       Stride<Stride<_32,_1>,Stride<_16,_8,_128>>>;
+```
+
+也就是：
+
+```text
+AtomShape_MNK = (_16,_8,_16)
+AtomThrID     = _32:_1
+AtomLayoutA_TV = ((_4,_8),(_2,_2,_2)):((_32,_1),(_16,_8,_128))
+```
+
+`MMA_EU_RepeatT` 是：
+
+```text
+(_2,_2,_1):(_1,_2,_0)
+```
+
+`MMA_P_T` 是：
+
+```text
+(_32,_32,_16)
+```
+
+其中：
+
+```text
+kMmaPM = 1 * 2 * 16 = 32
+kMmaPN = 2 * 2 *  8 = 32
+kMmaPK = 1 * 1 * 16 = 16
+```
+
+### 2. make_tiled_mma 如何得到 ThrLayoutVMNK
+
+`make_tiled_mma` 在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:582 make_tiled_mma` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:591 make_tiled_mma`：
+
+```cpp
+auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
+auto permutation_mnk = append<3>(permutations, _);
+
+return TiledMMA<...>{mma_atom, thr_layout_mnk};
+```
+
+这里 `thr_layout` 原本是 rank-3 的 `(M,N,K)` repeat layout：
+
+```text
+(_2,_2,_1):(_1,_2,_0)
+```
+
+`append<3>(..., Layout<_1,_0>{})` 后仍是：
+
+```text
+AtomLayoutMNK = (_2,_2,_1):(_1,_2,_0)
+```
+
+`PermutationMNK` 变成：
+
+```text
+(_32,_32,_16)
+```
+
+`TiledMMA` 构造函数在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:222 TiledMMA` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:225 TiledMMA`：
+
+```cpp
+thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk))
+```
+
+`ThrLayoutVMNK` 的类型也在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:219 TiledMMA` 定义：
+
+```cpp
+using ThrLayoutVMNK = decltype(tiled_product(AtomThrID{}, AtomLayoutMNK{}));
+```
+
+`tiled_product` 的实现见 `3rd/cutlass/include/cute/layout.hpp:1478 tiled_product` 到 `3rd/cutlass/include/cute/layout.hpp:1484 tiled_product`。本例中：
+
+```text
+tiled_product(_32:_1, (_2,_2,_1):(_1,_2,_0))
+```
+
+得到日志中的：
+
+```text
+ThrLayoutVMNK = (_32,_2,_2,_1):(_1,_32,_64,_0)
+```
+
+含义：
+
+```text
+ThrV: 32 个线程，来自单条 mma atom
+ThrM: 2 个 M 方向 atom repeat
+ThrN: 2 个 N 方向 atom repeat
+ThrK: 1 个 K 方向 atom repeat
+```
+
+它映射到 physical thread id 的公式是：
+
+```text
+thread_idx = ThrV + 32 * ThrM + 64 * ThrN + 0 * ThrK
+```
+
+因为 `ThrK` size 是 1，所以 stride 0 在这里只是一个 size-1 占位维。
+
+### 3. tile_size_mnk 得到 A tile 是 32x16
+
+`tile_size_mnk` 在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:381 tile_size_mnk` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:393 tile_size_mnk`：
+
+```cpp
+auto core_size = size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk());
+auto perm_size = size<I>(PermutationMNK{});
+return cute::max(core_size, perm_size);
+```
+
+对 M/N/K：
+
+```text
+M: core_size = AtomM 16 * ThrM 2 = 32, perm_size = 32 => tile M = 32
+N: core_size = AtomN  8 * ThrN 2 = 16, perm_size = 32 => tile N = 32
+K: core_size = AtomK 16 * ThrK 1 = 16, perm_size = 16 => tile K = 16
+```
+
+所以：
+
+```text
+tile_size(mma) = (_32,_32,_16)
+```
+
+对 A 来说只看 `(M,K)`，因此 `get_layoutA_TV()` 的参考 layout 是：
+
+```text
+ref_A = make_layout((_32,_16))
+      = (_32,_16):(_1,_32)
+```
+
+这对应 `3rd/cutlass/include/cute/atom/mma_atom.hpp:452 get_layoutA_TV` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:453 get_layoutA_TV`：
+
+```cpp
+auto ref_A = make_layout(make_shape(tile_size_mnk<0>(), tile_size_mnk<2>()));
+```
+
+### 4. thrfrg_A(ref_A) 的调用链和中间结果
+
+`get_layoutA_TV()` 在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:455 get_layoutA_TV` 调用：
+
+```cpp
+auto layoutA_TV = thrfrg_A(ref_A);
+```
+
+`thrfrg_A` 的实现是 `3rd/cutlass/include/cute/atom/mma_atom.hpp:288 thrfrg_A` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:313 thrfrg_A`。
+
+我用同样的类型实例化后，关键中间结果如下。
+
+第一步，按照 `PermutationMNK` 对 `(M,K)` 做 logical divide。代码在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:294 thrfrg_A` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:297 thrfrg_A`：
+
+```cpp
+auto t_tile = make_tile(get<0>(PermutationMNK{}),
+                        get<2>(PermutationMNK{}));
+auto t_tensor = logical_divide(atensor, t_tile);
+```
+
+本例：
+
+```text
+t_tile  = (_32,_16)
+ref_A   = (_32,_16):(_1,_32)
+t_tensor = ((_32,_1),(_16,_1)):((_1,_0),(_32,_0))
+```
+
+`logical_divide` 的实现见 `3rd/cutlass/include/cute/layout.hpp:1355 logical_divide` 到 `3rd/cutlass/include/cute/layout.hpp:1373 logical_divide`。
+
+第二步，把 tile 再按 atom shape `(16,16)` 切开。代码在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:299 thrfrg_A` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:302 thrfrg_A`：
+
+```cpp
+auto a_tile = make_tile(make_layout(size<0>(AtomShape_MNK{})),
+                        make_layout(size<2>(AtomShape_MNK{})));
+auto a_tensor = zipped_divide(t_tensor, a_tile);
+```
+
+本例：
+
+```text
+a_tile   = (_16:_1,_16:_1)
+a_tensor = ((_16,_16),(_2,_1)):((_1,_32),(_16,_0))
+```
+
+`zipped_divide` 的实现见 `3rd/cutlass/include/cute/layout.hpp:1389 zipped_divide` 到 `3rd/cutlass/include/cute/layout.hpp:1392 zipped_divide`。
+
+第三步，把 atom 内部 `(AtomM,AtomK)` 坐标转换成 `(ThrV,FrgV)`。代码在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:304 thrfrg_A` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:305 thrfrg_A`：
+
+```cpp
+auto tv_tensor = a_tensor.compose(AtomLayoutA_TV{},_);
+```
+
+本例：
+
+```text
+AtomLayoutA_TV = ((_4,_8),(_2,_2,_2)):((_32,_1),(_16,_8,_128))
+
+tv_tensor =
+(((_4,_8),(_2,_2,_2)),(_2,_1)):(((_64,_1),(_32,_8,_256)),(_16,_0))
+```
+
+这里第一大组 `((_4,_8),(_2,_2,_2))` 是 atom 内部的 `(ThrV, FrgV)` 结构；后面的 `(_2,_1)` 是 tiled atom 在 M/K 方向的 rest repeat，表示 M 方向有 2 个 atom，K 方向只有 1 个 atom。
+
+第四步，把 tiled atom 的 rest repeat 再切成线程 repeat `(ThrM,ThrK)`。代码在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:307 thrfrg_A` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:311 thrfrg_A`：
+
+```cpp
+auto thr_tile = make_tile(_,
+                          make_tile(make_layout(size<1>(thr_layout_vmnk_)),
+                                    make_layout(size<3>(thr_layout_vmnk_))));
+auto thr_tensor = zipped_divide(tv_tensor, thr_tile);
+```
+
+本例：
+
+```text
+thr_tile = (_,(_2:_1,_1:_0))
+
+thrfrg_A(ref_A) =
+(((_4,_8),(_2,_1)),((_2,_2,_2),(_1,_1))):(((_64,_1),(_16,_0)),((_32,_8,_256),(_0,_0)))
+```
+
+这时 `thrfrg_A(ref_A)` 的 shape 可以读作：
+
+```text
+((ThrV, (ThrM,ThrK)), (FrgV, (RestM,RestK)))
+```
+
+其中：
+
+```text
+ThrV  = (_4,_8)
+ThrM  = _2
+ThrK  = _1
+FrgV  = (_2,_2,_2)
+RestM = _1
+RestK = _1
+```
+
+注意这里还没有把 `ThrN` 放进去，因为 A 只依赖 M/K，不依赖 N。
+
+### 5. get_layoutA_TV 为什么还要 compose(atile, _)
+
+`get_layoutA_TV()` 并不是直接返回 `thrfrg_A(ref_A)`。它在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:457 get_layoutA_TV` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:461 get_layoutA_TV` 构造了 `atile`：
+
+```cpp
+auto atile = make_tile(_,
+                       make_tile(make_layout(make_shape (size<1>(thr_layout_vmnk_), size<2>(thr_layout_vmnk_)),
+                                             make_stride(               Int<1>{} ,                Int<0>{} )),
+                                 _));
+```
+
+本例：
+
+```text
+size<1>(thr_layout_vmnk_) = ThrM = 2
+size<2>(thr_layout_vmnk_) = ThrN = 2
+
+make_layout((_2,_2),(_1,_0)) = (_2,_2):(_1,_0)
+```
+
+所以：
+
+```text
+atile = (_,((_2,_2):(_1,_0),_))
+```
+
+它的作用是把 A 的线程维：
+
+```text
+(ThrV, (ThrM, ThrK))
+```
+
+扩展成完整 TiledMMA 线程维：
+
+```text
+(ThrV, (ThrM, ThrN, ThrK))
+```
+
+因为 A operand 只与 M/K 有关，不与 N 有关；但是完整的 `thr_idx` 包含 `(ThrV,ThrM,ThrN,ThrK)`。所以必须插入一个 `ThrN` 维，且这个维对 A 的 MK 坐标不产生偏移。
+
+执行：
+
+```cpp
+thrfrg_A(ref_A).compose(atile, _)
+```
+
+中间结果是：
+
+```text
+(((_4,_8),((_2,_2),_1)),((_2,_2,_2),(_1,_1))):(((_64,_1),((_16,_0),_0)),((_32,_8,_256),(_0,_0)))
+```
+
+可以看到 `(_2,_2):(_1,_0)` 被放进了线程 mode 中，这就是后面最终第一个 mode 出现 `(_4,_8,_2,_2)` 的原因。
+
+### 6. right_inverse(thr_layout_vmnk_) 为什么是 _128:_1
+
+`get_layoutA_TV()` 接着在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:463 get_layoutA_TV` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:467 get_layoutA_TV` 做：
+
+```cpp
+auto thridx_2_thrid = right_inverse(thr_layout_vmnk_);
+return thrfrg_A(ref_A).compose(atile, _).compose(thridx_2_thrid, _);
+```
+
+本例：
+
+```text
+thr_layout_vmnk_ = (_32,_2,_2,_1):(_1,_32,_64,_0)
+```
+
+这个 layout 的 cosize 是 128，覆盖 `thread_idx = 0..127`。它本来就接近 identity 展开，所以：
+
+```text
+right_inverse(thr_layout_vmnk_) = _128:_1
+```
+
+也就是把输入的 `thr_idx` 解释成完整的 `(ThrV,ThrM,ThrN,ThrK)` 坐标。
+
+最终：
+
+```text
+thrfrg_A(ref_A).compose(atile,_).compose(thridx_2_thrid,_)
+= ((_4,_8,_2,_2),((_2,_2,_2),(_1,_1))):((_64,_1,_16,_0),((_32,_8,_256),(_0,_0)))
+```
+
+这和日志完全一致。
+
+### 7. 最终 layout 每个 mode 的含义
+
+最终打印：
+
+```text
+((_4,_8,_2,_2),((_2,_2,_2),(_1,_1))):((_64,_1,_16,_0),((_32,_8,_256),(_0,_0)))
+```
+
+可以拆成两个大 mode：
+
+```text
+mode 0: thread mode
+  shape  = (_4,_8,_2,_2)
+  stride = (_64,_1,_16,_0)
+
+mode 1: value mode
+  shape  = ((_2,_2,_2),(_1,_1))
+  stride = ((_32,_8,_256),(_0,_0))
+```
+
+更语义化地写：
+
+```text
+mode 0 = (ThrV0, ThrV1, ThrM, ThrN)
+       = (_4,    _8,    _2,   _2)
+
+mode 1 = (FrgV,       RestM,RestK)
+       = ((_2,_2,_2), (_1,_1))
+```
+
+对应的 flat MK offset 公式可以写成：
+
+```text
+offset =
+  64  * ThrV0
++ 1   * ThrV1
++ 16  * ThrM
++ 0   * ThrN
++ 32  * FrgV0
++ 8   * FrgV1
++ 256 * FrgV2
++ 0   * RestM
++ 0   * RestK
+```
+
+因为 `RestM = RestK = 1`，所以最后两个 stride 0 是 size-1 维的占位，确实不产生不同坐标。
+
+### 8. 第一个 mode 中 stride=_0 有什么用？
+
+第一个 mode 是：
+
+```text
+shape  = (_4,_8,_2,_2)
+stride = (_64,_1,_16,_0)
+```
+
+这四个子维对应：
+
+```text
+(_4,_8) -> ThrV，单个 mma atom 内 32 个线程的分解
+_2      -> ThrM，M 方向 2 个 atom repeat
+_2      -> ThrN，N 方向 2 个 atom repeat
+```
+
+最后一个 `_2` 的 stride 是 `_0`，也就是：
+
+```text
+改变 ThrN，不改变 A 的 MK 坐标
+```
+
+这不是 bug，而是 A operand 的天然广播行为：
+
+```text
+C = A(M,K) * B(N,K)
+
+A 只依赖 M 和 K
+B 只依赖 N 和 K
+C 依赖 M 和 N
+```
+
+当前 TiledMMA 同时在 M 和 N 方向 repeat：
+
+```text
+ThrM = 2
+ThrN = 2
+```
+
+对 A 来说，两个不同的 N repeat 使用同一份 A 数据。因此 `ThrN` 维必须存在，因为完整线程编号 `thr_idx` 里确实包含 N 方向 repeat；但它映射到 A 的 MK 坐标时 stride 为 0。
+
+ASCII 图：
+
+```text
+完整线程组织:
+
+  ThrM = 0, ThrN = 0  -> 需要 A[m0,k]
+  ThrM = 0, ThrN = 1  -> 仍然需要 A[m0,k]
+
+  ThrM = 1, ThrN = 0  -> 需要 A[m1,k]
+  ThrM = 1, ThrN = 1  -> 仍然需要 A[m1,k]
+
+对 A 来说:
+
+  ThrN 改变
+      |
+      v
+  A 的 M/K offset 不变
+
+所以 ThrN stride = 0
+```
+
+也可以从公式看：
+
+```text
+offset = ... + 16 * ThrM + 0 * ThrN + ...
+```
+
+当 `ThrN` 从 0 变成 1：
+
+```text
+offset 不变
+```
+
+这表示 N 方向的两个线程组在 A copy/layout 上访问同一组 A 坐标。
+
+### 9. stride=_0 是否意味着对应 shape=_2 没意义？
+
+不是。
+
+需要区分两件事：
+
+```text
+1. 这个 mode 对 A 的坐标有没有贡献？
+2. 这个 mode 对完整 TiledMMA 的线程编号有没有意义？
+```
+
+`stride=_0` 说明：
+
+```text
+这个 mode 对 A 的 MK offset 没有贡献。
+```
+
+但 `shape=_2` 仍然有意义，因为它保留了完整线程拓扑中的 `ThrN=2` 这个维度。没有这个维度，`get_layoutA_TV()` 就不能把完整的 `thr_idx` 正确解释成 `(ThrV,ThrM,ThrN,ThrK)`，也无法和 `make_tiled_copy_A`、`make_tiled_copy_B`、`make_tiled_copy_C` 使用同一个 TiledMMA 线程组织对齐。
+
+更直观地说：
+
+```text
+stride = 0:
+  表示广播/复用，不表示 shape 没意义。
+
+shape = 2:
+  表示有两个 N 方向线程组，它们对 A 使用同一份数据。
+```
+
+类似地，最终 value mode 里的：
+
+```text
+((_2,_2,_2),(_1,_1)):((_32,_8,_256),(_0,_0))
+```
+
+其中 `(_1,_1)` 的 stride 是 `(_0,_0)`，这是因为当前 `RestM=RestK=1`，它们只是保留 layout 层级结构的 size-1 占位。
+
+一句话总结：`get_layoutA_TV()` 的结果来自 `ref_A(_32,_16)` 经 `thrfrg_A` 切成 atom/thread/value 层级，再用 `atile` 把 A 的 `(ThrM,ThrK)` 线程维扩展成完整 `(ThrM,ThrN,ThrK)`，最后用 `right_inverse(thr_layout_vmnk_)` 把完整 `thr_idx` 接进来；第一个 mode 中最后一个 `shape=_2,stride=_0` 是 `ThrN` 维，表示 N 方向两个线程组对 A 坐标是广播复用，不表示这个维度没有意义。
