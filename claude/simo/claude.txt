@@ -2444,3 +2444,5 @@ llama 和 deepseek 结构不同，MoE是一个巨大差距。对
 like-useful/answer_claude.md 14.1.3 DeepSeek Router Gate 确定性,14.1.4 MoE 层面 进行进一步排查。
 在like-useful/validate_batch_invariant_moe.py 离线验证 14.1.3 DeepSeek Router Gate 确定性,14.1.4 MoE 层面，对比有没有 enable_deterministic_inference 的时候，是否有区别.
 把测试结论写到 like-useful/answer_claude.md 里面
+
+# sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
