@@ -10701,3 +10701,103 @@ if can_run_graph and self._check_force_deterministic_extend(self.attn_backend):
 |---|---|
 | `triton_backend.py` | 新增 `SGLANG_FORCE_DETERMINISTIC_EXTEND=1` flag + 日志 |
 | `model_runner.py` | 新增 `_check_force_deterministic_extend()` + CUDA graph 跳过逻辑 |
+
+---
+
+## SGLANG_FORCE_DETERMINISTIC_EXTEND=1 崩溃分析 (第4次 - 正确根因)
+
+### 新观察
+
+即使同时禁用 CUDA graph 和 piecewise CUDA graph (`disable_cuda_graph=True`, `disable_piecewise_cuda_graph=True`, `skip_server_warmup=True`)，仍然崩溃在同一位置。这说明崩溃**与 CUDA graph 无关**。
+
+从日志 `lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_29___15_47_11`:
+```
+enable_deterministic_inference=False
+disable_cuda_graph=True
+disable_piecewise_cuda_graph=True
+skip_server_warmup=True
+```
+仍然崩溃: `RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered` in `_fwd_kernel_unified`
+
+### 真正根因
+
+崩溃的调用链：
+```
+DeepseekV2AttentionMLA.forward_core()
+  → forward_normal_core()                               # <-- MHA path
+    → self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)  # <-- KV NOT saved to buffer
+      → get_attn_backend().forward_extend()
+        → self._forward_extend_unified()                 # unified kernel: reads ALL KV from buffer
+          → _fwd_kernel_unified[grid](
+                q, o, K_Buffer, V_Buffer, ...            # <-- NO separate k/v for extend!
+            )
+          → CRASH: extend KV not in buffer → illegal memory access
+```
+
+原因分两步：
+
+**第一步：MHA 路径的问题**
+在 `forward_normal_core()` 中（`forward_mha.py:309`），MHA attention 以 `save_kv_cache=False` 调用：
+```python
+attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+```
+这意味着扩展的 k/v **不存储到 KV buffer** 中。
+
+**第二步：统一 kernel 的假设**
+`_fwd_kernel_unified` 只通过 `K_Buffer`/`V_Buffer` 读取 KV 缓存（位于 `kv_indices` 指定的位置），并且**不接收**独立的扩展 k/v 张量。相比之下，原始的 2 阶段 kernel 接收独立的 `k.contiguous()`、`v.contiguous()` 用于扩展 CEF，因此不需要它们在 buffer 中。
+
+因此，统一 kernel 在 `out_cache_loc` 位置从未被写入过的情况下，试图从 buffer 中读取扩展 KV → 非法内存访问。
+
+**为什么 `enable_deterministic_inference=True` 可以工作：**
+
+`handle_attention_triton`（在 `attention_backend_handler.py:174`）在确定性推理时会覆盖 dispatch：
+```python
+def handle_attention_triton(attn, forward_batch):
+    ...
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)  # ← 强制走 MLA 路径
+    ...
+    if sum(forward_batch.extend_prefix_lens_cpu) == 0:
+        return AttnForwardMethod.MHA  # ← 非确定性时走 MHA 路径 → 崩溃
+```
+
+当 `enable_deterministic_inference=True`：
+- 总是派发到 `AttnForwardMethod.MLA`
+- MLA 路径（`forward_absorb_core`）使用 `save_kv_cache=True`（`forward_mla.py:414`）
+- KV 在统一 kernel 之前被正确存储在 buffer 中
+- 没有崩溃
+
+当仅设置 `SGLANG_FORCE_DETERMINISTIC_EXTEND=1`（`enable_deterministic_inference=False`）：
+- 对于没有 prefix 缓存的请求（`sum(extend_prefix_lens_cpu) == 0`），会派发到 `AttnForwardMethod.MHA`
+- MHA 路径使用 `save_kv_cache=False`
+- KV 不在 buffer 中 → 崩溃
+
+### 正确修复
+
+修改 `handle_attention_triton`（`attention_backend_handler.py`），在设置 `SGLANG_FORCE_DETERMINISTIC_EXTEND=1` 时也走 MLA 路径，与 `enable_deterministic_inference=True` 的行为一致：
+
+```python
+def handle_attention_triton(attn, forward_batch):
+    if is_in_piecewise_cuda_graph():
+        return AttnForwardMethod.MLA
+
+    # when deterministic inference or force deterministic extend is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference or os.getenv(
+        "SGLANG_FORCE_DETERMINISTIC_EXTEND", ""
+    ) == "1":
+        return _dispatch_mla_subtype(attn, forward_batch)
+
+    if (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and sum(forward_batch.extend_prefix_lens_cpu) == 0
+    ):
+        return AttnForwardMethod.MHA
+    else:
+        return _dispatch_mla_subtype(attn, forward_batch)
+```
+
+### 修改文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `attention_backend_handler.py` | 添加 `import os`；在 `handle_attention_triton` 中添加 `SGLANG_FORCE_DETERMINISTIC_EXTEND` 检查以强制走 MLA 路径 |
