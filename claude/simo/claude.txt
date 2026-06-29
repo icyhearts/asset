@@ -2446,3 +2446,7 @@ like-useful/answer_claude.md 14.1.3 DeepSeek Router Gate 确定性,14.1.4 MoE �
 把测试结论写到 like-useful/answer_claude.md 里面
 
 # sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+ 现在我想验证，enable_deterministic_inference=False的情况下， attention KV split 保留enable_deterministic_inference=True的行为。
+其他部分，MoE Router行为， 矩阵乘法的行为，保留enable_deterministic_inference=False情况下的行为不变。
+即修改代码，把attention KV split固定下来，验证 enable_deterministic_inference的众多改变中，attention KV split是否是真的决定性因素。
+帮我修改代码，并进行讲解，追加到 like-useful/answer_claude.md 里面
