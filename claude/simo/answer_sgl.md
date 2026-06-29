@@ -10801,3 +10801,55 @@ def handle_attention_triton(attn, forward_batch):
 | 文件 | 修改内容 |
 |---|---|
 | `attention_backend_handler.py` | 添加 `import os`；在 `handle_attention_triton` 中添加 `SGLANG_FORCE_DETERMINISTIC_EXTEND` 检查以强制走 MLA 路径 |
+
+---
+
+## SGLANG_FORCE_BATCH_INVARIANT_OPS=1 实现
+
+### 目的
+
+模拟 `enable_deterministic_inference=True` 的 14.1.1 效果（全局算子替换：batch-invariant ops），配合 `SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1` + `SGLANG_FORCE_DETERMINISTIC_EXTEND=1`，逐步逼近完整 `enable_deterministic_inference=True` 的行为。
+
+### 修改
+
+在 `model_runner.py:740-750`，将条件从：
+```python
+if server_args.enable_deterministic_inference:
+```
+
+改为：
+```python
+if server_args.enable_deterministic_inference or os.getenv(
+    "SGLANG_FORCE_BATCH_INVARIANT_OPS", ""
+) == "1":
+```
+
+当 `SGLANG_FORCE_BATCH_INVARIANT_OPS=1` 但 `enable_deterministic_inference=False` 时，会调用 `enable_batch_invariant_mode()` 并输出 info 日志。
+
+### 实验命令
+
+```bash
+# 无负载
+SGLANG_FORCE_DETERMINISTIC_EXTEND=1 SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 \
+SGLANG_FORCE_BATCH_INVARIANT_OPS=1 \
+CUDA_VISIBLE_DEVICES=0 \
+lm-eval --model sglang \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "tp_size": 1, "dtype": "auto", "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3"}' \
+  --tasks gsm8k --batch_size auto \
+  > temp/fix-batchinv-lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.`nowstr.sh` 2>&1 &
+
+# 有负载 (另一个 GPU 同时运行)
+SGLANG_FORCE_DETERMINISTIC_EXTEND=1 SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 \
+SGLANG_FORCE_BATCH_INVARIANT_OPS=1 \
+CUDA_VISIBLE_DEVICES=7 \
+lm-eval --model sglang \
+  --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/", "tp_size": 1, "dtype": "auto", "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3"}' \
+  --tasks gsm8k --batch_size auto \
+  > temp/fix-batchinv-lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.`nowstr.sh` 2>&1 &
+```
+
+### 修改文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `model_runner.py` | 添加 `SGLANG_FORCE_BATCH_INVARIANT_OPS=1` 检查以启用 batch-invariant ops |
