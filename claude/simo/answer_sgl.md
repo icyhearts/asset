@@ -10509,3 +10509,45 @@ MoE 层面（已验证但不影响 DSV2-Lite）:
 
 **最终结论：在已验证的所有机制中，attention KV split 的非确定性是 `enable_deterministic_inference=true` 修复 gsm8k 分数差异的主要机制。MoE 层面的配置（14.1.3 和 14.1.4）对于 DSV2-Lite 而言是防御性的——它们不会在非确定性模式下产生不同的 expert 选择。**
 
+
+## decode_attention_fwd_grouped num_kv_splits 修改测试
+
+测试时间戳数量: 50, 成功: 50, 失败: 0
+
+### 修改方案: all_max
+- 测试次数: 50
+- Bitwise 完全相同: 0/50
+- Cosine similarity: min=0.9999994040, max=1.0000000000, mean=0.9999997687
+- L2 relative diff: min=3.85e-04, max=1.08e-03, mean=7.36e-04
+
+### 修改方案: all_ones
+- 测试次数: 50
+- Bitwise 完全相同: 0/50
+- Cosine similarity: min=0.9999987483, max=1.0000000000, mean=0.9999994934
+- L2 relative diff: min=2.16e-04, max=1.59e-03, mean=1.02e-03
+
+### 修改方案: double_splits
+- 测试次数: 50
+- Bitwise 完全相同: 0/50
+- Cosine similarity: min=0.9999998808, max=1.0000002384, mean=1.0000000072
+- L2 relative diff: min=8.50e-05, max=5.65e-04, mean=2.57e-04
+
+### 修改方案: half_max
+- 测试次数: 50
+- Bitwise 完全相同: 50/50
+- Cosine similarity: min=0.9999999404, max=1.0000002384, mean=1.0000000572
+- L2 relative diff: min=0.00e+00, max=0.00e+00, mean=0.00e+00
+
+### 结论
+num_kv_splits 的修改对 attention output 的影响如下:
+
+1. **单独修改 max_kv_splits（保持 num_kv_splits 不变）: 输出 bitwise 完全相同 (50/50)**
+   - 内核仅使用 `num_kv_splits[i]` 个元素/序列，`max_kv_splits` 仅定义缓冲区的步长。
+   - 将 max_kv_splits 从 256 减半到 128（保持 num_kv_splits=3）得到 bitwise 相同的结果。
+
+2. **修改 num_kv_splits: 输出不同（非 bitwise 相同）**
+   - L2 相对差异范围：`all_max` 的 7.4e-4（3→256），`double_splits` 的 2.6e-4（3→6），以及 `all_ones` 的 1.0e-3（3→1）。
+   - 余弦相似度在所有情况下均 > 0.999998。
+   - 差异由浮点部分和累加顺序变化（不同分块方案）导致。分块数变化越大，差异越大。
+
+3. **关键洞察**: `num_kv_splits` 的值直接影响 attention 输出 —— 将 `ceil(seq_len / 256)`（确定性公式，全部为 3）替换为非确定性公式（例如基于 batch 的 Triton 调度器）将产生不同的数值结果。这是 attention KV split 的 **# / root cause** 机制为非确定性的原因。消除它（如 `force_deterministic_kv_splits` 补丁所做）保证了 batch-invariant 的 attention 输出。
