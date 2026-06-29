@@ -10551,3 +10551,81 @@ num_kv_splits 的修改对 attention output 的影响如下:
    - 差异由浮点部分和累加顺序变化（不同分块方案）导致。分块数变化越大，差异越大。
 
 3. **关键洞察**: `num_kv_splits` 的值直接影响 attention 输出 —— 将 `ceil(seq_len / 256)`（确定性公式，全部为 3）替换为非确定性公式（例如基于 batch 的 Triton 调度器）将产生不同的数值结果。这是 attention KV split 的 **# / root cause** 机制为非确定性的原因。消除它（如 `force_deterministic_kv_splits` 补丁所做）保证了 batch-invariant 的 attention 输出。
+
+---
+
+## SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 GSM8K 测试分析
+
+### 测试结果
+
+| 运行 | 负载 | flexible-extract | strict-match | KV split mode (log) |
+|---|---|---|---|---|
+| 14_21_50 | 无 | **0.6611** | **0.6497** | SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 |
+| 14_39_37 | 无 | **0.6611** | **0.6497** | SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 |
+| 14_26_05 | 有 | **0.6535** | **0.6452** | SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 |
+| 14_33_05 | 有 | **0.6535** | **0.6452** | SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 |
+| 14_09_29 (baseline) | 无 | 0.6611 | 0.6497 | (未设置该环境变量) |
+
+日志确认所有 4 次运行都正确进入了确定性路径：
+
+```
+[get_num_kv_splits] PATH=deterministic (ceil(seq_len/256)),
+  triggered_by=SGLANG_FORCE_DETERMINISTIC_KV_SPLITS,
+  force_deterministic_kv_splits=True, enable_deterministic=False,
+  split_tile_size=256, seq_lens_sample=[1650, 1639, 1599, 1575, 1527],
+  num_kv_splits_sample=[7, 7, 7, 7, 6]
+```
+
+所有参数（seq_lens_sample、num_kv_splits_sample）在 4 次运行中完全一致。
+
+### 关键发现
+
+#### 1. SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 消除了运行间方差
+
+- **无负载**: 两次运行得分完全一致 (0.6611 = 0.6611)
+- **有负载**: 两次运行得分完全一致 (0.6535 = 0.6535)
+
+这证明了 attention KV split 的非确定性 **是运行间得分波动的主要原因**。
+固定 KV split 后，同一条件下得分 100% 可复现。
+
+#### 2. 负载仍然影响得分 (0.6611 vs 0.6535)
+
+即使 KV split 已固定，无负载和有负载之间仍有 **约 0.76% (10/1319 题)** 的得分差异。
+
+#### 3. 注意力 KV split 不是负载影响得分的唯一原因
+
+注意力 KV split 的非确定性导致的是 **同一条件下的运行间波动**。而负载导致的得分差异
+来自 **不同的根本原因**。
+
+### 负载影响得分的真实原因分析
+
+有负载和无负载之间的得分差异是**确定性的**（同条件下可复现），说明这不是内核级
+随机非确定性导致的，而是**调度器/批处理级别的确定性差异**：
+
+1. **批处理组成不同**: 有负载时，SGLang 调度器将 GSM8K 请求与负载请求交织处理。
+   即使每个注意力计算是确定性的，不同的批处理组成会导致不同的计算图，从而因
+   浮点运算顺序不同而产生不同的数值结果。
+
+2. **Extend/Prefill 路径不受影响**: `SGLANG_FORCE_DETERMINISTIC_KV_SPLITS` 只控制
+   decode attention 的 `get_num_kv_splits()`。`forward_extend()` 中的 unified 1-stage
+   kernel 仅在 `enable_deterministic_inference=True` 时启用。当仅设置
+   `SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1` 时，extend attention 仍使用原始的
+   2-stage kernel，其行为取决于批处理大小。
+
+3. **数值差异累积**: `decode_attention_fwd_grouped` 中 `num_kv_splits` 从 3 改为 6
+   产生的 L2 相对差异约 2.6e-4。同理，不同批处理组成下的 extend attention 产生的
+   微小数值差异，经过几十层累积后足以导致约 10 道题 (0.76%) 的 token 输出差异。
+
+4. **根本限制**: 这是批处理推理的固有属性——无法在有负载和无负载条件下获得完全相同
+   的计算图，因此无法实现完全相同的输出。要消除这种差异，需要使用
+   `enable_deterministic_inference=True`，它额外固定了 extend attention kernel
+   (unified 1-stage) 和 batch-invariant matmul 等所有非确定性来源。
+
+### 结论
+
+| 问题 | 答案 |
+|---|---|
+| attention KV split 是 gsm8k 得分运行间波动的原因吗？ | **是**。固定后运行间波动消失。 |
+| attention KV split 是负载影响得分的唯一原因吗？ | **否**。负载仍会导致 0.76% 的得分差异。 |
+| 负载影响得分的真实原因是什么？ | 批处理组成变化导致的计算图差异（extend attention、浮点累积顺序等），是批处理推理的固有属性。 |
+| 如何彻底消除负载影响？ | 使用 `enable_deterministic_inference=True`（固定所有非确定性来源，不仅限于 KV split）。 |
