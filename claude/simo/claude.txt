@@ -2462,3 +2462,23 @@ like-useful/answer_claude.md 14.1.3 DeepSeek Router Gate 确定性,14.1.4 MoE �
 
 # 仿照SGLANG_FORCE_DETERMINISTIC_KV_SPLITS变量，再加一个环境变量，把Extend/Prefill 路径的行为改成和 enable_deterministic_inference=True的一样，并加上日志证明该环境的效果。
 我想验证：enable_deterministic_inference=False, 但是加SGLANG_FORCE_DETERMINISTIC_KV_SPLITS和新的环境变量，把 attention kv split和Extend/Prefill 路径 给固定下来，gsm8k得分是否能和负载解耦。
+
+# sglang代码位于 /data//like/package/sglang_kernel_src/, sglang conda 环境位于/data/like/miniconda3/envs/simo_sglang/
+sglang code base 的python/sglang/srt/layers/attention/triton_ops/decode_attention.py, decode_attention_fwd_grouped函数，在打开 debug开关条件下，会把decode_attention_fwd_grouped的 所有参数保存下来，用 time stamp区别多次调用的参数。
+
+/data/like/temp/sgl_safe_tensor_sgl_decode_attention_fwd_grouped_dir/ 就是保存这些参数的目录。
+你要在sglang code base 实现 like-useful/load_sgl_decode_attention_fwd_grouped.py ，实现如下功能：
+遍历 /data/like/temp/sgl_safe_tensor_sgl_decode_attention_fwd_grouped_dir/ 所有 timestamp的 函数参数，对于个time stamp的参数，执行如下操作：
+  加载函数函数参数，调用decode_attention_fwd_grouped，得到原始的 attention output.
+  修改num_kv_splits tensor的数值和max_kv_splits，保证修改后的max_kv_splits >= num_kv_splits的最大值。用修改后的num_kv_splits tensor和max_kv_splits，再次调用 decode_attention_fwd_grouped，得到新的attention output.
+  每个time stamp的函数参数，至少修改2次num_kv_splits tensor和max_kv_splits，对比 修改前后 attention output的 cosine similarity, L2 norm, 以及是否bitwise相同。
+
+/data/like/temp/sgl_safe_tensor_sgl_decode_attention_fwd_grouped_dir/ 的文件比较多，加一个命令行参数控制运行测试的 time stamp的个数。
+写完代码，用sglang conda 环境运行测试。测试结论追加到 like-useful/answer_claude.md 里面
+
+
+# 第一次运行SGLANG_FORCE_DETERMINISTIC_EXTEND=1 SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1  CUDA_VISIBLE_DEVICES=7  lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" }' --tasks gsm8k --batch_size auto > temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.`nowstr.sh` 2>&1 &
+日志位于temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_29___15_03_38
+再次运行 CUDA_LAUNCH_BLOCKING=1 SGLANG_FORCE_DETERMINISTIC_EXTEND=1 SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" }' --tasks gsm8k --batch_size auto > temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.`nowstr.sh` 2>&1
+日志位于temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_29___15_16_47。
+分析日志崩溃原因，如何修复，答案追加到 like-useful/answer_claude.md 里面

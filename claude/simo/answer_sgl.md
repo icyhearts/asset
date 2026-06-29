@@ -10629,3 +10629,75 @@ num_kv_splits 的修改对 attention output 的影响如下:
 | attention KV split 是负载影响得分的唯一原因吗？ | **否**。负载仍会导致 0.76% 的得分差异。 |
 | 负载影响得分的真实原因是什么？ | 批处理组成变化导致的计算图差异（extend attention、浮点累积顺序等），是批处理推理的固有属性。 |
 | 如何彻底消除负载影响？ | 使用 `enable_deterministic_inference=True`（固定所有非确定性来源，不仅限于 KV split）。 |
+
+---
+
+## SGLANG_FORCE_DETERMINISTIC_EXTEND=1 崩溃分析
+
+### 崩溃日志
+
+```
+RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered
+  File ".../triton_backend.py", line 1132, in forward_extend
+    return self._forward_extend_unified(...)
+  File ".../triton_backend.py", line 1303, in _forward_extend_unified
+    self.extend_attention_fwd_unified(...)
+  File ".../extend_attention.py", line 1046, in extend_attention_fwd_unified
+    _fwd_kernel_unified[grid](...)
+```
+
+两次运行在同一位置崩溃（有/无 `CUDA_LAUNCH_BLOCKING=1`），确认是 `_fwd_kernel_unified` Triton kernel 中的非法内存访问。
+
+日志还显示：
+```
+[forward_extend] KERNEL=unified_1stage, triggered_by=SGLANG_FORCE_DETERMINISTIC_EXTEND, bs=1
+```
+CUDA graph compile/capture 阶段成功完成（42 个形状全部通过），崩溃发生在实际推理的第一个 batch。
+
+### 根因分析
+
+**根本原因**: piecewise CUDA graph 与 `_forward_extend_unified` 的动态索引构建不兼容。
+
+详细分析如下：
+
+1. **CUDA graph 捕获阶段**（warmup）:
+   - `piecewise_cuda_graph_runner.capture_one_batch_size()` 创建一个 `ForwardBatch` 用 `extend_prefix_lens=[0]` 的合成数据
+   - `model.forward()` → `forward_extend()` → `_forward_extend_unified()` → `build_unified_kv_indices()` 被调用
+   - `build_unified_kv_indices` 动态分配 tensor (`torch.empty`, `torch.cat`) 并启动 Triton kernel (`_copy_unified_indices_kernel`)
+   - 这些 GPU 操作**被 CUDA graph 捕获**，包括生成的 `unified_kv_indices` 指针
+
+2. **CUDA graph 回放阶段**（推理）:
+   - `replay()` → `replay_prepare()` 复制了实际的 `forward_batch`（含实际的 `out_cache_loc`）
+   - `init_forward_metadata(forward_batch)` 被调用，正确设置了 `kv_indptr`/`kv_indices`
+   - `model.forward()` 在 `enable_piecewise_cuda_graph()` 上下文中执行
+   - 模型内部，attention 逻辑**回放捕获的 CUDA graph**，而非执行 Python 代码
+   - `build_unified_kv_indices` 的输出来自捕获时，`out_cache_loc` 指向 warmup 的地址
+   - kernel 使用这些**陈旧的索引**访问 `k_buffer`/`v_buffer` → 越界 → 崩溃
+
+3. **为什么 `enable_deterministic_inference=True` 不崩溃**:
+   - `enable_deterministic_inference=True` 调用了 `enable_batch_invariant_mode()`，修改了底层 matmul
+   - 这些 matmul 替换可能影响了 CUDA graph 的捕获行为，使其与统一 kernel 兼容
+   - 或者整个 graph 被不同的机制处理
+
+### 修复方案
+
+在 `model_runner.forward_extend()` 中，当检测到 `force_deterministic_extend=True` 时，跳过 piecewise CUDA graph，使用正常的非 graph 路径：
+
+```python
+# model_runner.py line 3110-3118
+if can_run_graph and self._check_force_deterministic_extend(self.attn_backend):
+    logger.info(
+        "[forward_extend] Skipping piecewise CUDA graph for "
+        "SGLANG_FORCE_DETERMINISTIC_EXTEND (unified kernel uses dynamic indices)"
+    )
+    can_run_graph = False
+```
+
+正常路径会被触发：`init_forward_metadata(forward_batch)` → `model.forward()`，其中 `_forward_extend_unified` 的 `build_unified_kv_indices` 使用实时的 `out_cache_loc` 和 `extend_prefix_lens`，索引正确。
+
+### 修改文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `triton_backend.py` | 新增 `SGLANG_FORCE_DETERMINISTIC_EXTEND=1` flag + 日志 |
+| `model_runner.py` | 新增 `_check_force_deterministic_extend()` + CUDA graph 跳过逻辑 |
