@@ -2482,3 +2482,4 @@ sglang code base 的python/sglang/srt/layers/attention/triton_ops/decode_attenti
 再次运行 CUDA_LAUNCH_BLOCKING=1 SGLANG_FORCE_DETERMINISTIC_EXTEND=1 SGLANG_FORCE_DETERMINISTIC_KV_SPLITS=1 CUDA_VISIBLE_DEVICES=7 lm-eval --model sglang --model_args '{"pretrained": "/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/",   "tp_size": 1, "dtype": "auto",  "attention_backend": "triton", "mem_fraction_static": 0.4, "log_level": "info", "add_bos_token": true, "kv_cache_dtype": "fp8_e4m3" }' --tasks gsm8k --batch_size auto > temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.`nowstr.sh` 2>&1
 日志位于temp/lm-eval-gsm8k-dsv2-sgl-kvfp8.gpu7.2026_06_29___15_16_47。
 分析日志崩溃原因，如何修复，答案追加到 like-useful/answer_claude.md 里面
+对于 遗漏 #1: `truncation_align_size`（最关键）, 增加环境

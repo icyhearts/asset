@@ -10957,3 +10957,52 @@ envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
 4. **对于 tp=1 + triton backend 的配置**，还有以下 env var 可以补充模拟：
    - `SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE=4096` — 模拟 truncation_align_size
    - `SGLANG_ENABLE_DETERMINISTIC_INFERENCE=1` — 模拟全部 env var 层面的确定性行为
+
+---
+
+## SGLANG_FORCE_DETERMINISTIC_TRUNCATION_ALIGN=1 实现
+
+### 目的
+模拟 `enable_deterministic_inference=True` 的 `truncation_align_size` 效果，使 prefill input length 对齐到 split tile size（triton backend 默认 4096），消除 scheduler truncation 行为在不同 load 下的差异。
+
+### 修改
+`scheduler.py:1348-1372` — `init_deterministic_inference_config()`:
+```python
+force_truncation_align = os.getenv(
+    "SGLANG_FORCE_DETERMINISTIC_TRUNCATION_ALIGN", ""
+) == "1"
+if not self.server_args.enable_deterministic_inference and not force_truncation_align:
+    self.truncation_align_size = None
+    return
+# ... 设置 truncation_align_size（triton backend 默认 4096）
+if force_truncation_align:
+    logger.info(f"Truncation align enabled via SGLANG_FORCE_DETERMINISTIC_TRUNCATION_ALIGN=1, ...")
+```
+
+### 修改文件
+| 文件 | 修改内容 |
+|---|---|
+| `scheduler.py` | 添加 `SGLANG_FORCE_DETERMINISTIC_TRUNCATION_ALIGN=1` 检查，设置 `truncation_align_size` |
+| `triton_backend.py` | 新增 `force_deterministic_truncation_align` flag + 日志 |
+
+---
+
+## SGLANG_FORCE_DETERMINISTIC_SAMPLING=1 扩展：控制 sampling_seed
+
+### 目的
+`SGLANG_FORCE_DETERMINISTIC_SAMPLING=1` 不仅设置 `sampling_backend="pytorch"`，还创建 `sampling_seed` 张量（默认 seed=42），与 `enable_deterministic_inference=True` 的行为对齐。
+
+### 修改
+`sampling_batch_info.py:77-80` — `from_schedule_batch()`:
+```python
+enable_deterministic = (
+    global_server_args.enable_deterministic_inference
+    or os.getenv("SGLANG_FORCE_DETERMINISTIC_SAMPLING", "") == "1"
+)
+```
+之前只检查 `global_server_args.enable_deterministic_inference`。
+
+### 修改文件
+| 文件 | 修改内容 |
+|---|---|
+| `sampling_batch_info.py` | 添加 `import os`；`enable_deterministic` 同时检查 `SGLANG_FORCE_DETERMINISTIC_SAMPLING=1` |
