@@ -103,4 +103,4 @@ t1 = time.time()
 print("CUDA Graph decode avg time:", (t1 - t0) / 500 * 1000, "ms")
 for idx, eager_y in enumerate(eager_saved_ys):
     graph_y = graph_saved_ys[idx]
-    print("equal")
+    print(f"equal:{torch.equal(eager_y, graph_y)}")
