@@ -11006,3 +11006,108 @@ enable_deterministic = (
 | 文件 | 修改内容 |
 |---|---|
 | `sampling_batch_info.py` | 添加 `import os`；`enable_deterministic` 同时检查 `SGLANG_FORCE_DETERMINISTIC_SAMPLING=1` |
+
+---
+
+## Extend Attention Kernel 分析: 2-stage vs Unified 1-stage
+
+### 调用路径
+
+两个 kernel 都在 `triton_backend.py:forward_extend()` 中被调用：
+
+**`force_deterministic_extend=False`** — 原始 2-stage (`_fwd_kernel`, extend_attention.py:232):
+```python
+self.extend_attention_fwd(
+    q, k.contiguous(), v.contiguous(), o,     # extend KV 作为独立 tensor
+    k_buffer, v_buffer, ...)                   # prefix KV 从 buffer
+```
+
+**`force_deterministic_extend=True`** — Unified 1-stage (`_fwd_kernel_unified`, extend_attention.py:722):
+```python
+self.extend_attention_fwd_unified(
+    q, o, k_buffer, v_buffer, ...)            # 无独立的 k/v tensor!
+```
+
+### 核心差异: 两套数据源 vs 单一数据源
+
+**2-stage kernel 内部结构** (`_fwd_kernel`, extend_attention.py:334-537):
+
+```python
+# Stage 1 (line 334): extend Q × PREFIX K/V — 从 K_Buffer 读
+for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    k = tl.load(K_Buffer + offs_buf_k, ...)     # 通过 kv_indices
+    qk = tl.dot(q, k) * sm_scale * k_scale      # ← k_scale 反量化
+    acc += dot(p, v) * v_scale                   # ← v_scale 反量化
+
+# Stage 2 (line 435): extend Q × EXTEND K/V — 从 K_Extend tensor 读
+for start_n in range(0, cur_block_m_end, BLOCK_N):
+    k = tl.load(K_Extend + offs_k, ...)          # 直接 access
+    qk = tl.dot(q, k) * sm_scale                 # ← 无 k_scale!
+    acc += dot(p, v)                             # ← 无 v_scale!
+```
+
+**Unified 1-stage kernel 内部结构** (`_fwd_kernel_unified`, extend_attention.py:826-953):
+
+```python
+# 单一循环: extend Q × ALL K/V — 全部从 K_Buffer 读
+for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    k = tl.load(K_Buffer + offs_buf_k, ...)     # 统一通过 kv_indices
+    qk = tl.dot(q, k) * sm_scale_with_k          # ← 统一 scaling
+    acc += dot(p, v) * v_scale                   # ← 统一 scaling
+    # causal mask 通过 prefix_lens 判断 prefix/extend 边界
+```
+
+### 为什么 2-stage kernel 不保证 batch-invariant？
+
+#### 原因 1: 两个阶段使用不同的 scaling 因子
+
+```
+Stage 1 (prefix):  qk *= sm_scale * k_scale     acc += dot(p, v) * v_scale
+Stage 2 (extend):  qk *= sm_scale                acc += dot(p, v)
+```
+
+fp8 KV cache 的 prefix 需要 `k_scale`/`v_scale` 反量化，extend 是原始精度。online softmax 在两个阶段之间共享 `e_max`/`deno`/`acc` 状态，scaling 的不对称性意味着**两个阶段的数值贡献不平等**。
+
+不同 batch 下 prefix/extend 的长度比例不同 → Stage 1 和 Stage 2 的循环次数比例不同 → online softmax 的累积路径变化 → 浮点结果不同。
+
+#### 原因 2: 两个不同数据源的 memory coalescing 差异
+
+| 数据源 | Stage 1 (K_Buffer) | Stage 2 (K_Extend) |
+|---|---|---|
+| 内存布局 | KV pool, 固定 shape | 动态 shape, `k.contiguous()` |
+| Stride | `pool_size × head_dim` (固定) | `num_tokens × head_dim` (batch 相关) |
+| 访问方式 | `kv_indices` 间接寻址 | 直接线性寻址 |
+
+不同 batch 下 `num_extend_tokens` 不同 → `K_Extend` 的 stride 不同 → GPU memory coalescing 效率不同 → warp-level 的 FMA 合并行为不同 → 硬件层面数值差异。
+
+#### 原因 3: Softmax 稳定性分离
+
+Stage 1 先完成（所有 prefix tiles），此时 `e_max` 已达到 prefix 中的最大值；然后 Stage 2 才开始。如果 Stage 2 出现更大的 qk 值，需要 `re_scale = exp(e_max - n_e_max)` 重新缩放整个 prefix 累积结果。这个 rescale 的数值精度取决于 Stage 1 中处理的 tile 数量。**prefix token 越多，Stage 1 累积的 `acc` 越大，rescale 的精度损失越大**。
+
+#### 原因 4: Grid 维度受 batch 影响
+
+```python
+grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+```
+
+不同 batch composition → 不同 `max_len_extend` → 不同 grid 维度 → CUDA block scheduler 不同分配 → SM 间竞争不同 → L2 cache 命中率不同 → 底层数值差异。
+
+### 为什么 Unified 1-stage kernel 能够 batch-invariant？
+
+1. **单一数据源**: ALL K/V 从 `K_Buffer`/`V_Buffer` 读取。buffer 是固定大小的 KV pool，stride 恒定（`pool_size × head_dim`），与 batch composition 无关。
+
+2. **统一 scaling**: 所有 token 使用 `sm_scale_with_k` 和 `v_scale`，消除 prefix/extend 间的 scaling 不对称。
+
+3. **统一 online softmax**: 单一循环按线性顺序处理所有 token（prefix 和 extend 自然交错），无 stage boundary → prefix/extend 比例变化不影响累积路径的结构。
+
+4. **MLA dispatch**: `force_deterministic_extend=True` 强制走 MLA 路径（`attention_backend_handler.py:179`），确保 `save_kv_cache=True` → extend KV 在 kernel 前已写入 buffer。
+
+### 对比总结
+
+| 维度 | 2-stage (`force=False`) | 1-stage (`force=True`) |
+|---|---|---|
+| KV 来源 | prefix: buffer, extend: 独立 tensor | 全部: buffer |
+| Online softmax | 两阶段分离，scaling 不同 | 单一阶段，scaling 统一 |
+| 内存访问 stride | 随 batch 变化 | 固定 (KV pool) |
+| FlashInfer MLA 路径 | 可能走 MHA (`save_kv_cache=False`) | 强制 MLA (`save_kv_cache=True`) |
+| Batch-invariant | **否** | **是** |
