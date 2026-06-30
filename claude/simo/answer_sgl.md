@@ -11059,16 +11059,20 @@ for start_n in range(0, cur_seq_kv_len, BLOCK_N):
 
 ### 为什么 2-stage kernel 不保证 batch-invariant？
 
-#### 原因 1: 两个阶段使用不同的 scaling 因子
+#### 原因 1: 两个阶段使用不同的 scaling 因子 **(仅当 k_scale/v_scale ≠ 1.0 时成立)**
 
 ```
 Stage 1 (prefix):  qk *= sm_scale * k_scale     acc += dot(p, v) * v_scale
 Stage 2 (extend):  qk *= sm_scale                acc += dot(p, v)
 ```
 
-fp8 KV cache 的 prefix 需要 `k_scale`/`v_scale` 反量化，extend 是原始精度。online softmax 在两个阶段之间共享 `e_max`/`deno`/`acc` 状态，scaling 的不对称性意味着**两个阶段的数值贡献不平等**。
+**DeepSeek-V2-Lite 默认使用 fp8 KV cache，且 `k_scale=1.0, v_scale=1.0`**。在此条件下：
+```
+Stage 1: qk *= sm_scale * 1.0 = sm_scale      Stage 2: qk *= sm_scale  → 相同
+Stage 1: acc += dot(p, v) * 1.0 = dot(p, v)   Stage 2: acc += dot(p, v) → 相同
+```
 
-不同 batch 下 prefix/extend 的长度比例不同 → Stage 1 和 Stage 2 的循环次数比例不同 → online softmax 的累积路径变化 → 浮点结果不同。
+**在 DeepSeek-V2-Lite + fp8 KV cache 的默认配置下，这个原因不成立。** 它只在 `k_scale ≠ 1.0` 或 `v_scale ≠ 1.0` 时（例如某些手动指定的量化配置）才可能产生影响。
 
 #### 原因 2: 两个不同数据源的 memory coalescing 差异
 
@@ -11096,18 +11100,35 @@ grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
 
 1. **单一数据源**: ALL K/V 从 `K_Buffer`/`V_Buffer` 读取。buffer 是固定大小的 KV pool，stride 恒定（`pool_size × head_dim`），与 batch composition 无关。
 
-2. **统一 scaling**: 所有 token 使用 `sm_scale_with_k` 和 `v_scale`，消除 prefix/extend 间的 scaling 不对称。
+2. **统一 scaling**: 所有 token 使用 `sm_scale_with_k` 和 `v_scale` 缩放。不过在 `k_scale=v_scale=1.0`（DeepSeek-V2-Lite 默认）时，这与 2-stage 的 Stage 1 也是等价的，因此这不是关键差异。
 
 3. **统一 online softmax**: 单一循环按线性顺序处理所有 token（prefix 和 extend 自然交错），无 stage boundary → prefix/extend 比例变化不影响累积路径的结构。
 
-4. **MLA dispatch**: `force_deterministic_extend=True` 强制走 MLA 路径（`attention_backend_handler.py:179`），确保 `save_kv_cache=True` → extend KV 在 kernel 前已写入 buffer。
+4. **MLA dispatch**: `force_deterministic_extend=True` 强制走 MLA 路径（`attention_backend_handler.py:179`），确保 `save_kv_cache=True` → extend KV 在 kernel 前已写入 buffer。**这是最关键的第 4 点**——见下方补充分析。
 
 ### 对比总结
 
 | 维度 | 2-stage (`force=False`) | 1-stage (`force=True`) |
 |---|---|---|
 | KV 来源 | prefix: buffer, extend: 独立 tensor | 全部: buffer |
-| Online softmax | 两阶段分离，scaling 不同 | 单一阶段，scaling 统一 |
+| Online softmax | 两阶段分离 | 单一阶段 |
+| Softmax scaling | 相同 (k_scale=1.0 时两者等价) | 统一使用 sm_scale_with_k |
 | 内存访问 stride | 随 batch 变化 | 固定 (KV pool) |
 | FlashInfer MLA 路径 | 可能走 MHA (`save_kv_cache=False`) | 强制 MLA (`save_kv_cache=True`) |
 | Batch-invariant | **否** | **是** |
+
+### 补充分析：非 batch-invariant 的根本原因
+
+在剔除了已被证伪的原因 1（scaling 因子）之后，**非 batch-invariant 的根本原因有两个层面**：
+
+**层面 A: MHA vs MLA dispatch 路径（最关键）**
+
+`force_deterministic_extend=False` 时，`handle_attention_triton` 根据 `sum(extend_prefix_lens_cpu)` 选择 dispatch 路径：
+- `sum(extend_prefix_lens_cpu) == 0` → **MHA 路径**：`save_kv_cache=False`，k/v 通过 `kv_b_proj` 展开后直接传给 kernel，不经过 KV buffer
+- `sum(extend_prefix_lens_cpu) > 0` → **MLA 路径**：`save_kv_cache=True`，k/v 先写入 KV buffer（压缩的 kv_a），kernel 从 buffer 读取
+
+`sum(extend_prefix_lens_cpu)` 的值取决于 batch 中每个请求的 prefix 长度，而不同负载下 batch 组成不同 → dispatch 在 MHA 和 MLA 之间变化 → 硬件执行路径完全不同 → 结果不同。
+
+**层面 B: Kernel 内部的数据源差异（次要）**
+
+即使 dispatch 一致走 MLA 路径，2-stage kernel 内部 Stage 2 的 `K_Extend` tensor 来自 `k.contiguous()`（动态 stride），stride `num_tokens × head_dim` 随 batch 组成变化 → memory coalescing 不同（原因 2）。Unified 1-stage kernel 消除了这个差异，因为所有 K/V 都从固定 stride 的 KV buffer 读取。
