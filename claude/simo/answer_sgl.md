@@ -11132,3 +11132,245 @@ grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
 **层面 B: Kernel 内部的数据源差异（次要）**
 
 即使 dispatch 一致走 MLA 路径，2-stage kernel 内部 Stage 2 的 `K_Extend` tensor 来自 `k.contiguous()`（动态 stride），stride `num_tokens × head_dim` 随 batch 组成变化 → memory coalescing 不同（原因 2）。Unified 1-stage kernel 消除了这个差异，因为所有 K/V 都从固定 stride 的 KV buffer 读取。
+
+---
+
+## Section 19: `disable_piecewise_cuda_graph` 对 batch-invariant 和确定性的影响
+
+### 19.1 定义和配置
+
+**`disable_piecewise_cuda_graph`** 是 SGLang 的 server argument（`server_args.py:724`），布尔类型，**默认值为 `False`**（即 piecewise CUDA graph 默认启用）。
+
+相关配置项（`server_args.py:724-730`）：
+```python
+disable_piecewise_cuda_graph: bool = False          # 是否禁用
+enforce_piecewise_cuda_graph: bool = False            # 强制启用（覆盖 auto-disable）
+piecewise_cuda_graph_max_tokens: Optional[int] = None # 最大 token 捕获上限
+piecewise_cuda_graph_tokens: Optional[List[int]] = None # 手动指定捕获 token 数
+piecewise_cuda_graph_compiler: str = "eager"          # 编译器后端
+```
+
+### 19.2 什么情况下会被 auto-disable
+
+`server_args.py:_handle_piecewise_cuda_graph()` (line 1291) 在以下条件下自动设置 `disable_piecewise_cuda_graph = True`：
+
+| 条件 | 原因 |
+|---|---|
+| **`enable_deterministic_inference`** | **显式不兼容** (line 1342) |
+| 非 CUDA 硬件 (AMD/NPU/CPU/MPS/XPU) | 硬件不支持 |
+| `torch.compile` 已启用 | 不能与 `torch.compile` 叠加 |
+| DP attention / pipeline parallelism | 不兼容 |
+| LoRA / VLM (多模态) / GGUF 量化 | 不支持 |
+| DLLM / CPU offload / hierarchical cache | 打破 dynamo 追踪 |
+| PD disaggregation / symmetric memory | 不可追踪 |
+| Expert distribution recorder / EPLB | 不兼容 |
+| Context parallel / CUDA graph debug | 不兼容 |
+| DeepSeek-V3.2 / 特定模型架构 | 模型级禁用 |
+
+**关键发现：`enable_deterministic_inference=True` 会强制 `disable_piecewise_cuda_graph=True`。**
+
+### 19.3 完整调用链路
+
+#### 19.3.1 初始化链路
+
+```
+model_runner.py:831  self.init_piecewise_cuda_graphs()
+  └─ model_runner.py:2845  init_piecewise_cuda_graphs()
+       ├─ 检查 self.server_args.disable_piecewise_cuda_graph → 若 True 直接 return
+       ├─ 扫描模型层：收集 attention_layers, moe_layers, dsa_indexers
+       └─ 创建 PiecewiseCudaGraphRunner（或 BreakableCudaGraphRunner）
+             └─ piecewise_cuda_graph_runner.py:171  __init__()
+                  ├─ 设置 CompilationConfig (capture_sizes, compiler)
+                  ├─ 分配静态 input/output buffers
+                  ├─ 进入 enable_piecewise_cuda_graph() context
+                  │    └─ piecewise_context_manager.py:42  设置全局 _in_piecewise_cuda_graph = True
+                  ├─ 调用 install_torch_compiled() 修补模型 forward
+                  │    └─ compile.py:111  创建 trampoline 替换 module.forward
+                  │         def trampoline(self, *args, **kwargs):
+                  │             use_compiled = is_in_piecewise_cuda_graph()
+                  │             if use_compiled:
+                  │                 # 走 torch.compile 编译后的路径
+                  │                 return compiled_callable(*args, **kwargs)
+                  │             else:
+                  │                 # 走原始 eager 路径
+                  │                 return unbound_fwd(self, *args, **kwargs)
+                  ├─ 逐 token 数捕获 CUDA graph
+                  │    └─ capture_one_batch_size() (line 511)
+                  │         ├─ bs=1, ForwardMode.EXTEND
+                  │         ├─ 预热运行 → torch.compile 追踪 + 编译
+                  │         └─ torch.cuda.graph() 捕获 → 存入 cudagraph pool
+                  └─ 退出 PCG context
+```
+
+#### 19.3.2 运行时 Replay 链路
+
+```
+model_runner.py:3068  forward_extend()
+  ├─ can_run_graph() 检查：
+  │    ├─ piecewise_cuda_graph_runner 存在
+  │    ├─ 无 input_embeds, 非 target verify mode
+  │    ├─ num_tokens <= max_num_tokens
+  │    └─ 前向模式匹配
+  ├─ 若 can_run → piecewise_cuda_graph_runner.replay(forward_batch)
+  │    └─ piecewise_cuda_graph_runner.py:787  replay()
+  │         ├─ replay_prepare() (line 646)
+  │         │    ├─ bisect.bisect_left 找到最接近的已捕获 token 数
+  │         │    ├─ 将真实输入拷贝到静态 buffers，不足部分 zero-pad
+  │         │    ├─ MIXED mode 归一化为 EXTEND mode (dynamo guard 兼容)
+  │         │    └─ 设置 attention_layers, moe_layers 等 forward context
+  │         ├─ 进入 enable_piecewise_cuda_graph() context
+  │         │    └─ 全局 _in_piecewise_cuda_graph = True
+  │         ├─ self.model_runner.model.forward()  # 走 trampoline → compiled path
+  │         │    └─ 每个子模块 CUDAPiecewiseBackend.__call__()
+  │         │         └─ cuda_piecewise_backend.py:109
+  │         │              ├─ 第一次: compiled_graph_for_general_shape(*args)
+  │         │              ├─ 后续: entry.cudagraph.replay() + entry.output
+  │         │              └─ 返回预捕获的输出 tensor
+  │         └─ 切片输出到 self.raw_num_tokens
+  └─ 若 cannot_run → 直接调用 forward（eager 模式）
+```
+
+#### 19.3.3 关键分支：attention dispatch 在 PCG 中的行为
+
+`attention_backend_handler.py` 中多个位置检查 `is_in_piecewise_cuda_graph()`：
+
+```python
+# attention_backend_handler.py:175
+if is_in_piecewise_cuda_graph():
+    return _dispatch_mla_subtype(attn, forward_batch)
+```
+
+**当 PCG 处于 replay 模式时，attention dispatch 强制走 MLA 路径**（不能动态分支出 MHA，因为 CUDA graph 不能包含条件分支）。
+
+`dsa_backend.py:2208` 类似：
+```python
+if is_in_piecewise_cuda_graph():
+    self.use_mha = False  # 强制关闭 MHA
+```
+
+#### 19.3.4 token 捕获 schedule
+
+`server_args.py:1651` 生成捕获用的 token 数序列：
+
+```python
+capture_sizes = (
+    list(range(4, 33, 4))            # 4, 8, 12, ..., 32   (step 4)
+    + list(range(48, 257, 16))       # 48, 64, ..., 256    (step 16)
+    + list(range(288, 513, 32))      # 288, 320, ..., 512  (step 32)
+    + list(range(576, 1025, 64))     # 576, 640, ..., 1024 (step 64)
+    + list(range(1280, 4097, 256))   # 1280, 1536, ..., 4096 (step 256)
+    + list(range(4608, max+1, 512))  # 4608, 5120, ...     (step 512)
+)
+```
+
+默认 cap: `chunked_prefill_size`（非 MLA）或 `2048`（MLA，如 DeepSeek-V2-Lite）。
+
+Replay 时用 `bisect_left` 取 ceiling token 数对应的 graph。例如 batch 有 66 tokens → 取 80-token graph（66 到下一个捕获点 80）。
+
+### 19.4 对 batch-invariant 的影响
+
+PCG 对 batch-invariance 的影响是**双向的**：
+
+#### 正面影响：消除 attention dispatch 分支
+
+PCG ON（replay 模式）时 `is_in_piecewise_cuda_graph()` 返回 True，attention dispatch **强制走 MLA 路径**。这消除了此前分析的非 batch-invariant 的最关键来源——MHA vs MLA dispatch 分支。
+
+| 场景 | PCG OFF | PCG ON (replay) |
+|---|---|---|
+| attention dispatch | `sum(extend_prefix_lens_cpu) == 0` → MHA<br>`sum(...) > 0` → MLA | **始终 MLA** |
+| batch-dependence | dispatch 路径与 batch 组成相关 | **dispatch 路径固定** |
+| batch-invariant? | 否（原因见 Section 17 补充分析） | **是（消除层面 A）** |
+
+#### 负面影响：torch.compile 引入新的 batch 依赖
+
+1. **重新编译（Recompilation）**：如果 batch 的 token 数触发了新的 shape → Dynamo 重新追踪 → 不同的优化决策 → 不同的编译代码。虽然 `fullgraph=True` 保证同形状复用，但不同 token 数 ceiling 使用不同 graph → 不同的编译实例。
+
+2. **Ceiling token 差异**：batch A 有 66 tokens → 80-token graph；batch B 有 70 tokens → 也取 80-token graph → **相同**。但 batch A 有 80 tokens，batch B 有 82 tokens → 80 vs 96 → **不同 graph**。
+
+3. **Zero-padding**：小 batch 被 zero-pad 到 ceiling token 数。padding 区域的 attention 计算理论上不影响有效结果（通过 causal mask/length 限制），但如果 padding 数值通过 softmax 或 reduction 路径影响其余计算，可能引入差异。
+
+4. **Kernel fusion**：`torch.compile` (即使 `backend="eager"`) 可能进行 operator fusion，融合后的内核执行顺序可能与 eager 不同。不同 batch 形状 → 可能触发不同的 fusion 策略。
+
+#### 总体结论
+
+| | PCG OFF | PCG ON |
+|---|---|---|
+| attention dispatch batch-invariant | **否** (MHA/MLA 分支) | **是** (强制 MLA) |
+| 模型前向 batch-invariant | 取决于 kernel 内因素 | 受 `torch.compile` 重编译影响 |
+| 数值精度 | eager mode (直接执行) | 可能有融合后的精度差异 |
+
+**在 DeepSeek-V2-Lite 的默认配置下，PCG ON 实际上改善了 attention 层面的 batch-invariance**（因为强制 MLA dispatch），但代价是引入了 `torch.compile` 层面的 shape 依赖和重新编译风险。
+
+### 19.5 对确定性的影响（ON vs OFF 对比）
+
+#### PCG ON（默认 `disable_piecewise_cuda_graph=False`）
+
+| 确定性来源 | 行为 |
+|---|---|
+| CUDA graph replay | **确定性**：相同的 CUDA graph，相同的 kernel 启动序列，相同的参数。run-to-run 确定性高 |
+| `torch.compile` | 可能非确定性：autotuning 可能选不同 kernel；shape 触发的 recompile 可能产生不同代码 |
+| 静态 buffer | 地址固定（首次分配后不变），对应 CUDA graph 中的指针固定 |
+| attention dispatch | **强制 MLA**，消除了 dispatch 变化 |
+
+#### PCG OFF（`disable_piecewise_cuda_graph=True`）
+
+| 确定性来源 | 行为 |
+|---|---|
+| Eager execution | kernel 每次实时启动，GPU scheduler 可能做不同决定 |
+| attention dispatch | 可能走 MHA 或 MLA，取决于 `sum(extend_prefix_lens_cpu)` |
+| 内存分配 | 动态分配，tensor 地址每次不同 |
+| `torch.compile` | 无，原始 eager 模式 |
+
+#### 关键对比
+
+```
+                     PCG ON                     PCG OFF
+                    ─────────                  ────────
+运行模式      CUDA graph replay           eager execution
+torch.compile 是（模型被编译）           否（原始 forward）
+attention     强制 MLA                   可能 MHA 或 MLA
+内存          静态 buffer（固定地址）     动态分配
+run-to-run    ▲ 高（同 graph replay）     ▼ 低（动态执行）
+batch-to-batch ▼ 低（不同 graph/编译）    ▼ 低（dispatch 变化）
+```
+
+**PCG ON 的 run-to-run 确定性高**（相同 batch 相同 input 重跑多次结果相同），但 **batch-to-batch 确定性受制于 graph selection 和 torch.compile**。
+
+**PCG OFF 的 run-to-run 确定性低**（eager execution 有 GPU scheduler 变化），**batch-to-batch 确定性也低**（attention dispatch 变化）。
+
+### 19.6 与确定性环境变量的关系
+
+当前实验中，`enable_deterministic_inference=False` 时 PCG **默认启用**：
+
+```
+enable_deterministic_inference=False
+  └─ disable_piecewise_cuda_graph=False (默认)
+       └─ PCG 启用
+            ├─ attention dispatch: 强制 MLA ← 已在 batch-invariant 方向
+            ├─ torch.compile: 可能引入 shape 依赖 ← 新的不确定性来源
+            └─ CUDA graph replay: run-to-run 确定性高
+```
+
+当 `enable_deterministic_inference=True` 时：
+```
+enable_deterministic_inference=True
+  └─ disable_piecewise_cuda_graph=True (auto-disable, line 1342)
+       └─ PCG 完全禁用
+            ├─ attention: 走 MLA（force_deterministic_extend 的效果）
+            ├─ 无 torch.compile 影响
+            └─ eager execution
+```
+
+**这意味着 PCG 的 ON/OFF 切换本身可能引入另一种层面的差异**：当 `enable_deterministic_inference=False` 时 PCG 启用（torch.compile + CUDA graph），当 `=True` 时 PCG 禁用（eager）。两者不只是 attention 层面的差异，还有整个模型执行方式（compiled vs eager）的差异。
+
+### 19.7 实验建议
+
+如果要完全模拟 `enable_deterministic_inference=True` 的效果，还需考虑增加环境变量控制 PCG：
+
+```python
+# 在 model_runner.py init_piecewise_cuda_graphs() 中增加检查
+if os.getenv("SGLANG_FORCE_DISABLE_PIECEWISE_CUDA_GRAPH", "") == "1":
+    self.server_args.disable_piecewise_cuda_graph = True
+```
+
+这样可以通过 `SGLANG_FORCE_DISABLE_PIECEWISE_CUDA_GRAPH=1` 单独控制 PCG，与其他确定性环境变量组合使用，观察 PCG 自身对 batch-invariant 结果的净影响。
