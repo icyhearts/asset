@@ -55,8 +55,14 @@ for _ in range(10):
 torch.cuda.synchronize()
 t0 = time.time()
 
+eager_saved_xs = []
+eager_saved_ys = []
 for _ in range(500):
+    x = torch.randn(B, 256, device="cuda")
+    eager_saved_xs.append(x)
     y = decode_step_eager(model, x)
+    eager_saved_ys.append(y)
+
 
 torch.cuda.synchronize()
 t1 = time.time()
@@ -83,11 +89,18 @@ with torch.cuda.graph(g):
 torch.cuda.synchronize()
 t0 = time.time()
 
-for _ in range(500):
-    static_x.copy_(x) # 输入更新，但地址不变
+graph_saved_ys=[]
+#for _ in range(500):
+for eager_x in eager_saved_xs:
+    static_x.copy_(eager_x) # 输入更新，但地址不变
     g.replay()  # 整个 decode step 以 Graph 方式重放
+    graph_saved_ys.append(static_y.clone())
+
 
 torch.cuda.synchronize()
 t1 = time.time()
 
 print("CUDA Graph decode avg time:", (t1 - t0) / 500 * 1000, "ms")
+for idx, eager_y in enumerate(eager_saved_ys):
+    graph_y = graph_saved_ys[idx]
+    print("equal")
