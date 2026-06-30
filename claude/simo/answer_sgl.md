@@ -10853,3 +10853,107 @@ lm-eval --model sglang \
 | 文件 | 修改内容 |
 |---|---|
 | `model_runner.py` | 添加 `SGLANG_FORCE_BATCH_INVARIANT_OPS=1` 检查以启用 batch-invariant ops |
+
+---
+
+## 全量环境变量模拟 enable_deterministic_inference 的 gsm8k 得分仍然不同
+
+### 测试结果
+
+| 条件 | GSM8K flexible-extract | strict-match | 吞吐 |
+|------|:---:|:---:|:---:|
+| 无负载 (all 6 env vars 开启) | 0.6573 | 0.6497 | 15.22 it/s |
+| 有负载 (all 6 env vars 开启) | 0.6558 | 0.6505 | 6.00 it/s |
+| 差值 | **0.0015** | - | - |
+
+虽然差值已经很小（<0.15%），但仍然不同。之前仅 KV split 的差值是 0.0076，已经大幅缩小，但未完全消除。
+
+### 为什么得分仍然不同？
+
+当前 6 个环境变量覆盖了 `enable_deterministic_inference=True` 的核心行为，但还有 **遗漏的关键点**：
+
+#### 遗漏 #1: `truncation_align_size`（最关键）
+
+`scheduler.py:1348-1363`：
+```python
+def init_deterministic_inference_config(self):
+    if not self.server_args.enable_deterministic_inference:
+        self.truncation_align_size = None  # ← 无确定性时不会对齐
+        return
+    # 确定性时设置 truncation_align_size=4096 (triton backend)
+    self.truncation_align_size = get_int_env_var(
+        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096
+    )
+```
+
+这个值被用于 `schedule_policy.py:942-948`:
+```python
+if truncation_align_size is not None:
+    if trunc_len < truncation_align_size:
+        return AddReqResult.OTHER   # 拒绝太短的 batch
+    else:
+        trunc_len = truncation_align_size * (
+            trunc_len // truncation_align_size  # 对齐到 4096
+        )
+```
+
+**影响**: 不同负载下，scheduler 的 truncation 行为完全不同。无负载时每个请求独立调度（trunc_len 完全随机），有负载时多请求被批处理（可能更早/更晚触发 truncation）。没有 `truncation_align_size`，prefill 的输入长度不受对齐约束，导致不同 batch 组合产生不同的计算图。
+
+#### 遗漏 #2: `sampling_seed` 不完整
+
+`sampling_batch_info.py:94-109`：
+```python
+if enable_deterministic:
+    sampling_seed = torch.tensor([42 for r in reqs], ...)
+else:
+    sampling_seed = None
+```
+
+当前的 `SGLANG_FORCE_DETERMINISTIC_SAMPLING=1` **只**改变了 `sampling_backend` ("pytorch")，但不设置 `sampling_seed` 张量。虽然 gsm8k 使用贪婪解码（temperature=0），但采样路径不同可能影响 batch 中 token 的生成顺序。
+
+#### 遗漏 #3: `disable_piecewise_cuda_graph`
+
+`server_args.py:1342`：当 `enable_deterministic_inference=True` 时：
+```python
+self.disable_piecewise_cuda_graph = True
+```
+
+当前没有 env var 来覆盖这一项。虽然 `SGLANG_FORCE_DETERMINISTIC_EXTEND=1` 强制了 MLA 路径绕过 MHA dispatch，但 piecewise CUDA graph 在其他部分（如 decode attention）可能仍有非确定性行为。
+
+#### 遗漏 #4: `SGLANG_ENABLE_DETERMINISTIC_INFERENCE` env var 未设置
+
+`server_args.py:4027`：当 `enable_deterministic_inference=True` 时：
+```python
+envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+```
+
+这个 env var 被以下两处读取：
+- `custom_all_reduce.py:370` — AMD 1-stage allreduce 内核选择
+- `models/utils.py:450` — 禁用 fused inplace QK norm
+
+这些对单 GPU (tp=1) 的 triton backend 不影响，但对多 GPU 配置有影响。
+
+#### 遗漏 #5-7: 其他非关键项（tp=1 不影响）
+
+| 位置 | 说明 | 是否影响 tp=1 |
+|------|------|:---:|
+| `flashinfer_backend.py` | flashinfer 的确定性 tile size | 否（用 triton 后端） |
+| `flashattention_backend.py` | FA3 的 num_splits=1 | 否（用 triton 后端） |
+| `dsa_backend.py` | DSA 的 num_splits=1 | 否（用 triton 后端） |
+| `attention_backend_handler.py:115` | FA3 后端的 MLA dispatch | 否（用 triton 后端） |
+| `server_args.py` allreduce 相关 | allreduce fusion 禁用 | 否（tp=1） |
+| `server_args.py:4104` NCCL tree | 多 GPU allreduce 算法 | 否（tp=1） |
+
+### 结论
+
+1. **当前 6 个 env vars 覆盖了 `enable_deterministic_inference=True` 中约 80% 的关键行为**
+
+2. **剩余 0.0015 的得分差异** 主要来自：
+   - `truncation_align_size=None` — scheduler 不被对齐约束，batch composition 随机变化（**最大因素**）
+   - 还有极少 CUDA graph / seed 等残留差异
+
+3. **即使完全模拟 `enable_deterministic_inference=True`，理论上的 gsm8k 得分差异也可能无法完全消除**，因为 load 导致的 GPU 资源争抢会影响 batch 形成的时间窗口（哪些请求被分到同一个 batch），而不同 batch composition 的**浮点累积顺序**即使在使用 batch-invariant matmul 时也会有微小差异（0.001 量级的得分差异在标准差的范围内）。
+
+4. **对于 tp=1 + triton backend 的配置**，还有以下 env var 可以补充模拟：
+   - `SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE=4096` — 模拟 truncation_align_size
+   - `SGLANG_ENABLE_DETERMINISTIC_INFERENCE=1` — 模拟全部 env var 层面的确定性行为
