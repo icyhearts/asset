@@ -11374,3 +11374,210 @@ if os.getenv("SGLANG_FORCE_DISABLE_PIECEWISE_CUDA_GRAPH", "") == "1":
 ```
 
 这样可以通过 `SGLANG_FORCE_DISABLE_PIECEWISE_CUDA_GRAPH=1` 单独控制 PCG，与其他确定性环境变量组合使用，观察 PCG 自身对 batch-invariant 结果的净影响。
+
+---
+
+## Section 20: Piecewise CUDA Graph 与 Regular CUDA Graph 的关系和区别
+
+### 20.1 SGLang 中 CUDA Graph 的三层架构
+
+SGLang 有**三种** CUDA graph runner，外加 eager（无 graph）兜底路径：
+
+```
+                    SGLang Model Forward
+                           │
+                    forward_mode?
+                    ┌───────┴────────┐
+                    │                │
+              DECODE              EXTEND/PREFILL
+                    │                │
+              ┌─────┴─────┐    ┌────┴────────────────┐
+              │ Regular   │    │ Piecewise or         │
+              │ CUDA Graph│    │ Breakable CUDA Graph │
+              └───────────┘    └─────────────────────┘
+              CudaGraphRunner  ┌──────────┬───────────┐
+                               │Piecewise │Breakable  │
+                               │CudaGraph │CudaGraph  │
+                               │Runner    │Runner     │
+                               └──────────┴───────────┘
+```
+
+| Runner | 文件 | 用于 | `torch.compile` |
+|---|---|---|---|
+| `CudaGraphRunner` | `cuda_graph_runner.py` | DECODE | 可选 |
+| `PiecewiseCudaGraphRunner` | `piecewise_cuda_graph_runner.py` | EXTEND（默认） | 必须 |
+| `BreakableCudaGraphRunner` | `breakable_cuda_graph_runner.py` | EXTEND（实验性） | 不用 |
+
+### 20.2 Regular CUDA Graph（CudaGraphRunner）
+
+#### 核心思想：一次捕获 = 一整次模型前向
+
+```python
+# cuda_graph_runner.py:1108-1115
+def capture_one_batch_size(self, bs, forward, ...):
+    graph = self._create_device_graph()   # 一个 torch.cuda.CUDAGraph
+
+    def run_once():
+        return forward(input_ids, positions, forward_batch)  # 整个模型前向！
+
+    # 2 次预热
+    for _ in range(2):
+        run_once()
+
+    # 捕获：record 整个 forward 的所有 kernel
+    out = self._capture_graph(graph, pool, stream, run_once)
+    return graph, out  # 一个 graph 对 一个 batch_size
+```
+
+#### 关键特征
+
+| 特征 | 值 |
+|---|---|
+| **图的粒度** | **1 个 graph = 整个模型 1 次 forward** |
+| **变化维度** | **batch_size**（如 1, 2, 4, 8, ..., 256） |
+| **每个 token 数** | 固定 `num_tokens_per_bs = 1`（每个请求 1 token） |
+| **forward mode** | 始终 DECODE |
+| **捕获时的 bs** | 实际 batch_size（如捕获 bs=8 就用 8 个请求） |
+| **graph 数量** | = 捕获的 batch_size 数量（如 20 个 bs → 20 个 graph） |
+| **torch.compile** | 可选（`--enable-torch-compile`），仅用于 kernel fusion |
+
+#### Replay 策略
+
+```python
+# cuda_graph_runner.py:1190-1193
+index = bisect.bisect_left(self.capture_bs, forward_batch.batch_size)
+bs = self.capture_bs[index]  # padding batch size UP
+# 例如：实际 bs=7 → 取 bs=8 的 graph，多余的 1 个 slot 用 sentinel 填充
+```
+
+Regular CUDA graph 的本质是 **"用 batch_size 查表，replay 整个模型的 CUDA graph"**。
+
+### 20.3 Piecewise CUDA Graph（PiecewiseCudaGraphRunner）
+
+#### 核心思想：torch.compile 拆分模型 → 每个子图一个 CUDA graph
+
+```python
+# piecewise_cuda_graph_runner.py:171-354 (__init__ 完整生命周期)
+
+# Step 1: patch 模型，用 torch.compile 编译
+install_torch_compiled(model, fullgraph=True, backend=SGLangBackend)
+
+# Step 2: SGLangBackend 内部（backend.py:222-265）:
+#   - Dynamo 追踪整个 forward → 得到 FX Graph
+#   - 在 split_ops (如 MoE dispatch) 处切割 FX Graph
+#   - 每个切割出的子图 = 一个独立的编译单元
+
+# Step 3: 每个子图由 CUDAPiecewiseBackend 管理
+#   - 先 torch.compile 编译子图（general shape）
+#   - 再为每个 capture token 数捕获一个 torch.cuda.CUDAGraph
+```
+
+#### 关键特征
+
+| 特征 | 值 |
+|---|---|
+| **图的粒度** | **1 个 graph = 1 个模型子图（约 1 层）** |
+| **变化维度** | **token 数**（如 4, 8, 16, ..., 4096） |
+| **每个 bs** | 固定 `bs = 1`（捕获时始终 batch_size=1） |
+| **forward mode** | 始终 EXTEND |
+| **graph 数量** | = 子图数 × 捕获 token 数（如 32 层 × 30 sizes ≈ 960 graph） |
+| **torch.compile** | **必须**（用于 FX 追踪、图切割、子图编译） |
+
+#### Replay 策略
+
+```python
+# piecewise_cuda_graph_runner.py:652-654
+num_tokens = len(forward_batch.input_ids)
+index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+static_num_tokens = self.capture_num_tokens[index]
+# 例如：实际 66 tokens → 取 80-token graph，不足部分 zero-pad
+```
+
+Replay 时逐个子图 replay 其 CUDA graph，中间通过 split-op（如 MoE dispatch）的连接点传递数据。
+
+### 20.4 Breakable CUDA Graph
+
+实验性变体，**不使用 `torch.compile`**，直接在 attention 层边界切断 CUDA graph：
+
+```
+                           Regular                     Piecewise                  Breakable
+                          ──────────                 ────────────               ────────────
+模型 → [One Big Graph]    model → [Sub0][Split][Sub1]...[SubN]    model → [Seg0][Attn][Seg1]...[SegN]
+                             ▲                              ▲                            ▲
+                         1 graph                      N graphs                     N segments
+                     按 batch_size 查表          torch.compile 切分              eager_on_graph 切分
+```
+
+`BreakableCUDAGraph` (`breakable_cuda_graph.py:240-258`)：
+```python
+class BreakableCUDAGraph:
+    def __init__(self):
+        self._segments: list[torch.cuda.CUDAGraph] = []  # 每段一个 graph
+        self._break_fns: list[Callable] = []              # 段之间的 eager 函数
+
+    def replay(self):
+        for i, seg in enumerate(self._segments):
+            seg.replay()                    # replay 一段 graph
+            if i < len(self._break_fns):
+                self._break_fns[i]()        # 执行 eager break（如 attention）
+```
+
+### 20.5 核心对比
+
+| 维度 | Regular CUDA Graph | Piecewise CUDA Graph |
+|---|---|---|
+| **使用场景** | DECODE（每步 1 token/req） | EXTEND/PREFILL（多 token/req） |
+| **变化的是什么** | batch_size（请求数变化） | token 数（每个请求的 prompt 长度变化） |
+| **捕获单位** | 整个模型 1 次 forward | 模型子图（~每层）1 次 forward |
+| **graph 计数** | ~20 个（batch_size 数） | ~960 个（子图 × token sizes） |
+| **为什么需要切割** | 不需要（decode 的 batch_size 有限且固定） | 需要（extend token 数变化大，整图无法覆盖） |
+| **torch.compile** | 可选（kernel fusion） | 必须（FX 追踪 + 图切割） |
+| **确定性** | 高（replay 相同 kernel 启动序列） | 中（torch.compile 可引入差异） |
+| **init 成本** | 低（编译 + ~20 次 graph 捕获） | 高（编译 + ~960 次 graph 捕获） |
+
+### 20.6 为什么 DECODE 用 Regular CUDA Graph，EXTEND 用 Piecewise CUDA Graph？
+
+**DECODE 阶段**每个请求只有 **1 个 token**，变化的只有 batch_size（请求数）。batch_size 的取值范围有限（1-256），所以可以用"一个 graph 对应一个 batch_size"的策略覆盖所有情况。
+
+**EXTEND/PREFILL 阶段**每个请求有 **多个 token**（prompt），总 token 数变化范围极大（从几个到几万个）。如果像 Regular 一样用整图捕获，需要为每个可能的 token 数捕获一个 graph，这会因为 token 数变化范围太大而导致捕获数量爆炸。Solution：用 `torch.compile` + graph splitting 把模型切分成更小的子图，子图可以独立处理不同 token 数（CUDA graph 的 dynamic shape 支持），只在 split-op 处（如 MoE dispatch）断开。
+
+**本质差异**：
+- Regular: "batch_size 维度变化" → 1 graph/bs → 查表后 replay
+- Piecewise: "token 数维度变化" → 需要 flexible 子图 → torch.compile 切分 → 每个子图 1 graph/token_size
+
+### 20.7 两者的关系
+
+```
+Regular CUDA Graph 和 Piecewise CUDA Graph 是互补的，不是替代的：
+
+    ┌─────────────────────────────────────────────────┐
+    │              SGLang Model Runner                │
+    │                                                 │
+    │  forward() {                                    │
+    │    if is_decode():                              │
+    │      try Regular CUDA Graph  ──► CudaGraphRunner│
+    │      else eager                                 │
+    │    elif is_extend():                            │
+    │      try Piecewise CUDA Graph ──► Piecewise...  │
+    │      else eager                                 │
+    │  }                                              │
+    └─────────────────────────────────────────────────┘
+```
+
+两者**共享同一全局 CUDA memory pool**（`global_graph_memory_pool`），但**不在同一 forward 调用中同时存在**：一个请求的 forward 要么走 DECODE（regular graph），要么走 EXTEND（piecewise graph）。
+
+一个完整的生成流程中：
+1. 用户提交 prompt → 第一次 forward = EXTEND → 走 Piecewise CUDA Graph（或 eager）
+2. 之后每生成一个 token → DECODE → 走 Regular CUDA Graph（或 eager）
+3. 如果 batch 中 mix 了 extend 和 decode → MIXED mode → 走 eager forward（PCG 也处理 MIXED，但会先 normalize 为 EXTEND）
+
+### 20.8 对 batch-invariant 和确定性的影响
+
+| | Regular CUDA Graph | Piecewise CUDA Graph |
+|---|---|---|
+| **batch-invariant** | 高（相同 model, 相同 bs → 相同 graph → 相同 replay） | 中（相同 token 数 → 相同 graph，但 torch.compile 重编译可能引入差异） |
+| **run-to-run 确定性** | 高（相同 graph replay） | 高（子图 replay 也是确定的） |
+| **batch-to-batch 确定性** | 取决于 padding 和 attention mask | 取决于 token ceiling 和 torch.compile |
+| **与 `enable_deterministic_inference` 的关系** | Regular graph 不受影响（非 deterministic 也会用） | **deterministic 时被强制禁用**（`disable_piecewise_cuda_graph=True`） |
+
+**关键点**：Regular CUDA graph 和 Piecewise CUDA graph 都会在 `enable_deterministic_inference=True` 时受到影响——Piecewise 被直接禁用，Regular 虽然仍然启用但 attention/kv_split/ops/sampling 等都受确定性控制。对 Regular CUDA graph 而言，graph 的 replay 机制本身是确定性的，输入的变化才是不确定性的来源。
