@@ -11581,3 +11581,259 @@ Regular CUDA Graph 和 Piecewise CUDA Graph 是互补的，不是替代的：
 | **与 `enable_deterministic_inference` 的关系** | Regular graph 不受影响（非 deterministic 也会用） | **deterministic 时被强制禁用**（`disable_piecewise_cuda_graph=True`） |
 
 **关键点**：Regular CUDA graph 和 Piecewise CUDA graph 都会在 `enable_deterministic_inference=True` 时受到影响——Piecewise 被直接禁用，Regular 虽然仍然启用但 attention/kv_split/ops/sampling 等都受确定性控制。对 Regular CUDA graph 而言，graph 的 replay 机制本身是确定性的，输入的变化才是不确定性的来源。
+
+---
+
+## 附录 A: MXFP6 Quantization Kernel — Normal/Denormal 处理详解
+
+### A.1 背景：MX 格式的 FP6 子格式(Subnormal)表示
+
+SIMO 的 MX 量化使用**块内共享指数**(block-wise shared exponent) 策略：
+- 将输入 tensor 按 `block_size=32` 分组
+- 每组内所有元素共享一个 **E8M0 scale** (8bit 无偏移指数)
+- 组内每个元素用 `ebits+mbits` 位的子格式(subnormal)表示
+
+以 **MXFP6_E2M3** (2 指数位 + 3 尾数位 = 5 个幅值位 + 1 符号位 = 6 bit) 为例：
+
+```
+MXFP6_E2M3 的 5 个幅值位:
+┌──────┬────────────┬──────────────────────────────────┐
+│ Bits │ Biased Exp │ 表示的值 (乘以 2^block_scale)      │
+├──────┼────────────┼──────────────────────────────────┤
+│00000 │     0      │ ±0 (special case)                 │
+│00001 │     0      │ Denormal: 0.125 = 1/8             │
+│00010 │     0      │ Denormal: 0.250 = 2/8             │
+│ ...  │    ...     │ ...                               │
+│00111 │     0      │ Denormal: 0.875 = 7/8             │
+│01000 │     1      │ Normal:   1.000 = 2^0 × 1.000     │
+│01001 │     1      │ Normal:   1.125 = 2^0 × 1.125     │
+│ ...  │    ...     │ ...                               │
+│01111 │     1      │ Normal:   1.875 = 2^0 × 1.875     │
+│10000 │     2      │ Normal:   2.000 = 2^1 × 1.000     │
+│ ...  │    ...     │ ...                               │
+│10111 │     2      │ Normal:   3.750 = 2^1 × 1.875     │
+│11000 │     3      │ Normal:   4.000 = 2^2 × 1.000     │
+│ ...  │    ...     │ ...                               │
+│11110 │     3      │ Normal:   7.500 = 2^2 × 1.875     │
+│11111 │     -      │ Saturation (Inf/NaN)              │
+└──────┴────────────┴──────────────────────────────────┘
+```
+
+关键参数（来自 `_get_mx_format_info`）：
+
+| 参数 | MXFP6_E2M3 | MXFP6_E3M2 |
+|---|---|---|
+| ebits (指数位) | 2 | 3 |
+| mbits (尾数位) | 3 | 2 |
+| EXP_BIAS | `2^(ebits-1)-1 = 1` | `2^(ebits-1)-1 = 3` |
+| max_normal | 7.5 | 28.0 |
+| min_normal | 1.0 | 0.25 |
+
+### A.2 三类值的分支
+
+代码行 458-460 将输入划分为三个互斥区间：
+
+```python
+saturate_mask = x_pos >= max_normal           # 值 ≥ 7.5
+denormal_mask = (x_pos < min_normal) & ~saturate_mask  # 0 < 值 < 1.0
+normal_mask = ~saturate_mask & ~denormal_mask  # 1.0 ≤ 值 < 7.5
+```
+
+```
+0 ──────── Denormal ──────── 1.0 ──── Normal ──── 7.5 ──── Saturate ────→ ∞
+        (使用 Branch 2)            (使用 Branch 3)       (使用默认值 31)
+```
+
+### A.3 Branch 1: Saturation（值 ≥ max_normal）
+
+任何 ≥ 7.5 的值直接映射为 `saturated_val = 31 = 0b11111`（5 幅值位全 1）：
+
+```python
+saturated_val = (1 << (ebits + mbits)) - 1  # = (1 << 5) - 1 = 31
+mx_val = tl.where(normal_mask, normal_vals, saturated_val)
+```
+
+数值例子：8.0 → 31, 100.0 → 31
+
+### A.4 Branch 2: Denormal（0 < 值 < 1.0）—— 核心技巧
+
+Denormal 值（如 0.5, 0.125, 0.75）在 FP32 中已经有 normal 的 exponent field，但在 MXFP6 子格式中它们需要映射到 biased_exp=0，只靠尾数表示。这里使用了一个经典的 **"加法-减法"** 位操作技巧，避免 Triton 中的分支指令。
+
+```python
+# 第 465-469 行
+denorm_exp = (F32_EXP_BIAS - EXP_BIAS) + (F32_MBITS - mbits) + 1
+denorm_mask_int = denorm_exp << F32_MBITS
+denorm_mask_float = denorm_mask_int.to(tl.uint32).to(tl.float32, bitcast=True)
+denormal_x = (x_pos + denorm_mask_float).to(tl.uint32, bitcast=True)
+denormal_x -= denorm_mask_int
+```
+
+#### 为什么 `denorm_exp` 是这个值？
+
+```
+denorm_exp = (127 - 1) + (23 - 3) + 1 = 126 + 20 + 1 = 147
+```
+
+- `F32_EXP_BIAS - EXP_BIAS = 126`：补偿 FP32 bias(127) 和 MXFP6 bias(1) 的差异
+- `F32_MBITS - mbits = 20`：保证 FP32 尾数的 LSB 对齐 MXFP6 尾数的最低位
+- `+ 1`：补偿 denormal 隐含前导位（0 而非 normal 的 1）
+
+`denorm_mask_float` 对应的 FP32 值为 `2^(147-127) = 2^20 = 1,048,576`。在这个数量级上，FP32 尾数的 LSB = `2^(147-127-23) = 2^(-3) = 0.125`，**恰好等于 MXFP6_E2M3 的最小 denormal 值**，也正好是 MXFP6 尾数的粒度（3 个尾数位对应 8 个 bin）。
+
+#### 具体数值例子
+
+**例子 1: x = 0.5**
+```
+0.5 + 1,048,576.0 = 1,048,576.5
+
+FP32 表示: 1,048,576.5 = 2^20 + 4 × 2^(-3)
+  0x49800000 + 4 = 0x49800004
+
+bitcast → 0x49800004
+减 denorm_mask_int(0x49800000) → 4
+
+MXFP6 编码: 4 = 0b00100
+  mantissa bits = 100₂ = 4/8 = 0.5
+  biased_exp = 0 (denormal)
+  值 = 2^0 × 0.5 = 0.5  ✓
+```
+
+**例子 2: x = 0.125**
+```
+0.125 + 1,048,576.0 = 1,048,576.125
+
+FP32: 0x49800000 + 1 = 0x49800001
+减后 → 1
+
+MXFP6 编码: 1 = 0b00001
+  mantissa = 001₂ = 1/8 = 0.125
+  值 = 2^0 × 0.125 = 0.125  ✓
+```
+
+**例子 3: x = 0.875**
+```
+0.875 + 1,048,576.0 = 1,048,576.875
+
+FP32: 0x49800000 + 7 = 0x49800007
+减后 → 7
+
+MXFP6 编码: 7 = 0b00111
+  mantissa = 7/8 = 0.875
+  值 = 2^0 × 0.875 = 0.875  ✓
+```
+
+**例子 4: x = 0.3（不可精确表示，需要舍入）**
+```
+二进制 0.3 ≈ 0.0100110011...₂
+在 3-bit 精度下: 0.3/0.125 = 2.4 → 舍入到 2
+
+0.3 + 2^20 → float32 加法自动完成 round-to-nearest-even
+  (FP32 的 LSB = 0.125，0.3 离 0.25 比离 0.375 更近)
+减后 → 2
+
+MXFP6 编码: mantissa = 2/8 = 0.25
+  量化误差: 0.3 → 0.25  ← 这是一个不可精确表示值被舍入的例子
+```
+
+### A.5 Branch 3: Normal（1.0 ≤ 值 < 7.5）—— 舍入到最近偶数
+
+```python
+# 第 472-478 行
+magic_adder = (1 << (F32_MBITS - mbits - 1)) - 1
+val_to_add = ((EXP_BIAS - F32_EXP_BIAS) << F32_MBITS) + magic_adder
+x_pos_u32 = x_pos.to(tl.uint32, bitcast=True)
+mant_odd = (x_pos_u32 >> (F32_MBITS - mbits)) & 1
+normal_x_u32 = x_pos_u32 + val_to_add
+normal_x_u32 += mant_odd
+normal_vals = normal_x_u32 >> (F32_MBITS - mbits)
+```
+
+对于 MXFP6_E2M3：
+- `magic_adder = (1 << 19) - 1 = 0x7FFFF`（加 0.5 ULP 用于 round-to-nearest）
+- `val_to_add = ((1-127) << 23) + 0x7FFFF`（调整指数偏置 + 舍入常数）
+- `F32_MBITS - mbits = 20`（需要截取高 3 位尾数）
+
+`val_to_add` 同时做了两件事：
+1. `(EXP_BIAS - F32_EXP_BIAS) << F32_MBITS`：把 FP32 的 exponent bias 从 127 调整到 MXFP6 的 1
+2. `+ magic_adder`：加上 0.5 ULP 实现 round-to-nearest
+
+`mant_odd` 处理**舍入到最近偶数**（round-to-nearest-even）：当值恰好位于两个可表示值的正中间时（0.5 ULP），检查当前尾数最低位：为奇数则 +1 使结果变偶数。
+
+#### 具体数值例子
+
+**例子 5: x = 3.5（精确可表示）**
+```
+FP32: 3.5 = 0x40600000
+mant_odd: (0x40600000 >> 20) & 1 = 0x0406 & 1 = 0
+
+normal_x_u32 = 0x40600000 + val_to_add + 0
+shift right 20 → 22
+
+22 = 0b10110
+  biased_exp = 10₂ = 2, actual_exp = 2 - 1 = 1
+  mantissa = 110₂ = 6/8 = 0.75
+  值 = 2^1 × (1 + 0.75) = 2 × 1.75 = 3.5  ✓
+```
+
+**例子 6: x = 5.0（正常可表示）**
+```
+FP32: 5.0 = 0x40A00000
+mant_odd: (0x40A00000 >> 20) & 1 = 0x040A & 1 = 0
+
+经过加法 + shift → 28
+
+28 = 0b11100
+  biased_exp = 11₂ = 3, actual_exp = 3 - 1 = 2
+  mantissa = 100₂ = 4/8 = 0.5
+  值 = 2^2 × (1 + 0.5) = 4 × 1.5 = 6.0
+
+  原值 5.0 → 量化到 6.0，误差 = 1.0
+  这是因为 5.0 不是 MXFP6_E2M3 的可表示值
+  可表示值为: 4.0 和 6.0，5.0 更接近 6.0
+```
+
+**例子 7: x = 2.25（精确可表示）**
+```
+FP32: 2.25 = 0x40100000
+
+经过加法 + shift → 18
+
+18 = 0b10010
+  biased_exp = 10₂ = 2, actual_exp = 2 - 1 = 1
+  mantissa = 010₂ = 2/8 = 0.25
+  值 = 2^1 × (1 + 0.25) = 2 × 1.25 = 2.5
+
+  原值 2.25 → 量化到 2.5，误差 = 0.25
+  2.25 不可精确表示，mxFP6 中最接近的值为 2.0 和 2.5
+  2.25 距离两者等远（0.25），round-to-nearest-even 选 2.5（mantissa 010=even）
+```
+
+### A.6 最终组合
+
+```python
+# 第 481-488 行
+mx_val = tl.where(normal_mask, normal_vals, saturated_val)   # 默认 = 31
+mx_val = tl.where(denormal_mask, denormal_x, mx_val)          # 覆盖 denormal
+
+sign_mask = 1 << (ebits + mbits)                              # = 0x20
+shift_amount = 31 - (ebits + mbits)                            # = 26
+final_sign_bit = (signs >> shift_amount) & sign_mask
+quant_values = (mx_val.to(tl.uint8) | final_sign_bit.to(tl.uint8))
+```
+
+最终每个元素的 6-bit 表示为 `[1 bit sign][5 bit magnitude]`，存储在 uint8 中（高 2 位为零）。4 个 FP6 元素（共 24 bit）后续被 packed 为 3 个 uint8。
+
+**汇总示例：**
+
+| 输入 x | 分支 | 内部值 | MXFP6 bit 表示 | 反量化值 | 误差 |
+|---|---|---|---|---|---|
+| 100.0 | Saturate | 31 | `0b111111` | 7.5 | 大 |
+| 8.0 | Saturate | 31 | `0b111111` | 7.5 | 0.5 |
+| 7.0 | Normal | 28 | `0b111100` | 6.0 | 1.0 |
+| 3.5 | Normal | 22 | `0b101110` | 3.5 | 0 |
+| 1.0 | Normal | 8 | `0b101000` | 1.0 | 0 |
+| 0.875 | Denormal | 7 | `0b000111` | 0.875 | 0 |
+| 0.5 | Denormal | 4 | `0b000100` | 0.5 | 0 |
+| 0.3 | Denormal | 2 | `0b000010` | 0.25 | 0.05 |
+| 0.125 | Denormal | 1 | `0b000001` | 0.125 | 0 |
+| 0.0 | Denormal | 0 | `0b000000` | 0.0 | 0 |
