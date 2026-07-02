@@ -7,7 +7,7 @@ SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_ke
   --mem-fraction-static 0.7 \
    --cuda-graph-max-bs 16 \
   --log-level debug \
-  --tp 8 \
+  --tp 4 \
   --moe-runner-backend marlin \
   --speculative-algorithm EAGLE \
   --speculative-num-steps 3 \
