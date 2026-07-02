@@ -8960,3 +8960,238 @@ DSA 特有函数的真正调用条件是：当前 attention backend 必须能提
 所以本次调用条件没有触发的直接原因是：`attention_backend="triton"` 让 active backend 变成 `TritonAttnBackend`；`TritonAttnBackend.get_indexer_metadata` 走基类默认返回 `None`；`Indexer.forward_cuda` 因 metadata 为 `None` 提前返回；因此不会读写 `DSATokenToKVPool.index_k_with_scale_buffer`，也就看不到任何 `DSATokenToKVPool` 的 indexer buffer 特有函数调用。
 
 如果想验证这些函数被调用，应去掉显式 `"attention_backend": "triton"`，让 DeepSeek V3.2 默认选择 `attention_backend="dsa"`，或者显式设置 `"attention_backend": "dsa"`。这时 `DeepseekSparseAttnBackend.init_forward_metadata` 会准备 DSA metadata，见 `python/sglang/srt/layers/attention/dsa_backend.py:419 DeepseekSparseAttnBackend.init_forward_metadata` 到 `python/sglang/srt/layers/attention/dsa_backend.py:456 DeepseekSparseAttnBackend.init_forward_metadata`；随后 `get_indexer_metadata` 不再返回 `None`，`Indexer` 才会继续执行 index cache 的写入和 topk 读取逻辑。
+
+## 2026-07-02 `_downcast_to_mxfmt.py` 439~488 行的 MXFP6 E2M3 normal/denormal 处理
+
+运行 `python like-useful/test_simo_downcast_upcast.py -m 16 -k 1024` 时，默认配置文件是 `simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w6a6_mxfp.json`，其中 `weight.dtype` 是 `mxfp6_e2m3`。测试脚本读取的是 weight spec，所以这里会走 `MX_FORMAT_ID == MXFP6_E2M3` 这条分支。
+
+这段代码的位置在 `simo/ops/kernels/downcast/_downcast_to_mxfmt.py:439` 到 `simo/ops/kernels/downcast/_downcast_to_mxfmt.py:488`。它处理的不是原始 bf16/fp32 tensor，而是前面已经乘过 block quant scale 之后的 `quant_tensor`。也就是说，这里负责把一个已经缩放到 FP6 表示范围附近的 fp32 数值，编码成 6-bit 的 E2M3 bit pattern。
+
+MXFP6 E2M3 的格式是：
+
+```text
+bit5:    sign
+bit4-3:  exponent, 2 bits
+bit2-0:  mantissa/fraction, 3 bits
+bias:    1
+```
+
+`_get_mx_format_info(MXFP6_E2M3)` 返回的是：
+
+```text
+max_normal = 7.5
+min_normal = 1.0
+ebits = 2
+mbits = 3
+EXP_BIAS = 1
+```
+
+正数的 E2M3 可表示值如下：
+
+```text
+code 0x00: 0
+
+denormal, exponent field = 00:
+0x01 = 0.125
+0x02 = 0.25
+0x03 = 0.375
+0x04 = 0.5
+0x05 = 0.625
+0x06 = 0.75
+0x07 = 0.875
+
+normal, exponent field = 01:
+0x08 = 1.0
+0x09 = 1.125
+0x0a = 1.25
+...
+0x0f = 1.875
+
+normal, exponent field = 10:
+0x10 = 2.0
+0x11 = 2.25
+...
+0x17 = 3.75
+
+normal, exponent field = 11:
+0x18 = 4.0
+0x19 = 4.5
+...
+0x1f = 7.5
+```
+
+负数就是再加上 sign bit `0x20`，例如 `-0.5` 编码为 `0x24`，`-7.5` 编码为 `0x3f`。
+
+439~456 行先取格式常量和符号：
+
+```python
+F32_MBITS, F32_EXP_BIAS = 23, 127
+EXP_BIAS = (1 << (ebits - 1)) - 1
+quant_tensor_u32 = quant_tensor.to(tl.uint32, bitcast=True)
+signs = quant_tensor_u32 & 0x80000000
+x_pos = tl.abs(quant_tensor)
+max_normal = 7.5
+saturated_val = 31
+min_normal = 1.0
+```
+
+对 E2M3 来说，`saturated_val = (1 << (2 + 3)) - 1 = 31 = 0x1f`，也就是正数最大有限值 `7.5` 的 magnitude bits。注意 FP6 E2M3 没有 IEEE 那种 `exp=all ones` 表示 Inf/NaN 的保留规则；`0x1f` 在这里就是普通有限值 `7.5`。
+
+458~460 行把输入按正数幅值分成三类：
+
+```python
+saturate_mask = x_pos >= 7.5
+denormal_mask = x_pos < 1.0 and not saturate
+normal_mask = not saturate and not denormal
+```
+
+因此：
+
+```text
+|x| >= 7.5      -> saturate，最后变成 7.5 或 -7.5
+|x| < 1.0       -> denormal 分支，编码到 0, 0.125, ..., 0.875，也可能舍入到 1.0
+1.0 <= |x| < 7.5 -> normal 分支，编码到 1.0 到 7.5 之间的 normal 码
+```
+
+464~469 行是 denormal 分支：
+
+```python
+denorm_exp = (127 - 1) + (23 - 3) + 1 = 147
+denorm_mask_int = 147 << 23
+denorm_mask_float = bitcast_float32(denorm_mask_int) = 2^20
+denormal_x = bitcast_uint32(x_pos + 2^20) - denorm_mask_int
+```
+
+这个写法是一个经典的 float rounding trick。对 E2M3 denormal 来说，目标间隔是 `2^(1 - bias - mbits) = 2^(1 - 1 - 3) = 1/8 = 0.125`。`2^20` 这个 float32 数附近的 ULP 正好是 `2^(20 - 23) = 1/8`。所以把 `x_pos` 加到 `2^20` 上时，float32 加法会按 0.125 的网格做 round-to-nearest-even；再把 `2^20` 的 bit pattern 减掉，就得到 denormal 的整数 mantissa code。
+
+一些 denormal 例子：
+
+```text
+x_pos = 0.0      -> code 0x00 -> 0
+x_pos = 0.0625   -> code 0x00 -> 0       # 0 和 0.125 的正中间，ties-to-even 到 0
+x_pos = 0.09375  -> code 0x01 -> 0.125
+x_pos = 0.125    -> code 0x01 -> 0.125
+x_pos = 0.1875   -> code 0x02 -> 0.25    # 0.125 和 0.25 的正中间，ties-to-even 到 code 2
+x_pos = 0.5      -> code 0x04 -> 0.5
+x_pos = 0.875    -> code 0x07 -> 0.875
+x_pos = 0.9375   -> code 0x08 -> 1.0     # denormal 分支可以舍入到最小 normal
+x_pos = 0.999    -> code 0x08 -> 1.0
+```
+
+这里最容易漏掉的是：`denormal_mask` 是 `x_pos < min_normal`，但是 denormal 分支算出来的 code 可以是 `0x08`。`0x08` 已经是最小 normal `1.0`，这是注释里 “conversion to denormal as well as rounding up to normal” 的意思。
+
+471~478 行是 normal 分支：
+
+```python
+magic_adder = (1 << (23 - 3 - 1)) - 1
+val_to_add = ((1 - 127) << 23) + magic_adder
+x_pos_u32 = bitcast_uint32(x_pos)
+mant_odd = (x_pos_u32 >> (23 - 3)) & 1
+normal_x_u32 = x_pos_u32 + val_to_add
+normal_x_u32 += mant_odd
+normal_vals = normal_x_u32 >> (23 - 3)
+```
+
+这几行一次性做两件事。
+
+第一，`((EXP_BIAS - F32_EXP_BIAS) << 23)` 把 fp32 的 exponent bias 127 转成 E2M3 的 bias 1。第二，`magic_adder + mant_odd` 实现把 fp32 mantissa 舍入到 3 个 mantissa bit，而且是 round-to-nearest-even。`mant_odd` 是保留下来的最低一位 mantissa bit；在刚好半 ULP 的 tie 场景下，它决定是向上还是保持，从而让结果的最低保留位为偶数。
+
+一些 normal 例子：
+
+```text
+x_pos = 1.0     -> code 0x08 -> 1.0
+x_pos = 1.0625  -> code 0x08 -> 1.0      # 1.0 和 1.125 的中点，ties-to-even 到 code 8
+x_pos = 1.0626  -> code 0x09 -> 1.125
+x_pos = 1.125   -> code 0x09 -> 1.125
+x_pos = 1.1875  -> code 0x0a -> 1.25     # 1.125 和 1.25 的中点，ties-to-even 到 code 10
+x_pos = 1.5     -> code 0x0c -> 1.5
+x_pos = 1.875   -> code 0x0f -> 1.875
+x_pos = 2.0     -> code 0x10 -> 2.0
+x_pos = 2.25    -> code 0x11 -> 2.25
+x_pos = 3.75    -> code 0x17 -> 3.75
+x_pos = 4.0     -> code 0x18 -> 4.0
+x_pos = 4.25    -> code 0x18 -> 4.0      # 4.0 和 4.5 的中点，ties-to-even 到 code 24
+x_pos = 4.5     -> code 0x19 -> 4.5
+x_pos = 7.0     -> code 0x1e -> 7.0
+x_pos = 7.25    -> code 0x1e -> 7.0      # 7.0 和 7.5 的中点，ties-to-even 到 code 30
+x_pos = 7.49    -> code 0x1f -> 7.5
+```
+
+480~482 行合并三条路径：
+
+```python
+mx_val = tl.where(normal_mask, normal_vals, saturated_val)
+mx_val = tl.where(denormal_mask, denormal_x, mx_val)
+```
+
+也就是默认先给 `saturated_val = 0x1f`，normal 元素替换成 `normal_vals`，denormal 元素再替换成 `denormal_x`。所以 saturate 分支没有单独计算，靠默认值完成：
+
+```text
+x_pos = 7.5 -> code 0x1f -> 7.5
+x_pos = 8.0 -> code 0x1f -> 7.5
+x_pos = 100 -> code 0x1f -> 7.5
+```
+
+484~488 行最后把符号放回 6-bit 编码：
+
+```python
+sign_mask = 1 << (2 + 3) = 0x20
+shift_amount = 31 - (2 + 3) = 26
+final_sign_bit = (signs >> 26) & 0x20
+quant_values = mx_val | final_sign_bit
+```
+
+例子：
+
+```text
++0.5 -> magnitude 0x04, sign 0x00 -> 0x04
+-0.5 -> magnitude 0x04, sign 0x20 -> 0x24
++7.5 -> magnitude 0x1f, sign 0x00 -> 0x1f
+-7.5 -> magnitude 0x1f, sign 0x20 -> 0x3f
+```
+
+对 fp32 `inf` 来说，这段局部转换比较明确：
+
+```text
+x_pos = +inf
+saturate_mask = True
+denormal_mask = False
+normal_mask = False
+mx_val = saturated_val = 0x1f
+```
+
+所以：
+
+```text
++inf -> 0x1f -> upcast 后是 +7.5
+-inf -> 0x3f -> upcast 后是 -7.5
+```
+
+对 fp32 `nan` 来说，这段代码没有显式 `isnan` 处理，也没有保留 NaN 的编码。按 IEEE 比较语义，`nan >= 7.5` 是 false，`nan < 1.0` 也是 false，因此：
+
+```text
+saturate_mask = False
+denormal_mask = False
+normal_mask = True
+```
+
+NaN 会落入 normal 分支。随后 normal 分支把 `abs(nan)` 的 fp32 bit pattern 当作整数做 exponent rebias 和 mantissa rounding，最后截成 uint8 并只在后续 pack 时使用低 6 bit。因此 NaN 最终会变成某个有限的 FP6 E2M3 code，而不是 NaN。
+
+以常见的 canonical quiet NaN bit pattern `0x7fc00000` 为例，这段位运算会得到：
+
+```text
++qNaN 0x7fc00000 -> normal_vals = 1036 -> uint8 低位 0x0c -> FP6 code 0x0c -> upcast 后是 +1.5
+-qNaN 0xffc00000 -> magnitude 0x0c，加 sign bit -> FP6 code 0x2c -> upcast 后是 -1.5
+```
+
+如果 NaN payload 不同，结果也可能不同。例如按同样的位级路径：
+
+```text
+NaN bits 0x7fa00000 -> code 0x0e -> +1.75
+NaN bits 0x7fffffff -> code 0x10 -> +2.0
+NaN bits 0x7f800001 -> code 0x0c -> +1.5
+```
+
+所以结论是：`inf` 在这段转换里饱和到最大有限值 `±7.5`；`nan` 没有稳定的语义保证，会由 NaN payload 经过 normal 分支变成某个有限 E2M3 数。并且因为 MXFP6 E2M3 本身没有 NaN/Inf 专用编码，后面的 upcast kernel 也只会把这些 6-bit pattern 解释成有限数。
+
+还有一个上下文 caveat：上面的 NaN/Inf 讨论是针对 439~488 行看到的 `quant_tensor` 元素而言。如果原始输入 tensor 里已经有 NaN/Inf，它还会先参与 263~378 行的 block `max_val` 和 scale 计算；NaN 可能让一个 block 的 scale 也变成 NaN，Inf 也可能通过 scale 计算改变后续 `quant_tensor` 的值。因此端到端行为还要看前面的 observer/scale 分支。但只看 439~488 行这个“fp32 quant_tensor 到 FP6 E2M3 code”的局部转换，规则就是上面这些。
