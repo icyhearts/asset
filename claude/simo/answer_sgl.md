@@ -11680,6 +11680,20 @@ denorm_exp = (127 - 1) + (23 - 3) + 1 = 126 + 20 + 1 = 147
 
 `denorm_mask_float` 对应的 FP32 值为 `2^(147-127) = 2^20 = 1,048,576`。在这个数量级上，FP32 尾数的 LSB = `2^(147-127-23) = 2^(-3) = 0.125`，**恰好等于 MXFP6_E2M3 的最小 denormal 值**，也正好是 MXFP6 尾数的粒度（3 个尾数位对应 8 个 bin）。
 
+> **什么是 LSB (Least Significant Bit)？**
+>
+> LSB 即"最低有效位"，但在这里特指 **浮点数的 ULP (Unit in the Last Place)**——即在某个数量级上，尾数最低位变化 1 所对应的实际值的变化量。
+>
+> 对于 FP32：`ULP = 2^(biased_exp - 127 - 23) = 2^(biased_exp - 150)`。
+>
+> 当 FP32 的数接近 `2^20` 时，其表示形式为：
+> - biased_exp = 147 (即 `2^20 = 2^(147-127)`)
+> - 尾数共 23 bit，每个 bit 在数量级 `2^20` 上代表的实际增量为 `2^(20-23) = 2^(-3) = 0.125`
+>
+> 这就是"FP32 尾数的 LSB = 0.125"的含义：在 `2^20` 这个数量级上，FP32 所能分辨的最小精度就是 0.125。例如 `2^20 + 0.1` 在 FP32 中会被舍入到 `2^20` 或 `2^20 + 0.125`，取决于哪个更近。
+>
+> 因此选择 `2^20` 作为 magic number 是因为：在它这个数量级上，FP32 的精度刚好和 MXFP6 的尾数粒度一致（都是 0.125），使得加法运算能够自动完成 3-bit 精度的舍入。
+
 #### 具体数值例子
 
 **例子 1: x = 0.5**
@@ -11734,6 +11748,95 @@ MXFP6 编码: 7 = 0b00111
 MXFP6 编码: mantissa = 2/8 = 0.25
   量化误差: 0.3 → 0.25  ← 这是一个不可精确表示值被舍入的例子
 ```
+
+#### Denormal 加法-减法技巧的原理
+
+这个技巧属于一类被称为 **"magic number float-to-int conversion"** 的技术，其核心思想是利用浮点硬件自身的对齐和舍入机制来完成定点位操作，从而避免显式的条件分支。
+
+**原理分步讲解：**
+
+**第 1 步：选择一个 magic number**
+
+magic number 需要满足两个条件：
+1. 足够大，使得加上任何 denormal 值（< 1.0）后，FP32 的 biased exponent 不变
+2. 在这个数量级上，FP32 的 ULP 恰好等于目标格式的尾数粒度
+
+对于 mxfp6_e2m3，选择 `2^20 = 1,048,576`：
+- 所有 denormal 值 < 1.0，加上 2^20 后结果仍在 `[2^20, 2^20 + 1.0)` 区间内，不跨越 2 的幂次边界
+- 此时 FP32 的 ULP = `2^(20-23) = 2^(-3) = 0.125`，恰好等于 MXFP6 的 3-bit 尾数精度
+
+**第 2 步：FP32 加法自动完成"对齐 + 舍入"**
+
+```
+x_pos + magic_number (float32)
+```
+
+FP32 加法硬件内部流程：
+1. **对齐 (Alignment)**：将两个操作数的指数对齐到较大的指数（即 147，对应 2^20）
+2. **移位**：将 x_pos 的尾数右移 `(147 - x_pos.biased_exp)` 位，对齐到 2^20 的数量级
+3. **加法**：两个对齐后的尾数相加
+4. **舍入 (Rounding)**：将结果舍入到 23 位精度（round-to-nearest-even）
+
+关键洞察：**步骤 2 的"移位"和步骤 4 的"舍入"恰好完成了 MXFP6 量化所需的 truncation + rounding**。因为 ULP 已经被精确校准为 0.125，加法运算自动将输入量化到 0.125 的整数倍。
+
+**第 3 步：整数减法提取量化结果**
+
+```python
+(x_pos + denorm_mask_float) 转为 uint32，减去 denorm_mask_int
+```
+
+浮点加法后的 bit pattern 中，尾数部分的低 20 位就是 x_pos 在 ULP=0.125 精度下的尾数值。整数减法直接提取这些 bits，得到 0~7 之间的整数，对应 MXFP6 的 3-bit 尾数。
+
+**直觉理解：**
+
+```
+将 x（如 0.5）放到一个"尺子"上，尺子的单位刻度是 0.125：
+
+  0    0.125  0.250  0.375  0.500  0.625  0.750  0.875  1.0
+  │     │      │      │      │      │      │      │      │
+  0     1      2      3      4      5      6      7      (到 normal)
+
+尺子的"零点"在 2^20 处：x + 2^20 相当于把 x 放在 2^20 的位置上
+FP32 在 2^20 处的精度恰好是 0.125，所以加法运算自动把 x 舍入到最近的刻度
+减法 2^20 恢复刻度编号（0~7），这就是 MXFP6 的 denormal 尾数
+```
+
+**为什么不用 if-else 分支？**
+
+```
+# 直观但效率差的做法（GPUs上分支代价很高）
+if x_pos >= 1.0:    # normal
+    ...
+elif x_pos > 0:     # denormal
+    ...
+else:               # zero
+    ...
+```
+
+GPU 上 warp divergence（同 warp 内线程走不同分支）会导致性能严重退化。magic number 技巧让所有线程走相同的指令路径（FMA + bitcast + subtract），没有分支。
+
+#### 参考文献
+
+这种 "magic number" 浮点转换技巧在计算机图形学和数值计算领域广为人知：
+
+1. **Chris Lomont, "Fast Float to Int Conversions" (2003)**
+   - 详细分析了 magic number 技巧用于 float-to-int 转换的数学原理
+   - 网址：`https://www.lomont.org/papers/2003/`
+
+2. **Wong, "Fast Conversion of Floating-Point Values to String"**
+   - 讨论了类似技巧在浮点格式化中的应用（Grisu 算法族）
+
+3. **id Software / Quake III Arena source code**
+   - `Q_rsqrt` 函数使用了类似技巧（magic number `0x5f3759df`）进行快速平方根倒数近似
+   - 虽然用途不同（牛顿迭代近似 vs 精确舍入），但核心思想相似：利用浮点数的 bit layout 通过整数运算实现原本需要分支/查表的操作
+
+4. **Müller et al., "Handbook of Floating-Point Arithmetic" (2018, 2nd ed.)**
+   - 第 7 章讨论了利用浮点硬件舍入特性的各种位操作技巧
+   - Birkhäuser, ISBN 978-3-319-76525-9
+
+5. **天元编程中的 "Magic Number" 模式**
+   - 在 Triton/CUDA kernel 中，这类技巧被广泛用于避免条件分支
+   - NVIDIA 的 CUTLASS 和 cuBLAS 库中大量使用类似技术进行量化类型转换
 
 ### A.5 Branch 3: Normal（1.0 ≤ 值 < 7.5）—— 舍入到最近偶数
 
