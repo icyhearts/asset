@@ -12070,6 +12070,22 @@ truncated = (mantissa + 0x40000) >> 20            # 加 0.5 ULP 后截断
 result = (adjusted_exp << 3) | (truncated & 0x7)  # 组合
 ```
 
+> **注意：第 12069 行的 `0x40000` 有误 — 它不等于 0.5 ULP。**
+>
+> 在这个上下文中的 ULP 定义：
+> - 尾数 `mantissa` 是 24-bit 整数（bit 23 = 隐含前导 1，bits 22-0 = FP32 尾数）
+> - `>> 20` 保留高 4-bit（bits 23-20），丢弃低 20-bit（bits 19-0）
+> - **1 ULP** = 保留的最低位 (bit 20) 的权重 = **2^20 = 0x100000**
+> - **0.5 ULP** = 2^19 = **0x80000**
+>
+> 而代码中写的是 `0x40000` = 2^18 = **0.25 ULP**，不是 0.5 ULP。
+>
+> 正确值应该是：
+> - `0x80000` — 实现朴素的 "加 0.5 ULP 后截断"（round-to-nearest）
+> - `0x7FFFF` — kernel 实际使用的 `magic_adder` 值，即 0.5 ULP − 1 LSB，配合 `mant_odd` 实现 IEEE 754 round-to-nearest-even
+>
+> 下文第 12114 行已经正确说明了 kernel 的 `magic_adder = 0.5 ULP - 1 LSB = 0x7FFFF`，而这段伪代码中的 `0x40000` 与 kernel 实际行为不一致，注释也有误。
+
 ##### 为什么这一行就能完成偏置调整？
 
 FP32 的 uint32 布局：
