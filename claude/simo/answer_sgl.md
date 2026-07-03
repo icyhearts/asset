@@ -11911,6 +11911,118 @@ FP32: 2.25 = 0x40100000
   2.25 距离两者等远（0.25），round-to-nearest-even 选 2.5（mantissa 010=even）
 ```
 
+#### Normal 加法-减法技巧的原理
+
+与 Denormal 分支的 magic number 原理同源，但 Normal 分支要做的事更多：**一次整数加法同时完成指数偏置调整 + 尾数截断 + round-to-nearest-even**。
+
+##### 核心思想：把三个浮点操作编码为一次 uint32 加法
+
+```python
+# 这一行等价于三个浮点操作：
+normal_x_u32 = x_pos_u32 + val_to_add     # ← 一次 uint32 加法
+               # + mant_odd                 # ← 再修正 round-to-nearest-even 平局
+# 后续:
+normal_vals = normal_x_u32 >> 20           # ← 右移截断
+```
+
+等价地，用浮点语义可以写为：
+```python
+# (仅在概念层面等价，GPU上不能这么做因为有分支)
+biased_exp = (x_pos_u32 >> 23) & 0xFF            # 读 FP32 exponent
+adjusted_exp = biased_exp - 126                   # 偏置 127 → 1
+mantissa = x_pos_u32 & 0x7FFFFF | 0x800000       # 尾数 + 隐含前导 1
+truncated = (mantissa + 0x40000) >> 20            # 加 0.5 ULP 后截断
+result = (adjusted_exp << 3) | (truncated & 0x7)  # 组合
+```
+
+##### 为什么这一行就能完成偏置调整？
+
+FP32 的 uint32 布局：
+
+```
+Bit:  31    30───────────────────────23    22───────────────────────────0
+     [sign] [  biased exponent (8b) ] [        mantissa fraction (23b)  ]
+```
+
+`val_to_add` 中的 `(EXP_BIAS - F32_EXP_BIAS) << 23 = -126 * 2^23`，在 uint32 加法中直接作用于 exponent field：
+
+```
+FP32 3.5:  0 10000000 11000000000000000000000    biased_exp = 128
+         +   11000001 00000111111111111111111    val_to_add 低位部分
+         ─────────────────────────────────
+         = 0 00000001 10100111111111111111111    biased_exp → 128-126 = 2 ✓
+                                             ↑ exponent field 被减去了 126
+```
+
+uint32 加法中的 "borrow/进位" 自动处理了 exponent 和 mantissa 之间的跨字段传播，恰好就是偏置调整的语义等价操作。
+
+##### `magic_adder` 如何实现 round-to-nearest？
+
+```python
+magic_adder = (1 << 19) - 1 = 0x7FFFF
+```
+
+FP32 mantissa 共 23 bit。MXFP6_E2M3 只需要保留高 3 bit（bit 22-20），丢弃低 20 bit（bit 19-0）。
+
+`0x7FFFF` = 低 19 bit 全为 1（bit 18-0），相当于给要丢弃的低 20 bit 加了 `01111111111111111111`。效果：
+
+- 如果被丢弃部分 ≥ `100...0`（即 ≥ 0.5 ULP）：加法产生进位到保留位 → **向上舍入**
+- 如果被丢弃部分 < `011...1`（即 < 0.5 ULP）：无进位 → **向下舍入（截断）**
+
+```
+原始 mantissa bits:  [保留的 3b][xxxxx yyyyyyyyyyyyyyyy]
+                                     ↑ 要丢弃的 20b
+magic_adder bits:    000000000000000[1111111111111111111]
+                                     ↑ 18 个 1（bit 0-18）
+                                     ↑ bit 19 = 0
+
+magic_adder = 0.5 ULP - 1 LSB = 2^19 - 1 = 0x7FFFF
+```
+
+这种模式等价于 "加 0.5 ULP 后截断" = round-to-nearest。
+
+##### `mant_odd` 的平局处理
+
+```python
+mant_odd = (x_pos_u32 >> 20) & 1    # 截断后的 mantissa 最低位
+normal_x_u32 += mant_odd            # 若为奇数，再 +1（round to even）
+```
+
+| 场景 | 尾数最低位 | mant_odd | 效果 |
+|---|---|---|---|
+| 距上/下不等远 | 0 或 1 | - | 由 magic_adder 的 round-to-nearest 决定 |
+| 恰好等远（0.5 ULP） | 奇数（1） | 1 | 再加 1 → 进位使结果变偶数 |
+| 恰好等远（0.5 ULP） | 偶数（0） | 0 | 不加 → 保持偶数 |
+
+这就是 IEEE 754 标准的 **roundTiesToEven**（Banker's rounding）。
+
+##### 为什么用整数加法而不是 FP32 算术？
+
+```
+// 直观但低效的做法：
+if mantissa_fraction >= 0.5:
+    result = ceil(truncated_value)
+elif mantissa_fraction == 0.5:
+    if result & 1: result += 1  // tie break
+else:
+    result = floor(truncated_value)
+```
+
+GPU 上这段伪代码会产生 warp divergence（同一 warp 内线程走不同分支 → 串行化）。而 `x_pos_u32 + val_to_add + mant_odd; result = >> 20` 是所有线程统一的指令流，无分支。代价是理解难度—但这是 GPU kernel 优化的标准取舍。
+
+##### 直观类比
+
+把 FP32 的 bit pattern 想象成一个刻度尺：
+
+```
+val_to_add 在刻度尺上做了两件事：
+1. 把 0 刻度从 FP32 bias(127) 移到 MXFP6 bias(1) —— 移动刻度尺原点
+2. 在每个刻度（可表示值）的 0.5 处加了一个"倾斜角"
+   —— 使得截断操作自动向最近的刻度舍入
+```
+
+与 Denormal 分支的关系：Denormal 的 `denorm_mask_float` = 2^20 移到了足够大的数量级让 ULP 对齐；Normal 的 `val_to_add` = 偏置调整 + 舍入常数，一步完成所有操作。两者本质上都是"利用浮点硬件的整数表示进行位操作"这一技巧的不同变体。
+
 ### A.6 最终组合
 
 ```python
