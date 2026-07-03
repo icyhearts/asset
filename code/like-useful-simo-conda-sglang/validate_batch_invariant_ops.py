@@ -675,13 +675,14 @@ A_rows_f32 = rbf((ROW_COUNT, K_hidden), seed=42, scale=0.1).float()
 baseline_f32 = A_rows_f32
 
 def transformer_layer_f32(x):
-    h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
+    h = x
+    #h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
     h = torch.mm(h, W_q_f32)
     x = x + h
-    h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
+    #h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
     gate = torch.mm(h, W_gate_f32)
     up = torch.mm(h, W_up2_f32)
-    h = torch.nn.functional.silu(gate) * up
+    #h = torch.nn.functional.silu(gate) * up
     h = torch.mm(h, W_down2_f32)
     return x + h
 
