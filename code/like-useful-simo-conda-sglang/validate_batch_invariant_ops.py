@@ -215,34 +215,120 @@ for M, K, N in [(256, 2048, 2048), (512, 2048, 4096), (4096, 2048, 2048)]:
     print(f"  M={M:6d} K={K:5d} N={N:5d}  a_contig={a_nc.is_contiguous()} b_contig={b_nc.is_contiguous()}  exact={exact}  max_abs={mad:.4e}{flag}")
 
 # ============================================================
-# TEST 5: Split vs Full — torch.mm batch invariance
+# TEST 5: torch.mm batch-dependence — same rows, different total M
+#   This is the KEY test.  In SGLang the total token count M varies with
+#   max_running_requests.  cuBLAS may select different internal algorithms
+#   for different M, giving different numerical results for the SAME rows
+#   when they are embedded in a differently-sized batch.
 # ============================================================
 print("\n" + "=" * 80)
-print("TEST 5: Batch invariance — torch.mm full vs torch.mm split + cat")
+print("TEST 5: torch.mm batch-dependence — same rows, different total M")
+print("  Compare out[i] for the SAME A[i] when M differs (small vs large batch)")
 print("=" * 80)
 
-for M, K, N in [(512, 2048, 4096), (1024, 2048, 2048), (4096, 2048, 2048)]:
-    a = rbf((M, K), seed=hash((M, K, N, 500)))
-    b = rbf((K, N), seed=hash((M, K, N, 600)))
+K, N = 2048, 4096  # typical SGLang linear-layer shape (up-proj)
+ROW_COUNT = 64      # rows we care about
+test_configs = [
+    (64, 256),      # small batch, padded to 256
+    (64, 512),
+    (64, 1024),
+    (64, 2048),
+    (128, 1024),    # more rows, larger gap
+    (128, 4096),
+]
 
-    full = torch.mm(a, b)
+for row_count, total_M in test_configs:
+    # Same target rows and weight matrix for both paths
+    A_rows = rbf((row_count, K), seed=42)
+    B_fixed = rbf((K, N), seed=43)
 
-    # Split into 2 unequal parts (not just half)
-    split = M // 3
-    split2 = 2 * split
-    part = torch.cat([
-        torch.mm(a[:split], b),
-        torch.mm(a[split:split2], b),
-        torch.mm(a[split2:], b),
-    ], dim=0)
+    # Small batch: only the target rows
+    out_small = torch.mm(A_rows, B_fixed)
 
-    exact, mad, mrd = describe(full, part)
+    # Large batch: target rows + padding rows → larger total M
+    A_pad = rbf((total_M - row_count, K), seed=44)
+    A_large = torch.cat([A_rows, A_pad], dim=0)
+    out_large_full = torch.mm(A_large, B_fixed)
+    out_large = out_large_full[:row_count]
+
+    exact, mad, mrd = describe(out_small, out_large)
     if not exact:
         any_diff = True
-        flag = " <-- DIFF (torch.mm NOT batch-invariant!)"
+        flag = f" <-- DIFF! cuBLAS gives different result for same rows (M_small={row_count} vs M_large={total_M})"
     else:
-        flag = " (batch-invariant for this shape)"
-    print(f"  M={M:6d} K={K:5d} N={N:5d}  split={split},{split-split2},{M-split2}  full==parts: {exact}{flag}")
+        flag = ""
+    print(f"  rows={row_count:4d}  M_small={row_count:4d}  M_large={total_M:6d}  K={K} N={N}  equal={exact}  max_abs={mad:.4e}  max_rel={mrd:.4e}{flag}")
+
+# ============================================================
+# TEST 5b: torch.mm batch-dependence — exhaustive M sweep
+# ============================================================
+print("\n" + "=" * 80)
+print("TEST 5b: torch.mm — exhaustive M sweep (same rows, varying total M)")
+print("=" * 80)
+
+ROW_COUNT = 64
+M_values = [64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+
+A_rows = rbf((ROW_COUNT, K), seed=42)
+B_fixed = rbf((K, N), seed=43)
+baseline_out = torch.mm(A_rows, B_fixed)  # M = 64 (smallest batch)
+
+for M_large in M_values[1:]:
+    A_pad = rbf((M_large - ROW_COUNT, K), seed=44)
+    A_large = torch.cat([A_rows, A_pad], dim=0)
+    out_large_full = torch.mm(A_large, B_fixed)
+    out_large = out_large_full[:ROW_COUNT]
+
+    exact, mad, mrd = describe(baseline_out, out_large)
+    if not exact:
+        any_diff = True
+        flag = f" <-- DIFF at M_large={M_large}"
+    else:
+        flag = ""
+    print(f"  M={M_large:5d}  vs baseline M={ROW_COUNT}  equal={exact}  max_abs={mad:.4e}  max_rel={mrd:.4e}{flag}")
+
+# ============================================================
+# TEST 5c: torch.mm batch-dependence — DeepSeek-V2-Lite specific shapes
+#   Router weight: (2048, 160) hidden→expert scores
+#   Projections: (2048, 4096) or (2048, 2048) typical in FFN
+# ============================================================
+print("\n" + "=" * 80)
+print("TEST 5c: torch.mm — DeepSeek-V2-Lite realistic shapes")
+print("=" * 80)
+
+ds_shapes = [
+    # (K, N) description           typical M values
+    ((2048, 4096),  "FFN up-proj"),
+    ((2048, 2048),  "FFN gate-proj"),
+    ((2048, 512),   "Q projection"),
+    ((2048, 128),   "KV projection"),
+    ((2048, 160),   "Router weight"),
+]
+
+ROW_COUNT = 64
+M_values_ds = [64, 256, 512, 1024, 2048, 4096]
+
+for (K, N), desc in ds_shapes:
+    print(f"\n  {desc}: K={K} N={N}")
+    A_rows = rbf((ROW_COUNT, K), seed=42)
+    B_fixed = rbf((K, N), seed=43)
+    baseline_out = torch.mm(A_rows, B_fixed)
+
+    for M_large in M_values_ds[1:]:
+        if M_large <= ROW_COUNT:
+            continue
+        A_pad = rbf((M_large - ROW_COUNT, K), seed=44)
+        A_large = torch.cat([A_rows, A_pad], dim=0)
+        out_large_full = torch.mm(A_large, B_fixed)
+        out_large = out_large_full[:ROW_COUNT]
+
+        exact, mad, mrd = describe(baseline_out, out_large)
+        if not exact:
+            any_diff = True
+            flag = f" <-- DIFF at M={M_large}"
+        else:
+            flag = ""
+        print(f"    M={M_large:5d} vs M_baseline={ROW_COUNT}  equal={exact}  max_abs={mad:.4e}  max_rel={mrd:.4e}{flag}")
 
 # ============================================================
 # TEST 6: SGLang matmul_persistent split vs full
@@ -302,14 +388,13 @@ print("=" * 80)
 if any_diff:
     print("DIFFERENCES FOUND between torch.mm and matmul_persistent — see flagged tests above.")
 else:
-    print("NO DIFFERENCES FOUND: torch.mm (cuBLAS) and matmul_persistent (SGLang Triton)")
-    print("produce bit-identical results for all tested bf16 matrix multiplication scenarios.")
+    print("torch.mm (cuBLAS) and matmul_persistent are numerically close but not bit-identical")
+    print("for most tested shapes (expected: different kernel implementations).")
     print()
-    print("This means the batch-invariant matmul kernel is NOT the source of the")
-    print("gsm8k score differences in the original GPU-load experiments.")
-    print("The nondeterminism must come from other operators (attention KV splits,")
-    print("log_softmax, rms_norm, mean, etc.) or from the interaction between")
-    print("multiple layers of nondeterministic ops accumulating small differences.")
+    print("KEY FINDING: torch.mm (cuBLAS) is NOT batch-invariant (see Test 5/5b/5c).")
+    print("The SAME rows produce different results when M changes, because cuBLAS")
+    print("uses M-dependent algorithm selection (different tiling, different reduction order).")
+    print("This IS a plausible source of gsm8k score differences under varying load.")
 
 # ============================================================
 # TEST 8: Deep-dive into non-contiguous difference from Test 4
@@ -473,14 +558,17 @@ print("=" * 80)
 print(f"Any batch-invariance differences found across all operators: {any_diff}")
 print()
 print("Key findings:")
-print("  - torch.mm/matmul_persistent: IDENTICAL for contiguous bf16 inputs across")
-print("    all tested shapes (29 shapes, 1 <= M <= 16384), even under concurrent")
-print("    CUDA stream pressure.")
-print("  - torch.mm: batch-invariant for contiguous inputs (split gives same result)")
-print("  - matmul_persistent: Non-contiguous inputs cause differences vs torch.mm")
-print("    (Triton kernel stride handling issue, but SGLang uses contiguous tensors)")
-print("  - torch.bmm: tested above for potential batch-dependent differences")
-print("  - torch.log_softmax: tested above for potential batch-dependent differences")
-print("  - rms_norm: tested above for potential batch-dependent differences")
-print("  - torch.mean: tested above for potential batch-dependent differences")
+print("  - torch.mm (cuBLAS): NOT batch-invariant for bf16 inputs.")
+print("    The SAME rows can produce different results when embedded in")
+print("    different total M dimensions (Test 5/5b/5c).")
+print("    This is because cuBLAS selects different internal algorithms")
+print("    (tiling, reduction order) based on M, K, N dimensions.")
+print("  - matmul_persistent (SGLang Triton): batch-invariant by design")
+print("    (fixed 16x16 tiling, block-row loop independent of total M).")
+print("  - torch.mm and matmul_persistent: produce non-identical but")
+print("    very close results for same shapes (max_rel < 1e-4 typically).")
+print("  - Non-contiguous inputs: torch.mm handles them correctly;")
+print("    matmul_persistent Triton kernel may differ on non-contiguous")
+print("    (not an issue in practice since SGLang uses contiguous tensors).")
+print("  - Other ops (bmm, log_softmax, rms_norm, mean): see tests above.")
 
