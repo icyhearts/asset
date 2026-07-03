@@ -11583,6 +11583,141 @@ Regular CUDA Graph 和 Piecewise CUDA Graph 是互补的，不是替代的：
 **关键点**：Regular CUDA graph 和 Piecewise CUDA graph 都会在 `enable_deterministic_inference=True` 时受到影响——Piecewise 被直接禁用，Regular 虽然仍然启用但 attention/kv_split/ops/sampling 等都受确定性控制。对 Regular CUDA graph 而言，graph 的 replay 机制本身是确定性的，输入的变化才是不确定性的来源。
 
 ---
+## 21. validate_batch_invariant_ops.py — aten::mm batch-dependence 验证
+
+### 21.1 背景：GSM8k 实验确认 aten::mm 受 batch size 影响
+
+通过 `lm-eval` 测试 SGLang GSM8k 指标，控制变量实验证明了 `aten::mm` 的 batch-dependence：
+
+| 配置 | max_running_requests | GSM8k 分数 |
+|---|---|---|
+| `SGLANG_BATCH_INVARIANT_OPS_FORCE_SKIP_ATEN_MM=0`（使用 matmul_persistent Triton kernel） | 不同值 | **相同** |
+| `SGLANG_BATCH_INVARIANT_OPS_FORCE_SKIP_ATEN_MM=1`（使用 cuBLAS torch.mm） | 不同值 | **不同** |
+
+结论：**cuBLAS 的 `aten::mm` 是 batch-variant 的** — 在 `max_running_requests` 不同（导致 batch 大小不同）的情况下，cuBLAS 会产生不同的计算结果，最终导致 GSM8k 分数差异。
+
+### 21.2 测试脚本的问题：为什么单层 mm 测不出 batch-dependence？
+
+最初版本的 `like-useful/validate_batch_invariant_ops.py` 测试脚本使用了如下方法：
+
+```python
+# 错误方法：full vs split（拆分计算 vs 全量计算，B 矩阵相同）
+A_full = randn((M, K))
+out_full = torch.mm(A_full, B)
+out_part = torch.cat([torch.mm(A_full[:M//2], B), torch.mm(A_full[M//2:], B)])
+
+# 正确方法：相同行、不同 total M（A 矩阵的部分行相同，B 矩阵相同，total M 不同）
+A_rows = randn((ROW_COUNT, K))    # target rows
+baseline = torch.mm(A_rows, B)    # M=ROW_COUNT（小 batch）
+A_pad = randn((M_large - ROW_COUNT, K))
+A_large = torch.cat([A_rows, A_pad], dim=0)
+out_large = torch.mm(A_large, B)[:ROW_COUNT]  # M=M_large（大 batch）
+# compare baseline vs out_large
+```
+
+- **错误方法**之所以不行：每个输出行仅依赖对应的输入行，拆分后 B 矩阵不变，各行独立计算，cuBLAS 对这个场景天然是 batch-invariant 的
+- **正确方法**：在不同 M 值下计算相同的目标行，cuBLAS 对不同的 M 可能选择不同的内部算法（tiling、reduction order 等），导致结果不同
+
+另外还有一个 bug：Test 2 设置了 `allow_tf32=False` 但未恢复，导致后续测试运行在 TF32=OFF 状态下，使 cuBLAS 比真实的 SGLang 服务器（TF32=ON）更确定性。
+
+### 21.3 测试 5/5b/5c/5d/5e：正确方法下的单层 mm 测试
+
+修正后的测试使用了正确的方法（相同行、不同 total M），测试了：
+
+| 测试 | 内容 | 结果 |
+|---|---|---|
+| Test 5 | `torch.mm(A, B)` 不同 total M | 所有 M 值 bit-identical |
+| Test 5b | Exhaustive M sweep (64→4096) | 所有 M 值 bit-identical |
+| Test 5c | DeepSeek-V2-Lite 真实 shape (FFN, Q/KV, Router) | 所有 M 值 bit-identical |
+| Test 5d | `F.linear` dispatch path | 所有 M 值 bit-identical |
+| Test 5e | Residual-like small amplitudes (1e-1→1e-4) | 所有 M 值 bit-identical |
+
+关键环境设置：
+```python
+torch.backends.cuda.matmul.allow_tf32 = True  # 匹配 SGLang 服务器默认行为
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+```
+
+**发现**：在 bf16→bf16 的单层 mm 中，cuBLAS 对所有 M 值产生 bit-identical 的结果。TF32 内部精度（10-bit mantissa）足够高，使得任何 batch-dependent 的舍入差异都被 bf16 截断掩盖了。
+
+### 21.4 测试 13a/b/c/d：多层 chain 测试（bf16 内部精度）
+
+模拟 transformer 的层层计算：
+
+| 测试 | 内容 | 层数 | 结果 |
+|---|---|---|---|
+| Test 13a | 线性 chain + RMSNorm: `x_{i+1} = RMSNorm(mm(x_i, W))` | 26 | bit-identical |
+| Test 13b | FFN-like residual: `h = h + W_down @ gelu(W_up @ x)` | 16 | bit-identical |
+| Test 13c | 同 13b，逐层跟踪 per-layer divergence | 16 | 所有层 bit-identical |
+| Test 13d | Real server structure: RMSNorm + mm(Q) + residual + RMSNorm + mm(gate/up) + silu*gate + mm(down) + residual | 16 | bit-identical |
+
+**发现**：即使经过 16 层 FFN-like chain 或 26 层线性 chain，所有 bf16 输出仍然是 bit-identical 的。原因：每层 mm 的批量差异在 subt-bf16 level（< 1 bf16 ULP），后续 bf16 截断每次都将其清零，差异无法累积。
+
+### 21.5 测试 13e：Float32 累计 chain — **成功检测 batch-dependence**
+
+关键创新：将层间中间结果保留在 float32，阻止 bf16 截断掩盖 subt-bf16 差异。
+
+```python
+def transformer_layer_f32(x):
+    h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
+    h = torch.mm(h, W_q_f32)                # mm → f32
+    x = x + h                                # residual (f32)
+    h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
+    gate = torch.mm(h, W_gate_f32)           # mm → f32
+    up = torch.mm(h, W_up2_f32)              # mm → f32
+    h = torch.nn.functional.silu(gate) * up  # activation (f32)
+    h = torch.mm(h, W_down2_f32)             # mm → f32
+    return x + h                              # residual (f32)
+```
+
+**结果**：
+```
+M_small=64  M_large=  256  layers=16  equal=False  max_abs=1.1921e-06  <-- DIFF!
+M_small=64  M_large= 1024  layers=16  equal=False  max_abs=1.1921e-06  <-- DIFF!
+M_small=64  M_large= 4096  layers=16  equal=False  max_abs=1.1921e-06  <-- DIFF!
+```
+
+16 层后，相同输入行的输出在 float32 精度下有 `max_abs ~ 1.19e-6` 的差异。`max_rel = 7.16e-1`（71.5%）说明某些元素的绝对值很小（~1e-6），与差距在同一量级。
+
+### 21.6 测试 14：cuBLAS heuristics 检查
+
+测试了不同 CUBLAS_WORKSPACE_CONFIG（`:4096:8`, `:16:8`, `:4096:2`, default）下的单层 mm batch-dependence：所有配置下，所有 M 值都产生 bit-identical 结果。说明单层 cuBLAS heuristics 变更不能触发 batch-dependence。
+
+同时也检查了系统设置：
+```
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+torch.backends.cuda.preferred_blas_library() = _BlasBackend.Cublas
+torch.backends.cudnn.allow_tf32 = True
+```
+
+### 21.7 其他算子的测试
+
+| 算子 | 结果 |
+|---|---|
+| `torch.bmm` (batch matmul) | bit-identical (B=16/32/64/128/256) |
+| `torch._log_softmax` | bit-identical (M=16→4096, D=2048) |
+| `F.rms_norm` | bit-identical (M=16→4096, D=2048) |
+| `torch.mean` | bit-identical (M=16→4096, D=2048) |
+| `matmul_persistent` (SGLang Triton) | batch-invariant by design（固定 16×16 tiling）|
+
+### 21.8 结论与解释
+
+**aten::mm 确实是 batch-variant 的**——这一结论已被 GSM8k 实验和测试 13e 双重验证。
+
+**工作机制**：
+
+1. **单层 mm 的差异在 subt-bf16 级别**：cuBLAS 使用不同的 M-dependent 算法（tiling、reduction order），产生的舍入差异 < 1 bf16 ULP。单层测试中无法检测（bit-identical）。
+2. **bf16 截断掩蔽了差异**：每层 mm 输出的 subt-bf16 差异在存入 bf16 tensor 时被截断清零，无法层间累积。
+3. **Float32 累积暴露了差异**：f32 chain 中 subt-bf16 差异在层间存活并累积，16 层后达到 max_abs ~1e-6。
+4. **在真实 SGLang 服务中**，27 层 × 3-4 mm/层 的更大层数 + autoregressive decode（每个 token 依赖所有之前的 token）会进一步放大差异。Temperature sampling 将微小的 logit 差异转化为不同的 token 选择，导致完全不同的生成轨迹。
+
+**测试脚本验证了**：
+- matmul_persistent（Triton kernel）确实是 batch-invariant 的
+- 用 matmul_persistent 替换 aten::mm 可以消除 GSM8k 中观察到的 batch size 差异
+- `SGLANG_BATCH_INVARIANT_OPS_FORCE_SKIP_ATEN_MM` 环境变量是控制 batch-dependence 的关键开关
+
+---
 
 ## 附录 A: MXFP6 Quantization Kernel — Normal/Denormal 处理详解
 
@@ -12052,138 +12187,3 @@ quant_values = (mx_val.to(tl.uint8) | final_sign_bit.to(tl.uint8))
 | 0.3 | Denormal | 2 | `0b000010` | 0.25 | 0.05 |
 | 0.125 | Denormal | 1 | `0b000001` | 0.125 | 0 |
 | 0.0 | Denormal | 0 | `0b000000` | 0.0 | 0 |
-## 21. validate_batch_invariant_ops.py — aten::mm batch-dependence 验证
-
-### 21.1 背景：GSM8k 实验确认 aten::mm 受 batch size 影响
-
-通过 `lm-eval` 测试 SGLang GSM8k 指标，控制变量实验证明了 `aten::mm` 的 batch-dependence：
-
-| 配置 | max_running_requests | GSM8k 分数 |
-|---|---|---|
-| `SGLANG_BATCH_INVARIANT_OPS_FORCE_SKIP_ATEN_MM=0`（使用 matmul_persistent Triton kernel） | 不同值 | **相同** |
-| `SGLANG_BATCH_INVARIANT_OPS_FORCE_SKIP_ATEN_MM=1`（使用 cuBLAS torch.mm） | 不同值 | **不同** |
-
-结论：**cuBLAS 的 `aten::mm` 是 batch-variant 的** — 在 `max_running_requests` 不同（导致 batch 大小不同）的情况下，cuBLAS 会产生不同的计算结果，最终导致 GSM8k 分数差异。
-
-### 21.2 测试脚本的问题：为什么单层 mm 测不出 batch-dependence？
-
-最初版本的 `like-useful/validate_batch_invariant_ops.py` 测试脚本使用了如下方法：
-
-```python
-# 错误方法：full vs split（拆分计算 vs 全量计算，B 矩阵相同）
-A_full = randn((M, K))
-out_full = torch.mm(A_full, B)
-out_part = torch.cat([torch.mm(A_full[:M//2], B), torch.mm(A_full[M//2:], B)])
-
-# 正确方法：相同行、不同 total M（A 矩阵的部分行相同，B 矩阵相同，total M 不同）
-A_rows = randn((ROW_COUNT, K))    # target rows
-baseline = torch.mm(A_rows, B)    # M=ROW_COUNT（小 batch）
-A_pad = randn((M_large - ROW_COUNT, K))
-A_large = torch.cat([A_rows, A_pad], dim=0)
-out_large = torch.mm(A_large, B)[:ROW_COUNT]  # M=M_large（大 batch）
-# compare baseline vs out_large
-```
-
-- **错误方法**之所以不行：每个输出行仅依赖对应的输入行，拆分后 B 矩阵不变，各行独立计算，cuBLAS 对这个场景天然是 batch-invariant 的
-- **正确方法**：在不同 M 值下计算相同的目标行，cuBLAS 对不同的 M 可能选择不同的内部算法（tiling、reduction order 等），导致结果不同
-
-另外还有一个 bug：Test 2 设置了 `allow_tf32=False` 但未恢复，导致后续测试运行在 TF32=OFF 状态下，使 cuBLAS 比真实的 SGLang 服务器（TF32=ON）更确定性。
-
-### 21.3 测试 5/5b/5c/5d/5e：正确方法下的单层 mm 测试
-
-修正后的测试使用了正确的方法（相同行、不同 total M），测试了：
-
-| 测试 | 内容 | 结果 |
-|---|---|---|
-| Test 5 | `torch.mm(A, B)` 不同 total M | 所有 M 值 bit-identical |
-| Test 5b | Exhaustive M sweep (64→4096) | 所有 M 值 bit-identical |
-| Test 5c | DeepSeek-V2-Lite 真实 shape (FFN, Q/KV, Router) | 所有 M 值 bit-identical |
-| Test 5d | `F.linear` dispatch path | 所有 M 值 bit-identical |
-| Test 5e | Residual-like small amplitudes (1e-1→1e-4) | 所有 M 值 bit-identical |
-
-关键环境设置：
-```python
-torch.backends.cuda.matmul.allow_tf32 = True  # 匹配 SGLang 服务器默认行为
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-```
-
-**发现**：在 bf16→bf16 的单层 mm 中，cuBLAS 对所有 M 值产生 bit-identical 的结果。TF32 内部精度（10-bit mantissa）足够高，使得任何 batch-dependent 的舍入差异都被 bf16 截断掩盖了。
-
-### 21.4 测试 13a/b/c/d：多层 chain 测试（bf16 内部精度）
-
-模拟 transformer 的层层计算：
-
-| 测试 | 内容 | 层数 | 结果 |
-|---|---|---|---|
-| Test 13a | 线性 chain + RMSNorm: `x_{i+1} = RMSNorm(mm(x_i, W))` | 26 | bit-identical |
-| Test 13b | FFN-like residual: `h = h + W_down @ gelu(W_up @ x)` | 16 | bit-identical |
-| Test 13c | 同 13b，逐层跟踪 per-layer divergence | 16 | 所有层 bit-identical |
-| Test 13d | Real server structure: RMSNorm + mm(Q) + residual + RMSNorm + mm(gate/up) + silu*gate + mm(down) + residual | 16 | bit-identical |
-
-**发现**：即使经过 16 层 FFN-like chain 或 26 层线性 chain，所有 bf16 输出仍然是 bit-identical 的。原因：每层 mm 的批量差异在 subt-bf16 level（< 1 bf16 ULP），后续 bf16 截断每次都将其清零，差异无法累积。
-
-### 21.5 测试 13e：Float32 累计 chain — **成功检测 batch-dependence**
-
-关键创新：将层间中间结果保留在 float32，阻止 bf16 截断掩盖 subt-bf16 差异。
-
-```python
-def transformer_layer_f32(x):
-    h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
-    h = torch.mm(h, W_q_f32)                # mm → f32
-    x = x + h                                # residual (f32)
-    h = torch.nn.functional.rms_norm(x, [K_hidden], weight=norm_w_f32)
-    gate = torch.mm(h, W_gate_f32)           # mm → f32
-    up = torch.mm(h, W_up2_f32)              # mm → f32
-    h = torch.nn.functional.silu(gate) * up  # activation (f32)
-    h = torch.mm(h, W_down2_f32)             # mm → f32
-    return x + h                              # residual (f32)
-```
-
-**结果**：
-```
-M_small=64  M_large=  256  layers=16  equal=False  max_abs=1.1921e-06  <-- DIFF!
-M_small=64  M_large= 1024  layers=16  equal=False  max_abs=1.1921e-06  <-- DIFF!
-M_small=64  M_large= 4096  layers=16  equal=False  max_abs=1.1921e-06  <-- DIFF!
-```
-
-16 层后，相同输入行的输出在 float32 精度下有 `max_abs ~ 1.19e-6` 的差异。`max_rel = 7.16e-1`（71.5%）说明某些元素的绝对值很小（~1e-6），与差距在同一量级。
-
-### 21.6 测试 14：cuBLAS heuristics 检查
-
-测试了不同 CUBLAS_WORKSPACE_CONFIG（`:4096:8`, `:16:8`, `:4096:2`, default）下的单层 mm batch-dependence：所有配置下，所有 M 值都产生 bit-identical 结果。说明单层 cuBLAS heuristics 变更不能触发 batch-dependence。
-
-同时也检查了系统设置：
-```
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-torch.backends.cuda.preferred_blas_library() = _BlasBackend.Cublas
-torch.backends.cudnn.allow_tf32 = True
-```
-
-### 21.7 其他算子的测试
-
-| 算子 | 结果 |
-|---|---|
-| `torch.bmm` (batch matmul) | bit-identical (B=16/32/64/128/256) |
-| `torch._log_softmax` | bit-identical (M=16→4096, D=2048) |
-| `F.rms_norm` | bit-identical (M=16→4096, D=2048) |
-| `torch.mean` | bit-identical (M=16→4096, D=2048) |
-| `matmul_persistent` (SGLang Triton) | batch-invariant by design（固定 16×16 tiling）|
-
-### 21.8 结论与解释
-
-**aten::mm 确实是 batch-variant 的**——这一结论已被 GSM8k 实验和测试 13e 双重验证。
-
-**工作机制**：
-
-1. **单层 mm 的差异在 subt-bf16 级别**：cuBLAS 使用不同的 M-dependent 算法（tiling、reduction order），产生的舍入差异 < 1 bf16 ULP。单层测试中无法检测（bit-identical）。
-2. **bf16 截断掩蔽了差异**：每层 mm 输出的 subt-bf16 差异在存入 bf16 tensor 时被截断清零，无法层间累积。
-3. **Float32 累积暴露了差异**：f32 chain 中 subt-bf16 差异在层间存活并累积，16 层后达到 max_abs ~1e-6。
-4. **在真实 SGLang 服务中**，27 层 × 3-4 mm/层 的更大层数 + autoregressive decode（每个 token 依赖所有之前的 token）会进一步放大差异。Temperature sampling 将微小的 logit 差异转化为不同的 token 选择，导致完全不同的生成轨迹。
-
-**测试脚本验证了**：
-- matmul_persistent（Triton kernel）确实是 batch-invariant 的
-- 用 matmul_persistent 替换 aten::mm 可以消除 GSM8k 中观察到的 batch size 差异
-- `SGLANG_BATCH_INVARIANT_OPS_FORCE_SKIP_ATEN_MM` 环境变量是控制 batch-dependence 的关键开关
-
----
