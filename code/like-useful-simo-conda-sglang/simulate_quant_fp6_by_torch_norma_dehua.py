@@ -37,8 +37,10 @@ print("val_to_add")
 print_tensor_in_hex(val_to_add.view(torch.int32))
 print("")
 
+# 1) no ceil, no mant_odd
 #x_pos = torch.tensor([3.5],dtype=torch.float32)
 x_pos = torch.tensor([3.5],dtype=torch.float32)
+# 2) ceil, no mant_odd
 x_pos = torch.tensor([0x40690000],dtype=torch.int32).view(torch.float32)
 
 print(f"x_pos:{x_pos}")
@@ -47,13 +49,14 @@ print_tensor_in_hex(x_pos_u32)
 print("")
 #x_pos_u32=(torch.tensor([5.0],dtype=torch.float32).view(torch.int32))
 
-mant_odd = (x_pos_u32 >> (F32_MBITS - mbits)) & 1
-print(f"mant_odd:{mant_odd}")
 
 normal_x_u32 = x_pos_u32 + val_to_add
 print(f"normal_x_u32 = x_pos_u32 + val_to_add:{normal_x_u32}")
 print_tensor_in_hex(normal_x_u32)
 print("")
+
+mant_odd = (x_pos_u32 >> (F32_MBITS - mbits)) & 1
+print(f"mant_odd:{mant_odd}")
 
 normal_x_u32 += mant_odd
 print(f"normal_x_u32 += mant_odd :{normal_x_u32}")
