@@ -46,5 +46,9 @@ print("")
 mant_odd = (x_pos_u32 >> (F32_MBITS - mbits)) & 1
 
 normal_x_u32 = x_pos_u32 + val_to_add
+print(f"normal_x_u32:{normal_x_u32}")
+print_tensor_in_hex(normal_x_u32)
+print("")
+
 normal_x_u32 += mant_odd
 normal_vals = normal_x_u32 >> (F32_MBITS - mbits)
