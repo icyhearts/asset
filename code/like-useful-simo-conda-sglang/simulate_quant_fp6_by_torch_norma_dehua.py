@@ -53,4 +53,10 @@ print_tensor_in_hex(normal_x_u32)
 print("")
 
 normal_x_u32 += mant_odd
+print(f"normal_x_u32 += mant_odd :{normal_x_u32}")
+print_tensor_in_hex(normal_x_u32)
+print("")
+
 normal_vals = normal_x_u32 >> (F32_MBITS - mbits)
+print(f"normal_vals = normal_x_u32 >> ({F32_MBITS} - {mbits}):{normal_vals}")
+print_tensor_in_hex(normal_vals)
