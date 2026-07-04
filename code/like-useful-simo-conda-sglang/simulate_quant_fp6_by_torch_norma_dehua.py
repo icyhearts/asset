@@ -7,11 +7,13 @@ F32_EXP_BIAS=127
 
 def print_tensor_in_hex(arr):
   arr_bytes = arr.view(torch.uint8)
-  fstr = ""
-  bin_str = ""
+  fstr = "0X"
+  bin_str = "0b"
   for idx in range(3,-1,-1):
-    fstr += "," + hex(arr_bytes[idx])
-    bin_str += "," + bin(arr_bytes[idx])
+    #fstr += "," + hex(arr_bytes[idx])
+    #bin_str += "," + bin(arr_bytes[idx])
+    fstr += "," + f"{arr_bytes[idx]:02X}"
+    bin_str += "," + f"{arr_bytes[idx]:08b}"
   print( fstr)
   print( bin_str)
 
