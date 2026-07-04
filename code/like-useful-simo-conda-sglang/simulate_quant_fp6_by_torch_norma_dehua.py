@@ -42,6 +42,8 @@ print("")
 x_pos = torch.tensor([3.5],dtype=torch.float32)
 # 2) ceil, no mant_odd
 x_pos = torch.tensor([0x40690000],dtype=torch.int32).view(torch.float32)
+# 3) 平局, round to even, 但是我自己是even, mant_odd=0
+x_pos = torch.tensor([0x40680000],dtype=torch.int32).view(torch.float32)
 
 print(f"x_pos:{x_pos}")
 x_pos_u32=x_pos.view(torch.int32)
