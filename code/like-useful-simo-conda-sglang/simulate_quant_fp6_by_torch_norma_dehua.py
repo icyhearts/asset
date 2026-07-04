@@ -43,7 +43,9 @@ x_pos_u32=x_pos.view(torch.int32)
 print_tensor_in_hex(x_pos_u32)
 print("")
 #x_pos_u32=(torch.tensor([5.0],dtype=torch.float32).view(torch.int32))
+
 mant_odd = (x_pos_u32 >> (F32_MBITS - mbits)) & 1
+print(f"mant_odd:{mant_odd}")
 
 normal_x_u32 = x_pos_u32 + val_to_add
 print(f"normal_x_u32:{normal_x_u32}")
