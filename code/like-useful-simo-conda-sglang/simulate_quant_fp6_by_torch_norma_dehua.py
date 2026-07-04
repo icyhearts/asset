@@ -23,12 +23,24 @@ print("")
 val_to_add_step1 = torch.tensor([EXP_BIAS - F32_EXP_BIAS],dtype=torch.int32)
 print(f"val_to_add_step1:{val_to_add_step1} = EXP_BIAS - F32_EXP_BIAS")
 print_tensor_in_hex(val_to_add_step1)
+print("")
+
 val_to_add_step2 = val_to_add_step1 << F32_MBITS
+print(f"val_to_add_step2:{val_to_add_step2}=val_to_add_step1 << {F32_MBITS}")
+print_tensor_in_hex(val_to_add_step2)
+print("")
+
 val_to_add = val_to_add_step2 + magic_adder
 print("val_to_add")
 print_tensor_in_hex(val_to_add.view(torch.int32))
-#x_pos_u32=(torch.tensor([3.5],dtype=torch.float32).view(torch.int32))
-x_pos_u32=(torch.tensor([5.0],dtype=torch.float32).view(torch.int32))
+print("")
+
+x_pos = torch.tensor([3.5],dtype=torch.float32)
+print(f"x_pos:{x_pos}")
+x_pos_u32=x_pos.view(torch.int32)
+print_tensor_in_hex(x_pos_u32)
+print("")
+#x_pos_u32=(torch.tensor([5.0],dtype=torch.float32).view(torch.int32))
 mant_odd = (x_pos_u32 >> (F32_MBITS - mbits)) & 1
 
 normal_x_u32 = x_pos_u32 + val_to_add
