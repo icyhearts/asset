@@ -158,3 +158,127 @@ Layer 27: [bf16 matmul]→[fused_add_rmsnorm(fp32)→bf16]→[attn(bf16)]→[fus
 | Test 13e 还有价值吗？ | **有** — 证明了 cuBLAS batch-variant 的存在性，并提供了 FP32 累积链模拟 fused kernel 精度的有效实验方法 |
 
 ---
+
+## 23. deepseek-v4-flash inference — convert.py 的功能与必要性
+
+### 23.1 convert.py 的主要功能
+
+`/data/like/hf-models/deepseek-v4-flash/inference/convert.py` 负责将 HuggingFace 格式的 safetensors 权重文件转换为该项目的自定义推理代码能直接加载的格式。它做了四件事：
+
+#### 23.1.1 命名映射 (Name Mapping)
+
+将 HuggingFace 的 key 命名规范映射为自定义 `model.py` 的命名规范：
+
+```
+HF key                          →  自定义 key
+─────────────────────────────────────────────────────
+model.layers.X.self_attn.*      →  layers.X.attn.*
+model.layers.X.mlp.*            →  layers.X.ffn.*
+weight_scale_inv                →  scale
+e_score_correction_bias         →  bias
+q_b_proj                        →  wq_b
+kv_a_proj_with_mqa              →  wkv_a
+gate_proj                       →  w1
+up_proj                         →  w3
+down_proj                       →  w2
+o_proj                          →  wo
+lm_head                         →  head
+```
+
+#### 23.1.2 Tensor Parallelism (TP) 分片
+
+根据 `--model-parallel` 参数，将权重沿指定维度切分到多个 rank：
+
+```python
+# 例如 q_proj 沿 dim=0 切分
+new_param = param.narrow(dim, i * shard_size, shard_size)
+```
+
+MoE expert 按 rank 分配：每个 rank 持有 `n_experts / mp` 个 expert 的权重。
+
+#### 23.1.3 wo_a 反量化 (FP8 → BF16)
+
+这是最关键的一步。原始的 `wo_a.weight` 是 **FP8 E4M3** 格式（`torch.float8_e4m3fn`），附带有 per-block 的 E8M0 scale。但 `model.py` 中 `wo_a` 被定义为 `torch.bfloat16`：
+
+```python
+# model.py:462
+self.wo_a = ColumnParallelLinear(..., dtype=torch.bfloat16)
+```
+
+convert.py 执行反量化：
+
+```python
+# convert.py:137-141
+weight = state_dicts[i][name]                                          # FP8
+scale  = state_dicts[i].pop(name.replace("weight", "scale"))           # E8M0
+weight = weight.unflatten(0,(-1,128)).unflatten(-1,(-1,128)).float() * scale[:,None,:,None].float()
+state_dicts[i][name] = weight.flatten(2,3).flatten(0,1).bfloat16()     # → BF16
+```
+
+这会**永久性地**将 block-wise quantized FP8 权重展开为 BF16，不可逆。
+
+#### 23.1.4 Expert 权重格式转换
+
+原始 expert 权重存储在 `torch.int8` 中，每个 int8 打包了两个 E2M1 格式的 4-bit 值（即 `float4_e2m1fn_x2`，每元素 4 bit，共 16 个可表示值）。
+
+- **`--expert-dtype fp8` 模式**：调用 `cast_e2m1fn_to_e4m3fn()`，将 packed int8 解包→查 FP4_TABLE→乘以 per-block scale→转换为 `torch.float8_e4m3fn`，scale 转为 `torch.float8_e8m0fnu`
+
+  ```
+  [2xE2M1 packed in int8] → 查表 → [E4M3 × scale] + [E8M0 scale]
+  ```
+
+- **`--expert-dtype fp4` 模式**：直接做 `view(torch.float4_e2m1fn_x2)`，将 int8 reinterpret 为 FP4 dtype，保持 packed 格式。
+
+#### 23.1.5 输出
+
+每个 rank 输出一个 `model{rank}-mp{world_size}.safetensors` 文件，以及 tokenizer 文件。
+
+### 23.2 为什么 generate.py 不能直接读取原始 safetensors？
+
+#### 原因 1：命名不匹配
+
+generate.py 使用 `load_model()` 按 PyTorch 参数名匹配权重。原始 HF 格式使用 `model.layers.X.self_attn.q_b_proj.weight` 等名称，而模型定义中使用 `layers.X.attn.wq_b.weight` 等。直接加载会因名称不匹配而报错（`strict=False` 虽然不报错，但权重不会被加载到正确位置）。
+
+#### 原因 2：TP 分片是必须的
+
+模型代码（`model.py`）假设权重已经按 TP rank 切分好。例如 `ColumnParallelLinear` 和 `RowParallelLinear` 只持有部分权重。原始 safetensors 是全量权重，没有切分。convert.py 中的 `param.narrow(dim, ...)` 负责这一工作。
+
+#### 原因 3：wo_a 的格式差异（最关键）
+
+| 位置 | dtype | 说明 |
+|---|---|---|
+| 原始 safetensors | `torch.float8_e4m3fn` + per-block E8M0 scale | Block-wise FP8 量化 |
+| model.py 定义 | `torch.bfloat16` | 模型参数声明为 BF16 |
+| 转换后 | `torch.bfloat16` | convert.py 执行反量化 |
+
+generate.py 在推理时**没有**对 wo_a 做运行时 FP8 反量化——它假设 wo_a 已经是 BF16。如果直接用原始 safetensors，wo_a 是 FP8，model.py 会尝试将其赋给 BF16 参数，导致 dtype mismatch 或静默错误。
+
+generate.py 代码中也有一条注释确认了这一点：
+
+```python
+# model.py:539
+# NOTE: wo_a is FP8 in checkpoint; could do FP8 einsum here for better perf,
+```
+
+这说明开发者也考虑过直接在模型中使用 FP8 wo_a，但当前实现选择了"convert.py 一次性反量化"的方案。
+
+#### 原因 4：Expert 权重格式不匹配
+
+原始 expert 权重是 `int8`（packed E2M1 x2），generate.py 的 fp8_gemm / fp4_gemm kernel 期望特定格式：
+- FP8 模式：`torch.float8_e4m3fn` + `torch.float8_e8m0fnu` scale
+- FP4 模式：`torch.float4_e2m1fn_x2`
+
+convert.py 负责这个格式转换。如果 expert_dtype 设为 fp8，还需要调用 `cast_e2m1fn_to_e4m3fn()` 执行完整的格式提升（E2M1→E4M3）。
+
+### 23.3 总结
+
+| 转换步骤 | 做什么 | 是否可逆 |
+|---|---|---|
+| 命名映射 | HF key → 自定义 key | 是（纯字符串替换） |
+| TP 分片 | 沿 dim 切分权重 | 是（合并后可还原） |
+| wo_a 反量化 | FP8+scale → BF16（乘 scale、reshape） | **否**（信息丢失） |
+| Expert 格式转换 | int8(E2M1x2) → fp8/fp4 | 一定程度上可逆 |
+
+**核心结论**：`convert.py` 不仅仅是重命名和分片，它做了**不可逆的精度转换**。`wo_a` 的 FP8→BF16 反量化和 expert 的 E2M1→E4M3 格式提升是 generate.py 不能直接读取原始 safetensors 的根本原因。
+
+---
