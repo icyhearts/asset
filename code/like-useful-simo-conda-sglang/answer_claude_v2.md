@@ -282,3 +282,179 @@ convert.py 负责这个格式转换。如果 expert_dtype 设为 fp8，还需要
 **核心结论**：`convert.py` 不仅仅是重命名和分片，它做了**不可逆的精度转换**。`wo_a` 的 FP8→BF16 反量化和 expert 的 E2M1→E4M3 格式提升是 generate.py 不能直接读取原始 safetensors 的根本原因。
 
 ---
+
+## 24. deepseek-v4-flash inference — config.json 与并行策略详解
+
+### 24.1 应该使用哪个 config.json？
+
+有两个 config.json 文件：
+
+| 路径 | 格式 | 用途 |
+|---|---|---|
+| `.../deepseek-v4-flash-git-control-by-like/config.json` | HuggingFace 格式 | 给 transformers 库加载模型用 |
+| `.../deepseek-v4-flash-git-control-by-like/inference/config.json` | 自定义 ModelArgs 格式 | 给 generate.py 的 model.py 用 |
+
+#### 应该使用 `inference/config.json`
+
+README 中的 `--config ${CONFIG}` 传给 `generate.py`：
+
+```python
+# generate.py:94
+with open(config) as f:
+    args = ModelArgs(**json.load(f))
+```
+
+`ModelArgs` 期望的 key 名称是自定义格式：
+
+```
+inference/config.json          root config.json (HuggingFace)
+─────────────────────────     ─────────────────────────────
+"dim": 4096                    "hidden_size": 4096
+"n_layers": 43                 "num_hidden_layers": 43
+"n_heads": 64                  "num_attention_heads": 64
+"dtype": "fp8"                 "torch_dtype": "bfloat16"
+```
+
+如果用 root 的 `config.json`，`ModelArgs(**json.load(f))` 会因为 key 名称不匹配而报错或静默忽略（取决于 `ModelArgs` 是否允许 extra fields）。
+
+#### 两个 config.json 的关键差异
+
+| 维度 | root config.json | inference/config.json |
+|---|---|---|
+| 定位 | HuggingFace 模型配置 | 自定义推理引擎配置 |
+| key 风格 | `hidden_size`, `num_hidden_layers` | `dim`, `n_layers` |
+| dtype 含义 | `torch_dtype: "bfloat16"` (模型参数精度) | `dtype: "fp8"` (运行时激活量化精度，即 GEMM 前将激活量化为 FP8) |
+| 额外字段 | `architectures`, `model_type`, `quantization_config`, `transformers_version` | `n_activated_experts`, `score_func`, `route_scale`, `window_size`, `original_seq_len`, `rope_factor`, `compress_ratios` |
+| 用途 | HF AutoModel 加载、SGLang/vLLM 服务 | deepseek-v4-flash 自有推理代码 |
+
+### 24.2 `--model-parallel` 是专家并行还是 Tensor 并行？
+
+**两者都是。** `--model-parallel ${MP}` 在 convert.py 中同时做了 TP 和 EP：
+
+#### Tensor Parallelism 部分
+
+convert.py 中 `mapping` 字典指定了每个权重沿哪个 dim 切分：
+
+```python
+mapping = {
+    "q_proj":  ("wq", 0),    # 沿 out_features 切分 → ColumnParallel
+    "o_proj":  ("wo", 1),    # 沿 in_features 切分  → RowParallel
+    "gate_proj": ("w1", 0),
+    "down_proj": ("w2", 1),
+    ...
+}
+```
+
+`dim=0` 对应 `ColumnParallelLinear`（输出维度切分），`dim=1` 对应 `RowParallelLinear`（输入维度切分）。
+
+#### Expert Parallelism 部分
+
+```python
+if "experts" in name and "shared_experts" not in name:
+    idx = int(name.split(".")[-3])
+    if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
+        continue  # 不属于本 rank，跳过
+```
+
+每个 rank 持有 `n_experts / mp` 个 expert 的完整权重（不切分 expert 内部的矩阵维度，只按 expert 编号分配）。
+
+#### 一句话总结
+
+> `--model-parallel ${MP}` 是一种 **TP + EP 联合并行**：所有非 expert 层的权重按 TP 切分，MoE expert 按 EP 分配。同一组 GPU 同时承担 TP 和 EP 角色。
+
+### 24.3 generate.py 使用专家并行还是 Tensor 并行？
+
+**同样两者都使用。**
+
+generate.py 启动时：
+
+```python
+# model.py:773-775
+world_size = dist.get_world_size()     # = torchrun 的 --nproc-per-node
+rank = dist.get_rank()
+```
+
+这个 `world_size` 被用于所有并行逻辑：
+
+#### Tensor Parallelism 运行时行为
+
+```python
+class ColumnParallelLinear(Linear):
+    """Shards output dim. No all-reduce needed on output."""
+    def __init__(self, in_features, out_features, ...):
+        self.part_out_features = out_features // world_size  # 只持有部分输出
+
+class RowParallelLinear(Linear):
+    """Shards input dim. All-reduce on output to sum partial results."""
+    def forward(self, x):
+        y = linear(x, self.weight, None)
+        if world_size > 1:
+            dist.all_reduce(y)  # 汇总各 rank 的部分结果
+        return y
+```
+
+#### Expert Parallelism 运行时行为
+
+```python
+class MoE(nn.Module):
+    self.n_local_experts = args.n_routed_experts // world_size  # 只管理部分 expert
+```
+
+所有 rank 的 router 产生相同的 top-k 选择，但每个 rank 只计算自己持有的 expert。结果通过 all-reduce 汇总。
+
+#### 一句话总结
+
+> generate.py 使用与 convert.py 完全对称的 **TP + EP 联合并行**。`torchrun --nproc-per-node ${MP}` 中的 MP 同时控制 TP 和 EP 的并行度，没有独立的 TP size 和 EP size 配置项。
+
+---
+
+## 25. deepseek-v4-flash inference — 其他大模型并行策略分析
+
+### 25.1 现有并行策略
+
+确认 convert.py 和 generate.py 只使用了 **TP + EP 联合并行**。完整的 `dist.*` 通信原语调用如下：
+
+| 调用 | 位置 (model.py) | 用途 |
+|---|---|---|
+| `dist.all_reduce(y)` | ParallelEmbedding.forward | 合并 vocab-sharded embedding 的部分结果 |
+| `dist.all_reduce(y)` | RowParallelLinear.forward | 合并 TP 切分后的部分线性输出 |
+| `dist.all_reduce(index_score)` | Indexer.forward | 合并 TP 切分的 indexer 分数 |
+| `dist.all_reduce(y)` | MoE.forward | 合并各 rank 的 expert 输出 |
+| `dist.all_gather(all_logits, logits)` | ParallelHead.forward | 收集 vocab-sharded 的 logits |
+| `dist.broadcast_object_list(...)` | generate.py:main | 交互模式下广播用户输入到所有 rank（非模型并行） |
+
+### 25.2 未被使用的大模型并行策略
+
+| 策略 | 是否使用 | 说明 |
+|---|---|---|
+| **Pipeline Parallelism (PP)** | 否 | 无 `pipeline`、`stage`、`microbatch`、`schedule` 相关代码。所有层在单次 `forward` 中顺序执行，没有将层分配到不同 GPU 的逻辑 |
+| **Data Parallelism (DP)** | 否 | 无 `data_parallel`、`dp`、`replicate` 相关代码。generate.py 中所有 rank 收到相同的 prompt（通过 broadcast），各自计算完整的 batch |
+| **Sequence Parallelism (SP)** | 否 | 无 `sequence_parallel`、`sp`、`seq_parallel` 相关代码。序列维度没有被切分到不同 rank |
+| **Context Parallelism (CP)** | 否 | 无 `context_parallel`、`cp`、`ring_attention`、`ulysses` 相关代码 |
+| **FSDP / ZeRO** | 否 | 无 `FullyShardedDataParallel`、`ZeRO` 相关代码。权重通过 `load_model()` 一次性加载，不在 rank 间分片或重组 |
+
+### 25.3 为什么只用 TP + EP 就够了？
+
+对于 deepseek-v4-flash（43 层、4096 hidden dim、256 experts、1 KV head）的推理场景：
+
+1. **不需要 PP**：43 层 × 4096 hidden dim 的总参数量约 300B+，但推理时计算密集度远高于训练，PP 的 pipeline bubble 开销（需要 micro-batch 填充）在低延迟推理中不可接受。且单层就能放入单卡时 PP 无必要。
+
+2. **不需要 DP**：推理场景下 DP 要求每张卡持有完整模型副本，300B+ 模型（即使是 FP8/FP4）无法放入单卡。DP 只适用于小模型的大吞吐场景。
+
+3. **不需要 SP/CP**：SP 和 CP 主要用于超长序列（百万 token 级别）。该推理代码的 `max_seq_len` 默认为 4096，单卡的 attention 计算完全够用。
+
+4. **TP+EP 联合是最优组合**：
+   - TP 解决单层权重大于单卡显存的问题（attention 的 Q/O projection）
+   - EP 解决 256 个 expert 总权重大于单卡显存的问题
+   - 两者共用同一组 GPU，通信路径最短（TP 的 all-reduce 和 EP 的 all-reduce 在同一个 NCCL group 内）
+
+### 25.4 当前方案的局限
+
+| 局限 | 说明 |
+|---|---|
+| TP 和 EP 无法独立扩展 | MP=8 意味着 8-way TP **且** 8-way EP，无法做到 2-way TP + 4-way EP |
+| 不支持跨节点 | `torchrun --nproc-per-node` 仅单节点，TP 的 all-reduce 跨节点时带宽急剧下降 |
+| 无 DP 弹性 | 无法通过增加 DP 维度来线性提升吞吐 |
+| Expert 负载不均无解 | 256 experts 按编号均分到各 rank，不保证各 rank 的计算量均衡（某些 expert 被选中频率更高） |
+
+---
