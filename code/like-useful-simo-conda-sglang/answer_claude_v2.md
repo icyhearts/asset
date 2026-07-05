@@ -458,3 +458,82 @@ class MoE(nn.Module):
 | Expert 负载不均无解 | 256 experts 按编号均分到各 rank，不保证各 rank 的计算量均衡（某些 expert 被选中频率更高） |
 
 ---
+
+## 26. 为什么没有 all-to-all 通信？
+
+标准 MoE 推理的专家并行通常需要 **两次 all-to-all**：第一次将 token 发送到持有对应 expert 的 rank，计算后再 send back。流程为：
+
+```
+标准 EP 流程:
+  Router → all-to-all(dispatch tokens) → 各 rank 计算本地 expert → all-to-all(combine results)
+```
+
+但 deepseek-v4-flash 的 MoE 实现使用 `all_reduce` 而不是 `all_to_all`：
+
+```python
+# model.py:629-644 (MoE.forward)
+def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    x = x.view(-1, self.dim)
+    weights, indices = self.gate(x, input_ids.flatten())  # 所有 rank 独立路由所有 token
+    y = torch.zeros_like(x, dtype=torch.float32)
+    counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+    for i in range(self.experts_start_idx, self.experts_end_idx):  # 只遍历本地 expert
+        if counts[i] == 0:
+            continue
+        expert = self.experts[i]
+        idx, top = torch.where(indices == i)
+        y[idx] += expert(x[idx], weights[idx, top, None])   # 用全量 token 中的匹配子集计算
+    if world_size > 1:
+        dist.all_reduce(y)                                   # ← all_reduce, 不是 all-to-all
+    y += self.shared_experts(x)
+    return y.type_as(x).view(shape)
+```
+
+### 关键差异：每个 rank 持有全量 token
+
+标准 EP 中，token 分布在不同的 DP rank 上，需要 all-to-all 搬运。但在这个架构中，**因为 TP 的存在，所有 rank 持有相同的全量 token**：
+
+```
+标准 EP+DP:                          deepseek-v4-flash TP+EP:
+┌──────────┐  ┌──────────┐          ┌──────────┐  ┌──────────┐
+│ Rank 0   │  │ Rank 1   │          │ Rank 0   │  │ Rank 1   │
+│ token A,B│  │ token C,D│          │token A,B │  │token A,B │  ← 相同 token!
+│ expert 0 │  │ expert 1 │          │expert 0-3│  │expert 4-7│
+└──────────┘  └──────────┘          └──────────┘  └──────────┘
+      ↓ all-to-all                       ↓ all_reduce
+  dispatch A→0, B→1                 Rank0: expert0-3(A,B) → y₀
+  compute, then send back           Rank1: expert4-7(A,B) → y₁
+                                          y = y₀ + y₁ (all_reduce)
+```
+
+### 为什么 all_reduce 可行？
+
+每个 rank 的 `y` 初始化为 0（float32 零张量），遍历本地 expert 时只修改**属于该 expert 的 token 位置**。对于不归本地 expert 处理的 token-expert 组合，`y` 保持为 0。`all_reduce` 将所有 rank 的部分结果求和，得到完整的 MoE 输出。
+
+```
+Rank 0 (expert 0-3):    y = [exp0(token_A), exp1(token_B), 0, 0, ...]
+Rank 1 (expert 4-7):    y = [0,              0,             exp4(token_A), exp5(token_B), ...]
+all_reduce(y):          y = [exp0(A)+0, exp1(B)+0, 0+exp4(A), 0+exp5(B), ...]  ← 正确!
+```
+
+### 这种方案的优劣
+
+| | all-to-all 方案（标准 EP） | all_reduce 方案（本实现） |
+|---|---|---|
+| token 数据量 | 只搬运被路由的 token | 每个 rank 处理全量 token |
+| 通信模式 | 2× all-to-all（dispatch + combine） | 1× all-reduce |
+| 通信复杂度 | 依赖 token-to-expert 分布 | 固定 = hidden_dim × num_tokens |
+| 计算浪费 | 无（只算本地需处理的 token） | 有（rank 持有全量 token 但只算本地 expert） |
+| 实现复杂度 | 高（需要管理 dispatch/combine 的索引和 buffer） | 低（标准 all_reduce） |
+| 适合场景 | 大 batch / 训练（token 多，all-to-all 收益大） | 小 batch / 推理（token 少，全量遍历开销可接受） |
+
+### 为什么推理场景下 all_reduce 方案更合适？
+
+1. **推理 batch 小**：单次请求只有几十到几百个 token，全量遍历的额外计算开销微乎其微
+2. **实现简单**：不需要管理复杂的 all-to-all 索引映射和 buffer 分配
+3. **TP 天然提供全量 token**：TP 架构中所有 rank 本来就持有完整 hidden states（ColumnParallel 输出后再 RowParallel），不需要额外广播
+4. **all_reduce 被高度优化**：NCCL 的 all_reduce 在节点内（NVLink）极为高效，而 all-to-all 即使在同一节点也有额外的拓扑调度开销
+
+**结论**：deepseek-v4-flash 的推理代码不需要 all-to-all，因为它用 **全量 token + all_reduce** 替代了 **token dispatch + all-to-all**。这是 TP 架构下推理专用 MoE 的一种常见优化——用少量冗余计算换取通信简洁性。
+
+---
