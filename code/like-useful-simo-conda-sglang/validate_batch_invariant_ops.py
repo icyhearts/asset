@@ -706,6 +706,83 @@ for M_large in [256, 1024, 4096]:
     print(f"    M_small={ROW_COUNT}  M_large={M_large:5d}  layers={NUM_LAYERS_SMALL}  equal={exact}  max_abs={mad:.4e}  max_rel={mrd:.4e}{flag}")
 
 # ============================================================
+# TEST 13f: SGLang RMSNorm + SiluAndMul with bf16 data
+#   Use SGLang's actual RMSNorm (fused_add_rmsnorm CUDA kernel) and
+#   SiluAndMul (fused silu_and_mul CUDA kernel) instead of
+#   F.rms_norm and F.silu(gate)*up.  This tests whether the SGLang
+#   fused kernel path produces batch-dependent results in a bf16
+#   multilayer chain, matching what the real SGLang server uses.
+# ============================================================
+print("\n  --- Test 13f: SGLang RMSNorm + SiluAndMul with bf16 chain ---")
+print("    Using sglang.srt.layers.layernorm.RMSNorm (fused_add_rmsnorm)")
+print("    Using sglang.srt.layers.activation.SiluAndMul (fused silu_and_mul)")
+
+# SGLang's SiluAndMul.__init__ accesses global server args, so we need to
+# set a minimal mock before importing.
+from types import SimpleNamespace
+from sglang.srt.server_args import set_global_server_args_for_scheduler
+set_global_server_args_for_scheduler(SimpleNamespace(
+    rl_on_policy_target=None,
+    debug_ppl_silu_and_mul_force_torch_native_forward=0,
+))
+
+from sglang.srt.layers.layernorm import RMSNorm as SglRMSNorm
+from sglang.srt.layers.activation import SiluAndMul as SglSiluAndMul
+
+# Create SGLang layer instances on CUDA
+sgl_norm_attn = SglRMSNorm(K_hidden, eps=1e-6).cuda()
+sgl_norm_ffn  = SglRMSNorm(K_hidden, eps=1e-6).cuda()
+sgl_silu_mul  = SglSiluAndMul().cuda()
+
+# Copy weights from the bf16 test norm_w into SGLang RMSNorm weight parameters
+with torch.no_grad():
+    sgl_norm_attn.weight.data.copy_(norm_w)
+    sgl_norm_ffn.weight.data.copy_(norm_w)
+
+def full_transformer_layer_sgl_layer(x):
+    """Same transformer layer structure as full_transformer_layer (Test 13d),
+    but using SGLang's fused RMSNorm and SiluAndMul instead of
+    torch.nn.functional.rms_norm and F.silu(gate)*up."""
+    # Pre-norm + attention projection
+    h = sgl_norm_attn(x)
+    h = torch.mm(h, W_q)
+    x = x + h
+    # Pre-norm + FFN with gated activation
+    h = sgl_norm_ffn(x)
+    gate = torch.mm(h, W_gate)
+    up   = torch.mm(h, W_up2)
+    # SiluAndMul expects [gate, up] concatenated along last dim:
+    #   silu(x[..., :d]) * x[..., d:]  where d = shape[-1] // 2
+    h = torch.cat([gate, up], dim=-1)
+    h = sgl_silu_mul(h)
+    h = torch.mm(h, W_down2)
+    return x + h
+
+# Baseline: small batch (M=ROW_COUNT)
+A_rows_sgl = rbf((ROW_COUNT, K_hidden), seed=42, scale=0.1)
+baseline_sgl = A_rows_sgl
+for i in range(NUM_LAYERS_SMALL):
+    baseline_sgl = full_transformer_layer_sgl_layer(baseline_sgl)
+
+# Compare against large batches
+for M_large in [256, 1024, 4096]:
+    A_pad = rbf((M_large - ROW_COUNT, K_hidden), seed=101, scale=0.1)
+    A_large = torch.cat([A_rows_sgl, A_pad], dim=0)
+    x_large = A_large
+    for i in range(NUM_LAYERS_SMALL):
+        x_large = full_transformer_layer_sgl_layer(x_large)
+    large_rows = x_large[:ROW_COUNT]
+
+    exact, mad, mrd = describe(baseline_sgl, large_rows)
+    if not exact and not math.isnan(mad):
+        any_diff = True
+        mm_batch_diff = True
+        flag = f" <-- DIFF! SGLang fused kernels propagate batch-dependence (M={M_large})"
+    else:
+        flag = ""
+    print(f"    M_small={ROW_COUNT}  M_large={M_large:5d}  layers={NUM_LAYERS_SMALL}  equal={exact}  max_abs={mad:.4e}  max_rel={mrd:.4e}{flag}")
+
+# ============================================================
 # TEST 14: cuBLAS algorithm introspection — does M affect selection?
 # ============================================================
 print("\n" + "=" * 80)
@@ -792,8 +869,10 @@ if mm_batch_diff:
     print("     16-26 layers, residual connections, and interleaved operations.")
     print("     bf16 truncation at each layer masks sub-bf16 rounding differences.")
     print("  3. Float32 accumulation chain (Test 13e): DIFFERENCES DETECTED.")
+    print("  4. SGLang RMSNorm+SiluAndMul bf16 chain (Test 13f): see results above.")
     print("     When intermediate results are kept in float32, sub-bf16 differences")
     print("     survive layer-to-layer and accumulate.  At final output, max_abs~1e-6.")
+    print("  4. SGLang RMSNorm+SiluAndMul bf16 chain (Test 13f): see results above.")
     print()
     print("INTERPRETATION: The batch-dependence exists but is at the sub-bf16 level")
     print("per layer.  It cannot be detected in single-mm or bf16-only chain tests.")
@@ -802,7 +881,7 @@ if mm_batch_diff:
     print("  - Autoregressive decode: each token's logits depend on ALL prior tokens")
     print("  - Temperature sampling: tiny logit differences → different tokens → diverged trajectories")
 else:
-    print("Standalone test: mm batch-dependence NOT detected in any of Tests 5/13/14.")
+    print("Standalone test: mm batch-dependence NOT detected in any of Tests 5/13a-13d/13f/14.")
     print()
     print("All mm outputs were bit-identical across different batch sizes (M values).")
     print()
@@ -991,7 +1070,10 @@ print("    Different kernel implementations, numerically close but not bit-ident
 print("  - GSM8k experiments CONFIRM aten::mm IS batch-variant under real serving load.")
 print("    (SGLANG_BATCH_INVARIANT_OPS_FORCE_SKIP_ATEN_MM controls gsm8k batch-dependence)")
 print("  - This standalone test successfully DETECTED mm batch-dependence")
-print("    via the float32 accumulation chain (Test 13e).  This confirms")
+print("    via the float32 accumulation chain (Test 13e).  Test 13f extends")
+print("    this using SGLang's actual RMSNorm+SiluAndMul fused kernels with")
+print("    bf16 data, matching the real server's layernorm/activation code path.")
+print("    This confirms")
 print("    that cuBLAS produces M-dependent differences at the sub-bf16")
 print("    level, which accumulate detectably after 16 layers of")
 print("    RMSNorm + mm + SiLU + residual (max_abs ~ 1e-6 in float32).")
