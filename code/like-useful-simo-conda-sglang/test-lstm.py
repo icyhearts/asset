@@ -1,12 +1,7 @@
 from torch import nn
+import torch
 rnn = nn.LSTM(10, 20, 2)
 print(f"rnn:{rnn}, rnn.input_size:{rnn.input_size}, rnn.hidden_size:{rnn.hidden_size}, rnn.num_layers:{rnn.num_layers}")
->>> rnn.num_layers
-2
->>> rnn.input_size
-rnn.input_size
->>> rnn.hidden_size
-20
 
 input = torch.randn(5, 3, 10)
 h0 = torch.randn(2, 3, 20)
