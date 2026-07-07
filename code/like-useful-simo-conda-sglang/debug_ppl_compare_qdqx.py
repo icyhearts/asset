@@ -110,7 +110,7 @@ for sgl_path in sorted_full_paths:
     sgl_tensor = sgl_data_dict[name]
     ref_tensor = ref_data_dict[name]
     if "contiguous" in name and sgl_tensor.dtype == torch.bool and sgl_tensor.numel() == 1:
-      print(f"name:{base_name}, data_dict_key:{name}, sgl_tensor:{sgl_tensor.item()}, ref_tensor{ref_tensor.item()}")
+      print(f"name:{base_name}, data_dict_key:{name}, sgl_tensor:{sgl_tensor.item()}, ref_tensor:{ref_tensor.item()}")
       continue
     cosine_sim = cosine_similarity(sgl_tensor.reshape(-1), ref_tensor.reshape(-1))
     abs_ratio = sgl_tensor.abs().max() / ref_tensor.abs().max()
