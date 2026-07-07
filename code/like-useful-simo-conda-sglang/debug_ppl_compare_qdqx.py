@@ -28,6 +28,10 @@ ref_dir = "/data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm"
 sgl_directory = "/data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-online"
 ref_dir = "/data/like/temp/qdqx_2026_05_11___11_45_27_safetensors-vllm"
 
+
+sgl_directory = "/data/like/temp/sgl_safe_tensor_batch_invariant_triton"
+ref_dir = "/data/like/temp/sgl_safe_tensor_batch_invariant"
+
 full_paths = [str(f) for f in Path(sgl_directory).glob("*.safetensors")]
 
 ## all about compare all reduce
