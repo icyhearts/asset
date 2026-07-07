@@ -249,6 +249,7 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 K, N = 10944, 4096  # typical SGLang linear-layer shape (up-proj)
 ROW_COUNT = 64      # rows we care about
 test_configs = [
+    (6, 256),      # small batch, padded to 256
     (64, 256),      # small batch, padded to 256
     (64, 512),
     (64, 1024),
@@ -279,6 +280,18 @@ for row_count, total_M in test_configs:
     else:
         flag = ""
     print(f"  rows={row_count:4d}  M_small={row_count:4d}  M_large={total_M:6d}  K={K} N={N}  equal={exact}  max_abs={mad:.4e}  max_rel={mrd:.4e}{flag}")
+
+    # Same test with matmul_persistent (SGLang Triton kernel)
+    out_small_mp = matmul_persistent(A_rows, B_fixed)
+    out_large_full_mp = matmul_persistent(A_large, B_fixed)
+    out_large_mp = out_large_full_mp[:row_count]
+
+    exact_mp, mad_mp, mrd_mp = describe(out_small_mp, out_large_mp)
+    if not exact_mp:
+        flag_mp = f" <-- DIFF! matmul_persistent unexpectedly batch-variant"
+    else:
+        flag_mp = " (batch-invariant as expected)"
+    print(f"  matmul_persistent:   rows={row_count:4d}  M_small={row_count:4d}  M_large={total_M:6d}  equal={exact_mp}  max_abs={mad_mp:.4e}  max_rel={mrd_mp:.4e}{flag_mp}")
 
 # ============================================================
 # TEST 5b: torch.mm batch-dependence — exhaustive M sweep
