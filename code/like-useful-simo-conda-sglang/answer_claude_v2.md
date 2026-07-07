@@ -537,3 +537,117 @@ all_reduce(y):          y = [exp0(A)+0, exp1(B)+0, 0+exp4(A), 0+exp5(B), ...]  �
 **结论**：deepseek-v4-flash 的推理代码不需要 all-to-all，因为它用 **全量 token + all_reduce** 替代了 **token dispatch + all-to-all**。这是 TP 架构下推理专用 MoE 的一种常见优化——用少量冗余计算换取通信简洁性。
 
 ---
+
+## 27. 为什么 K=10944 时 cuBLAS 单层 mm 直接测出 batch-dependence，而 matmul_persistent 始终 batch-invariant？
+
+### 27.1 实验现象
+
+Test 5 使用 DeepSeek-V2-Lite 真实 FFN 层参数（K=10944, N=4096, bf16, TF32=ON）：
+
+```
+torch.mm:          rows=   6  M_small=   6  M_large=   256  equal=False  max_abs=1.0  <-- DIFF!
+torch.mm:          rows=  64  M_small=  64  M_large=   256  equal=False  max_abs=2.0  <-- DIFF!
+matmul_persistent: rows=   6  M_small=   6  M_large=   256  equal=True   max_abs=0.0  (batch-invariant)
+matmul_persistent: rows=  64  M_small=  64  M_large=   256  equal=True   max_abs=0.0  (batch-invariant)
+```
+
+K=2048 时 cuBLAS 是 bit-identical，K=10944 时同样代码直接出 DIFF。为什么？
+
+### 27.2 cuBLAS 为什么在 K=10944 时产生 batch-dependence
+
+cuBLAS 内部使用 **启发式算法选择器（heuristics）**，根据 M、K、N 三个维度决定：
+- 沿 K 维度的 tile 大小（`K_tile`）
+- 沿 M 维度的 tile 大小（`M_tile`）
+- 线程块级别的 reduction 策略
+
+**浮点加法不满足结合律**：
+```
+(a + b) + c ≠ a + (b + c)    在有限精度下
+```
+
+不同的 K-tile 意味着不同的累加顺序，产生不同的舍入误差。
+
+```
+K=2048, K_tile=128:  累加顺序固定为 [0:128]+[128:256]+...+[1920:2048]
+K=10944, K_tile 根据 M 动态选择:
+  M=6 (小 batch):  cuBLAS 可能选 K_tile=256, M_tile=4
+  M=64+:          cuBLAS 可能选 K_tile=128, M_tile=64
+
+  不同的 K_tile 导致不同的累加顺序 → 不同结果
+```
+
+**TF32 加剧了差异**：TF32 只有 10-bit mantissa（vs FP32 的 23-bit），非结合性引起的误差被放大。
+
+**为什么 K=2048 是 bit-identical？** 因为 K=2048 恰好是 cuBLAS 内部 tiling 粒度（通常为 128 或 256）的倍数，且 K 维度不够大，cuBLAS 的启发式算法对所有 M 值选择了相同的 tiling 策略。K=10944 超过了一个阈值，触发了 M-dependent 的算法选择。
+
+### 27.3 matmul_persistent 如何做到 batch-invariant
+
+matmul_persistent 是一个 Triton persistent kernel，通过以下 5 个设计决策**消除所有非确定性源**：
+
+#### 1. 固定 tiling —— 无 autotuning
+
+```python
+configs = {
+    torch.bfloat16: {
+        "BLOCK_SIZE_M": 128,   # 固定 128 行
+        "BLOCK_SIZE_N": 128,   # 固定 128 列
+        "BLOCK_SIZE_K": 64,    # 固定 64 个 K 元素
+        "num_stages": 3,
+        "num_warps": 8,
+    },
+}
+```
+
+所有维度都硬编码。没有 `@triton.autotune`，不根据 M/K/N 动态选择 tile size。
+
+#### 2. 固定 grid —— grid size 不随 M 变化
+
+```python
+def grid(META):
+    return (min(NUM_SMS, triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)),)
+```
+
+`grid = min(NUM_SMS, num_tiles)`。对于 K=10944 的实际场景，`num_tiles` 始终远大于 `NUM_SMS`（132 个 SM），所以 grid 始终固定在 `NUM_SMS`，与 M 无关。
+
+#### 3. 顺序 K-reduction —— 累加顺序固定
+
+```python
+accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+for ki in range(k_tiles):
+    a = tl.load(a_ptrs, mask=...)
+    b = tl.load(b_ptrs, mask=...)
+    accumulator = tl.dot(a, b, accumulator)  # FMA: accum += a @ b
+```
+
+K 循环从 `ki=0` 到 `ki=k_tiles-1` 顺序遍历，每次累加一个 K_tile。顺序完全固定，不随 M 变化。累加器是 **float32**，精度足够。
+
+#### 4. Persistent striding —— 确定性 tile 调度
+
+```python
+for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+    pid_m, pid_n = _compute_pid(tile_id, ...)
+    # 计算 tile (pid_m, pid_n)
+```
+
+每个 thread block 处理 `[start_pid, num_tiles, step=NUM_SMS)` 的 tile 序列，调度顺序完全确定。
+
+#### 5. 无算法选择 —— 无条件分支
+
+matmul_persistent 内部没有 `if M > threshold then use_strategy_A else strategy_B` 这类条件。相同的代码路径对所有输入执行。
+
+### 27.4 对比总结
+
+| 维度 | cuBLAS (torch.mm) | matmul_persistent (Triton) |
+|---|---|---|
+| Tiling | 动态启发式，M/K/N-dependent | 硬编码，固定 BLOCK_SIZE_{M,N,K} |
+| Grid size | cuBLAS 内部决定，M-dependent | 固定 NUM_SMS（对实际场景） |
+| K-reduction | tile size 和 order 取决于算法选择 | 固定 BLOCK_SIZE_K=64，ki 顺序递增 |
+| 算法选择 | 有 — 启发式 + workspace 状态 | **无** — 无条件分支 |
+| 累加器精度 | TF32（10-bit mantissa） | float32（23-bit mantissa） |
+| 批量下的确定性 | batch-variant（M 不同 → 算法不同 → 结果不同） | batch-invariant（通过设计保证） |
+
+### 27.5 一句话总结
+
+> cuBLAS 为了性能针对不同 M/K/N 选择不同的内部 tiling 策略，不同策略的累加顺序不同，浮点非结合性 + TF32 低精度导致结果差异。matmul_persistent 通过**固定 tiling + 固定 grid + 顺序 K-reduction + 无算法选择 + float32 累加器**消除了所有非确定性源。
+
+---
