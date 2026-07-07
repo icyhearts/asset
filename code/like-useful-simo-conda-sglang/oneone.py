@@ -16,5 +16,12 @@ W_dict = load_file("/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/model-0
 for k in W_dict.keys():
   if "layers.0.mlp.down_proj" in k:
     print(f"found k:{k}")
-    layers_0_mlp_down_proj_w = W_dict.get(k)
+    layers_0_mlp_down_proj_w = W_dict.get(k).to(act_out_tensor.device)
+
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import matmul_persistent
+
+torch_out = torch.mm(act_out_tensor, layers_0_mlp_down_proj_w.T)
+sgl_out = matmul_persistent(act_out_tensor, layers_0_mlp_down_proj_w.T)
+
+byte_diff = (torch_out.view(torch.uint8) - sgl_out.view(torch.uint8)).max()
 
