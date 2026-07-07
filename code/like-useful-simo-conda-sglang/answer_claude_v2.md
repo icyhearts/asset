@@ -753,3 +753,110 @@ cuBLAS 对这个 (M=6, K=10944, N=4096) 问题选择了 **split-K 因子 2**。�
 > nsys profile 揭示了 cuBLAS 的 `torch.mm` 使用了 **split-K 策略**（`nvjet_tst_..._splitK_NNT` + `splitKreduce_kernel`，共 2 个 kernel），其 split 因子和 MMA tile 尺寸由启发式动态选择，不同 M 值可能导致不同选择 → batch-variance。而 `matmul_persistent` 只用 1 个固定 kernel，K 维度顺序遍历，无 split/reduce 分离 → batch-invariant。
 
 ---
+
+## 29. 小 M vs 大 M：cuBLAS 和 matmul_persistent 的行为对比
+
+### 29.1 实验设置
+
+```python
+# like-useful/split-k.py  — 同一脚本中连续执行 4 个 matmul
+K, N = 10944, 4096
+
+A_rows = rbf((6, K))         # M=6
+B_fixed = rbf((K, N))
+A_large = cat([A_rows, rbf((250, K))])  # M=256
+
+out_small       = torch.mm(A_rows, B_fixed)       # ① cuBLAS M=6
+out_small_mp    = matmul_persistent(A_rows, B_fixed)  # ② Triton M=6
+out_large_full  = torch.mm(A_large, B_fixed)       # ③ cuBLAS M=256
+out_large_full_mp = matmul_persistent(A_large, B_fixed)  # ④ Triton M=256
+```
+
+从同一个 `cuda_gpu_trace.csv` 中提取 4 个 matmul 的 kernel：
+
+### 29.2 cuBLAS：M=6 vs M=256 策略完全不同
+
+| | M=6（小 batch） | M=256（大 batch） |
+|---|---|---|
+| **Kernel 名称** | `nvjet_tst_64x8_64x16_2x1_v_bz_splitK_NNT` | `nvjet_tst_128x64_64x8_1x2_h_bz_NNT` |
+| **Grid** | (2, 64, 1) — 128 blocks | (2, 64, 1) — 128 blocks |
+| **Block** | (384, 1, 1) | (384, 1, 1) |
+| **MMA tile** | 64×8, 64×16（小 tile） | 128×64, 64×8（大 M tile + 小 K tile） |
+| **Split-K** | **是**（名称含 `splitK`） | **否**（名称不含 `splitK`） |
+| **Split-K 因子** | 2（Grid.X = 2） | —（不使用 split-K） |
+| **Reduce kernel** | `splitKreduce_kernel` Grid=(128), Block=(32,16) | **无** — 不需要 reduce |
+| **kernel variant** | `v_bz` | `h_bz` |
+| **总耗时** | 39,009 + 1,984 = 40,993 ns | 45,216 ns（单 kernel） |
+| **K 维度处理** | 拆 2 份并行，reduce 合并 | 完整 K 直接处理 |
+
+#### 策略选择逻辑推演
+
+cuBLAS 的启发式根据 M 的大小做出不同决策：
+
+```
+M=6（极小 batch）:
+  K=10944 很大，M=6 极小
+  → 每个 thread block 的工作沿着 M 方向太少（6 行）
+  → 启用 split-K：把 K 拆成 2 份，增加并行度
+  → 用较小的 MMA tile（64×8）适配较少的 M 方向工作量
+  → variant: v_bz（"vertical" 优化？）
+
+M=256（中等 batch）:
+  K=10944，M=256
+  → M 方向有足够工作量（256 行），无需 split-K
+  → 直接用更大的 MMA tile（128×64）沿 M 方向
+  → K 方向顺序遍历，单 kernel 完成
+  → variant: h_bz（"horizontal" 优化？）
+```
+
+**关键结论**：cuBLAS 对**同一个 K=10944, N=4096 问题**，仅因为 M 从 6 变为 256，就选择了完全不同的策略——不同的 MMA tile 尺寸、不同的 kernel variant、是否启用 split-K。这直接导致了数值上的 batch-dependence。
+
+### 29.3 matmul_persistent：M=6 vs M=256 策略一致
+
+| | M=6（小 batch） | M=256（大 batch） |
+|---|---|---|
+| **Kernel 名称** | `matmul_kernel_persistent` | `matmul_kernel_persistent` |
+| **Grid** | (32, 1, 1) | (64, 1, 1) |
+| **Block** | (256, 1, 1) | (256, 1, 1) |
+| **Registers** | 124 | 124 |
+| **Static SMem** | 0.000 MB | 0.000 MB |
+| **Dynamic SMem** | 0.082 MB | 0.082 MB |
+| **BLOCK_SIZE_*** | 128/128/64（硬编码） | 128/128/64（硬编码，完全相同） |
+| **K-reduction** | `for ki in range(k_tiles)` 顺序 | `for ki in range(k_tiles)` 顺序（完全相同） |
+| **Accumulator** | float32 | float32 |
+| **策略变化** | **无** | **无** |
+| **总耗时** | 247,937 ns | 203,233 ns |
+
+Grid 从 32 变为 64 的原因：
+
+```
+M=6:  num_tiles = ceil(6/128)   * ceil(4096/128) = 1 * 32 = 32
+      grid = min(132, 32) = 32
+
+M=256: num_tiles = ceil(256/128) * ceil(4096/128) = 2 * 32 = 64
+       grid = min(132, 64) = 64
+```
+
+Grid 大小完全由确定性公式决定，不是启发式选择。Grid 增大只意味着更多 thread block 并行工作，**不影响每个 tile 内部的 K-reduction 顺序**。
+
+### 29.4 对比总结图
+
+```
+cuBLAS (torch.mm):
+  M=6  ──→ splitK=2, MMA=64x8, variant=v_bz, reduce kernel ──→ 结果 A
+  M=256 ──→ splitK=NONE, MMA=128x64, variant=h_bz, 无 reduce ──→ 结果 B
+  ↑                                                            ↑
+  完全不同的策略 → 不同的累加顺序 → 结果不同 (batch-variant)
+
+matmul_persistent:
+  M=6  ──→ grid=32, BLOCK=128x128x64, 顺序 K-reduction ──→ 结果 A
+  M=256 ──→ grid=64, BLOCK=128x128x64, 顺序 K-reduction ──→ 结果 A
+  ↑                              ↑
+  相同策略，仅有 grid 不同 → 相同累加顺序 → 结果相同 (batch-invariant)
+```
+
+### 29.5 一句话总结
+
+> cuBLAS 对 M=6 和 M=256 使用了**完全不同的 kernel**（`splitK` vs 非 splitK，`64x8` vs `128x64` MMA tile，`v_bz` vs `h_bz` variant），策略变化导致不同的累加路径 → batch-dependence。matmul_persistent 只用**同一个 kernel**，Grid 变化（32→64）仅改变并行度，内部 K-reduction 顺序不变 → batch-invariant。
+
+---

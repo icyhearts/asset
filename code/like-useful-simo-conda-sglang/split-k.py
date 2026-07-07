@@ -27,7 +27,13 @@ for row_count, total_M in test_configs:
     A_rows = rbf((row_count, K), seed=42)
     B_fixed = rbf((K, N), seed=43)
 
+    A_pad = rbf((total_M - row_count, K), seed=44)
+    A_large = torch.cat([A_rows, A_pad], dim=0)
+
     # Small batch: only the target rows
     out_small = torch.mm(A_rows, B_fixed)
 
     out_small_mp = matmul_persistent(A_rows, B_fixed)
+
+    out_large_full = torch.mm(A_large, B_fixed)
+    out_large_full_mp = matmul_persistent(A_large, B_fixed)
