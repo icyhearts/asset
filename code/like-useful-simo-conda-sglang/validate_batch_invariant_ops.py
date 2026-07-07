@@ -246,7 +246,7 @@ print("=" * 80)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
-K, N = 2048, 4096  # typical SGLang linear-layer shape (up-proj)
+K, N = 10944, 4096  # typical SGLang linear-layer shape (up-proj)
 ROW_COUNT = 64      # rows we care about
 test_configs = [
     (64, 256),      # small batch, padded to 256

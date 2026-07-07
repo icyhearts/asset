@@ -1,5 +1,33 @@
 
 from safetensors.torch import load_file
+import os
+import re
+from safetensors.torch import load_file
+from pathlib import Path
+import torch
+import torch.nn.functional as F
+
+
+def cosine_similarity(a, b, dim=0):
+    return F.cosine_similarity(a.float(), b.float(), dim=dim)
+
+def relative_l2_error(x: torch.Tensor, x_hat: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # 转为 float32 以保证计算精度
+    x_f32 = x.float()
+    x_hat_f32 = x_hat.float()
+
+    # torch.norm 会计算整个张量的 L2 范数
+    diff_norm = torch.norm(x_f32 - x_hat_f32)
+    orig_norm = torch.norm(x_f32)
+
+    return diff_norm / (orig_norm + eps)
+
+def describe(tensor1, tensor2, name1, name2):
+  cos_sim = cosine_similarity(tensor1.reshape(-1).float(), tensor2.reshape(-1).float())
+  l2_err = relative_l2_error(tensor1.reshape(-1).float(), tensor2.reshape(-1).float())
+  byte_diff = (tensor1.view(torch.uint8) - tensor2.view(torch.uint8)).max()
+  print(f"{name1} vs {name2}, cosine_similarity:{cos_sim}, relative_l2_error:{l2_err}, byte_diff:{byte_diff}")
+
 sgl_directory = "/data/like/temp/sgl_safe_tensor_batch_invariant_triton/"
 ref_dir = "/data/like/temp/sgl_safe_tensor_batch_invariant/"
 
@@ -25,3 +53,11 @@ sgl_out = matmul_persistent(act_out_tensor, layers_0_mlp_down_proj_w.T)
 
 byte_diff = (torch_out.view(torch.uint8) - sgl_out.view(torch.uint8)).max()
 
+
+
+
+torch_out_f32 = torch.mm(act_out_tensor.float(), layers_0_mlp_down_proj_w.T.float())
+sgl_out_f32 = matmul_persistent(act_out_tensor.float(), layers_0_mlp_down_proj_w.T.float())
+
+describe(torch_out_f32, torch_out, "torch_out_f32", "torch_out bf16")
+describe(sgl_out_f32, sgl_out, "sgl_out_f32", "sgl bf16")
