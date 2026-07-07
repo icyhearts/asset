@@ -651,3 +651,105 @@ matmul_persistent 内部没有 `if M > threshold then use_strategy_A else strate
 > cuBLAS 为了性能针对不同 M/K/N 选择不同的内部 tiling 策略，不同策略的累加顺序不同，浮点非结合性 + TF32 低精度导致结果差异。matmul_persistent 通过**固定 tiling + 固定 grid + 顺序 K-reduction + 无算法选择 + float32 累加器**消除了所有非确定性源。
 
 ---
+
+## 28. nsys profile 分析：torch.mm vs matmul_persistent 的 CUDA kernel 层级对比
+
+### 28.1 实验设置
+
+```python
+# like-useful/split-k.py
+K, N = 10944, 4096
+test_configs = [(6, 256)]  # M=6, bf16, TF32=ON
+
+out_small   = torch.mm(A_rows, B_fixed)             # cuBLAS
+out_small_mp = matmul_persistent(A_rows, B_fixed)    # Triton persistent
+```
+
+nsys profile 结果从 `temp/cuda_gpu_trace.csv` 中提取。
+
+### 28.2 torch.mm 调用的 CUDA kernel（2 个）
+
+#### Kernel 1: cuBLAS Split-K Matmul
+
+```
+Name:  nvjet_tst_64x8_64x16_2x1_v_bz_splitK_NNT
+Grid:  (2, 64, 1)    — 128 thread blocks (2 split-K × 64 output tiles)
+Block: (384, 1, 1)   — 384 threads per block
+Time:  37,856 ns
+```
+
+名称解码：
+- `nvjet` = NVIDIA JIT-compiled kernel（cuBLAS 运行时编译的 kernel）
+- `tst` = Tensor Core 指令
+- `64x8` / `64x16` = MMA（Matrix Multiply-Accumulate）Tile 尺寸，由 cuBLAS 启发式选择
+- `2x1` = Split-K 因子为 2（K 维度被切分为 2 份并行计算）
+- `v_bz` = kernel variant
+- `splitK` = **Split-K 策略**：K 维度被拆分为多个 chunk，各 chunk 独立计算部分和，最后 reduce
+- `NNT` = A Not Transposed, B Not Transposed（也可能第三位指输出类型）
+
+**Split-K 策略详解**：
+
+```
+常规 matmul:
+  K=10944 → 每个 thread block 顺序处理全量 K → 单次结果
+
+Split-K matmul (此例 split=2):
+  K=10944 → 拆为 K1=5472, K2=5472
+  Thread block 0-63 算 K1 部分，block 64-127 算 K2 部分
+  各 block 产生 partial sum → 需要 reduction kernel 合并
+```
+
+Grid(2, 64) 表示：2 个 split-K 分组 × 64 个输出 tile = 128 thread blocks，每个 block 只处理一半的 K。
+
+#### Kernel 2: Split-K Reduction
+
+```
+Name:  cublasLt::splitKreduce_kernel
+Grid:  (128, 1, 1)  — 128 thread blocks（与 splitK 的 block 数对应）
+Block: (32, 16, 1)  — 512 threads per block
+Time:  1,984 ns
+```
+
+将 128 个 partial sum（来自 2 split × 64 tiles）合并为最终结果。Grid 数量与 splitK matmul 的 block 总数一致。
+
+### 28.3 matmul_persistent 调用的 CUDA kernel（1 个）
+
+```
+Name:  matmul_kernel_persistent
+Grid:  (32, 1, 1)   — 32 thread blocks（min(NUM_SMS=132, num_tiles=32)）
+Block: (256, 1, 1)  — 256 threads per block
+Time:  246,401 ns
+```
+
+- `num_tiles = ceil(M/128) * ceil(N/128) = ceil(6/128) * ceil(4096/128) = 1 * 32 = 32`
+- 32 < 132(SMs)，所以 grid = 32
+- 每个 block 处理 1 个 tile（无 striding）
+- 单 kernel 完成全部计算，无 split/reduce 分离
+
+### 28.4 关键对比
+
+| 维度 | torch.mm (cuBLAS) | matmul_persistent (Triton) |
+|---|---|---|
+| Kernel 数量 | **2**（splitK matmul + reduce） | **1**（persistent kernel） |
+| MMA tile 选择 | cuBLAS 启发式动态选择（`64x8`/`64x16`） | 硬编码 `BLOCK_SIZE_K=64`（固定） |
+| K 维度策略 | **Split-K**（拆 2 份并行 → reduce 合并） | 顺序遍历全量 K（无 split） |
+| Grid 决定因素 | cuBLAS 内部算法决定（128 blocks） | `min(NUM_SMS, ceil(M/128)*ceil(N/128))` |
+| Kernel 命名 | `nvjet_tst_..._splitK_...`（JIT 编译，名称编码策略） | `matmul_kernel_persistent`（Triton 编译） |
+| 确定性 | 否 — 启发式选择可能因 M 不同而选不同 split-K 因子或 tile 尺寸 | **是** — 固定策略，无动态选择 |
+
+### 28.5 Split-K 是 batch-dependence 的直接证据
+
+cuBLAS 对这个 (M=6, K=10944, N=4096) 问题选择了 **split-K 因子 2**。当 M 变为 64 或更大时，cuBLAS 的启发式可能选择完全不同的 split-K 因子（如 1，即不用 split-K）或不同的 MMA tile 尺寸。
+
+不同的 split-K 因子意味着：
+- 不同的 K 维度分组 → 不同的累加顺序
+- 不同的 partial sum 数量 → 不同的 reduction tree 结构
+- 不同的 rounding 误差累积路径
+
+**这直接解释了为什么 torch.mm 在 K=10944 时产生 batch-variance 而 K=2048 时不产生**：K=10944 时 cuBLAS 启用了 M-dependent 的 split-K 策略，而 K=2048 时没有（可能所有 M 都使用统一的 non-split 路径）。
+
+### 28.6 一句话总结
+
+> nsys profile 揭示了 cuBLAS 的 `torch.mm` 使用了 **split-K 策略**（`nvjet_tst_..._splitK_NNT` + `splitKreduce_kernel`，共 2 个 kernel），其 split 因子和 MMA tile 尺寸由启发式动态选择，不同 M 值可能导致不同选择 → batch-variance。而 `matmul_persistent` 只用 1 个固定 kernel，K 维度顺序遍历，无 split/reduce 分离 → batch-invariant。
+
+---

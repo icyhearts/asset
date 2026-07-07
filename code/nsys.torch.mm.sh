@@ -5,5 +5,4 @@ which python
 cd /data/like/package/simo_conda_sglang/
 mkdir -p temp
 
-#/share_data/users/like/opt/cuda-12.8/bin/nsys profile --force-overwrite=true  -o temp/torch_mm_batch_varian.nsys --trace='cuda,cublas,cudnn,nvtx,osrt,opengl' python like-useful/split-k.py  
-/share_data/users/like/opt/cuda-12.8/bin/nsys profile --export=text --force-overwrite=true  -o temp/torch_mm_batch_varian.nsys.text --trace='cuda,cublas,cudnn,nvtx,osrt,opengl' python like-useful/split-k.py  
+/share_data/users/like/opt/cuda-12.8/bin/nsys profile --force-overwrite=true  -o temp/torch_mm_batch_varian.nsys --trace='cuda,cublas,cudnn,nvtx,osrt,opengl' python like-useful/split-k.py  
