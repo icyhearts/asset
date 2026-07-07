@@ -45,6 +45,7 @@ for k in W_dict.keys():
   if "layers.0.mlp.down_proj" in k:
     print(f"found k:{k}")
     layers_0_mlp_down_proj_w = W_dict.get(k).to(act_out_tensor.device)
+    print(layers_0_mlp_down_proj_w.shape)
 
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import matmul_persistent
 
@@ -59,5 +60,3 @@ byte_diff = (torch_out.view(torch.uint8) - sgl_out.view(torch.uint8)).max()
 torch_out_f32 = torch.mm(act_out_tensor.float(), layers_0_mlp_down_proj_w.T.float())
 sgl_out_f32 = matmul_persistent(act_out_tensor.float(), layers_0_mlp_down_proj_w.T.float())
 
-describe(torch_out_f32, torch_out, "torch_out_f32", "torch_out bf16")
-describe(sgl_out_f32, sgl_out, "sgl_out_f32", "sgl bf16")
