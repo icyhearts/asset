@@ -20,6 +20,12 @@ struct CommandResult {
   std::string output;
 };
 
+struct ComputeApp {
+  std::string gpu_uuid;
+  std::string pid;
+  std::optional<int> gpu_memory_mib;
+};
+
 std::string trim(const std::string &value) {
   auto begin = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
     return std::isspace(ch) != 0;
@@ -135,6 +141,26 @@ std::optional<int> parse_positive_int(const std::string &value) {
   return parsed;
 }
 
+std::optional<int> parse_non_negative_int(const std::string &value) {
+  if (value.empty()) {
+    return std::nullopt;
+  }
+
+  int parsed = 0;
+  for (char ch : value) {
+    if (std::isdigit(static_cast<unsigned char>(ch)) == 0) {
+      return std::nullopt;
+    }
+    const int digit = ch - '0';
+    if (parsed > (2147483647 - digit) / 10) {
+      return std::nullopt;
+    }
+    parsed = parsed * 10 + digit;
+  }
+
+  return parsed;
+}
+
 bool is_positive_integer(const std::string &value) {
   return parse_positive_int(value).has_value();
 }
@@ -149,11 +175,14 @@ std::string basename(const std::string &path) {
 
 void print_usage(const std::string &program) {
   std::cerr << "Usage:\n"
-            << "  " << program << " [--once] <gpu_id_list> <protected_user> <sig_num>\n"
-            << "  " << program << " --loop <gpu_id_list> <protected_user> <sig_num>\n"
+            << "  " << program << " [--once] <gpu_id_list> <protected_user> <sig_num> [gpu_mem_usage]\n"
+            << "  " << program << " --loop <gpu_id_list> <protected_user> <sig_num> [gpu_mem_usage]\n"
+            << "    gpu_mem_usage is optional and measured in MiB. When set, only processes\n"
+            << "    using more GPU memory than this threshold are signaled.\n"
             << "Example:\n"
             << "  " << program << " \"1,3,5\" like 11\n"
-            << "  " << program << " --loop \"1,3,5\" like 11\n";
+            << "  " << program << " --loop \"1,3,5\" like 11\n"
+            << "  " << program << " \"1,3,5\" like 11 4096\n";
 }
 
 std::map<std::string, std::string> query_gpu_uuid_by_index() {
@@ -184,10 +213,13 @@ std::map<std::string, std::string> query_gpu_uuid_by_index() {
   return result;
 }
 
-std::vector<std::pair<std::string, std::string>> query_compute_apps() {
-  std::vector<std::pair<std::string, std::string>> result;
+std::vector<ComputeApp> query_compute_apps(bool include_gpu_memory) {
+  std::vector<ComputeApp> result;
+  const auto fields =
+      include_gpu_memory ? "gpu_uuid,pid,used_gpu_memory" : "gpu_uuid,pid";
   const auto command_result = run_and_capture(
-      "nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader,nounits",
+      std::string("nvidia-smi --query-compute-apps=") + fields +
+          " --format=csv,noheader,nounits",
       true);
 
   if (command_result.status != 0) {
@@ -207,7 +239,11 @@ std::vector<std::pair<std::string, std::string>> query_compute_apps() {
     const auto uuid = trim(fields[0]);
     const auto pid = trim(fields[1]);
     if (!uuid.empty() && is_positive_integer(pid)) {
-      result.emplace_back(uuid, pid);
+      std::optional<int> gpu_memory_mib;
+      if (include_gpu_memory && fields.size() >= 3) {
+        gpu_memory_mib = parse_non_negative_int(trim(fields[2]));
+      }
+      result.push_back(ComputeApp{uuid, pid, gpu_memory_mib});
     }
   }
 
@@ -238,14 +274,15 @@ std::vector<std::string> parse_gpu_list(const std::string &gpu_list) {
 }
 
 bool run_once(const std::string &gpu_list, const std::string &protected_user,
-              int signal_number) {
+              int signal_number,
+              std::optional<int> gpu_memory_threshold_mib) {
   const auto gpu_ids = parse_gpu_list(gpu_list);
   const auto gpu_uuid_by_index = query_gpu_uuid_by_index();
   if (gpu_uuid_by_index.empty()) {
     return false;
   }
 
-  const auto compute_apps = query_compute_apps();
+  const auto compute_apps = query_compute_apps(gpu_memory_threshold_mib.has_value());
 
   for (const auto &gpu_index : gpu_ids) {
     const auto uuid_it = gpu_uuid_by_index.find(gpu_index);
@@ -254,21 +291,38 @@ bool run_once(const std::string &gpu_list, const std::string &protected_user,
     }
 
     const auto &gpu_uuid = uuid_it->second;
-    for (const auto &[app_uuid, pid] : compute_apps) {
-      if (app_uuid != gpu_uuid) {
+    for (const auto &app : compute_apps) {
+      if (app.gpu_uuid != gpu_uuid) {
         continue;
       }
 
-      const auto owner = query_owner(pid);
+      const auto owner = query_owner(app.pid);
       if (owner.empty() || owner == protected_user) {
         continue;
       }
 
-      std::cout << "[KILL] GPU " << gpu_index << " PID " << pid << " owned by "
-                << owner << '\n';
-      if (!send_signal(pid, signal_number)) {
+      if (gpu_memory_threshold_mib.has_value()) {
+        if (!app.gpu_memory_mib.has_value()) {
+          std::cerr << "[WARN] GPU " << gpu_index << " PID " << app.pid
+                    << " owned by " << owner
+                    << " has unknown GPU memory usage; skip\n";
+          continue;
+        }
+        if (*app.gpu_memory_mib <= *gpu_memory_threshold_mib) {
+          continue;
+        }
+      }
+
+      std::cout << "[KILL] GPU " << gpu_index << " PID " << app.pid
+                << " owned by " << owner;
+      if (gpu_memory_threshold_mib.has_value()) {
+        std::cout << " using " << *app.gpu_memory_mib << " MiB > "
+                  << *gpu_memory_threshold_mib << " MiB";
+      }
+      std::cout << '\n';
+      if (!send_signal(app.pid, signal_number)) {
         std::cerr << "[WARN] failed to send signal " << signal_number
-                  << " to PID " << pid << '\n';
+                  << " to PID " << app.pid << '\n';
       }
     }
   }
@@ -299,7 +353,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (argc - first_arg != 3) {
+  if (argc - first_arg != 3 && argc - first_arg != 4) {
     print_usage(program);
     return 1;
   }
@@ -312,12 +366,25 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::optional<int> gpu_memory_threshold_mib;
+  if (argc - first_arg == 4) {
+    gpu_memory_threshold_mib = parse_non_negative_int(argv[first_arg + 3]);
+    if (!gpu_memory_threshold_mib.has_value()) {
+      std::cerr << "[ERROR] gpu_mem_usage must be a non-negative integer MiB value\n";
+      return 1;
+    }
+  }
+
   if (mode == Mode::once) {
-    return run_once(gpu_list, protected_user, *signal_number) ? 0 : 1;
+    return run_once(gpu_list, protected_user, *signal_number,
+                    gpu_memory_threshold_mib)
+               ? 0
+               : 1;
   }
 
   while (true) {
-    if (!run_once(gpu_list, protected_user, *signal_number)) {
+    if (!run_once(gpu_list, protected_user, *signal_number,
+                  gpu_memory_threshold_mib)) {
       return 1;
     }
     //std::this_thread::sleep_for(std::chrono::seconds(1));

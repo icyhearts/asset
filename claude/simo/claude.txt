@@ -2486,3 +2486,7 @@ sglang code base 的python/sglang/srt/layers/attention/triton_ops/decode_attenti
 对于 遗漏 #1: `truncation_align_size`（最关键）, 增加新的环境变量模拟，并在日志中打印环境变量产生的效果。
 对于#### 遗漏 #2: `sampling_seed` 不完整，复用SGLANG_FORCE_DETERMINISTIC_SAMPLING=1环境变量的开关，SGLANG_FORCE_DETERMINISTIC_SAMPLING要能控制sampling_seed。
 
+修改 ~/asset/code/cpp_guard/kgp.cpp , gpu_id_list,  protected_user, sig_num 3个参数后面 追加一个可选的显存占用参数 gpu_mem_usage ，显存单位是 MiB.
+
+对于 owner != protected_user 的进程，如果 gpu_mem_usage 参数没有设置，保留原来的kill 逻辑
+如果 gpu_mem_usage 参数有值， 只有它的 gpu memory 占用 > gpu_mem_usage, 才 发送 kill
