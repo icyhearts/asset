@@ -1,0 +1,7 @@
+deepseek-v4 inference code 位于 /data/like/hf-models/deepseek-v4-flash/inference
+deepseek-v4 inference code generate.py
+```
+    if rank != 0:
+        print = lambda *_, **__: None
+```
+这里有什么作用 ?
