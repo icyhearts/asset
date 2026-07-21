@@ -2608,3 +2608,22 @@ pip 安装 onnxruntime-gpu，本质上是从 /softhome/like/package/onnxruntime 
 
 onnxruntime 代码 /softhome/like/package/onnxruntime/ 是否有能力编译出 onnxruntime-gpu 需要的wheel包？这份代码有能力提供 CUDAExecutionProvider 吗?
 把答案追加到 like-useful/answer_codex_v2.md
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+torch LSTM文档位于 https://docs.pytorch.org/docs/2.13/generated/torch.nn.LSTM.html
+修改 like-useful/test-lstm.py，实现以下目的:
+根据 LSTM的数学公式， 手动计算lstm，和 torch.nn.LSTM 的结果做对比，理论上，手动计算的结果应该保持一致。
+把  LSTMExportWrapper.lstm 的4个权重和bias等内部 parameter 提取出来， 单独和 input/c0/h0 进行 torch.matmul, torch.sigmoid, torch.tanh等运算，和LSTMExportWrapper的输出做对比。
+
+
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+torch LSTM文档位于 https://docs.pytorch.org/docs/2.13/generated/torch.nn.LSTM.html
+把  like-useful/test-lstm.py copy 成 like-useful/test-lstm-bidirectional.py, 把 like-useful/test-lstm-bidirectional.py 改成双向 lstm, NUM_LAYERS layer仍旧保持1层。
+所有的测试，包括 torch和 onnxruntime 的对比， torch  和 manual_lstm_forward的对比，都改成双向  LSTM的对比.
+
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+torch LSTM文档位于 https://docs.pytorch.org/docs/2.13/generated/torch.nn.LSTM.html
+把 like-useful/test-lstm-bidirectional.py copy 成 like-useful/test-lstm-bidirectional-multi-layer.py, 把 like-useful/test-lstm-bidirectional-multi-layer.py 改成 NUM_LAYERS=2, 进行2层双向LSTM的测试.
+所有的测试，包括 torch和 onnxruntime 的对比， torch  和 manual_lstm_forward的对比，都改成2层双向  LSTM的对比.

@@ -9,9 +9,9 @@ from torch import nn
 
 INPUT_SIZE = 10
 HIDDEN_SIZE = 20
-NUM_LAYERS = 1
-NUM_DIRECTIONS = 1
-ONNX_PATH = Path("temp/test-lstm.onnx")
+NUM_LAYERS = 2
+NUM_DIRECTIONS = 2
+ONNX_PATH = Path("temp/test-lstm-bidirectional-multi-layer.onnx")
 EXPORT_SHAPE = (5, 3)
 VERIFY_SHAPES = (
   (5, 3),
@@ -38,40 +38,32 @@ def make_inputs(seq_len: int, batch_size: int, generator: torch.Generator):
   return input_tensor, h0, c0
 
 
-def manual_lstm_forward(
-  lstm: nn.LSTM,
+def _manual_lstm_direction(
   input_tensor: torch.Tensor,
-  h0: torch.Tensor,
-  c0: torch.Tensor,
+  initial_h: torch.Tensor,
+  initial_c: torch.Tensor,
+  weight_ih: torch.Tensor,
+  weight_hh: torch.Tensor,
+  bias_ih: torch.Tensor,
+  bias_hh: torch.Tensor,
+  *,
+  reverse: bool,
 ):
-  """Evaluate this script's one-layer LSTM directly from its gate equations."""
-  if lstm.num_layers != 1:
-    raise ValueError("manual_lstm_forward only supports num_layers=1")
-  if lstm.bidirectional:
-    raise ValueError("manual_lstm_forward only supports a forward LSTM")
-  if lstm.batch_first:
-    raise ValueError("manual_lstm_forward expects (seq_len, batch, input_size)")
-  if lstm.proj_size != 0:
-    raise ValueError("manual_lstm_forward does not support LSTM projections")
-  if not lstm.bias:
-    raise ValueError("manual_lstm_forward expects both LSTM bias tensors")
+  w_ii, w_if, w_ig, w_io = weight_ih.chunk(4, dim=0)
+  w_hi, w_hf, w_hg, w_ho = weight_hh.chunk(4, dim=0)
+  b_ii, b_if, b_ig, b_io = bias_ih.chunk(4, dim=0)
+  b_hi, b_hf, b_hg, b_ho = bias_hh.chunk(4, dim=0)
 
-  # PyTorch stores four registered parameters. Each parameter concatenates the
-  # input, forget, cell, and output gate values in I/F/G/O order.
-  weight_ih_l0 = lstm.weight_ih_l0
-  weight_hh_l0 = lstm.weight_hh_l0
-  bias_ih_l0 = lstm.bias_ih_l0
-  bias_hh_l0 = lstm.bias_hh_l0
-
-  w_ii, w_if, w_ig, w_io = weight_ih_l0.chunk(4, dim=0)
-  w_hi, w_hf, w_hg, w_ho = weight_hh_l0.chunk(4, dim=0)
-  b_ii, b_if, b_ig, b_io = bias_ih_l0.chunk(4, dim=0)
-  b_hi, b_hf, b_hg, b_ho = bias_hh_l0.chunk(4, dim=0)
-
-  h_t = h0[0]
-  c_t = c0[0]
+  h_t = initial_h
+  c_t = initial_c
   output_steps = []
-  for x_t in input_tensor.unbind(dim=0):
+  if reverse:
+    time_indices = range(input_tensor.size(0) - 1, -1, -1)
+  else:
+    time_indices = range(input_tensor.size(0))
+
+  for time_index in time_indices:
+    x_t = input_tensor[time_index]
     i_t = torch.sigmoid(
       torch.matmul(x_t, w_ii.T) + b_ii
       + torch.matmul(h_t, w_hi.T) + b_hi
@@ -92,20 +84,87 @@ def manual_lstm_forward(
     h_t = o_t * torch.tanh(c_t)
     output_steps.append(h_t)
 
+  # Reverse recurrence visits L-1 ... 0. Restore output to the original
+  # sequence positions before concatenating it with the forward direction.
+  if reverse:
+    output_steps.reverse()
+
   output = torch.stack(output_steps, dim=0)
-  hn = h_t.unsqueeze(0)
-  cn = c_t.unsqueeze(0)
+  return output, h_t, c_t
+
+
+def manual_lstm_forward(
+  lstm: nn.LSTM,
+  input_tensor: torch.Tensor,
+  h0: torch.Tensor,
+  c0: torch.Tensor,
+):
+  """Evaluate this script's two-layer bidirectional LSTM gate by gate."""
+  if lstm.num_layers != NUM_LAYERS:
+    raise ValueError(
+      f"manual_lstm_forward expects num_layers={NUM_LAYERS}, "
+      f"got {lstm.num_layers}"
+    )
+  if not lstm.bidirectional:
+    raise ValueError("manual_lstm_forward expects a bidirectional LSTM")
+  if lstm.batch_first:
+    raise ValueError("manual_lstm_forward expects (seq_len, batch, input_size)")
+  if lstm.proj_size != 0:
+    raise ValueError("manual_lstm_forward does not support LSTM projections")
+  if not lstm.bias:
+    raise ValueError("manual_lstm_forward expects both LSTM bias tensors")
+
+  # A layer's forward/backward outputs are concatenated at every time step and
+  # become the next layer's input. State order is layer-major, then direction.
+  layer_input = input_tensor
+  final_hidden_states = []
+  final_cell_states = []
+  for layer_index in range(lstm.num_layers):
+    state_index = layer_index * NUM_DIRECTIONS
+    forward = _manual_lstm_direction(
+      layer_input,
+      h0[state_index],
+      c0[state_index],
+      getattr(lstm, f"weight_ih_l{layer_index}"),
+      getattr(lstm, f"weight_hh_l{layer_index}"),
+      getattr(lstm, f"bias_ih_l{layer_index}"),
+      getattr(lstm, f"bias_hh_l{layer_index}"),
+      reverse=False,
+    )
+    backward = _manual_lstm_direction(
+      layer_input,
+      h0[state_index + 1],
+      c0[state_index + 1],
+      getattr(lstm, f"weight_ih_l{layer_index}_reverse"),
+      getattr(lstm, f"weight_hh_l{layer_index}_reverse"),
+      getattr(lstm, f"bias_ih_l{layer_index}_reverse"),
+      getattr(lstm, f"bias_hh_l{layer_index}_reverse"),
+      reverse=True,
+    )
+
+    forward_output, forward_hn, forward_cn = forward
+    backward_output, backward_hn, backward_cn = backward
+    layer_input = torch.cat((forward_output, backward_output), dim=2)
+    final_hidden_states.extend((forward_hn, backward_hn))
+    final_cell_states.extend((forward_cn, backward_cn))
+
+  output = layer_input
+  hn = torch.stack(final_hidden_states, dim=0)
+  cn = torch.stack(final_cell_states, dim=0)
   return output, hn, cn
 
 
 def print_lstm_parameter_shapes(lstm: nn.LSTM) -> None:
-  parameter_names = (
-    "weight_ih_l0",
-    "weight_hh_l0",
-    "bias_ih_l0",
-    "bias_hh_l0",
-  )
-  print("LSTM parameters (I/F/G/O concatenation):")
+  parameter_names = []
+  for layer_index in range(lstm.num_layers):
+    for direction_suffix in ("", "_reverse"):
+      parameter_names.extend((
+        f"weight_ih_l{layer_index}{direction_suffix}",
+        f"weight_hh_l{layer_index}{direction_suffix}",
+        f"bias_ih_l{layer_index}{direction_suffix}",
+        f"bias_hh_l{layer_index}{direction_suffix}",
+      ))
+  print("Two-layer bidirectional LSTM parameters (I/F/G/O concatenation):")
   for name in parameter_names:
     parameter = getattr(lstm, name)
     print(f"  {name}: shape={tuple(parameter.shape)}")
@@ -135,8 +194,23 @@ def export_dynamic_onnx(model: nn.Module, example_inputs) -> None:
   onnx_model = onnx.load(ONNX_PATH)
   onnx.checker.check_model(onnx_model)
   op_types = [node.op_type for node in onnx_model.graph.node]
-  assert "LSTM" in op_types, f"Expected an ONNX LSTM node, got {op_types}"
-  print(f"exported={ONNX_PATH} ops={op_types}")
+  lstm_nodes = [node for node in onnx_model.graph.node if node.op_type == "LSTM"]
+  assert len(lstm_nodes) == NUM_LAYERS, (
+    f"Expected {NUM_LAYERS} ONNX LSTM nodes, got {op_types}"
+  )
+  for layer_index, lstm_node in enumerate(lstm_nodes):
+    direction_attributes = {
+      attribute.name: onnx.helper.get_attribute_value(attribute)
+      for attribute in lstm_node.attribute
+    }
+    assert direction_attributes.get("direction") == b"bidirectional", (
+      f"Expected layer {layer_index} direction=bidirectional, "
+      f"got {direction_attributes}"
+    )
+  print(
+    f"exported={ONNX_PATH} layers={len(lstm_nodes)} "
+    f"direction=bidirectional ops={op_types}"
+  )
 
 
 def verify_dynamic_metadata(session: ort.InferenceSession) -> None:
@@ -211,7 +285,12 @@ def main() -> None:
   torch.manual_seed(20260720)
   input_generator = torch.Generator().manual_seed(20260721)
   model = LSTMExportWrapper(
-    nn.LSTM(INPUT_SIZE, HIDDEN_SIZE, num_layers=NUM_LAYERS)
+    nn.LSTM(
+      INPUT_SIZE,
+      HIDDEN_SIZE,
+      num_layers=NUM_LAYERS,
+      bidirectional=True,
+    )
   ).eval()
   print_lstm_parameter_shapes(model.lstm)
 
@@ -224,7 +303,8 @@ def main() -> None:
     verify_case(model, session, seq_len, batch_size, input_generator)
 
   print(
-    "PASS: manual LSTM matches PyTorch and ONNX Runtime matches PyTorch "
+    "PASS: manual two-layer bidirectional LSTM matches PyTorch and "
+    "ONNX Runtime matches PyTorch "
     f"for {len(VERIFY_SHAPES)} dynamic input shapes"
   )
 
