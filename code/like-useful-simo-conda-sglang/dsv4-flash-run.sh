@@ -1,4 +1,5 @@
 set -x
+source /share/users/like/package/sglang_kernel_src/like-useful/env-build-pip.sh
 # CUDA_VISIBLE_DEVICES=0,4,6,7 
 # SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.json
 SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_kernel_src/like-useful/custom_sglang.simple.json SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES  sglang serve \

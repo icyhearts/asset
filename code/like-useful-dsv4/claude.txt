@@ -5,3 +5,7 @@ deepseek-v4 inference code generate.py
         print = lambda *_, **__: None
 ```
 这里有什么作用 ?
+
+
+/data/like/hf-models/deepseek-v4-flash-git-control-by-like//inference/kernel.py hc_split_sinkhorn_kernel函数进行详细讲解
+答案追加到 /softhome/like/asset/code/like-useful-dsv4/answer_codex.md

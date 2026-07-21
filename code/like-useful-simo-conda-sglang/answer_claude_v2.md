@@ -860,3 +860,502 @@ matmul_persistent:
 > cuBLAS 对 M=6 和 M=256 使用了**完全不同的 kernel**（`splitK` vs 非 splitK，`64x8` vs `128x64` MMA tile，`v_bz` vs `h_bz` variant），策略变化导致不同的累加路径 → batch-dependence。matmul_persistent 只用**同一个 kernel**，Grid 变化（32→64）仅改变并行度，内部 K-reduction 顺序不变 → batch-invariant。
 
 ---
+
+## 30. lm-eval 跑 GSM8K 时保存每道题、标准答案、模型输出和错题
+
+当前环境里的 `lm-eval` 是 `lm_eval` 0.4.9.2。要让输出结果包含每个 GSM8K 样本，需要在原来的评测命令后面加：
+
+```bash
+--log_samples --output_path <输出目录>
+```
+
+也就是说，把原来的命令：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/lm-eval \
+  ...你的原有 model/model_args 参数... \
+  --tasks gsm8k
+```
+
+改成：
+
+```bash
+OUT=like-useful/lm_eval_gsm8k_$(date +%Y%m%d_%H%M%S)
+
+/data/like/miniconda3/envs/simo_sglang/bin/lm-eval \
+  ...你的原有 model/model_args 参数... \
+  --tasks gsm8k \
+  --log_samples \
+  --output_path "$OUT"
+```
+
+新版 CLI 也可以显式写 `run`，等价：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/lm-eval run \
+  ...你的原有 model/model_args 参数... \
+  --tasks gsm8k \
+  --log_samples \
+  --output_path "$OUT"
+```
+
+注意：`--log_samples` 必须配合 `--output_path`。只用 `--write_out` 不够，`--write_out` 主要打印前几个 prompt，不会保存完整每题结果。也不要用 `--predict_only` 来分析错题，因为它会跳过 metric 计算；分析“哪题错了”需要保留 `exact_match`。
+
+评测结束后，samples 文件通常在：
+
+```bash
+find "$OUT" -name 'samples_gsm8k_*.jsonl' -print
+```
+
+如果 `--output_path` 是目录，lm-eval 会在目录下再建一个模型名子目录，里面会有：
+
+```text
+results_<timestamp>.json
+samples_gsm8k_<timestamp>.jsonl
+```
+
+每行 JSONL 是一个样本记录，关键字段是：
+
+```text
+doc_id              GSM8K test 集样本 id
+doc.question        原始问题
+doc.answer          GSM8K 标准解答，末尾通常有 #### final_answer
+target              lm-eval 的 target；对 gsm8k 默认基本就是标准 answer 字符串
+resps               模型原始生成
+filtered_resps      经过 regex 抽取后的答案
+filter              使用哪个抽取规则
+exact_match         这个样本在该 filter 下是否答对，通常 1/0 或 true/false
+```
+
+GSM8K 默认配置有两个 filter：
+
+```text
+strict-match       要求模型输出里有类似 #### 42 的格式
+flexible-extract   更宽松，从输出里抽取数字
+```
+
+因此同一道题通常会在 `samples_gsm8k_*.jsonl` 里出现两条记录：一条 `filter=="strict-match"`，一条 `filter=="flexible-extract"`。你要按最终结果表里关注的那一列选择对应 filter。一般排查模型实际答错了哪些题，`flexible-extract` 更直观；如果你关心严格格式是否符合，就看 `strict-match`。
+
+列出所有题目、标准答案、模型原始输出和抽取答案：
+
+```bash
+SAMPLE=$(find "$OUT" -name 'samples_gsm8k_*.jsonl' | head -n 1)
+
+jq -r '
+  select(.filter == "flexible-extract") |
+  "doc_id=\(.doc_id)\nQ: \(.doc.question)\nGOLD: \(.doc.answer)\nMODEL_RAW: \(.resps[0][0])\nEXTRACTED: \(.filtered_resps[0])\nexact_match=\(.exact_match)\n---"
+' "$SAMPLE" > "$OUT/gsm8k_all_samples.txt"
+```
+
+只筛出错题：
+
+```bash
+jq -r '
+  select(.filter == "flexible-extract" and (.exact_match == 0 or .exact_match == false)) |
+  "doc_id=\(.doc_id)\nQ: \(.doc.question)\nGOLD: \(.doc.answer)\nMODEL_RAW: \(.resps[0][0])\nEXTRACTED: \(.filtered_resps[0])\n---"
+' "$SAMPLE" > "$OUT/gsm8k_wrong_samples.txt"
+```
+
+如果你要分析 `strict-match` 下的错题，把上面命令里的：
+
+```jq
+select(.filter == "flexible-extract" ...)
+```
+
+改成：
+
+```jq
+select(.filter == "strict-match" ...)
+```
+
+如果只想抽取标准答案的最终数字，可以从 `doc.answer` 里的 `####` 后面取：
+
+```bash
+jq -r '
+  select(.filter == "flexible-extract" and (.exact_match == 0 or .exact_match == false)) |
+  (.doc.answer | capture("#### (?<gold>.*)$").gold) as $gold |
+  "doc_id=\(.doc_id)\nQ: \(.doc.question)\nGOLD_FINAL: \($gold)\nMODEL_RAW: \(.resps[0][0])\nEXTRACTED: \(.filtered_resps[0])\n---"
+' "$SAMPLE" > "$OUT/gsm8k_wrong_final_answer.txt"
+```
+
+如果你拿到错题 `doc_id` 后想单独重跑几道题，可以用 `--samples`，例如只跑第 12、345、678 题：
+
+```bash
+/data/like/miniconda3/envs/simo_sglang/bin/lm-eval \
+  ...你的原有 model/model_args 参数... \
+  --tasks gsm8k \
+  --samples '{"gsm8k":[12,345,678]}' \
+  --log_samples \
+  --output_path "$OUT/rerun_selected"
+```
+
+`--samples` 和 `--limit` 不能同时用。
+
+---
+
+## 31. 2026-07-11 GSM8K 复测日志检查及参考分数对比
+
+输入日志：
+
+```text
+temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_07_11___11_36_29
+```
+
+### 31.1 日志完整性、OOM 和 crash
+
+- 评测已经结束，日志不再写入，也没有残留的评测或 SGLang 服务进程。
+- 没有 `OutOfMemoryError`、`CUDA out of memory` 或其他 OOM。
+- 没有 SGLang scheduler、server 或 `lm-eval` 的运行期 crash、CUDA error、SIGKILL、segfault 或结果缺失。
+- 脚本预期运行 `2 * (1 个无量化 + 13 个权重量化 + 7 个 KV cache 量化) = 42` 项；日志中 42 项全部有完整的 GSM8K 结果，覆盖 42/42，没有缺失或重复。
+- 每项成功输出结果并关闭服务后，都出现一次 Python `resource_tracker`/loky 清理期 `KeyError('/loky-...')`，共 42 次。这是退出清理辅助进程的异常/资源泄漏告警，不是模型推理或评测 crash，不影响已经输出的分数。
+- 脚本只有 `set -e`，没有 `set -o pipefail`；由于命令使用 `lm-eval ... | tee ...`，未来若 `lm-eval` 失败，退出码可能被 `tee` 掩盖。因此提取聚合日志时仍应像本次一样校验预期结果数量。
+
+### 31.2 对比口径
+
+- 使用 lm-eval 表格中的 `flexible-extract / exact_match`，不使用下一行 `strict-match`。
+- 日志原始值乘以 100，并保留两位小数后，与 `tests/sglang_simo/references_accuracy/gsm8k.yaml` 比较。
+- `差值 = 本次分数 - 参考分数`，单位是百分点（pp）。
+- 为避免把单次评测约 1.1-1.4 pp 的 stderr 直接当成明显回归，这里将 `|差值| >= 3.00 pp` 定义为“较大差别”；`2.00 <= |差值| < 3.00 pp` 标记为“需关注”；其余标记为“否”。
+- 权重量化名称对应 `quant_config_<quant_algo>.json`。KV cache 的 `fp8_per_group_64`、`int8_per_group_64` 分别对应日志中的 `quant_config_kvquant_fp8_per_group.json`、`quant_config_kvquant_int8_per_group.json`。
+
+### 31.3 Llama-3.1-8B-Instruct
+
+| 类型 | 配置 | 参考 | 本次 | 差值(pp) | 较大差别 |
+|---|---|---:|---:|---:|---|
+| 无量化 | baseline | 78.01 | 77.63 | -0.38 | 否 |
+| 权重 | w8a8_fp8_per_block | 77.48 | 76.95 | -0.53 | 否 |
+| 权重 | w4a16_int4_per_group | 72.71 | 72.93 | +0.22 | 否 |
+| 权重 | w8a8_int8_per_block | 77.79 | 77.26 | -0.53 | 否 |
+| 权重 | w8a8_fp8_per_channel | 76.35 | 77.71 | +1.36 | 否 |
+| 权重 | w8a8_int8_per_channel | 77.94 | 75.59 | -2.35 | 需关注 |
+| 权重 | w8a8_mxint | 78.17 | 77.48 | -0.69 | 否 |
+| 权重 | w8a8_mxfp | 76.95 | 77.03 | +0.08 | 否 |
+| 权重 | w6a6_mxfp | 77.63 | 76.35 | -1.28 | 否 |
+| 权重 | w4a4_mxfp | 47.92 | 47.61 | -0.31 | 否 |
+| 权重 | w4a16_nvfp4_per_group | 72.48 | 73.46 | +0.98 | 否 |
+| 权重 | w4a16_nvfp4_per_group_4_over_6 | 73.24 | 74.00 | +0.76 | 否 |
+| 权重 | w4a4_nvfp | 69.37 | 69.07 | -0.30 | 否 |
+| 权重 | w4a4_nvfp_4_over_6 | 70.36 | 70.13 | -0.23 | 否 |
+| KV cache | mxfp8 | 78.92 | 76.72 | -2.20 | 需关注 |
+| KV cache | mxfp4 | 68.61 | 69.90 | +1.29 | 否 |
+| KV cache | mxfp6 | 77.94 | 77.79 | -0.15 | 否 |
+| KV cache | mxint8 | 78.32 | 77.94 | -0.38 | 否 |
+| KV cache | fp8_per_group_64 | 77.33 | 76.95 | -0.38 | 否 |
+| KV cache | int8_per_group_64 | 78.01 | 77.10 | -0.91 | 否 |
+| KV cache | nvfp4 | 75.13 | 76.57 | +1.44 | 否 |
+
+Llama 没有达到 `3.00 pp` 的“较大差别”项。需要关注两项下降：权重 `w8a8_int8_per_channel` 为 `-2.35 pp`，KV cache `mxfp8` 为 `-2.20 pp`。其余 19 项均小于 2 pp，Llama 全部 21 项的平均绝对差约为 `0.80 pp`。
+
+### 31.4 DeepSeek-V2-Lite-Chat-16B_A2.4B
+
+| 类型 | 配置 | 参考 | 本次 | 差值(pp) | 较大差别 |
+|---|---|---:|---:|---:|---|
+| 无量化 | baseline | 67.10 | 66.03 | -1.07 | 否 |
+| 权重 | w8a8_fp8_per_block | 64.06 | 64.97 | +0.91 | 否 |
+| 权重 | w4a16_int4_per_group | 59.44 | 58.68 | -0.76 | 否 |
+| 权重 | w8a8_int8_per_block | 66.49 | 66.64 | +0.15 | 否 |
+| 权重 | w8a8_fp8_per_channel | 58.15 | 65.50 | +7.35 | 较大 |
+| 权重 | w8a8_int8_per_channel | 63.61 | 64.06 | +0.45 | 否 |
+| 权重 | w8a8_mxint | 66.19 | 65.28 | -0.91 | 否 |
+| 权重 | w8a8_mxfp | 63.91 | 64.90 | +0.99 | 否 |
+| 权重 | w6a6_mxfp | 63.99 | 64.37 | +0.38 | 否 |
+| 权重 | w4a4_mxfp | 35.48 | 38.51 | +3.03 | 较大 |
+| 权重 | w4a16_nvfp4_per_group | 62.47 | 63.84 | +1.37 | 否 |
+| 权重 | w4a16_nvfp4_per_group_4_over_6 | 61.94 | 61.71 | -0.23 | 否 |
+| 权重 | w4a4_nvfp | 56.79 | 56.18 | -0.61 | 否 |
+| 权重 | w4a4_nvfp_4_over_6 | 56.63 | 60.20 | +3.57 | 较大 |
+| KV cache | mxfp8 | 66.79 | 66.03 | -0.76 | 否 |
+| KV cache | mxfp4 | 29.95 | 31.39 | +1.44 | 否 |
+| KV cache | mxfp6 | 65.81 | 64.37 | -1.44 | 否 |
+| KV cache | mxint8 | 66.19 | 66.03 | -0.16 | 否 |
+| KV cache | fp8_per_group_64 | 67.10 | 66.03 | -1.07 | 否 |
+| KV cache | int8_per_group_64 | 66.03 | 66.26 | +0.23 | 否 |
+| KV cache | nvfp4 | 48.29 | 47.08 | -1.21 | 否 |
+
+DeepSeek 有 3 项达到“较大差别”，并且都是分数上升：权重 `w8a8_fp8_per_channel` 为 `+7.35 pp`，`w4a4_nvfp_4_over_6` 为 `+3.57 pp`，`w4a4_mxfp` 为 `+3.03 pp`。其余 18 项均小于 2 pp；DeepSeek 全部 21 项的平均绝对差约为 `1.34 pp`。
+
+### 31.5 总结
+
+42 项的总体平均绝对差约为 `1.07 pp`。按上述 `3.00 pp` 阈值，只有 3/42 项存在较大差别，均为 DeepSeek 权重量化且本次分数更高；另有 2/42 项需要关注，都是 Llama 的下降。其余 37/42 项没有较大差别。
+
+本次日志提取并按参考文件顺序重排后的完整分数已写入：
+
+```text
+temp/gsm8k-fix.yaml
+```
+
+---
+
+## 32. 2026-07-11 MMLU 复测日志检查及参考分数对比
+
+输入日志：
+
+```text
+temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_mmlu__CUDA_VISIBLE_DEVICES_6.log.2026_07_11___11_33_06
+```
+
+### 32.1 日志完整性、OOM 和 crash
+
+- 评测已经结束，日志不再写入，也没有残留的评测或 SGLang 服务进程。
+- 没有 `OutOfMemoryError`、`CUDA out of memory` 或其他 OOM。
+- 没有 SGLang scheduler、server 或 `lm-eval` 的运行期 crash、CUDA/NCCL error、SIGKILL、segfault 或结果缺失。
+- 预期的 42 项评测全部完成：42 条 `lm-eval` 启动记录、42 个结果块、42 次 loglikelihood 100% 完成，没有缺失或重复配置。
+- 每轮结果包含 `Tasks` 表和 `Groups` 表，两张表各打印一次相同的聚合 `mmlu` 分数，因此日志有 84 条聚合行。提取时每轮只计一次，并验证同轮两个值相等。
+- 与 GSM8K 日志相同，每项成功出分并关闭服务后都有一次 `resource_tracker`/loky 清理期 `KeyError('/loky-...')`，共 42 次。这是退出清理辅助进程的异常/潜在资源泄漏告警，不是模型评测 crash，不影响分数。
+- 本次只使用文件名结尾为 `2026_07_11___11_33_06` 的新日志；没有混用目录中存在 OOM 和旧 `page_size` 错误的 `2026_07_10___21_39_32` 旧日志。
+
+### 32.2 对比口径
+
+- 从每轮 `Tasks` 表中取第一列去空白后精确等于 `mmlu`、Metric 为 `acc` 的聚合行，不取四个 category 或具体学科行，也不自行重新平均。
+- 日志原始 Value 乘以 100，并保留两位小数后，与 `tests/sglang_simo/references_accuracy/mmlu.yaml` 比较。
+- `差值 = 本次分数 - 参考分数`，单位是百分点（pp）。
+- 本次 MMLU 汇总分数的 stderr 约为 `0.37-0.41 pp`。这里将 `|差值| >= 1.00 pp` 定义为“较大差别”，`0.50 <= |差值| < 1.00 pp` 标记为“需关注”，其余标记为“否”。
+- 权重量化和 KV cache 配置名称映射规则与上一节 GSM8K 相同。
+
+### 32.3 Llama-3.1-8B-Instruct
+
+| 类型 | 配置 | 参考 | 本次 | 差值(pp) | 较大差别 |
+|---|---|---:|---:|---:|---|
+| 无量化 | baseline | 68.15 | 68.47 | +0.32 | 否 |
+| 权重 | w8a8_fp8_per_block | 67.81 | 68.18 | +0.37 | 否 |
+| 权重 | w4a16_int4_per_group | 65.96 | 66.22 | +0.26 | 否 |
+| 权重 | w8a8_int8_per_block | 67.87 | 68.17 | +0.30 | 否 |
+| 权重 | w8a8_fp8_per_channel | 67.50 | 67.89 | +0.39 | 否 |
+| 权重 | w8a8_int8_per_channel | 67.44 | 67.73 | +0.29 | 否 |
+| 权重 | w8a8_mxint | 68.07 | 68.20 | +0.13 | 否 |
+| 权重 | w8a8_mxfp | 67.51 | 67.67 | +0.16 | 否 |
+| 权重 | w6a6_mxfp | 67.54 | 68.07 | +0.53 | 需关注 |
+| 权重 | w4a4_mxfp | 60.54 | 57.99 | -2.55 | 较大 |
+| 权重 | w4a16_nvfp4_per_group | 65.99 | 66.10 | +0.11 | 否 |
+| 权重 | w4a16_nvfp4_per_group_4_over_6 | 66.01 | 66.53 | +0.52 | 需关注 |
+| 权重 | w4a4_nvfp | 64.21 | 64.13 | -0.08 | 否 |
+| 权重 | w4a4_nvfp_4_over_6 | 64.59 | 64.45 | -0.14 | 否 |
+| KV cache | mxfp8 | 68.09 | 68.27 | +0.18 | 否 |
+| KV cache | mxfp4 | 68.09 | 68.27 | +0.18 | 否 |
+| KV cache | mxfp6 | 68.09 | 68.27 | +0.18 | 否 |
+| KV cache | mxint8 | 68.09 | 68.27 | +0.18 | 否 |
+| KV cache | fp8_per_group_64 | 68.09 | 68.27 | +0.18 | 否 |
+| KV cache | int8_per_group_64 | 68.09 | 68.27 | +0.18 | 否 |
+| KV cache | nvfp4 | 68.09 | 68.27 | +0.18 | 否 |
+
+Llama 有 1 项较大差别：权重 `w4a4_mxfp` 从 `60.54` 降至 `57.99`，差值 `-2.55 pp`。另有两项小幅上升需要关注：`w6a6_mxfp` 为 `+0.53 pp`，`w4a16_nvfp4_per_group_4_over_6` 为 `+0.52 pp`。全部 21 项平均绝对差约为 `0.35 pp`。
+
+### 32.4 DeepSeek-V2-Lite-Chat-16B_A2.4B
+
+| 类型 | 配置 | 参考 | 本次 | 差值(pp) | 较大差别 |
+|---|---|---:|---:|---:|---|
+| 无量化 | baseline | 56.78 | 56.72 | -0.06 | 否 |
+| 权重 | w8a8_fp8_per_block | 56.87 | 56.52 | -0.35 | 否 |
+| 权重 | w4a16_int4_per_group | 55.18 | 54.62 | -0.56 | 需关注 |
+| 权重 | w8a8_int8_per_block | 56.71 | 56.55 | -0.16 | 否 |
+| 权重 | w8a8_fp8_per_channel | 56.38 | 55.94 | -0.44 | 否 |
+| 权重 | w8a8_int8_per_channel | 56.05 | 55.88 | -0.17 | 否 |
+| 权重 | w8a8_mxint | 56.73 | 56.56 | -0.17 | 否 |
+| 权重 | w8a8_mxfp | 56.85 | 55.86 | -0.99 | 需关注 |
+| 权重 | w6a6_mxfp | 56.64 | 55.93 | -0.71 | 需关注 |
+| 权重 | w4a4_mxfp | 49.78 | 48.66 | -1.12 | 较大 |
+| 权重 | w4a16_nvfp4_per_group | 54.52 | 54.03 | -0.49 | 否 |
+| 权重 | w4a16_nvfp4_per_group_4_over_6 | 54.87 | 54.69 | -0.18 | 否 |
+| 权重 | w4a4_nvfp | 53.35 | 53.06 | -0.29 | 否 |
+| 权重 | w4a4_nvfp_4_over_6 | 53.57 | 52.98 | -0.59 | 需关注 |
+| KV cache | mxfp8 | 56.60 | 56.76 | +0.16 | 否 |
+| KV cache | mxfp4 | 56.60 | 56.76 | +0.16 | 否 |
+| KV cache | mxfp6 | 56.60 | 56.76 | +0.16 | 否 |
+| KV cache | mxint8 | 56.60 | 56.76 | +0.16 | 否 |
+| KV cache | fp8_per_group_64 | 56.60 | 56.76 | +0.16 | 否 |
+| KV cache | int8_per_group_64 | 56.60 | 56.76 | +0.16 | 否 |
+| KV cache | nvfp4 | 56.60 | 56.76 | +0.16 | 否 |
+
+DeepSeek 有 1 项较大差别：权重 `w4a4_mxfp` 从 `49.78` 降至 `48.66`，差值 `-1.12 pp`。另有四项下降需要关注：`w8a8_mxfp` 为 `-0.99 pp`、`w6a6_mxfp` 为 `-0.71 pp`、`w4a4_nvfp_4_over_6` 为 `-0.59 pp`、`w4a16_int4_per_group` 为 `-0.56 pp`。全部 21 项平均绝对差约为 `0.35 pp`。
+
+### 32.5 总结
+
+42 项总体平均绝对差约为 `0.35 pp`。按 `1.00 pp` 阈值，有 2/42 项存在较大差别，都是权重 `w4a4_mxfp` 的下降：Llama `-2.55 pp`，DeepSeek `-1.12 pp`。另有 6/42 项处于 `0.50-0.99 pp` 的需关注区间，其余 34/42 项差异小于 `0.50 pp`。所有 KV cache 配置相对参考文件都只变化 `+0.16` 或 `+0.18 pp`，没有较大差别。
+
+本次日志提取并按参考文件顺序重排后的完整分数已写入：
+
+```text
+temp/mmlu-fix.yaml
+```
+
+---
+
+## 33. MMLU 与 GSM8K 结束时间差异分析
+
+### 33.1 结论
+
+这次运行中，MMLU 的评测工作量确实明显大于 GSM8K，但差异不只是 GPU 计算量：MMLU 还需要为 57 个子任务反复构造上下文、分词并生成大量 `loglikelihood` 请求。两个脚本都遍历 2 个模型和 21 种配置，共完成 42 轮评测，因此配置轮数相同。
+
+按日志文件名中的启动时间和文件最后修改时间计算：
+
+| 任务 | 启动时间 | 日志结束时间 | 总运行时长 |
+|---|---|---|---:|
+| MMLU（GPU 6） | 11:33:06 | 19:13:50.879 | 7:40:44.9 |
+| GSM8K（GPU 7） | 11:36:29 | 14:34:24.407 | 2:57:55.4 |
+
+- MMLU 的总运行时长约为 GSM8K 的 `2.59` 倍，多运行约 `4:42:49.5`。
+- 因为 MMLU 早启动约 `3:23`，所以日志文件的实际结束时刻比 GSM8K 晚约 `4:39:26.5`。
+- 两份日志都完整跑完 42 轮，没有 OOM、crash、重试或缺失结果，因此不是失败重试把 MMLU 拖慢。
+
+### 33.2 两个任务的实际工作量不同
+
+当前安装的 `lm-eval` 任务定义和日志显示：
+
+| 任务 | 评测方式 | 每轮数据规模 | 每轮 lm-eval 请求数 |
+|---|---|---:|---:|
+| MMLU | 57 个子任务，0-shot，多选题；每题 4 个选项分别做 `loglikelihood` | 14,042 题 | 56,168 |
+| GSM8K | 单任务，5-shot，使用 `generate_until` 生成推理和答案 | 1,319 题 | 1,319 |
+
+MMLU 每轮的请求条数是 GSM8K 的约 `42.6` 倍。但不能据此推断运行时间也应是 42.6 倍：
+
+- MMLU 的单个请求主要是短 continuation 的 likelihood 计算，可以大量合批，工作以 prompt/prefill 和 logprob 计算为主。
+- GSM8K 的请求数少，但每条都有较长的 5-shot prompt，并且需要逐 token 自回归生成推理过程；decode 串行依赖更强，单条请求明显更贵。
+- SGLang scheduler 在每轮开始时报告的待处理输入 token，MMLU 约为 `6.8M-7.2M`，GSM8K 约为 `1.15M-1.34M`，中位比例约 `5.6` 倍；GSM8K 此后还要生成输出 token。
+
+因此，更准确的说法是：MMLU 的题目数、输入 token 和请求准备量大很多；GSM8K 单请求的生成成本更高，所以总耗时比例被压缩到约 2.6 倍，而不是请求条数对应的 42.6 倍。
+
+### 33.3 42 轮评测的耗时拆分
+
+以下按每轮日志标记累计。`Tree cache initialized` 作为引擎初始化完成的稳定代理；“请求和结果”包含请求执行、指标聚合以及结果写出。
+
+| 阶段（42 轮累计） | MMLU | GSM8K | MMLU 相对增加 |
+|---|---:|---:|---:|
+| 模型/服务初始化及 CUDA Graph | 0:35:19 | 0:36:10 | -0:00:51 |
+| 任务、上下文和请求准备 | 1:28:30 | 0:10:48 | +1:17:42 |
+| 请求执行、聚合和结果写出 | 5:02:30 | 1:45:05 | +3:17:25 |
+| 41 次轮间清理和重启间隔 | 0:33:46 | 0:25:08 | +0:08:38 |
+| 首轮开始到末轮结果 | 7:40:05 | 2:57:11 | +4:42:54 |
+
+分解结果表明：
+
+- 两者模型加载、服务初始化和 CUDA Graph 总时间几乎相同，MMLU 甚至少 51 秒，所以模型启动不是主因。
+- MMLU 在任务/上下文准备上多用约 `1:17:42`。MMLU 每轮需要处理 57 个子任务和 56,168 个请求，而 GSM8K 每轮只有一个任务和 1,319 个请求。
+- MMLU 在请求执行到结果写出阶段多用约 `3:17:25`，这是总差异中最大的一部分。只看 tqdm 所覆盖的实际请求阶段，MMLU 累计约 `4:17:47`，GSM8K 约 `1:18:07`，比例约 `3.30` 倍。
+- 每轮从任务启动到出结果，MMLU 的中位数为 `8:45`、均值为 `10:09`；GSM8K 的中位数为 `3:16.5`、均值为 `3:37`。
+
+### 33.4 GPU 6 和 GPU 7 不是主要原因
+
+当前 GPU 6 和 GPU 7 都是 `NVIDIA H100 80GB HBM3`，两份日志也都使用 SM90。对应 42 轮的 SGLang 服务参数和模型配置一致，服务初始化累计时间也分别只有 `35:19` 和 `36:10`，没有证据表明 GPU 6 明显慢于 GPU 7。
+
+两个作业在 GSM8K 结束前并发运行，可能存在少量 CPU、磁盘或系统调度干扰，但这不足以解释近 4 小时 43 分钟的运行时长差异。差异随任务准备量和请求执行量稳定出现，主要原因仍然是任务工作负载不同。
+
+不同量化 kernel 的速度差异也会放大总时间。例如 DeepSeek 的 `w4a16_int4_per_group` 是两个任务中共同最慢的一轮：MMLU 请求进度耗时约 `28:43`，GSM8K 约 `9:28`。这说明是该配置在不同任务负载下都较慢，而不是某个 GPU 偶发卡死。
+
+综上，这次 MMLU 比 GSM8K 慢很多是正常的工作量差异：约 1 小时 18 分钟来自额外的任务/请求准备，约 3 小时 17 分钟来自额外的请求计算和结果处理。它不是 OOM、crash、重试或 GPU id 不同造成的。不过 `2.59` 倍是本次模型、量化配置和 lm-eval 参数下的实测比例，不应当视为所有 MMLU/GSM8K 运行的固定比例。
+
+---
+
+## 34. `self._kv_buffer_descs = self._build_kv_buffer_descs()` 的作用
+
+### 34.1 上下文
+
+这行代码出现在 `SIMOMHATokenToKVPool._create_buffers()` 中（`simo/extensions/sglang_simo/mem_cache/memory_pool.py:209-210`）：
+
+```python
+# Override store_dtype to uint8 since buffers are quantized
+self.store_dtype = torch.uint8
+if hasattr(self, "_build_kv_buffer_descs"):
+    self._kv_buffer_descs = self._build_kv_buffer_descs()
+```
+
+它位于 SIMO 子类重写的 `_create_buffers` 末尾，在 `self.store_dtype` 被设为 `torch.uint8` **之后**，在构造 `k_data_ptrs` / `v_data_ptrs` **之前**。
+
+### 34.2 `_build_kv_buffer_descs()` 做了什么
+
+该方法定义在 SGLang 的 `KVCache` 基类中（`sglang/srt/mem_cache/memory_pool.py:1593`），构建一个 `KvBufferDesc` 对象的列表，覆盖所有层的 k buffer 和 v buffer，顺序为 `k0, k1, ..., k(L-1), v0, v1, ..., v(L-1)`。
+
+核心逻辑：
+
+```python
+def _build_kv_buffer_descs(self):
+    itemsize = self.store_dtype.itemsize           # ← 对 SIMO 是 torch.uint8 → 1 byte
+    if getattr(self, "k_buffer", None) and getattr(self, "v_buffer", None):
+        k_shape = tuple(self.k_buffer[0].shape)    # ← 从实际张量获取形状
+        v_shape = tuple(self.v_buffer[0].shape)
+    else:
+        k_shape, v_shape = self._kv_buffer_shapes()  # ← 回退到参数推导
+
+    num_slots = self.size + self.page_size
+    tokens_per_row = (
+        self.page_size if k_shape[0] * self.page_size == num_slots else 1
+    )
+    descs = []
+    for prefix, shape in (("k", k_shape), ("v", v_shape)):
+        row_bytes = int(np.prod(shape[1:])) * itemsize
+        for layer in range(self.layer_num):
+            descs.append(KvBufferDesc(
+                f"{prefix}{layer}", shape,
+                row_bytes=row_bytes,
+                tokens_per_row=tokens_per_row,
+            ))
+    return descs
+```
+
+每个 `KvBufferDesc` 是一个轻量描述符，包含 4 个字段：
+
+| 字段 | 含义 | SIMO 场景下的值（以 k buffer 为例） |
+|---|---|---|
+| `name` | 描述符名称 | `"k0"`, `"k1"`, ... |
+| `shape` | 张量形状 | `(size + page_size, head_num, k_combined_head_size)` |
+| `row_bytes` | 每行（首维度的一行）的字节数 | `head_num × k_combined_head_size × 1`（uint8） |
+| `tokens_per_row` | 每行包含的 token 数 | NHD 布局下为 `1`；HND 布局下为 `page_size` |
+
+### 34.3 为什么 SIMO 需要在 `store_dtype = torch.uint8` 之后重新调用
+
+SIMO 子类在 `_create_buffers` 中做了两件改变缓冲区布局的事：
+
+1. **分配 uint8 缓冲区**：k_buffer 和 v_buffer 是 `torch.uint8` 张量，形状为 `[size+page_size, head_num, k_combined_head_size]`，而非父类的 float16 张量
+2. **修改 `store_dtype`**：设置为 `torch.uint8`
+
+父类 `_create_buffers` 结束时也会调用 `self._build_kv_buffer_descs()`，但那时 `store_dtype` 还是 `torch.bfloat16` 或 `torch.float16`。SIMO 必须在修改 `store_dtype` 之后重新调用，否则：
+
+- `itemsize` 会错误地等于 2 bytes（bf16/fp16）而非 1 byte（uint8）
+- `row_bytes` = `np.prod(shape[1:]) × itemsize` 会被高估一倍
+
+这会导致下游消费者（见 34.4）对缓冲区的字节跨度计算错误，进而导致 KV cache 数据传输、内存注册等操作读取或写入错误大小。
+
+### 34.4 `_kv_buffer_descs` 的下游消费者
+
+`_kv_buffer_descs` 列表在 SGLang 中有 **两个核心消费点**：
+
+#### 消费点 1：PD（Prefill-Decode）分离的 KV 传输 — `get_contiguous_buf_infos()`
+
+```python
+def get_contiguous_buf_infos(self):
+    tensors = self._pd_registerable_tensors()      # ← 顺序需与 descs 一致
+    ptrs = [t.data_ptr() for t in tensors]
+    lens = [d.final_span_bytes(self.size, self.page_size) for d in self._kv_buffer_descs]
+    item_lens = [d.item_len_bytes(self.page_size) for d in self._kv_buffer_descs]
+    return ptrs, lens, item_lens
+```
+
+在 PD 分离模式下，prefill server 需要将计算出的 KV cache 传输给 decode server。`get_contiguous_buf_infos` 利用 `_kv_buffer_descs` 计算：
+- `lens`: 每个 buffer 需要传输的总字节数
+- `item_lens`: 每个 page 对应的字节块大小
+
+如果 SIMO 没有正确设置 `store_dtype = uint8` 并重建描述符，这里计算的 `lens` 和 `item_lens` 会是实际值的 **2 倍**，导致传输错误。
+
+#### 消费点 2：CUDA-VMM Post-Capture 内存管理 — `_alloc_post_capture_buffers()`
+
+```python
+def _alloc_post_capture_buffers(self):
+    self._post_capture_owner = KvVmmBufferOwner(
+        store_dtype=self.store_dtype,
+        page_size=self.page_size,
+        reserved_num_tokens=self.size,
+        buffer_descs=self._build_kv_buffer_descs(),   # ← 传入描述符
+    )
+```
+
+在 CUDA Graph capture 后的动态 resize 场景下，`KvVmmBufferOwner` 使用描述符来确定每个 buffer 的字节大小，驱动 CUDA Virtual Memory Management 的内存分配。错误的 `itemsize` 会导致分配过多或过少的内存。
+
+### 34.5 总结
+
+| 问题 | 答案 |
+|---|---|
+| `_build_kv_buffer_descs()` 做了什么？ | 为所有层的 k buffer 和 v buffer 构建 `KvBufferDesc` 列表，记录每个 buffer 的**名称、形状、每行字节数、每行 token 数** |
+| 为什么用 `hasattr` 检查？ | 旧版本 SGLang 的 `KVCache` 可能没有这个方法，做了向前兼容 |
+| 为什么要在 `store_dtype = torch.uint8` 之后调用？ | `itemsize` 依赖 `store_dtype`。SIMO 将 dtype 从 float16 改成 uint8，必须用新 dtype 重建描述符，否则字节跨度计算会差一倍 |
+| 不调用有什么后果？ | PD 分离模式下 KV 传输的 `lens`/`item_lens` 会被高估一倍；CUDA-VMM 分配的大小不正确。SIMO 在 `_create_buffers` 中重建了 uint8 缓冲区，如果不重建描述符，描述符仍然反映旧的 float16 buffer 形状，导致后续数据传输或内存操作出现 size mismatch |
+
+**一句话总结**：`self._kv_buffer_descs = self._build_kv_buffer_descs()` 在 SIMO 将 KV buffer 改为 uint8 量化存储后，重新构建缓冲区描述符列表，确保下游的 KV 传输（PD 分离）和 CUDA VMM 内存管理中字节跨度的计算基于正确的 `store_dtype`（uint8）和 buffer 形状（packed + scale 格式）。

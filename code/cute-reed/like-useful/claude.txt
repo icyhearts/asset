@@ -89,3 +89,15 @@ mma.get_layoutA_TV():
 解释为什么是这个结果? 推导出get_layoutA_TV()函数调用过程和中间结果和最终结果。
 第1个mode shape=(_4,_8,_2,_2), stride=(_64,_1,_16,_0), stride=_0有什么用？ stride=_0，是否意味着mode=_0对应的shape=_2是没有意义的?
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md
+
+
+cute-gemm 仓库位于 /share/users/like/package/cute-gemm
+修改gemm-multi-stage-like.cu 
+ if (this_thread_print)里面，
+
+
+cute-gemm 仓库位于 /share/users/like/package/cute-gemm
+对gemm-multi-stage-like.cu kernel gemm_multi_stage函数进行讲解.
+运行日志位于 /share/users/like/package/cute-gemm/run.gemm-multi-stage-like.log
+忽略kernel内所有的 print/printf
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md

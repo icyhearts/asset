@@ -2490,3 +2490,121 @@ sglang code base 的python/sglang/srt/layers/attention/triton_ops/decode_attenti
 
 对于 owner != protected_user 的进程，如果 gpu_mem_usage 参数没有设置，保留原来的kill 逻辑
 如果 gpu_mem_usage 参数有值， 只有它的 gpu memory 占用 > gpu_mem_usage, 才 发送 kill
+
+/data/like/miniconda3/envs/simo_sglang/bin/lm-eval --tasks gsm8k 如何让输出结果中，包含每个gsm8k的问题和答案？我想分析它具体是哪个问题回答错了
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+解释一下/share/users/like/package/jdjv/kws_simo_quant/test_quant_onnx.sh在做什么？
+把答案追加到 like-useful/answer_codex_v2.md 里面
+## 
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+simo code base simo/onnx/ort_plugin/build_runtime.py, 对build_sm90_runtime的原理进行讲解
+它会调用nvcc吗？会调用  nvrtc 吗？
+把答案追加到 like-useful/answer_codex_v2.md 里面
+
+###
+simo/onnx/tests/test_dynamic_qdq_runtime_debug.py test_simo_custom_qdq_plugin_runs_mx_qdq_tiny_tensor 进行讲解
+1) tmp_path 参数不在 @pytest.mark.parametrize 里面，pytest 运行的时候 tmp_path 参数的值怎么确定？
+2)
+以 dtype=mxint8, block_size=32为例讲解， _tiny_simo_qdq_model 里面 
+```
+      onnx.helper.make_node(
+        "Quantize",
+```
+Quantize 节点调用的 kernel 实现在哪里？
+
+```
+      onnx.helper.make_node(
+        "Dequantize",
+```
+Dequantize 节点调用的 kernel 实现中哪里？
+把 Quantize and Dequantize 节点调用kernel 的调用链路整理出来。
+
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+./simo/onnx/ort_plugin/custom_op_library.cc
+RegisterCustomOps 没有任何显式的调用，是谁在调用它？ RegisterCustomOps 只是一个普通的函数，什么特点让它被调用?
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+
+###
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+_qdq_unaligned_matmul_activation_qdq_model 进行讲解， 它对 onnx 的 Matmul 算子做了什么改变？如何实现的Matmul量化?
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_claude_v2.md 里面
+
+
+like-useful/answer_codex_v2.md, 4296行，W转置后[4,18]
+, 权重使用128x128 per block量化, 需要padding吗？
+4297行, 4298行的shape 是正确的吗？ 如果有错误，原地修改文档
+
+###
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+simo/onnx/onnx_quant.py _name_nodes 函数有什么功能? 
+
+###
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+simo/onnx/onnx_quant.py _find_qdq_target 函数有什么功能 ？
+
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+simo/onnx/onnx_quant.py  _create_activation_qdq_nodes 函数有什么功能 ？
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+python3 like-useful/test-lstm.py > temp/test-lstm.log 2>&1
+ 日志位于  temp/test-lstm.log
+如何解决 torch lstm模型导出onnx的错误?
+
+## 修改like-useful/test-lstm.py,
+按照  like-useful/answer_codex_v2.md ### 47.9 可选：支持动态 sequence length 和 batch 的方案修改，并用 onnxruntime验证结果.
+最少使用两种 batch size + seq_len, 对于相同输入， 把onnxruntime的结果和pytorch的结果做对比。
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+simo/onnx/onnx_quant.py 是如何处理 Matmul 算子第2个输入不是常量的情况？ 还会对权重量化 + 插入 Dequantize节点吗？
+simo/onnx/tests/test_dynamic_qdq_runtime_debug.py 有没有第2个输入不是常量的情况的例子 ？
+要求：讲解代码的时候要使用 相对 code base 的路径 + 行号 + 函数名 ，把答案追加在 like-useful/answer_codex_v2.md 里面
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+like-useful/test-lstm.py 导出 lstm 模型后，like-useful/test-onnx-dynamic-quant-lstm.py 尝试用 quantize_dynamic 进行量化。
+你现在修改 like-useful/test-onnx-dynamic-quant-lstm.py, 把 quantize_dynamic 量化后的模型用 onnxruntime加载，先用 cpu 运行，再用 cuda 运行。如果无法用 cuda 运行，把原因追加到 like-useful/answer_codex_v2.md。
+
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+onnx 代码位于 /softhome/like/package/onnx
+onnxruntime  DynamicQuantizeLSTM 算子的实现是否位于 /softhome/like/package/onnxruntime/onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc?
+
+onnxruntime  DynamicQuantizeLSTM 算子的实现是真量化还是和 simo Matmul量化类型，采用的QDQ方式?
+onnxruntime  DynamicQuantizeLSTM 算子 的 matmul是 int8 运算吗？
+把答案追加到 like-useful/answer_codex_v2.md
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+onnx 代码位于 /softhome/like/package/onnx
+pip 显示 onnxruntime-gpu已经安装
+pip show onnxruntime-gpu
+Name: onnxruntime-gpu
+Version: 1.27.0
+Summary: ONNX Runtime is a runtime accelerator for Machine Learning models
+Home-page: https://onnxruntime.ai
+Author: Microsoft Corporation
+Author-email: onnxruntime@microsoft.com
+License: MIT License
+Location: /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages
+Requires: flatbuffers, numpy, packaging, protobuf
+Required-by:
+
+pip 安装 onnxruntime-gpu，本质上是从 /softhome/like/package/onnxruntime 编译出来的吗？
+把答案追加到 like-useful/answer_codex_v2.md
+
+onnxruntime 代码 /softhome/like/package/onnxruntime/ 是否有能力编译出 onnxruntime-gpu 需要的wheel包？这份代码有能力提供 CUDAExecutionProvider 吗?
+把答案追加到 like-useful/answer_codex_v2.md
