@@ -616,3 +616,104 @@ M = 81920, N = 256, K = 256
 | 497、705--732 | 本次 Config 实例、grid/block/shared-memory launch |
 
 一句话概括整个 kernel：它让 4 个 warp 共同计算一个 `128 x 128` 输出 tile，用三份 swizzled shared-memory A/B tile 和两个寄存器 K 子片，把“未来 tile 的 `cp.async`、下一 fragment 的 `ldmatrix`、当前 fragment 的 `mma.sync`”交错起来，最后复用一份 A shared stage 完成适合 128-bit global store 的输出重排。
+
+## 17. 手动展开本次 `gemm_multi_stage` 主循环
+
+本节只代入本次运行的三个数值：
+
+```text
+kStage = 3
+ntile  = K / kTileK = 256 / 32 = 8
+nk     = size<2>(tCrA) = 2
+```
+
+因此外层 `itile=0..7`、内层 `ik=0..1`，主循环共有 `8 * 2 = 16` 次内层迭代。
+
+### 17.1 分片符号与 prologue 后的状态
+
+下表用 `tile t` 表示第 `t` 个 K tile。它覆盖 A/B 的同一段 K 下标：
+
+```text
+tile t / fragment 0: K[32t,      32t + 15]
+tile t / fragment 1: K[32t + 16, 32t + 31]
+tile t 整体:          K[32t,      32t + 31]
+```
+
+A 和 B 的 G2S、S2R 始终使用相同的 tile、stage 和 fragment 下标。为让 16 行时间线保持可读，表中使用下面两个缩写；它们同时代表 A、B 两条 copy：
+
+```text
+S2R(f, s -> r):
+  tAsA(_,_,f,s) -> tCrA_view(_,_,r)
+  tBsB(_,_,f,s) -> tCrB_view(_,_,r)
+
+G2S(t -> s):
+  tAgA_copy(_,_,_,t) -> tAsA_copy(_,_,_,s)
+  tBgB_copy(_,_,_,t) -> tBsB_copy(_,_,_,s)
+```
+
+这里 `f=ik_next`，目标寄存器槽 `r=ik_next`。prologue 已经把 tile 0 提交到 shared stage 0、把 tile 1 提交到 stage 1，并执行 `cp_async_wait<1>()` 与 `__syncthreads()`，使 tile 0 可读。进入主循环前的精确状态是：
+
+```text
+(itile_to_read, ismem_read, ismem_write) = (2, 0, 2)
+register slot 0 = tile 0 / fragment 0   // S2R(0, stage 0 -> slot 0)
+```
+
+### 17.2 十六次内层迭代的精确时间线
+
+“写游标”一列记录 `(itile_to_read, ismem_write)`；`ismem_read` 则在“末片判断”列单独记录。每一行的操作顺序与源码一致：必要时先 wait/sync 并轮转 read stage，然后 S2R，再按条件 G2S 和 fence，最后执行 GEMM。
+
+| # | `(itile,ik)`；`ik_next` | `ik==nk-1`；`ismem_read` 前后 | S2R 源 -> 目标；实际数据 | `ik==0`；`itile_to_read<ntile` | G2S / fence；写游标前后 | `cute::gemm` 实际消费 |
+|---:|---|---|---|---|---|---|
+| 1 | `(0,0)`；1 | 假；`0 -> 0` | `S2R(1,0 -> 1)`；tile 0/f1 | 真；`2<8` 真 | `G2S(2 -> 2)`；有数据 group；`(2,2) -> (3,0)` | tile 0/f0 |
+| 2 | `(0,1)`；0 | 真；wait/sync；`0 -> 1` | `S2R(0,1 -> 0)`；tile 1/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(3,0) -> (3,0)` | tile 0/f1 |
+| 3 | `(1,0)`；1 | 假；`1 -> 1` | `S2R(1,1 -> 1)`；tile 1/f1 | 真；`3<8` 真 | `G2S(3 -> 0)`；有数据 group；`(3,0) -> (4,1)` | tile 1/f0 |
+| 4 | `(1,1)`；0 | 真；wait/sync；`1 -> 2` | `S2R(0,2 -> 0)`；tile 2/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(4,1) -> (4,1)` | tile 1/f1 |
+| 5 | `(2,0)`；1 | 假；`2 -> 2` | `S2R(1,2 -> 1)`；tile 2/f1 | 真；`4<8` 真 | `G2S(4 -> 1)`；有数据 group；`(4,1) -> (5,2)` | tile 2/f0 |
+| 6 | `(2,1)`；0 | 真；wait/sync；`2 -> 0` | `S2R(0,0 -> 0)`；tile 3/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(5,2) -> (5,2)` | tile 2/f1 |
+| 7 | `(3,0)`；1 | 假；`0 -> 0` | `S2R(1,0 -> 1)`；tile 3/f1 | 真；`5<8` 真 | `G2S(5 -> 2)`；有数据 group；`(5,2) -> (6,0)` | tile 3/f0 |
+| 8 | `(3,1)`；0 | 真；wait/sync；`0 -> 1` | `S2R(0,1 -> 0)`；tile 4/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(6,0) -> (6,0)` | tile 3/f1 |
+| 9 | `(4,0)`；1 | 假；`1 -> 1` | `S2R(1,1 -> 1)`；tile 4/f1 | 真；`6<8` 真 | `G2S(6 -> 0)`；有数据 group；`(6,0) -> (7,1)` | tile 4/f0 |
+| 10 | `(4,1)`；0 | 真；wait/sync；`1 -> 2` | `S2R(0,2 -> 0)`；tile 5/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(7,1) -> (7,1)` | tile 4/f1 |
+| 11 | `(5,0)`；1 | 假；`2 -> 2` | `S2R(1,2 -> 1)`；tile 5/f1 | 真；`7<8` 真 | `G2S(7 -> 1)`；有数据 group；`(7,1) -> (8,2)` | tile 5/f0 |
+| 12 | `(5,1)`；0 | 真；wait/sync；`2 -> 0` | `S2R(0,0 -> 0)`；tile 6/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 5/f1 |
+| 13 | `(6,0)`；1 | 假；`0 -> 0` | `S2R(1,0 -> 1)`；tile 6/f1 | 真；`8<8` 假 | 无 G2S；提交空 group；`(8,2) -> (8,2)` | tile 6/f0 |
+| 14 | `(6,1)`；0 | 真；wait/sync；`0 -> 1` | `S2R(0,1 -> 0)`；tile 7/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 6/f1 |
+| 15 | `(7,0)`；1 | 假；`1 -> 1` | `S2R(1,1 -> 1)`；tile 7/f1 | 真；`8<8` 假 | 无 G2S；提交空 group；`(8,2) -> (8,2)` | tile 7/f0 |
+| 16 | `(7,1)`；0 | 真；wait/sync；`1 -> 2` | `S2R(0,2 -> 0)`；stage 2 中旧 tile 5/f0，结果不用 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 7/f1 |
+
+最后一行的 `S2R(0,2 -> 0)` 不是 global tile 8 的读取。stage 2 最后一次真实写入的是 tile 5，所以这次统一流水路径重新读到旧 tile 5/f0；主循环随即结束，slot 0 不再传给任何 GEMM。
+
+### 17.3 G2S 写游标的独立核对
+
+只看真实 G2S 提交，两个写游标按下列顺序变化：
+
+| 时点 | `(itile_to_read, ismem_write)` |
+|---|---|
+| prologue 完成后 | `(2,2)` |
+| tile 2 -> stage 2 | `(3,0)` |
+| tile 3 -> stage 0 | `(4,1)` |
+| tile 4 -> stage 1 | `(5,2)` |
+| tile 5 -> stage 2 | `(6,0)` |
+| tile 6 -> stage 0 | `(7,1)` |
+| tile 7 -> stage 1 | `(8,2)` |
+| 最后四次内层迭代 | 始终为 `(8,2)` |
+
+prologue 的 G2S 只读取 tile 0、1，主循环的真实 G2S 只读取 tile 2--7。到 `itile_to_read=8` 后，`8<8` 为假，因而没有 tile 8 的 global-memory 越界读取。
+
+### 17.4 为什么槽位覆盖与尾部空操作都正确
+
+- `ik_next=(ik+1)%2`：`ik=0` 时为 1，`ik=1` 时为 0，两个寄存器 fragment 槽循环覆盖。每次覆盖的都是当前 GEMM 不读取的另一个槽。
+- 每次 `ik=1` 都执行 `cp_async_wait<1>()`、`__syncthreads()`，再令 `ismem_read=(ismem_read+1)%3`。8 次轮转是 `0 -> 1 -> 2 -> 0 -> 1 -> 2 -> 0 -> 1 -> 2`，最终 `ismem_read=2`。
+- 每次 `ik=0` 都执行 `cp_async_fence()`。`itile=0..5` 提交真实 G2S group；`itile=6,7` 没有新 copy，但仍提交空 group，以保持统一的 commit/wait 节拍。
+- `cute::gemm` 的源码参数只出现 `ik`，没有 `itile`。外层 tile 身份来自该寄存器槽此前由哪个 shared tile/fragment 装入；因此表中的“实际消费”必须沿寄存器数据流判断，不能只看调用表达式。
+- 第 16 次迭代的最后一次 S2R 是统一流水路径产生的无用预取，不参与任何后续 GEMM，也不会改变累加结果。
+
+最终状态为：
+
+```text
+ismem_read    = 2
+itile_to_read = 8
+ismem_write   = 2
+```
+
+16 次 `cute::gemm` 恰好消费 `(tile 0/f0, tile 0/f1, ..., tile 7/f0, tile 7/f1)`：8 个 K tile 的两个 fragment 各参与一次，完整且无重复地覆盖 `K[0,255]`。

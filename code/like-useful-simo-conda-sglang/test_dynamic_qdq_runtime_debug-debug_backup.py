@@ -4,7 +4,6 @@ from functools import cache
 import os
 import pathlib
 import tempfile
-import traceback
 
 import numpy as np
 import onnx
@@ -308,27 +307,9 @@ def _require_simo_native_reference():
     pytest.skip("simo._C is required for this numerical reference")
 
 
-def _save_onnx_snapshot(model, path):
-  """Save an ONNX graph snapshot, creating the destination directory first."""
-  path = pathlib.Path(path)
-  if os.getenv("DEBUG_ONNX_NAME", "") == path.name:
-    print(f"{path} DEBUG_ONNX_NAME found")
-  path.parent.mkdir(parents=True, exist_ok=True)
-  onnx.save(model, path)
-
-
-def _apply_qdq_quantization_with_native_weight_quant(
-  model, config_path, *, before_path=None, after_path=None
-):
-  if (before_path is None) != (after_path is None):
-    raise ValueError("before_path and after_path must be provided together")
-  if before_path is not None:
-    _save_onnx_snapshot(model, before_path)
+def _apply_qdq_quantization_with_native_weight_quant(model, config_path):
   _require_simo_native_reference()
-  model_with_qdq = apply_qdq_quantization(model, config_path)
-  if after_path is not None:
-    _save_onnx_snapshot(model_with_qdq, after_path)
-  return model_with_qdq
+  return apply_qdq_quantization(model, config_path)
 
 
 def create_simo_activation_matching(qdq_activations, float_activations=None):
@@ -436,8 +417,7 @@ def _dynamic_conv_activation_qdq_model(tmp_path):
     [onnx.numpy_helper.from_array(weight, "W")],
   )
   model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_operatorsetid("", 18)])
-  model_stem = "dynamic_conv_activation"
-  _save_onnx_snapshot(model, tmp_path / f"{model_stem}_orig.onnx")
+  onnx.save(model, tmp_path / "dynamic_conv_activation_orig.onnx")
   config_path = tmp_path / "dynamic_conv_quant_config.json"
   config_path.write_text(
     json.dumps({
@@ -450,16 +430,11 @@ def _dynamic_conv_activation_qdq_model(tmp_path):
       ],
     })
   )
-  model_with_qdq = _apply_qdq_quantization_with_native_weight_quant(
-    model,
-    config_path,
-    before_path=tmp_path / f"{model_stem}_before_quantization.onnx",
-    after_path=tmp_path / f"{model_stem}_after_quantization.onnx",
-  )
+  model_with_qdq = _apply_qdq_quantization_with_native_weight_quant(model, config_path)
   assert any(
     node.domain == "com.simo" and node.op_type == "Quantize" for node in model_with_qdq.graph.node
   )
-  _save_onnx_snapshot(model_with_qdq, tmp_path / f"{model_stem}_qdq.onnx")
+  onnx.save(model_with_qdq, tmp_path / "dynamic_conv_activation_qdq.onnx")
   return _create_cuda_session(model_with_qdq)
 
 
@@ -483,7 +458,7 @@ def _qdq_unaligned_matmul_activation_qdq_model(
     else:
       shape_id = "static"
   model_stem = f"unaligned_matmul_activation_{input_config['dtype']}_{shape_id}"
-  _save_onnx_snapshot(model, tmp_path / f"{model_stem}_orig.onnx")
+  onnx.save(model, tmp_path / f"{model_stem}_orig.onnx")
   config_path = tmp_path / "unaligned_matmul_quant_config.json"
   config_path.write_text(
     json.dumps({
@@ -496,20 +471,13 @@ def _qdq_unaligned_matmul_activation_qdq_model(
       ],
     })
   )
-  model_with_qdq = _apply_qdq_quantization_with_native_weight_quant(
-    model,
-    config_path,
-    before_path=tmp_path / f"{model_stem}_before_quantization.onnx",
-    after_path=tmp_path / f"{model_stem}_after_quantization.onnx",
-  )
-  _save_onnx_snapshot(model_with_qdq, tmp_path / f"{model_stem}_before_output_append.onnx")
+  model_with_qdq = _apply_qdq_quantization_with_native_weight_quant(model, config_path)
   model_with_qdq.graph.output.append(
     onnx.helper.make_tensor_value_info(
       "matmul_input_simo_restore", onnx.TensorProto.FLOAT, [2, 3, 18]
     )
   )
-  _save_onnx_snapshot(model_with_qdq, tmp_path / f"{model_stem}_after_output_append.onnx")
-  _save_onnx_snapshot(model_with_qdq, tmp_path / f"{model_stem}_qdq.onnx")
+  onnx.save(model_with_qdq, tmp_path / f"{model_stem}_qdq.onnx")
   return _create_cuda_session(model_with_qdq)
 
 
@@ -526,7 +494,6 @@ def _qdq_fp8_per_group_tail_model(tmp_path):
     [onnx.numpy_helper.from_array(weight, "W")],
   )
   model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_operatorsetid("", 18)])
-  model_stem = "fp8_per_group_tail"
   config_path = tmp_path / "fp8_per_group_tail_quant_config.json"
   config_path.write_text(
     json.dumps({
@@ -539,20 +506,13 @@ def _qdq_fp8_per_group_tail_model(tmp_path):
       ],
     })
   )
-  model_with_qdq = _apply_qdq_quantization_with_native_weight_quant(
-    model,
-    config_path,
-    before_path=tmp_path / f"{model_stem}_before_quantization.onnx",
-    after_path=tmp_path / f"{model_stem}_after_quantization.onnx",
-  )
+  model_with_qdq = _apply_qdq_quantization_with_native_weight_quant(model, config_path)
   assert not any(node.op_type in {"Pad", "Slice"} for node in model_with_qdq.graph.node)
-  _save_onnx_snapshot(model_with_qdq, tmp_path / f"{model_stem}_before_output_append.onnx")
   model_with_qdq.graph.output.append(
     onnx.helper.make_tensor_value_info(
       "matmul_SimoDequantOutput", onnx.TensorProto.FLOAT, ["N", 320]
     )
   )
-  _save_onnx_snapshot(model_with_qdq, tmp_path / f"{model_stem}_after_output_append.onnx")
   return _create_cuda_session(model_with_qdq, options)
 
 
@@ -1175,7 +1135,6 @@ def test_symbolic_transposed_gemm_padding_preserves_output_shape(tmp_path):
     [onnx.numpy_helper.from_array(weight, "W")],
   )
   model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_operatorsetid("", 18)])
-  model_stem = "symbolic_transposed_gemm"
   config_path = tmp_path / "symbolic_transposed_gemm.json"
   config_path.write_text(
     json.dumps({
@@ -1188,12 +1147,7 @@ def test_symbolic_transposed_gemm_padding_preserves_output_shape(tmp_path):
       ]
     })
   )
-  model = _apply_qdq_quantization_with_native_weight_quant(
-    model,
-    config_path,
-    before_path=tmp_path / f"{model_stem}_before_quantization.onnx",
-    after_path=tmp_path / f"{model_stem}_after_quantization.onnx",
-  )
+  model = _apply_qdq_quantization_with_native_weight_quant(model, config_path)
   session = _create_cuda_session(model)
   tensor = np.linspace(-1.0, 1.0, 18 * 5, dtype=np.float32).reshape(18, 5)
 
@@ -1389,208 +1343,8 @@ def test_simo_custom_dequant_plugin_runs_int4_per_group_tiny_tensor(tmp_path, qu
   )
 
 
-def _manual_case_path(base_temp_path, test_name, case_id="default"):
-  def _safe_component(value):
-    return "".join(
-      character if character.isalnum() or character in "-_" else "_" for character in str(value)
-    )
-
-  case_path = base_temp_path / _safe_component(test_name) / _safe_component(case_id)
-  case_path.mkdir(parents=True, exist_ok=True)
-  return case_path
-
-
-def _run_manual_test(test_name, test_function, *args):
-  print(f"[RUN] {test_name}")
-  try:
-    test_function(*args)
-  except pytest.skip.Exception as exc:
-    print(f"[SKIP] {test_name}: {exc}")
-    return "skipped"
-  except Exception:
-    print(f"[FAIL] {test_name}")
-    traceback.print_exc()
-    return "failed"
-  else:
-    print(f"[PASS] {test_name}")
-    return "passed"
-
-
 def main():
-  base_temp_path = pathlib.Path("temp/test_dynamic_qdq_runtime_debug-debug/manual")
-  base_temp_path.mkdir(parents=True, exist_ok=True)
-  failed_tests = []
-  status_counts = {"passed": 0, "skipped": 0, "failed": 0}
-
-  def run(test_name, test_function, *args):
-    status = _run_manual_test(test_name, test_function, *args)
-    status_counts[status] += 1
-    if status == "failed":
-      failed_tests.append(test_name)
-
-  run(
-    "test_simo_activation_matching_pairs_dynamic_qdq_names",
-    test_simo_activation_matching_pairs_dynamic_qdq_names,
-  )
-
-  test_name = "test_simo_custom_qdq_plugin_rejects_unsupported_mxint8_shape"
-  run(
-    test_name,
-    test_simo_custom_qdq_plugin_rejects_unsupported_mxint8_shape,
-    _manual_case_path(base_temp_path, test_name),
-  )
-
-  mx_qdq_cases = (
-    ("mxint8", 32),
-    ("mxfp8_e5m2", 32),
-    ("mxfp8_e4m3", 32),
-    ("mxfp6_e3m2", 32),
-    ("mxfp6_e2m3", 32),
-    ("mxfp4_e2m1", 32),
-    ("nvfp4_e2m1", 16),
-  )
-  test_name = "test_simo_custom_qdq_plugin_runs_mx_qdq_tiny_tensor"
-  for dtype, block_size in mx_qdq_cases:
-    case_id = f"dtype-{dtype}-block_size-{block_size}"
-    run(
-      f"{test_name}[{case_id}]",
-      test_simo_custom_qdq_plugin_runs_mx_qdq_tiny_tensor,
-      _manual_case_path(base_temp_path, test_name, case_id),
-      dtype,
-      block_size,
-    )
-
-  for test_function, test_name in (
-    (
-      test_simo_custom_qdq_plugin_preserves_float16_io_dtype,
-      "test_simo_custom_qdq_plugin_preserves_float16_io_dtype",
-    ),
-    (
-      test_simo_custom_qdq_plugin_preserves_bfloat16_io_dtype,
-      "test_simo_custom_qdq_plugin_preserves_bfloat16_io_dtype",
-    ),
-  ):
-    run(test_name, test_function, _manual_case_path(base_temp_path, test_name))
-
-  int8_io_cases = (
-    ("fp32", onnx.TensorProto.FLOAT, "Dequantize", torch.float32),
-    ("fp16", onnx.TensorProto.FLOAT16, "DequantizeFloat16", torch.float16),
-    ("bf16", onnx.TensorProto.BFLOAT16, "DequantizeBFloat16", torch.bfloat16),
-  )
-  int8_builders = (
-    ("per-block", _tiny_simo_int8_per_block_qdq_model),
-    ("per-channel", _tiny_simo_int8_per_channel_qdq_model),
-  )
-  int8_range_cases = (
-    ("full", -128.0, 127.0, 127.5, -128),
-    ("narrow", -127.0, 127.0, 127.0, -127),
-  )
-  test_name = "test_simo_custom_int8_range_and_half_even_rounding"
-  for io_id, tensor_dtype, dequantize_op, torch_dtype in int8_io_cases:
-    for builder_id, builder in int8_builders:
-      for range_id, quant_min, quant_max, amax, minimum_code in int8_range_cases:
-        case_id = f"{io_id}-{builder_id}-{range_id}"
-        run(
-          f"{test_name}[{case_id}]",
-          test_simo_custom_int8_range_and_half_even_rounding,
-          _manual_case_path(base_temp_path, test_name, case_id),
-          builder,
-          quant_min,
-          quant_max,
-          amax,
-          minimum_code,
-          tensor_dtype,
-          dequantize_op,
-          torch_dtype,
-        )
-
-  test_name = "test_simo_custom_int8_rejects_unsupported_numeric_range"
-  for builder_id, builder in int8_builders:
-    case_id = builder_id
-    run(
-      f"{test_name}[{case_id}]",
-      test_simo_custom_int8_rejects_unsupported_numeric_range,
-      _manual_case_path(base_temp_path, test_name, case_id),
-      builder,
-    )
-
-  flex_io_cases = (
-    ("fp16", onnx.TensorProto.FLOAT16, "DequantizeFloat16", torch.float16),
-    ("bf16", onnx.TensorProto.BFLOAT16, "DequantizeBFloat16", torch.bfloat16),
-  )
-  flex_builders = (
-    ("per-group", _tiny_simo_fp8_per_group_qdq_model, [8, 128]),
-    ("per-block", _tiny_simo_fp8_per_block_qdq_model, [130, 129]),
-    ("per-channel", _tiny_simo_fp8_per_channel_qdq_model, [8, 65]),
-  )
-  test_name = "test_simo_custom_typed_flex_qdq_wrapper_smoke"
-  for io_id, tensor_dtype, dequantize_op, torch_dtype in flex_io_cases:
-    for builder_id, builder, shape in flex_builders:
-      case_id = f"{io_id}-{builder_id}"
-      run(
-        f"{test_name}[{case_id}]",
-        test_simo_custom_typed_flex_qdq_wrapper_smoke,
-        _manual_case_path(base_temp_path, test_name, case_id),
-        builder,
-        shape,
-        tensor_dtype,
-        dequantize_op,
-        torch_dtype,
-      )
-
-  int4_io_cases = (
-    ("fp16", onnx.TensorProto.FLOAT16, "DequantizeFloat16", torch.float16),
-    ("bf16", onnx.TensorProto.BFLOAT16, "DequantizeBFloat16", torch.bfloat16),
-  )
-  test_name = "test_simo_custom_typed_int4_dequantize_wrapper_smoke"
-  for io_id, tensor_dtype, dequantize_op, torch_dtype in int4_io_cases:
-    run(
-      f"{test_name}[{io_id}]",
-      test_simo_custom_typed_int4_dequantize_wrapper_smoke,
-      _manual_case_path(base_temp_path, test_name, io_id),
-      tensor_dtype,
-      dequantize_op,
-      torch_dtype,
-    )
-
-  e8m0_dtypes = (
-    "mxint8",
-    "mxfp8_e5m2",
-    "mxfp8_e4m3",
-    "mxfp6_e3m2",
-    "mxfp6_e2m3",
-    "mxfp4_e2m1",
-  )
-  test_name = "test_simo_custom_qdq_plugin_runs_mx_e8m0_sipu_tiny_tensor"
-  for dtype in e8m0_dtypes:
-    run(
-      f"{test_name}[dtype-{dtype}]",
-      test_simo_custom_qdq_plugin_runs_mx_e8m0_sipu_tiny_tensor,
-      _manual_case_path(base_temp_path, test_name, f"dtype-{dtype}"),
-      dtype,
-    )
-
-  test_name = "test_simo_custom_qdq_plugin_matches_torch_fake_quant_for_kws_mxfp8_e5m2_activation"
-  run(
-    test_name,
-    test_simo_custom_qdq_plugin_matches_torch_fake_quant_for_kws_mxfp8_e5m2_activation,
-    _manual_case_path(base_temp_path, test_name),
-  )
-
-  test_name = "test_dynamic_conv_activation_qdq_runs_with_symbolic_batch_and_spatial_dims"
-  run(
-    test_name,
-    test_dynamic_conv_activation_qdq_runs_with_symbolic_batch_and_spatial_dims,
-    _manual_case_path(base_temp_path, test_name),
-  )
-
-  test_name = "test_symbolic_transposed_gemm_padding_preserves_output_shape"
-  run(
-    test_name,
-    test_symbolic_transposed_gemm_padding_preserves_output_shape,
-    _manual_case_path(base_temp_path, test_name),
-  )
-
+  base_temp_path = pathlib.Path("temp/test_dynamic_qdq_runtime_debug-debug")
   unaligned_matmul_cases = (
     ("static", "mxint8", [2, 3, 18]),
     ("symbolic", "mxint8", ["B", "S", 18]),
@@ -1599,71 +1353,30 @@ def main():
     ("symbolic", "int8", ["B", "S", 18]),
     ("unknown_rank", "int8", None),
   )
-  test_name = "test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding"
+
+  matmul_temp_path = base_temp_path / "matmul"
+  matmul_temp_path.mkdir(parents=True, exist_ok=True)
   for shape_id, dtype, input_shape in unaligned_matmul_cases:
-    case_id = f"{dtype}-{shape_id}"
-    run(
-      f"{test_name}[{case_id}]",
-      test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding,
-      _manual_case_path(base_temp_path, test_name, case_id),
+    print(
+      f"[RUN] input_shape={input_shape!r}, dtype={dtype}, "
+      f"temp_path={matmul_temp_path}"
+    )
+    test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding(
+      matmul_temp_path,
       input_shape,
       dtype,
       shape_id,
     )
+    print(f"[PASS] input_shape={input_shape!r}, dtype={dtype}")
 
-  single_tmp_tests = (
-    (
-      test_simo_custom_qdq_plugin_runs_fp8_per_group_tail_without_padding,
-      "test_simo_custom_qdq_plugin_runs_fp8_per_group_tail_without_padding",
-    ),
-    (
-      test_simo_custom_qdq_plugin_runs_fp8_per_group_tiny_tensor,
-      "test_simo_custom_qdq_plugin_runs_fp8_per_group_tiny_tensor",
-    ),
-    (
-      test_simo_custom_qdq_plugin_runs_fp8_per_block_tiny_tensor,
-      "test_simo_custom_qdq_plugin_runs_fp8_per_block_tiny_tensor",
-    ),
-    (
-      test_simo_custom_qdq_plugin_runs_int8_per_block_tiny_tensor,
-      "test_simo_custom_qdq_plugin_runs_int8_per_block_tiny_tensor",
-    ),
-    (
-      test_simo_custom_qdq_plugin_runs_fp8_per_channel_tiny_tensor,
-      "test_simo_custom_qdq_plugin_runs_fp8_per_channel_tiny_tensor",
-    ),
-    (
-      test_simo_custom_qdq_plugin_rejects_noncanonical_per_channel_axis,
-      "test_simo_custom_qdq_plugin_rejects_noncanonical_per_channel_axis",
-    ),
-    (
-      test_simo_custom_qdq_plugin_runs_int8_per_channel_tiny_tensor,
-      "test_simo_custom_qdq_plugin_runs_int8_per_channel_tiny_tensor",
-    ),
+  dynamic_conv_temp_path = base_temp_path / "conv"
+  dynamic_conv_temp_path.mkdir(parents=True, exist_ok=True)
+  print(f"[RUN] dynamic Conv, temp_path={dynamic_conv_temp_path}")
+  test_dynamic_conv_activation_qdq_runs_with_symbolic_batch_and_spatial_dims(
+    dynamic_conv_temp_path
   )
-  for test_function, test_name in single_tmp_tests:
-    run(test_name, test_function, _manual_case_path(base_temp_path, test_name))
-
-  test_name = "test_simo_custom_dequant_plugin_runs_int4_per_group_tiny_tensor"
-  for range_id, quant_min, quant_max in (
-    ("full", -8.0, 7.0),
-    ("narrow", -7.0, 7.0),
-  ):
-    run(
-      f"{test_name}[{range_id}]",
-      test_simo_custom_dequant_plugin_runs_int4_per_group_tiny_tensor,
-      _manual_case_path(base_temp_path, test_name, range_id),
-      quant_min,
-      quant_max,
-    )
-
-  print(
-    "[SUMMARY] "
-    f"passed={status_counts['passed']}, skipped={status_counts['skipped']}, "
-    f"failed={status_counts['failed']}"
-  )
-  if failed_tests:
-    raise AssertionError("Manual test failures: " + ", ".join(failed_tests))
+  print("[PASS] dynamic Conv")
+  print(f"[PASS] completed {len(unaligned_matmul_cases)} unaligned MatMul cases")
 
 
 if __name__ == "__main__":

@@ -101,3 +101,7 @@ cute-gemm 仓库位于 /share/users/like/package/cute-gemm
 运行日志位于 /share/users/like/package/cute-gemm/run.gemm-multi-stage-like.log
 忽略kernel内所有的 print/printf
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+
+gemm-multi-stage-like.cu 240~278行进行手动模拟，ntile * nk 次循环 手动展开循环。
+描述循环内部if 语句判断情况，ismem_read, ik_next,itile_to_read,ismem_write,变量变化情况, G2S/S2R cute::copy 时源数据和目标数据所属分片下标，cute::gemm 所属分片的下标
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md

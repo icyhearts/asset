@@ -2627,3 +2627,197 @@ torch LSTM文档位于 https://docs.pytorch.org/docs/2.13/generated/torch.nn.LST
 torch LSTM文档位于 https://docs.pytorch.org/docs/2.13/generated/torch.nn.LSTM.html
 把 like-useful/test-lstm-bidirectional.py copy 成 like-useful/test-lstm-bidirectional-multi-layer.py, 把 like-useful/test-lstm-bidirectional-multi-layer.py 改成 NUM_LAYERS=2, 进行2层双向LSTM的测试.
 所有的测试，包括 torch和 onnxruntime 的对比， torch  和 manual_lstm_forward的对比，都改成2层双向  LSTM的对比.
+ 
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+修改 like-useful/test_dynamic_qdq_runtime_debug-debug.py, 1329行调用 test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding 改成手动展开 1146 行的 pytest.mark.parametrize 里面的参数，对展开的参数 逐个调用  test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding, 并修改 temp_path,  不同的input_shape, dtype  使用不同的temp_path
+最终效果：python like-useful/test_dynamic_qdq_runtime_debug-debug.py 可以运行，不用 pytest
+修改完成使用指定conda运行测试
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+ee319fc686ecdea40b82f952376d433734e10d58 这个修改， 把 simo/onnx/tests/test_dynamic_qdq_runtime_debug.py test_dynamic_conv_activation_qdq_runs_with_symbolic_batch_and_spatial_dims, test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding 函数不再保存 插入QDQ后的onnx文件.  我现在测试需要他们保存onnx，又不想直接修改 simo/onnx/tests/test_dynamic_qdq_runtime_debug.py, 你在  like-useful/test_dynamic_qdq_runtime_debug-debug.py  里面,把这些保存插入QDQ算子后 onnx文件的逻辑，重新加回来。 
+
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+
+1.继续修改 like-useful/test_dynamic_qdq_runtime_debug-debug.py 把 插入 QDQ 节点前的 原始 onnx 模型也保存成 onnx 文件.
+2. 保存 onnx的目录不要使用多级目录，改成单级目录，matmul一个目录，conv 一个目录，matmul下面不同测试用途不要有子目录，用文件名本身区别不同配置下的 onnx文件
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo/onnx/onnx_quant.py 在对 MatMul/Gemm 算子的权重量化，会先对权重transpose，量化后的权重保存成 initializer, 在计算图里面加入 Dequantize 节点， Dequantize的输出会 transpose 再恢复成原来的顺序，
+1. 它在量化前加入 transpose, Dequantize后再插入 transpose恢复顺序，这么做的目的是什么？
+2. Gemm 的 transA/transB 属性会影响 transpose 的插入吗 ？
+把答案追加到 like-useful/answer_codex_v2.md
+
+
+## {
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo/onnx/onnx_quant.py
+def validate_graphsurgeon_conversion(model: ModelProto) -> None:
+这个函数的功能是什么 ？
+把答案追加到 like-useful/answer_codex_v2.md
+
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+以 like-useful/test_dynamic_qdq_runtime_debug-debug.py main 函数 调用test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding, 传的参数是("static", "mxint8", [2, 3, 18]),为例，讲解
+激活插入 Flatten, Pad, Quantize, Dequantize,  Slice,  Reshape, Shape 7个算子，分别是在哪行代码插入的
+权重量化成 uint8 weigh load 和 scale uint8 load是在哪行代码完成的?
+权重后面插入 Dequantize, Transpose 2个算子，分别是在哪行代码插入的?
+把答案追加到 like-useful/answer_codex_v2.md
+
+## LSTM 量化
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+conda 环境已经安装 onnx, onnxruntime, GraphSurgeon
+
+/share/users/like/package/onnx/ 有完整的 onnx 源码，和conda 环境的 通过 pip 安装的包，是相同的版本。
+/share/users/like/package/onnxruntime/ 有完整的 onnxruntime 源码，和conda 环境的 通过 pip 安装的包，是相同的版本。
+
+
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+
+参考  simo/onnx/onnx_quant.py 对于 MatMul/Conv QDQ 量化，实现 onnx LSTM QDQ 量化.
+* /share/users/like/package/onnx/docs/Operators.md 显示， ONNX LSTM 的输入个数: Inputs (3 - 8), 只对 input 1,input 2,input 3进行量化，其他input不用管
+* input 1, The input sequences, 对于激活值，完全参考 MatMul 的量化做法，插入 Flatten, Pad, Quantize, Dequantize,  Slice,  Reshape, Shape 等算子
+* input 2, The weight tensor for the gates. Concatenation of `W[iofc]` and `WB[iofc]` (if bidirectional) along dimension 0. The tensor has shape `[num_directions, 4*hidden_size, input_size]`. 这个权重在 onnx 中是 W[iofc] 的 Concatenation, 在量化权重的时候，要先把 input 2 拆开.
+ ** 单向 lstm 拆成 W[iofc] 4个矩阵， 分别调用 simo 量化 kernel，得到4个 权重 carrier和4个 scale, 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为输入。
+ ** 双向 lstm 拆成 W[iofc] 4个矩阵 + WB[iofc] 4个，总共8个矩阵， 分别调用 simo 量化 kernel，得到8个 权重 carrier和8个 scale, 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为输入。
+
+* input 3,  The recurrence weight tensor. Concatenation of `R[iofc]` and `RB[iofc]` (if bidirectional) along dimension 0. This tensor has shape `[num_directions, 4*hidden_size, hidden_size]`.
+* 要有完善的单元测试,  在 simo/onnx/tests/test_dynamic_qdq_runtime_debug.py 中插入 LSTM 的量化测试。
+}
+
+
+
+##
+
+sglang conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+sglang 代码位于  /share/users/like/package/sglang_kernel_src
+sglang 以editable方式安装
+
+vllm conda 环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/
+vllm 代码位于  /share/users/like/package/vllm-for-conda-simo/
+vllm 以editable方式安装
+
+1)
+CUDA_VISIBLE_DEVICES=7 SIMO_SGLANG_REGISTER=1 pytest tests/sglang_simo/e2e_test/test_basic_generate.py  > temp//smoke.txt 2>&1 &
+日志位于 temp/smoke.txt
+期望的文本 'Paris' 不在 sglang 输出中。
+2)
+又改成单个 quant config测试,单独测试 w4a16 int4 per group 量化:
+CUDA_VISIBLE_DEVICES=6 SIMO_SGLANG_REGISTER=1 python tests/sglang_simo/e2e_test/test_basic_generate_single.py  > temp//smoke.single.txt.`nowstr.sh` 2>&1 &
+日志位于  temp//smoke.single.txt.2026_07_23___17_27_40
+期望的文本 'Paris' 还是不在 sglang 输出中。
+3)
+但是 同样使用 w4a16 int4 per group 量化, vllm 可以符合预期:
+CUDA_VISIBLE_DEVICES=2 python3 tests/vllm_simo/e2e_test/test_basic_generate_single.py > temp/vllm.test_basic_generate_single.py.`nowstr.sh` 2>&1 &
+
+日志位于 temp/vllm.test_basic_generate_single.py.2026_07_23___17_50_21
+期望的文本 'Paris' 在 vllm 输出中。
+分析 sglang 在 temperature = 0, w4a16 int4 per group量化，输出文本明显不符合预期的原因, 把答案追加到 like-useful/answer_codex_v2.md
+
+
+
+
+SMOKE_PREFIX="" CUDA_VISIBLE_DEVICES=0 SIMO_SGLANG_REGISTER=1 SMOKE_MODEL=/data/like/hf-models/Llama3.1-8B-Instruct/  python  like-useful/test_basic_generate_single_parameter.py > temp/test_basic_generate_single_parameter.py.`nowstr.sh` 2>&1 &
+日志位于:
+temp/test_basic_generate_single_parameter.py.2026_07_23___18_29_18
+###
+你再试下 /data/like/hf-models/Llama3.1-8B-Instruct/ 这个模型，同样 w4a16 量化， sglang_simo还能得到 Paris作为首 token吗？
+如何设置 sglang_simo ，在 /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights 和 /data/like/hf-models/Llama3.1-8B-Instruct 模型上都能在输出中得到 稳定的 Paris 这个单词？
+把答案追加到 like-useful/answer_codex_v2.md
+
+
+tokenizer.apply_chat_template 方式生成prompt，和原来的 prompt= list of prompt, 有什么区别 ？ 
+把答案追加到 like-useful/answer_codex_v2.md
+
+
+sglang conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+sglang 代码位于  /share/users/like/package/sglang_kernel_src
+sglang 以editable方式安装
+
+vllm conda 环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/
+vllm 代码位于  /share/users/like/package/vllm-for-conda-simo/
+vllm 以editable方式安装
+
+修改 like-useful/test_basic_generate_tokenizer_prompt_all_in_one.py
+1. 模型方面，改成 /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights 和 /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/ 两个模型，两个模型都参与 smoke test
+2. 量化配置方面 simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/ 和 simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/  目录下的 json，都参与测试
+3. sgl.Engine 构造的时候，显式传入 attention_backend="triton", 因为 simo kv cache量化配置, simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/的配置，只支持 triton backend.
+
+sgl.Engine 构造的时候，改成:
+simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/ 的配置不需要传 attention_backend
+simo/extensions/sglang_simo/example/simo_quantization_config/kv_cache_quant/  目录下的 json，传 attention_backend="triton_simo"
+
+
+## {
+如何使用 sglang 自己的  插件注册 sglang_simo 插件?
+sglang conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+sglang 代码位于  /share/users/like/package/sglang_kernel_src
+sglang 以editable方式安装
+
+vllm conda 环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/
+vllm 代码位于  /share/users/like/package/vllm-for-conda-simo/
+vllm 以editable方式安装
+
+sglang code base python/sglang/srt/environ.py  定义了 SGLANG_PLUGINS 环境变量。
+sglang code base python/sglang/srt/plugins/__init__.py 会读取 SGLANG_PLUGINS 环境变量.
+
+
+
+simo/extensions/sglang_simo/__init__.py 的register_simo_extensions函数，可以通过 sitecustomize.py 调用，注册 simo自定义函数。
+
+pyproject.toml里面有一个 vllm 插件的例子
+```
+[project.entry-points."vllm.general_plugins"]
+vllm_simo_extensions = "simo.extensions.vllm_simo:register_simo_extensions"
+```
+
+现在我想抛弃  sitecustomize.py 注册 sglang_simo 插件, 使用 sglang 自带 SGLANG_PLUGINS环境变量，触发 simo/extensions/sglang_simo/__init__.py register_simo_extensions 函数
+，应该如何做？
+SGLANG_PLUGINS 触发  simo/extensions/sglang_simo/__init__.py register_simo_extensions 的函数调用栈是怎么样的?
+setup.py 和 pyproject.toml 需要修改吗?
+
+把答案追加到 like-useful/answer_codex_v2.md, 只写答案，不要对任何仓库代码做修改
+}
+
+##{
+sglang conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+sglang 代码位于  /share/users/like/package/sglang_kernel_src
+sglang 以editable方式安装
+修改 like-useful/test_dynamic_qdq_runtime_debug-debug.py
+1.
+对于所有的 pytest 能触发的函数，即以 def test的函数，都在 main函数中手动调用，如果一个函数有 pytest.mark.parametrize修饰，在main函数中，手动把参数展开， 即在main函数中模拟 pytest 的调用过程。
+2. 所有改  onnx 图的操作，都在改图前保存 onnx文件，改图后再 保存onnx文件，文件名要做区分，不同函数参数，改图前后的onnx文件名，要不同。
+}
+## {
+
+sglang conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+sglang 代码位于  /share/users/like/package/sglang_kernel_src
+sglang 以editable方式安装
+
+vllm conda 环境位于 /share_data/users/like/miniconda3/envs/simo_vllm/
+vllm 代码位于  /share/users/like/package/vllm-for-conda-simo/
+vllm 以editable方式安装
+1.
+现在你对 like-useful/answer_codex_v2.md ## 65. 使用 SGLang 原生插件框架注册 `sglang_simo` ，进行实现.
+我对于“抛弃 `sitecustomize.py`”的定义是,指连自动导入入口也完全不要， 从 `setup.py` 删除 sitecustomize. 彻底删除 sitecustomize方式，拥抱 sglang自己的插件。
+
+2.改完代码后，在 sglang conda 环境中, 使用 /share/users/like/package/sglang_kernel_src/like-useful//env-build-pip.sh 中环境变量，保证使用 cuda 13编译。先 pip uninstall simo 删除 simo, 再完成一次重新 editable 安装:
+```
+   pip install -e ".[dev]" --no-build-isolation
+```
+3. 重新安装后， 用 sglang conda 环境对 like-useful/test_basic_generate_tokenizer_prompt_all_in_one.py  进行smoke测试，全部json配置都测试太费时间，为了节省时间，deepseek 模型从 kv_cache_quant 和 online_quantization 中各选一个配置测试。 llama 模型 从 kv_cache_quant 和 online_quantization 中各选一个配置测试。  deepseek 2个，llama 2个，总共 4个测试
+}
+## {
+sglang conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+test_dynamic_conv_activation_qdq_runs_with_symbolic_batch_and_spatial_dims 的输入是
+}
+
+
+#{
+sglang conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+like-useful/test_dynamic_qdq_runtime_debug-debug.py, 1605 行,
+shape_id, dtype, input_shape 分别是 ('symbolic', 'int8', ['B', 'S', 18])
+的时候，对于激活量化的处理，simo/onnx/onnx_quant.py 765 行的if 语句是True
+simo/onnx/onnx_quant.py 765 行if=True的时候，为什么要把 per tensor的粒度强行改成 per channel?
+把答案追加到 like-useful/answer_codex_v2.md
+
+}

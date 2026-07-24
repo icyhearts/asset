@@ -7611,3 +7611,2046 @@ libcudnn.so.9: cannot open shared object file
 
 因此，这个文件可以概括为一张**透明背景的少年孙悟空全身人物素材图**，而不是一张
 gtest 测试图片。
+
+## 56. 在北京住建委网站查询期房项目网签情况
+
+### 56.1 查询项目整体销售/网签状态的具体路径
+
+截至 2026-07-22，推荐使用项目公示入口，而不是先进入“期房合同信息查询”：
+
+1. 打开北京住建委官网：<https://zjw.beijing.gov.cn/>。
+2. 选择“房屋”业务下的“房地产开发管理”。也可以直接打开：
+   <https://zjw.beijing.gov.cn/bjjs/fdckfgl/index.shtml>。
+3. 在“预售许可”区域找到“已办理预售许可项目公示”（页面标题为“项目信息公示”），点击“查询”。
+   直接入口通常为：
+   <https://bjjs.zjw.beijing.gov.cn/eportal/ui?isTrue=1&pageId=307670>。
+4. 在查询条件中填写或选择：
+   - “项目名称”：优先使用预售许可证或住建委备案中的项目名称；
+   - “开发单位”：可用开发商全称缩小结果范围；
+   - “项目地址”和“所属区县”：用于排除同名项目；
+   - “现房/期房”：选择“期房”；
+   - “预售证号”：已知时可直接使用。
+5. 点击“查询”，在结果中确认项目名称、坐落、开发单位和预售证信息，进入该项目的“详细信息”。
+6. 在项目详情中选择对应的预售楼栋，打开“楼盘表”。楼盘表按楼栋、楼层和房号列出每套房的公示状态；逐套查看即可判断该项目哪些房屋已签约、已预订或仍显示为未签约/可售。
+
+住建委的“房地产开发管理”页面明确说明，该数据库可按“项目名称”“开发单位”“项目地址”
+“现房/期房”“预售证号”“所属区县”查询新建商品房及已办理预售许可项目。若项目在售楼处使用的
+营销名查不到，应改用预售许可证上的备案项目名，或结合开发单位、地址查询。
+
+### 56.2 如何从楼盘表判断“网签”
+
+楼盘表中的文字或图例应以页面当前显示为准，常见含义如下：
+
+| 页面状态 | 含义 | 是否计入已网签 |
+| --- | --- | --- |
+| 已签约、已预售，或已联机备案 | 已提交商品房预售合同网上签约/备案流程 | 是，按页面的具体标签统计 |
+| 已预订、已认购 | 只完成认购书或网上预订，尚未完成预售合同网签 | 不应直接当作已网签 |
+| 未签约、可售 | 当前公示中没有网签标识 | 否，但仍应核对是否存在限售、抵押或开发企业更新延迟 |
+| 不可售、抵押等 | 当前不能按普通可售房源交易 | 不作为已网签房源统计 |
+
+北京住建委公开的预售管理说明要求楼盘表公示网上已预订、已签约房屋；预售合同网上签约后，
+楼盘表会标识该套房屋已预售。部分页面使用颜色图例，颜色可能随页面版本变化，因此应以楼盘表
+旁边的文字图例为准，不要只凭红色、粉色或褐色等颜色推断。公开数据是交易管理系统的公示快照，
+合同撤销、换房、备案变更或开发企业尚未更新时，页面状态可能与销售现场口径不同。
+
+### 56.3 查询某一份期房合同的另一条路径
+
+如果问题不是“这个项目卖了多少套”，而是核验某一位购房人的具体合同，则走：
+
+1. 官网首页 → “房屋” → “房地产交易” → “网签合同”；或直接打开
+   <https://zjw.beijing.gov.cn/bjjs/fdcjy/wqht/index.shtml>。
+2. 找到“期房合同网上签约查询”，进入“期房合同信息查询”；也可从查询中心
+   <https://zjw.beijing.gov.cn/bjjs/cxzx29/index.shtml> 选择“房地产交易 → 期房合同信息查询”。
+3. 按页面要求填写合同号（或合同编码）、买方名称、证件号码、网签密码和验证码。
+
+这条查询需要合同号、购房人身份信息和签约时设置的密码，不能用来仅凭项目名称查看全项目的
+销售套数；项目整体情况应使用 56.1 的“项目信息公示 → 楼盘表”。
+
+### 56.4 结果解释和核对建议
+
+- “已预订”不等于“已网签”。北京住建委公布的流程是先认购/预订，再在规定期限内签订商品房预售合同；合同网上提交并联机备案后才属于合同网签/备案状态。
+- 统计时应明确口径：通常只统计楼盘表标为“已签约/已预售/已联机备案”的房屋，另行列出“已预订/已认购”，不要把两者相加后称为网签套数。
+- 页面若显示项目已取得预售许可但没有可售楼栋，可能是已售完、部分楼栋尚未公示、项目状态已变更，或查询条件使用了营销名而非备案名；可用预售证号、开发商全称和区县重新查询。
+- 如需对合同效力、退房或备案解除作正式证明，应以购房人通过合同号和密码查询到的合同/联机备案信息，以及开发企业和区住建部门出具的材料为准，网页楼盘表只适合作为公开信息核对。
+
+相关官方入口：
+
+- 北京住建委“房地产开发管理”：<https://zjw.beijing.gov.cn/bjjs/fdckfgl/index.shtml>
+- 北京住建委“网签合同”：<https://zjw.beijing.gov.cn/bjjs/fdcjy/wqht/index.shtml>
+- 北京住建委“查询中心”：<https://zjw.beijing.gov.cn/bjjs/cxzx29/index.shtml>
+- 北京住建委“项目信息公示”动态查询：<https://bjjs.zjw.beijing.gov.cn/eportal/ui?isTrue=1&pageId=307670>
+
+## 57. 提交 `d19622e34e8cd86d7d6e2194f9539a7906049856` 修改说明
+
+### 57.1 提交基本信息和总体结论
+
+```text
+commit:  d19622e34e8cd86d7d6e2194f9539a7906049856
+parent:  ee319fc686ecdea40b82f952376d433734e10d58
+author:  haifeng <hfxu@siorigin.com>
+time:    2026-07-21 08:10:45 UTC（北京时间 2026-07-21 16:10:45）
+subject: [feat] Add ONNX accuracy debug compute output comparison (model-opt/simo!190)
+规模:    10 files changed, 2549 insertions(+), 1 deletion(-)
+```
+
+这个提交包含两个相互配合的功能：
+
+1. 新增 ONNX 精度调试工具：将两个 ONNX 模型中 `MatMul`、`Gemm`、`Conv` 节点的内部输出
+   暂时暴露为 graph output，在相同输入下分别用 ONNX Runtime 执行，再生成逐节点误差报告。
+2. 新增 `com.simo::Quantize` 和 `com.simo::Dequantize` 的 CPU custom-op 实现，使带 SIMO Q/DQ
+   节点的量化 ONNX 模型可以选择 `CPUExecutionProvider` 执行，方便与浮点参考模型做精度对比。
+
+它**没有修改** `simo/onnx/onnx_quant.py` 的量化图转换流程，也没有改变 MatMul/Conv 本身的
+量化策略；它增加的是运行、采集中间结果和比较误差所需的调试基础设施。
+
+提交新增 6 个文件、修改 4 个文件：
+
+| 文件 | 变化 | 作用 |
+| --- | ---: | --- |
+| `examples/accuracy_debug/run_compare_onnx.py` | `+145` | ONNX 模型比较命令行入口 |
+| `examples/accuracy_debug/run_compare_onnx.sh` | `+44` | 用环境变量封装 CLI 的示例脚本 |
+| `simo/accuracy_debug/onnx_runner.py` | `+409` | ONNX 扫描、插桩、执行、对齐和比较的核心实现 |
+| `simo/accuracy_debug/__init__.py` | `+8` | 导出新的 ONNX accuracy-debug API |
+| `simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc` | `+1224` | SIMO Quantize/Dequantize CPU kernel |
+| `simo/onnx/ort_plugin/build_runtime.py` | `+1` | 将 CPU Q/DQ 源文件加入 custom-op 共享库构建 |
+| `simo/onnx/ort_plugin/custom_op_library.cc` | `+8/-1` | 根据环境变量选择注册 CPU 或原 CUDA Q/DQ op |
+| `simo/onnx/ort_plugin/simo_qdq_ops.h` | `+1` | 声明 `RegisterCpuQdqOps()` |
+| `tests/simo_quant/test_accuracy_debug_onnx.py` | `+187` | ONNX 精度调试功能测试 |
+| `simo/onnx/tests/test_cpu_qdq_custom_ops.py` | `+522` | CPU Q/DQ 编译、运行和格式一致性测试 |
+
+### 57.2 ONNX 中间计算结果比较的实现
+
+#### 57.2.1 查找需要比较的节点
+
+`simo/accuracy_debug/onnx_runner.py:23` 的 `DEFAULT_COMPUTE_OP_TYPES` 默认只包含：
+
+```text
+MatMul, Gemm, Conv
+```
+
+`simo/accuracy_debug/onnx_runner.py:60` 的 `find_onnx_compute_outputs()` 遍历 ONNX graph：
+
+- 只选择标准 ONNX domain，即 `node.domain` 为空的节点；
+- 按 `op_types` 过滤算子类型；
+- 按节点名称应用 `include`/`exclude` glob；
+- 节点没有名称时生成 `MatMul_<graph index>` 形式的调试名称；
+- 记录每个非空输出的 tensor name、输出序号和用于报告对齐的 capture name。
+
+因此，即使自定义 domain 中也有一个叫 `MatMul` 的节点，它也不会被这个函数直接选中。这一点由
+`tests/simo_quant/test_accuracy_debug_onnx.py:70` 的
+`test_find_onnx_compute_outputs_filters_standard_domain_and_globs()` 覆盖。
+
+#### 57.2.2 把中间 tensor 临时变成 graph output
+
+ONNX Runtime 通常只返回原模型声明的 graph output。为取得中间节点结果，
+`simo/accuracy_debug/onnx_runner.py:119` 的 `_instrument_model_outputs()` 会：
+
+1. 深拷贝模型，不原地修改输入模型；
+2. 尝试调用 ONNX shape inference；
+3. 查找目标 tensor 对应的 `ValueInfoProto`；
+4. 将目标 tensor 追加到 `model.graph.output`；
+5. 找不到类型/shape 信息时，退化为未知 shape 的 FLOAT output。
+
+插桩模型只以序列化内存数据传给 ORT，不会覆盖磁盘上的原 ONNX 文件。
+
+#### 57.2.3 输入和 ONNX Runtime session
+
+`simo/accuracy_debug/onnx_runner.py:172` 的 `normalize_onnx_inputs()` 支持三种输入：
+
+- Python `dict[str, numpy.ndarray/torch.Tensor/array-like]`；
+- `.npz` 文件；
+- `torch.save()` 保存的 mapping，既可直接保存输入字典，也可保存 `{"inputs": {...}}`。
+
+Torch tensor 会先 `detach().cpu().numpy()`。`simo/accuracy_debug/onnx_runner.py:147` 的
+`_session_options()` 可以设置 ORT graph optimization level，并按需调用
+`simo.onnx.runtime.register_custom_ops()`。`simo/accuracy_debug/onnx_runner.py:189` 的
+`_create_session()` 分别为参考模型和实际模型创建 ORT session。
+
+默认 providers 为：
+
+```text
+CUDAExecutionProvider, CPUExecutionProvider
+```
+
+默认 optimization level 是 `disable`。精度调试时关闭图优化有助于保留原始计算节点和中间输出；
+也可以显式选择 `basic`、`extended` 或 `all`。
+
+#### 57.2.4 采集、对齐和比较
+
+`simo/accuracy_debug/onnx_runner.py:211` 的 `collect_onnx_compute_outputs()` 完成单个模型的流程：
+
+```text
+选择节点输出
+  -> 插桩为 graph output
+  -> 创建 ORT session
+  -> session.run(output_names, feeds)
+  -> NumPy 转 CPU torch.Tensor
+  -> 生成 TensorSummary/CaptureResult
+```
+
+`simo/accuracy_debug/onnx_runner.py:308` 的 `compare_onnx_models()` 对参考模型和实际模型分别执行
+上述流程，然后复用原有 `compare_capture_results()` 和 `write_report()`。比较指标包括 MSE、RMSE、
+MAE、最大绝对/相对误差、cosine similarity、SQNR；若节点被标为 `class_logits`，还会计算 sigmoid
+分数误差、阈值翻转率和 top-k overlap。
+
+该函数提供两种对齐方式：
+
+- `align_by="name"`：默认方式，以节点 capture name 对齐。名称不同的节点不会产生比较项；底层
+  `simo/accuracy_debug/comparator.py:21` 的 `compare_capture_results()` 会跳过实际模型中不存在的名称，
+  不会报 missing-node 错误。
+- `align_by="order"`：`simo/accuracy_debug/onnx_runner.py:279` 的 `_align_outputs_by_order()` 按 graph
+  拓扑顺序配对，要求两侧被选输出数量相同，且每一对 `op_type` 相同；实际模型节点名可以不同，
+  报告统一使用参考模型名称。数量或 op type 不匹配会立即抛出 `ValueError`。
+
+比较模式会通过 `simo/accuracy_debug/onnx_runner.py:261` 的 `_force_tensor_mode()` 强制保存 tensor，
+因为只有 summary 无法计算逐元素误差。若提供 `output_dir`，会写出：
+
+```text
+summary.json
+anomaly.json
+layer_metrics.json
+summary.md
+```
+
+`simo/accuracy_debug/onnx_runner.py:372` 的 `scan_onnx_model()` 则只扫描一个模型，适合检查 NaN、Inf
+等异常，不进行双模型比较。
+
+#### 57.2.5 Python API 导出
+
+`simo/accuracy_debug/__init__.py:5-9` 和 `simo/accuracy_debug/__init__.py:17-30` 新增公开导出：
+
+```python
+collect_onnx_compute_outputs
+compare_onnx_models
+scan_onnx_model
+```
+
+低层的 `find_onnx_compute_outputs()` 和 `normalize_onnx_inputs()` 仍可从
+`simo.accuracy_debug.onnx_runner` 直接导入。
+
+### 57.3 命令行和示例脚本
+
+`examples/accuracy_debug/run_compare_onnx.py:31` 的 `main()` 新增 CLI，主要参数包括：
+
+- `--ref-model`、`--actual-model`、`--input`、`--output-dir`；
+- `--include`、`--exclude` 和可重复的 `--op-type`；
+- `--align-by name|order`；
+- 公共或独立的 `--providers`、`--ref-providers`、`--actual-providers`；
+- `--register-simo-ops-for-ref/actual` 和 `--simo-custom-ops-library`；
+- `--optimization-level`、`--top-k`、`--eps`；
+- class-logits 的 semantic pattern、阈值和 top-k 参数。
+
+`examples/accuracy_debug/run_compare_onnx.sh:4-44` 用环境变量构造这些参数。比较普通 FP ONNX 和
+SIMO 量化 ONNX，并让量化模型的 Q/DQ 在 CPU 上运行，可使用：
+
+```bash
+SIMO_ONNX_QDQ_PROVIDER=CPU \
+python examples/accuracy_debug/run_compare_onnx.py \
+  --ref-model /path/ref.onnx \
+  --actual-model /path/quantized.onnx \
+  --input /path/inputs.npz \
+  --output-dir /path/report \
+  --providers CPUExecutionProvider \
+  --register-simo-ops-for-actual \
+  --align-by name
+```
+
+若两个模型量化前后节点名发生变化，应考虑 `--align-by order`，但必须确认两侧选中的计算节点数量
+和 op-type 顺序确实一一对应，否则“拓扑顺序相同”并不自动等于“语义上是同一个层”。
+
+### 57.4 SIMO Q/DQ CPU custom op
+
+#### 57.4.1 构建和注册方式
+
+`simo/onnx/ort_plugin/build_runtime.py:70-76` 的 `build_sm90_runtime()` 将新增的
+`simo_qdq_cpu_ops.cc` 加入 `libSimoOnnxCustomOps_sm90.so`。共享库仍同时包含原 CUDA Q/DQ、Triton
+loader 和生成的 cubin，因此：
+
+- CPU Q/DQ 不是一个独立 `.so`；
+- 库名仍然是 `libSimoOnnxCustomOps_sm90.so`；
+- 从源码调用 `build_sm90_runtime()` 时仍会构建 SM90 cubin、包含 CUDA 头文件并链接 CUDA driver，
+  “运行 Q/DQ 用 CPU”不等于“构建过程不需要 CUDA”。
+
+`simo/onnx/ort_plugin/simo_qdq_ops.h:13-14` 增加 `RegisterCpuQdqOps()` 声明。
+`simo/onnx/ort_plugin/custom_op_library.cc:13` 的 `QdqDomain()` 在第一次创建静态 `com.simo` domain 时
+读取环境变量：
+
+```text
+SIMO_ONNX_QDQ_PROVIDER=CPU  -> RegisterCpuQdqOps(domain)
+其他值或未设置             -> RegisterQdqOps(domain)，保留原 CUDA 路径
+```
+
+判断是大小写敏感的精确字符串 `CPU`，而且 domain 是进程内静态对象，所以环境变量必须在该进程
+第一次调用 `register_custom_ops()` 之前设置，最稳妥的方式是在启动 Python 前设置。第一次注册后
+再修改变量，不会重建 domain。
+
+#### 57.4.2 CPU kernel 的输入输出和限制
+
+`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:91-128` 的 `IoDtype` 支持 Q/DQ 外部浮点类型：
+
+```text
+fp32, fp16, bf16
+```
+
+`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:1138` 的 `QuantizeCpuDirectOp`：
+
+```text
+一个 fp32/fp16/bf16 输入 -> quantized UINT8 + scale UINT8
+Execution Provider       -> CPUExecutionProvider
+com.simo opset           -> version 2
+```
+
+`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:1173` 的 `DequantizeCpuDirectOp` 执行反方向转换。
+这里 scale 的 ONNX carrier 类型是 `UINT8`；FP32 scale 以 4 个原始字节存储，并不代表 scale 的
+数学类型是整数。
+
+`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:160` 的 `ResolveSpec()` 先复用嵌入式 SM90 semantic
+spec 的布局元数据，未命中时再构造 CPU fallback spec。这个提交的参数化端到端测试明确验证了
+以下组合；该表表示**已验证集合**，不应扩大解释成所有 resolver 可能返回组合的稳定公共契约：
+
+| 量化 family | dtype | granularity | scale mode/典型 block |
+| --- | --- | --- | --- |
+| MX | `mxfp8_e4m3`, `mxfp8_e5m2` | `per_group` | `e8m0_floor`, block 32 |
+| MX | `mxfp6_e2m3`, `mxfp6_e3m2` | `per_group` | `e8m0_floor`, block 32 |
+| MX | `mxfp4_e2m1` | `per_group` | `e8m0_floor`, block 32 |
+| NV | `nvfp4_e2m1` | `per_group` | `e4m3`, block 16 |
+| MX integer | `mxint8`, `mxint4` | `per_group` | `e8m0_floor`, block 32 |
+| Flex | `fp8_e4m3`, `int8` | `per_group`, `per_channel`, `per_block` | `fp32`, test block 32 |
+
+主要边界条件：
+
+- `simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:342` 的 `DequantizeShape()` 和
+  `:373` 的 `QuantizeShape()` 只接受 rank-2 tensor；kernel 也要求 contiguous rank-2 输入。
+- `simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:257` 的 `SpecFromKernelInfo()` 要求 per-channel 的
+  canonical `axis=0`。
+- MX 最后一维 K 必须能被 `block_size` 整除；4-bit、6-bit 格式还必须满足相应 packed K 比例。
+- 该实现只补充 Quantize/Dequantize CPU kernel，不是所有 SIMO custom op 的 CPU 实现。
+
+#### 57.4.3 实际量化/反量化计算
+
+`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:565-647` 实现格式最大值和 scale 计算；
+`:667-705` 将归一化浮点数编码为 MX/Flex 数据；`:711-759` 实现 4-bit 和 6-bit packing；
+`:761-810` 解码 packed 数据。
+
+`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:819` 的 `DequantizeCpu()` 遍历二维 tensor，根据 MX、
+per-group、per-channel 或 per-block 布局找到对应 scale，然后计算：
+
+```text
+output = decoded_quantized_value * scale
+```
+
+`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:891` 的 `QuantizeCpu()` 在各 scale block 内计算有限值的
+`amax`，生成 scale，再除以 scale、舍入/截断到目标格式并完成 packing。`:1001` 和 `:1072` 的
+kernel 类负责校验输入 shape、计算 packed/scale shape、分配 ORT 输出并调用上述 CPU 循环。
+
+最后，`simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:1209` 的 `RegisterCpuQdqOps()` 为 fp32、fp16、bf16
+分别注册 Quantize 和 Dequantize，共 6 个 custom-op type specialization。
+
+### 57.5 新增测试及本机验证结果
+
+`tests/simo_quant/test_accuracy_debug_onnx.py:70-187` 新增 6 项测试，覆盖：
+
+- 标准 domain 和 glob 过滤；
+- MatMul/Conv 中间结果及 summary 采集；
+- 按名称比较并写出 JSON/Markdown report；
+- 不同节点名按拓扑顺序对齐；
+- 输出数量不匹配时报错；
+- `.npz` 与 torch-saved mapping 输入。
+
+`simo/onnx/tests/test_cpu_qdq_custom_ops.py:30-522` 新增 21 项展开后的测试，覆盖：
+
+- 注册源码检查和 C++17 syntax-only 编译；
+- `mxfp6_e2m3` Q/DQ 共享库端到端运行；
+- 14 种 dtype/granularity 组合与 PyTorch reference 的逐元素一致性；
+- FP6 packing、FP8/MX/NVFP4 carrier 和 scale dtype；
+- 必要时查找或即时构建 `libSimoOnnxCustomOps_sm90.so`。
+
+在 `/share_data/users/like/miniconda3/envs/simo_sglang/` 中对当前代码实际执行：
+
+```text
+python -m pytest -q tests/simo_quant/test_accuracy_debug_onnx.py
+结果：6 passed in 3.03s
+
+python -m pytest -q simo/onnx/tests/test_cpu_qdq_custom_ops.py
+结果：21 passed, 14 warnings in 81.12s
+```
+
+14 个 warning 均来自 PyTorch `torch.jit.script_method` deprecation，不是本提交测试失败。
+
+### 57.6 最终概括
+
+```text
+这个提交解决的问题：
+  给定浮点参考 ONNX 和 SIMO 量化 ONNX，能够抓取两者 MatMul/Gemm/Conv 的中间输出，
+  按节点名或计算顺序比较误差，并生成逐层精度报告。
+
+为什么同时加入 CPU Q/DQ：
+  量化 ONNX 含 com.simo::Quantize/Dequantize；没有 CPU kernel 时，CPUExecutionProvider
+  无法加载/执行这些节点。新增 CPU kernel 后，可以在不执行 CUDA Q/DQ kernel 的情况下
+  跑量化模型，便于确定误差来自哪一层。
+
+没有做什么：
+  没有修改 ONNX 量化插入策略，没有把 MatMul/Conv 自定义实现改成 CPU，也没有让所有
+  SIMO custom op 都支持 CPU。CPU Q/DQ 当前有 rank-2、格式、granularity 和 axis 限制。
+```
+
+## 58. 提交 `ee319fc686ecdea40b82f952376d433734e10d58` 做了哪些重构
+
+### 58.1 提交范围和总体结论
+
+提交信息为：
+
+```text
+commit:  ee319fc686ecdea40b82f952376d433734e10d58
+parent:  ea99510019e20ae1d982aebc65b2ad5d6fa188e8
+author:  dehua <hchu@siorigin.com>
+date:    2026-07-17 08:30:34 +0000
+subject: refactor_onnx (model-opt/simo!188)
+```
+
+规模为 66 个文件、5022 行新增、4382 行删除，其中 4 个文件新增、46 个修改、16 个删除。
+它不是单纯的函数改名或格式整理，而是一次 **SIMO ONNX QDQ v2 的端到端重构**：
+
+```text
+旧链路：
+ONNX protobuf 手工改图
+  -> v1 QDQ 属性
+  -> 运行时检查源码/hash/cache
+  -> 缺少 .so 时现场编译
+  -> ORT 自定义算子调用内嵌 cubin
+
+新链路：
+ONNX GraphSurgeon 统一改图
+  -> v2 语义属性 + 严格配置/类型检查
+  -> 声明式 Triton kernel spec 在构建期 AOT 编译
+  -> cubin 嵌入 libSimoOnnxCustomOps_sm90.so
+  -> .so 随 wheel 安装，运行阶段只加载、不再编译
+```
+
+以下路径和行号均以该提交自身的文件快照为准，而不是后续 `HEAD` 的行号。
+
+### 58.2 ONNX 公共接口和图改写器重构
+
+#### 1. `insert_qdq_nodes` 被替换为 `apply_qdq_quantization`
+
+- `simo/onnx/api.py:15-25` 的 `quantize()` 改为调用
+  `simo/onnx/onnx_quant.py:238-345` 的 `apply_qdq_quantization()`。
+- 配置参数从只接受 JSON 路径，扩展为 `str | Path | Mapping | QuantizeConfig`。
+- 新增 `simplify=False` 关键字参数；显式开启时才调用
+  `simo/onnx/onnx_quant.py:437-449` 的 `simplify_onnx_model()`，并禁止 ONNXSlim 把
+  `Gemm` 融合掉。简化失败会记录 warning 后使用原模型。
+- 公开的 `simo.onnx.quantize()` 名字保持不变，但内部的
+  `insert_qdq_nodes`、`rewrite_dynamic_qdq` 已删除。因此直接导入这些旧内部函数的代码会失效。
+
+#### 2. 从手写 protobuf 编辑器切换到 ONNX GraphSurgeon
+
+旧代码使用 `GraphBuilder`、`ONNXTensorTransformer`、`ActivationQdqPlan`、`OpTarget` 等多层中间
+对象，手动维护 `GraphProto.node`、initializer、shape 和名称。新代码引入
+`onnx-graphsurgeon`，由 `simo/onnx/onnx_quant.py:172-235` 的 `SIMOGraphEditor` 统一创建
+常量、节点、输出 dtype 和唯一名称；主图与递归子图在 `apply_qdq_quantization()` 中采用同一条
+处理路径。
+
+这带来几个具体变化：
+
+- 不再先执行 `_name_nodes()` 重命名原模型所有匿名或重名节点，只保证新生成的节点和 tensor
+  名称唯一，减少对原图的无关修改。
+- 使用 `graph.cleanup().toposort()` 清理和排序改写后的图。
+- 能处理子图中的 Constant，以及子图捕获外层 initializer 的情况。
+- 忽略自定义 domain 中恰好也叫 `MatMul/Gemm/Conv` 的节点，只处理标准 ONNX domain。
+- 输入模型先深拷贝，改写结果再写回模型外壳；无任何插入时直接返回原始内容，避免 GraphSurgeon
+  round-trip 改变一个本应 no-op 的模型。
+
+GraphSurgeon 不能无损保留所有 protobuf 字段，因此新增
+`simo/onnx/onnx_quant.py:348-434` 的 `validate_graphsurgeon_conversion()`：遇到 sparse
+initializer、未加载的 external tensor、graph/value/node/tensor metadata、不能保留的 attribute
+类型等情况会明确拒绝，而不是静默丢字段。
+
+#### 3. 目标选择和错误处理更严格
+
+`simo/onnx/onnx_quant.py:625-736` 的 `prepare_quantization_target()` 集中负责匹配目标、排除项、
+常量权重、dtype 和离线权重量化：
+
+- 仍然只量化第二个输入是 initializer/Constant 的 `MatMul/Gemm/Conv`；动态权重记录
+  `dynamic_weight` 并跳过。
+- 多条 module config 同时匹配时由“第一条生效”改成“最后一条生效”，便于前面写通配默认值、
+  后面写更具体的覆盖规则。
+- 被选中的静态权重如果量化失败，不再记录 warning 后静默跳过，而是抛出带节点名和算子名的
+  `ValueError`，防止输出模型少量化节点却不易察觉。
+- 检查 activation、weight、bias、output 的模型计算 dtype 是否一致。
+- 根据模型计算 dtype 选择 FP32、FP16 或 BF16 的 Dequantize 自定义算子，并检查相应 ONNX
+  opset 是否足够。
+
+### 58.3 配置格式升级为严格的 QDQ v2 配置
+
+`simo/onnx/onnx_quant.py:452-579` 的 `load_quantization_config()` 不再兼容旧包装格式，而是要求
+直接使用 `QuantizeConfig` 字段：
+
+```json
+{
+  "module_configs": [
+    {
+      "targets": ["MatMul"],
+      "input": {"dtype": "mxint8", "axis": -1},
+      "weight": {"dtype": "int8", "axis": 0}
+    }
+  ]
+}
+```
+
+主要兼容性变化为：
+
+- 拒绝顶层 `quantization_config`、`quant_method`、`quant_algo`。
+- 拒绝 module 中的 `targets_op_types`，统一改为 `targets`。
+- 支持 `Linear -> MatMul/Gemm`、`Conv2d/Conv3d -> Conv` 别名和 `"*"` 通配目标。
+- 严格拒绝未知字段；不再因 Pydantic 默认忽略字段而把拼写错误吞掉。
+- 当前 v2 只支持 `algorithm.name=naive`、静态 weight、动态 input、`abs_max`、对称量化和
+  `half_even`；不支持 output/bias 量化、zero point 和 `pre_quant_opt`。
+- `simo/onnx/onnx_quant.py:582-622` 的 `validate_quantization_spec()` 把实际 runtime 支持的
+  dtype、granularity、group/block size、scale mode 组合变成显式白名单。
+
+原来 `simo/onnx/quant_schema/` 下的 10 个示例 JSON 全部删除，提交中没有一对一替代文件；旧配置
+需要改成上述直接 `module_configs + targets` 格式。
+
+### 58.4 activation 和 weight 布局逻辑重构
+
+#### 1. 删除大而全的 `LayoutRecipe`
+
+`simo/onnx/layout_utils.py` 从 96 行缩减到 36 行，删除 `LayoutRecipe`、padding 状态和 NumPy
+执行逻辑，只保留四个纯 permutation 工具：
+
+```text
+move_axis_to_last_permutation
+move_axis_to_first_permutation
+invert_permutation
+compose_permutations
+```
+
+padding、reshape、unpad 等决策移到真正拥有上下文的 activation/weight 处理代码中，避免同一套
+布局状态在多个对象间重复表达。
+
+#### 2. `QuantizedWeight` 改成“载荷 + 恢复步骤”描述
+
+`simo/onnx/weight_quant.py:22-33` 的 `QuantizedWeight` 从 `q/scale/logical_shape/LayoutRecipe`
+改为：
+
+```text
+quantized_values     实际量化字节载荷
+scale_values         scale 字节载荷
+source_shape         原始 ONNX 权重形状
+dequantized_shape    custom DQ 输出的规范 rank-2 形状
+dequantize_spec      DQ 节点真正采用的规范配置
+restore_shape        可选 Reshape
+unpad_last_axis_to   可选 Slice
+output_permutation   可选 Transpose
+```
+
+`simo/onnx/weight_quant.py:55-155` 的 `quantize_weight_array()` 先把 MatMul/Gemm/Conv 权重转换到
+逻辑视图，再规范化为 runtime 接受的 rank-2 布局。MX 权重按 block size padding；per-channel
+把量化轴移到第 0 维；per-tensor 降成单行；最后组合量化布局逆变换与算子存储转置，减少多余
+Transpose。所有 quantized/scale initializer 最终都转换成连续的 `uint8` carrier，具体 dtype
+由 QDQ 属性和内核解释。
+
+`simo/onnx/onnx_quant.py:739-1008` 的 `insert_activation_qdq()` 对 activation 做同样的规范化：
+
+- rank-N tensor 通过 Transpose/Flatten 变成连续 rank-2；
+- MX 的 K 不对齐时支持静态或动态 padding，并在 DQ 后 Slice、Reshape、Transpose 恢复；
+- per-channel 在 runtime 侧统一为 `axis=0`；
+- FP8/INT8 per-tensor 复用单行 per-channel 内核；
+- 非 MX 的 per-group kernel 本身支持 tail，不再无条件插入 Pad/Slice。
+
+`simo/onnx/onnx_quant.py:1011-1073` 的 `insert_weight_dequantization()` 只消费
+`QuantizedWeight` 描述并依次生成 DQ、Reshape、Slice、Transpose，职责比旧
+`_create_weight_dq_nodes()` 更清晰。
+
+### 58.5 QDQ 自定义算子升级到 opset v2
+
+`simo/onnx/onnx_quant.py:35-36` 把 `com.simo` opset 从 1 升到 2。v2 节点只携带 runtime
+真正需要的语义属性；`simo/onnx/onnx_quant.py:1076-1100` 的 `build_qdq_attributes()` 生成：
+
+```text
+dtype, granularity, scale_mode, group_size, block_size,
+axis/axes，以及整数格式的 quant_min/quant_max
+```
+
+旧的 `observer_mode` 和布尔 `narrow_range` 不再进入 ONNX runtime ABI。整数范围直接编码为
+`quant_min/quant_max`，例如 INT8 full range 为 `[-128, 127]`、narrow range 为
+`[-127, 127]`；INT4 对应 `[-8, 7]` 或 `[-7, 7]`。
+
+`simo/onnx/ort_plugin/simo_qdq_ops.cc` 的主要重构包括：
+
+- `:30-52` 用 `IoDtype<T>` 为 FP32、FP16、BF16 建立类型映射。
+- `:74-158` 根据 op、I/O dtype、quant dtype、granularity、scale mode、尺寸和数值范围精确选择
+  AOT kernel，不再依赖宽松的运行时分支。
+- `:263-380` 把各类 kernel 的 host 参数组装和 grid 计算集中到 `LaunchQdqKernel()`，并显式
+  附加 Triton 3.6 的 global/profile scratch 两个 ABI 参数。
+- `:385-443` 统一 rank-2 Q/DQ shape inference；`:447-569` 用模板化的
+  `QuantizeCustomOp<T>` / `DequantizeCustomOp<T>` 实现计算。
+- `:573-605` 注册一个 Quantize 名称的三种输入类型，以及
+  `Dequantize`、`DequantizeFloat16`、`DequantizeBFloat16` 三种输出 wrapper。
+
+同时删除了四个复制进仓库的 ONNX Runtime 私有 provider/resource 头文件，custom op 改用公开的
+Lite Custom Op API，并通过 `KernelContext_GetGPUComputeStream` 获取 ORT CUDA stream。这样减少了
+对 ORT 内部 C++ 实现的耦合；`simo/onnx/ort_plugin/simo_qdq_ops.h:11` 将使用的 ORT API 固定为
+17。
+
+`simo/onnx/ort_plugin/triton_loader.cc:21-40` 新增 `ScopedCudaContext`，kernel launch 前使用
+`cuCtxPushCurrent`，结束后 `cuCtxPopCurrent`，避免旧代码 `cuCtxSetCurrent` 永久改变调用线程的
+CUDA context。
+
+### 58.6 Triton AOT 内核构建改成声明式单一来源
+
+旧 `build_qdq_cubins.py` 在文件内部包装或复制了多套 Triton kernel，并用大量 `_compile_*`、
+`_condition()`、`_entry()` 函数组装结果。新实现直接导入 `simo.ops.kernels` 中的生产 kernel：
+
+- `simo/onnx/ort_plugin/build_qdq_cubins.py:82-97` 的 `QdqKernelBuildSpec` 同时描述 kernel、
+  signature、constexpr、op/dtype/granularity、I/O dtype、scale mode 和 quant range。
+- `:142-406` 的 `create_kernel_specs()` 用一个声明式表生成所有变体，包括 FP32/FP16/BF16、
+  MX、NVFP4、FP8、INT8 full/narrow range、INT4 DQ、per-group/per-block/per-channel。
+- 提交中的测试确认生成 99 个唯一编译 spec，对应 126 个唯一语义匹配组合。
+- `:99-139` 的 `validate_kernel_abi()` 校验 `num_warps=8`、warp size 32、scratch size 为 0，
+  并解析 PTX 验证参数个数等于显式 signature 加 Triton 3.6 的两个 scratch 参数。
+- `:409-542` 把 cubin 字节、符号名、shared memory、grid/shape 元数据和精确 resolver 一并生成
+  到 `embedded_qdq_kernels_sm90.cc`；不生成外部 cubin 文件或 manifest。
+
+这一变化消除了“ONNX runtime builder 自己维护一份 Triton wrapper 逻辑”和“PyTorch 执行路径
+维护另一份 kernel”之间的漂移风险。
+
+### 58.7 `.so` 从运行时现场编译改成安装/构建时产物
+
+这是运行方式上最重要的重构。
+
+#### 旧行为
+
+旧 `simo/onnx/runtime.py` 会：
+
+1. 检查当前 GPU 是否为 sm90；
+2. 对 Python、ORT、CUDA、源码和 Triton kernel 源码计算 cache key；
+3. 在 `~/.cache/simo/onnx/` 上锁；
+4. 找不到已打包 `.so` 时调用 `build_sm90_runtime()` 现场构建。
+
+#### 新行为
+
+- `setup.py:97-110` 的 `SimoBuildExtension.run()` 在 `pip install .`、`pip install -e .` 或 wheel
+  build 阶段调用 `build_sm90_runtime()`，并把
+  `libSimoOnnxCustomOps_sm90.so` 写入目标 package。
+- `setup.py:117-122` 让 wheel 只携带最终 `.so`，源码/header 不进入已安装 wheel；新增
+  `MANIFEST.in` 保证构建 sdist 时这些源文件仍存在。
+- 新增 `simo/onnx/ort_plugin/build_wheel.sh`，统一执行
+  `python -m pip wheel --no-build-isolation --no-cache-dir --no-deps .`。
+- `simo/onnx/ort_plugin/build_runtime.py:48-99` 不再调用
+  `torch.utils.cpp_extension.load()`；它在临时目录 AOT 编译 Triton cubin，然后直接调用系统
+  C++17 编译器链接 CUDA Driver API，产出 `.so` 后原子移动到目标路径。
+- custom-op `.so` 这一段使用 Triton compiler + host `c++`，不直接调用 `nvcc`；但同一安装过程
+  中主 `simo._C` CUDA extension 仍由 PyTorch `CUDAExtension`/nvcc 构建，并在
+  `setup.py:64` 固定 `sm_90` gencode。
+- `simo/onnx/runtime.py:11-26` 的 `get_custom_ops_library_path()` 现在只返回 wheel 中的固定路径，
+  或读取 `SIMO_ONNX_CUSTOM_OPS_LIBRARY` 覆盖值；若 `.so` 不存在则直接提示重新安装，不再创建
+  runtime cache，也不再运行编译器。
+
+结果是构建环境必须有 C++17、CUDA headers、Triton 和 CUDA driver link stub/library；而正确安装
+的 wheel 在运行环境不再需要编译器、Triton 源码或可写 cache。
+
+还有一个调用约定变化：`simo/onnx/runtime.py:35-49` 的 `create_session()` 只有在自己创建
+`SessionOptions` 时才自动注册 SIMO custom ops；调用者传入自定义 `sess_options` 时必须先显式
+调用 `register_custom_ops(options)`。此外它新增了直接接收 `onnx.ModelProto` 并序列化的能力。
+
+### 58.8 整数范围和 rounding 在整个代码库中统一
+
+该提交虽以 `refactor_onnx` 命名，但同时重构了通用量化内核，因为 ONNX AOT runtime 必须与
+PyTorch/SGLang/vLLM 的参考结果使用完全一致的数值语义：
+
+- `simo/quantization/dtypes.py:115-118` 新增 `INT_DType.quant_range()`。
+- `simo/quantization/config.py:354-406` 的 `QuantizeSpecInt` 冻结 `dtype/narrow_range`，构造时
+  解析并缓存 `_quant_range`；FP/MX spec 也提供 `quant_range` property。
+- observer、quantizer、`simo/quantization/kernels.py:21-96`、
+  `simo/ops/flex_api.py:44-55` 和所有 downcast operator 不再各自接收/推断 `narrow_range`，而是
+  显式传递并校验 `quant_min/quant_max`。
+- scale divisor 统一为 `(quant_max - quant_min) / 2`：INT8 full/narrow 分别为 127.5/127，
+  INT4 full/narrow 分别为 7.5/7。
+- Torch 参考路径使用 `torch.round`，Triton 整数路径使用 `rint`，统一为 half-even rounding。
+- KV cache、attention、GEMM、fused MoE 等调用方改为传完整 quant spec；fused MoE 也显式接收
+  min/max，避免自身重新推断范围。
+
+因此，这部分不是只为 ONNX 改接口，而是修复不同执行后端对 full range、narrow range、scale
+和舍入方式可能不一致的问题。
+
+### 58.9 依赖、测试和删除内容
+
+`pyproject.toml:35-40` 的 ONNX 可选依赖改为：
+
+```text
+onnx>=1.19,<1.23
+onnx-graphsurgeon>=0.6.1,<0.7
+onnxslim>=0.1.84,<0.2
+onnxruntime-gpu>=1.24,<1.28
+```
+
+即新增 GraphSurgeon，删除 onnxscript，并给 ONNX、ONNXSlim、ORT 添加明确兼容范围。
+
+测试重构不是简单删测试：
+
+- 删除 `test_activation_qdq_plan.py` 和 `test_qdq_runtime_contract.py` 两个旧白盒/源码字符串测试。
+- 新增 `test_weight_quant.py`，覆盖 per-channel 布局、BF16 离线转换和 INT8/INT4 full/narrow range。
+- 新增 `test_fused_moe_narrow_range.py`，验证 fused MoE 与通用 downcast 数值一致。
+- `test_qdq_utils.py` 从 1582 行扩大到 2617 行，增加 GraphSurgeon 保真限制、子图、dtype、opset、
+  配置优先级、no-op 字节保持、动态 shape/padding、carrier dtype 等测试。
+- `test_dynamic_qdq_runtime_debug.py` 增加 FP16/BF16、整数范围、half-even、非法 ABI 组合和多种
+  runtime kernel 的真实 CUDA 执行验证。
+- `test_qdq_cubin_build.py:88-159` 检查 spec 唯一性、支持矩阵和 Triton/PTX ABI，而不是只比较
+  生成源码是否包含某些字符串。
+
+### 58.10 最终归纳和迁移影响
+
+这次提交可以概括为五个核心重构：
+
+1. **图层**：protobuf 手工改图改为 GraphSurgeon 图编辑，并增强子图、动态 shape、dtype 和模型
+   保真检查。
+2. **配置/ABI 层**：启用 QDQ v2 严格语义配置，用明确的 dtype、granularity、layout 和数值范围
+   选择 kernel。
+3. **kernel 层**：用声明式 `QdqKernelBuildSpec` 直接 AOT 编译生产 Triton kernel，校验 Triton
+   ABI 并把 cubin/resolver 嵌入 `.so`。
+4. **交付层**：从运行时现场构建/cache 改成安装或 wheel 构建时生成 sm90 `.so`，运行时只加载。
+5. **数值层**：把 full/narrow integer range、scale divisor 和 half-even rounding 统一到 ONNX、
+   PyTorch、Triton、attention、GEMM 和 MoE 路径。
+
+它同时包含明确的 breaking changes：旧 `insert_qdq_nodes` 内部 API、旧 JSON wrapper、
+`targets_op_types`、运行时自动编译和传入 `sess_options` 后的自动注册都不再兼容。迁移时至少需要：
+
+```text
+旧配置 targets_op_types -> targets
+删除 quantization_config/quant_method/quant_algo 外层
+使用 simo.onnx.quantize() 或 apply_qdq_quantization()
+重新 pip install -e . / 构建 wheel，确保 .so 在 package 内
+自定义 SessionOptions 时先调用 register_custom_ops(options)
+确认目标 GPU 为 sm90，且 ONNX/ORT 版本落在新的依赖范围
+```
+
+## 59. MatMul/Gemm 权重量化中的布局变换
+
+核心结论是：量化前的 transpose 是把权重整理成量化内核需要的规范布局，Dequantize 后的
+transpose 是把结果还原成原 ONNX 算子期望的存储布局。它们处理的是“同一份权重如何排布”，
+不会改变 MatMul/Gemm 的乘法定义；真正可能引入数值误差的是量化和反量化本身，而不是这些可逆的
+布局变换。
+
+### 59.1 原始存储布局与量化逻辑布局不是一回事
+
+对线性层，量化代码统一把二维逻辑权重看成 `[N, K]`：一行通常对应一个输出通道，最后一维是
+乘法的归约维 K。ONNX 算子实际保存的 B 不一定是这个方向：
+
+| 算子情况 | ONNX 中 B 的原始形状 | 量化使用的逻辑视图 | 从逻辑视图恢复原始 B 的基础排列 |
+| --- | --- | --- | --- |
+| `MatMul` | `[K, N]` | `B.T`，即 `[N, K]` | `(1, 0)` |
+| `Gemm(transB=0)` | `[K, N]` | `B.T`，即 `[N, K]` | `(1, 0)` |
+| `Gemm(transB=1)` | `[N, K]`，算子内部使用 `B.T` | `B`，即 `[N, K]` | identity |
+
+这正是 `simo/onnx/weight_quant.py:36-50` 中 `logical_weight_view()` 的行为：`MatMul` 总是返回
+`weight.T`；`Gemm` 在 `transB=0` 时返回 `weight.T`，在 `transB=1` 时直接返回 `weight`。
+`simo/onnx/weight_quant.py:61-68` 随后用相同条件建立 `storage_permutation`，记录最终怎样回到算子原来
+接收的 B 布局。
+
+以 `MatMul` 为例，原图计算 `A[M,K] @ B[K,N]`。离线量化先处理 `B.T[N,K]`，是因为量化器更适合
+按“输出通道为行、K 为最后一维”的方式生成量化值和 scale；运行时 Dequantize 得到近似的
+`B.T[N,K]` 后，再转置为 `[K,N]` 交给原 MatMul。MatMul 仍执行原来的 `A @ B`。
+
+需要注意，权重是 initializer，所以这里的量化前 transpose/reshape/pad 发生在模型转换期的 NumPy
+数组上，不是在最终 ONNX 图里插入一个运行时 Quantize 前的 Transpose。最终图中的权重路径只有量化
+常量、Dequantize 和必要的恢复节点。
+
+### 59.2 为什么量化器需要规范的二维布局
+
+`simo/onnx/weight_quant.py:55-125` 的 `quantize_weight_array()` 不只是简单执行一次 `.T`，而是根据
+量化粒度把逻辑权重规范成内核接受的连续 rank-2 输入：
+
+- per-channel 在 `:104-115` 把配置的 channel axis 移到第 0 维，再把其余维度展平。这样每一行对应
+  一个 channel，scale 的行数和 channel 数严格一致，传给内核的规范配置也统一为 `axis=0`。
+- per-group 要求二维逻辑权重沿最后一维分组；`:119-125` 会拒绝不是最后一维的 group axis。这样每行
+  都能沿连续的 K 维按 `group_size` 划分，scale 形状和 kernel 索引规则一致。
+- MX/flex 的 block 量化在 `:75-94` 把配置轴移到最后一维，按 `block_size` 补齐尾部，再展平为
+  `[rows, padded_K]`。这保证每个 block 完整且连续，并记录原 K，供 DQ 后去 padding。
+- FP8/INT8 per-tensor 在 `:95-103` 展平成单行；per-block 等其余二维 flex 路径则保留规范 rank-2
+  布局。它们共同满足 custom kernel 对维度、连续性、scale 形状和 block/group 索引的约定。
+
+因此 transpose 的目的不是适配 MatMul/Gemm 本身，而是给不同量化方式提供统一、可预测的“行”和
+“最后一维”语义。reshape 负责得到内核 ABI 使用的二维形状，pad 负责满足 MX block size 对齐；这些
+都是量化计算的临时布局要求。
+
+### 59.3 Dequantize 后如何恢复原布局
+
+`quantize_weight_array()` 把恢复信息写入 `QuantizedWeight`：`restore_shape` 保存展平前形状，
+`unpad_last_axis_to` 保存 padding 前的 K，`output_permutation` 保存最后的轴排列。对发生过轴移动的
+情况，最终排列等价于：
+
+```text
+规范量化布局 --逆量化布局排列--> 逻辑权重 [N,K]
+             --存储排列----------> 原始 ONNX B 布局
+```
+
+代码在 `simo/onnx/weight_quant.py:93-115` 用 `compose_permutations()` 把这两步合成一个
+`output_permutation`；如果合成结果是 identity，`:127-129` 就把它消掉。因此：
+
+- `MatMul` 或 `Gemm(transB=0)` 通常需要恢复 B 的存储方向，但这个 transpose 可能和量化轴移动的
+  逆 transpose 抵消；
+- `Gemm(transB=1)` 不需要额外的“存储方向”转置，但若量化时移动过轴，仍可能需要恢复布局的
+  transpose。不能简单理解为 `transB=1` 时权重路径永远没有 Transpose。
+
+`simo/onnx/onnx_quant.py:1011-1073` 的 `insert_weight_dequantization()` 严格按
+`Dequantize -> Reshape -> Slice(unpad) -> Transpose(output_permutation)` 的顺序生成图，并把最终结果
+接回 `node.inputs[1]`。所以 MatMul/Gemm 看到的形状、轴顺序以及保留的 `transB` 属性都与原图一致。
+
+例如未对齐的 MatMul MX 权重 `B[18,4]` 会在转换期经历：
+
+```text
+B[18,4] -> B.T[4,18] -> pad [4,32] -> 离线 Quantize
+运行时 Dequantize [4,32] -> Slice [4,18] -> Transpose [18,4] -> MatMul
+```
+
+`simo/onnx/tests/test_qdq_utils.py:576-605` 验证了 DQ 的 `logical_shape == [4,32]`、Slice 恢复到
+18，以及 Slice 后才执行权重 Transpose；`:1436-1467` 也直接断言量化元数据中的
+`unpad_last_axis_to == 18` 和 `output_permutation == (1,0)`。
+
+### 59.4 `transA` 与 `transB` 分别影响什么
+
+Gemm 的语义是 `Y = alpha * op(A) @ op(B) + beta * C`。因此两个属性不能混在一起解释：
+
+| 属性 | 权重 B 路径 | 激活 A 路径 | 对恢复 Transpose 的影响 |
+| --- | --- | --- | --- |
+| `transB` | 直接决定 `logical_weight_view()` 是 `B.T` 还是 `B`，并决定基础 `storage_permutation` | 当允许从权重形状推断激活 K 时，决定原始 B 的哪一维是 K | 直接参与权重 `output_permutation`；实际节点还取决于它与量化布局逆排列合成后是否为 identity |
+| `transA` | 不改变 B，不参与 `logical_weight_view()`、权重离线量化或权重 `output_permutation` | 把配置针对逻辑 `op(A)` 的轴映射回原始 A 的轴，影响 K 的取得、QDQ 前的规范化排列以及 DQ 后的逆排列 | 只直接影响激活路径的前后 Transpose；对权重 Dequantize 分支没有直接作用 |
+
+具体来说，`simo/onnx/onnx_quant.py:774-823` 的 `insert_activation_qdq()` 把配置轴解释为逻辑
+`op(A)` 的轴。对 Gemm，`transA=1` 时用 `raw_axis = 1 - logical_axis` 映射回原始二维 A；per-channel
+把该轴移到第 0 维，per-group/MX 则把它移到最后一维。`:894-1007` 在 Quantize/Dequantize 前插入
+规范化 Transpose，并在 DQ、去 padding 和恢复 shape 后插入其逆排列，最后才接回 `node.inputs[0]`。
+
+K 维推断也体现了两者的分工。`simo/onnx/onnx_quant.py:817-844` 优先按照 `transA` 映射后的原始 A
+轴读取静态 K；`:881-892` 只在 `Gemm(transA=0)` 时允许从权重补充推断 K，并再用 `transB` 选择
+`source_shape[-2]` 或 `source_shape[-1]`。也就是说，`transA` 决定怎样解释 A，`transB` 决定怎样
+解释 B；二者可能共同参与 K 的确定，但只有 `transB` 改变权重的逻辑视图。
+
+现有测试给出了直接的行为依据：
+
+- `simo/onnx/tests/test_weight_quant.py:26-82` 同时覆盖 MatMul、默认 Gemm 和
+  `Gemm(transB=1)` 的 canonicalization、rank-2 形状与最终排列；其中 `transB=1`、axis 0 的案例
+  明确断言 `output_permutation is None`。
+- `simo/onnx/tests/test_qdq_utils.py:637-647` 验证量化后 Gemm 仍保留 `transB=1` 和原 bias；恢复后的
+  权重由 Dequantize 经 Reshape 直接接入 B，不需要额外的存储方向 Transpose。
+- `simo/onnx/tests/test_qdq_utils.py:1285-1311` 验证 `transA=1` 时逻辑 per-channel axis 映射到原始
+  A 后，Q 前和 DQ 后各出现一个 `(1,0)` Transpose。
+- `simo/onnx/tests/test_qdq_utils.py:650-681` 验证 `transA=1` 的 MX 激活路径使用逻辑 K=18 做
+  padding/unpadding，并在两侧使用互逆的 `(1,0)` 排列。
+
+最终可以简化为一句话：`transB` 管 B 的权重解释与权重恢复，`transA` 管 A 的激活解释与激活恢复；
+权重 DQ 后是否真的插入 Transpose，以合成后的 `output_permutation` 是否为 identity 为准。
+
+## 60. `validate_graphsurgeon_conversion()` 的功能
+
+### 60.1 核心结论
+
+`simo/onnx/onnx_quant.py:348-434` 的 `validate_graphsurgeon_conversion(model)` 是一个
+**ONNX GraphSurgeon 无损转换的前置兼容性检查器**。它在模型进入
+`gs.import_onnx(...) -> 图编辑 -> gs.export_onnx(...)` 之前，检查图中是否含有当前
+`onnx-graphsurgeon` 不能可靠保留的 protobuf 结构。
+
+它的策略是“不能保证保留就提前失败”：
+
+- 所有检查通过时返回 `None`，并且不修改传入的 `ModelProto`；
+- 遇到第一个不支持的结构时抛出 `NotImplementedError`；
+- 这样可避免量化本身成功，但 GraphSurgeon 导入/导出后静默丢失 metadata、类型信息、属性或
+  initializer 表示等模型内容。
+
+因此，这个函数名中的 `conversion` 指的是 **ONNX protobuf 与 GraphSurgeon 内部图表示之间的
+往返转换**，不是检查量化数值是否正确。
+
+### 60.2 它在量化流程中的位置
+
+`apply_qdq_quantization()` 中的关键顺序如下：
+
+```text
+输入 ModelProto/模型路径
+  -> 深拷贝模型
+  -> validate_graphsurgeon_conversion(model)
+  -> 可选 ONNXSlim simplify
+  -> validate_graphsurgeon_conversion(simplified_model)
+  -> gs.import_onnx
+  -> 插入 QDQ、cleanup、toposort
+  -> gs.export_onnx
+  -> 将编辑后的 graph 和 opset_import 写回模型外壳
+```
+
+对应代码是 `simo/onnx/onnx_quant.py:251-265` 和 `:329-334`。原模型在 `:251-252` 先被深拷贝，
+普通路径在 `:253` 检查一次；若 `simplify=True`，简化结果还会在 `:258` 再检查一次。这保证原图和
+简化器产生的新图都满足 GraphSurgeon 的转换约束。
+
+GraphSurgeon 实际处理的是 `:260-264` 用 `graph`、`opset_import` 和 `ir_version` 临时构造的
+working model。模型外层的 `domain`、`model_version`、`doc_string`、`metadata_props`、
+`training_info`、`functions` 和 `configuration` 不经过这次 GraphSurgeon round-trip；导出后只把
+新 `graph` 和 `opset_import` 写回原有模型外壳。因此本函数主要检查 `GraphProto` 及其内部对象，
+而不是拒绝这些可由外壳直接保留的 `ModelProto` 字段。
+
+### 60.3 具体检查了什么
+
+| 检查对象 | 被拒绝的内容 | 代码位置 |
+| --- | --- | --- |
+| 图 `GraphProto` | `metadata_props`、`quantization_annotation` | `:352-355` |
+| 图 initializer | `sparse_initializer` | `:356-359` |
+| 图输入与 initializer | 同一个名称同时是 graph input 和 initializer，即 initializer-backed graph input | `:361-365` |
+| `value_info` | 与 graph input、output 或 initializer 重名；或者没有被图输入、输出、initializer、节点输入/输出引用 | `:367-378` |
+| 输入、输出和 `value_info` | `doc_string`、`metadata_props`，以及 tensor 以外的 value type，例如 sequence、map、optional 或 sparse tensor type | `:384-389` |
+| 类型和维度 | `TypeProto.denotation` 或任意 shape dimension 的 `denotation` | `:390-398` |
+| 节点 `NodeProto` | `doc_string`、`metadata_props`、`overload`、`device_configurations` | `:400-404` |
+| 节点属性 | `doc_string`、`ref_attr_name`、不支持的属性类型，以及空的 `FLOATS`/`INTS`/`STRINGS` 重复属性 | `:405-420` |
+| 普通张量 | `doc_string`、`metadata_props`、`segment`，或者仍使用 `data_location=EXTERNAL` 的外部数据 | `:426-433` |
+
+属性类型采用白名单。`simo/onnx/onnx_quant.py:53-62` 只允许：
+
+```text
+FLOAT, INT, STRING, TENSOR, GRAPH, FLOATS, INTS, STRINGS
+```
+
+所以 `TENSORS`、`GRAPHS`、`SPARSE_TENSOR`、`TYPE_PROTO` 及其重复形式等属性会被拒绝。即使类型在
+白名单内，空的 `FLOATS`、`INTS` 或 `STRINGS` 也会被拒绝，因为 GraphSurgeon 往返时不能可靠区分
+并保留这种带显式类型的空序列属性。
+
+### 60.4 如何遍历子图和张量
+
+函数用 `graphs = [model.graph]` 作为栈，从主图开始检查。遇到受支持的单个 `GRAPH` 属性时，
+把 `attr.g` 加入栈，因此 `If`、`Loop` 等节点属性中的嵌套子图也会递归执行相同检查。`GRAPHS`
+属性本身不在白名单中，会直接失败，而不会递归处理。
+
+需要检查的张量先包含当前图的普通 initializer；遇到 `TENSOR` 属性时，再把属性中的 `attr.t`
+加入列表。随后统一检查这些张量的 metadata、segment 和 external-data 状态。也就是说，检查范围
+不只包括主图权重，还包括嵌套子图的 initializer 和节点携带的 tensor attribute。
+
+`data_location=EXTERNAL` 的张量会收到
+`external tensor ... must be loaded before graph editing`。这并不是禁止模型最初使用 ONNX external
+data 格式，而是要求在交给 GraphSurgeon 编辑前，外部数据已经加载并物化到 `TensorProto` 中，
+否则导入/导出无法保证权重数据仍然完整。
+
+### 60.5 它不负责什么
+
+这个函数不是 `onnx.checker.check_model()` 的替代品。它不会：
+
+- 校验节点是否满足 ONNX schema、opset 或拓扑规则；
+- 做 shape inference 或验证张量维度能否进行 MatMul/Gemm/Conv；
+- 检查量化配置、量化 dtype、scale 或 QDQ 数值正确性；
+- 证明 GraphSurgeon 对所有普通字段都绝对无损。
+
+它只编码当前实现已经知道的、GraphSurgeon 无法保留或表示不稳定的情况。因此抛出
+`NotImplementedError` 表示“该 ONNX 表示目前不支持走这条图编辑链路”，并不表示输入一定是非法
+ONNX 模型。
+
+测试也体现了这条边界：
+
+- `simo/onnx/tests/test_qdq_utils.py:1178-1193` 验证 sparse initializer 会被拒绝；
+- `:1988-1993` 验证带节点 `doc_string` 的图会在转换前失败；
+- `:1996-2008` 验证 `GRAPHS` 属性类型会被拒绝；
+- `:2011-2020` 验证显式空的重复属性会被拒绝；
+- `:2023-2061` 验证模型外壳字段会被保留，且源 `ModelProto` 不会被原地修改。
+
+一句话概括：`validate_graphsurgeon_conversion()` 是 QDQ 图改写前的防丢数据护栏，负责确认
+GraphSurgeon 即将接管的图结构处于当前代码支持的可往返表示范围内；不满足时宁可明确报错，也不
+生成一个字段已被静默丢弃的量化模型。
+
+## 61. 静态 MXINT8 MatMul QDQ 节点的插入位置
+
+### 61.1 本节对应的具体案例
+
+这里严格以 `main()` 中的 `("static", "mxint8", [2, 3, 18])` 为准。
+`like-useful/test_dynamic_qdq_runtime_debug-debug.py:1346-1369` 将该元组依次解包为：
+
+```text
+shape_id   = "static"
+dtype      = "mxint8"
+input_shape = [2, 3, 18]
+```
+
+然后它调用 `like-useful/test_dynamic_qdq_runtime_debug-debug.py:1166-1182` 的
+`test_unaligned_matmul_activation_qdq_matches_simo_torch_with_padding()`。测试把激活配置转换为
+`{"dtype": "mxint8"}`，运行模型，并把 QDQ 后的激活与 SIMO Torch 参考结果做数值比较。
+
+建图函数位于 `like-useful/test_dynamic_qdq_runtime_debug-debug.py:441-481`。它创建：
+
+```text
+X: float32 [2,3,18] @ W: float32 [18,4] -> Y: float32 [2,3,4]
+```
+
+同一处配置了两条不同的量化路径：激活 `X` 使用 MXINT8；权重 `W` 使用
+`fp8_e4m3, axis=[0,1], group_size=128`，即 FP8 E4M3 per-block。下面分别说明两条路径。
+
+### 61.2 激活路径的七类节点
+
+对于 rank-3 的 `X[2,3,18]`，最后一维 K 已经是量化轴。实现先把前两维合并成 token 行，把
+K=18 补到 MXINT8 block size 32，完成 QDQ 后再切回 K=18 并恢复原形状。
+
+| 算子 | 创建位置 | 导出的节点名 | 输入 -> 输出 | 用途 |
+| --- | --- | --- | --- | --- |
+| `Shape` | `simo/onnx/onnx_quant.py:906-907` | `matmul_input_simo_shape` | `X [2,3,18] -> int64 [3]`，值为 `[2,3,18]` | 保存原始形状，供末尾 `Reshape` 使用 |
+| `Flatten` | `simo/onnx/onnx_quant.py:908-915` | `matmul_input_simo_flatten` | `X [2,3,18] -> matmul_input_simo_rank2 [6,18]` | `axis=-1`，把 `2*3` 合并为 6 行 |
+| `Pad` | `simo/onnx/onnx_quant.py:932-961` | `matmul_input_simo_pad` | `[6,18] -> matmul_input_simo_pad [6,32]` | 使用 `pads=[0,0,0,14]`，仅在 K 维右侧补 14 个零 |
+| `Quantize` | `simo/onnx/onnx_quant.py:963-972` | `matmul_input_simo_quant` | `[6,32] -> matmul_SimoQuantInput uint8 [6,32]` 和 `matmul_SimoScale uint8 [6,1]` | 运行时按每行一个 32 元素 block 生成 MXINT8 数据与 scale |
+| `Dequantize` | `simo/onnx/onnx_quant.py:973-984` | `matmul_input_simo_dequant` | 两个 UINT8 carrier -> `matmul_SimoDequantOutput_padded float32 [6,32]` | 按相同 MXINT8 属性恢复浮点值 |
+| `Slice` | `simo/onnx/onnx_quant.py:986-992` | `matmul_input_simo_unpad` | `[6,32] -> matmul_SimoDequantOutput [6,18]` | 使用 `starts=[0], ends=[18], axes=[1]` 去掉补齐区 |
+| `Reshape` | `simo/onnx/onnx_quant.py:993-999` | `matmul_input_simo_restore` | `[6,18] + Shape结果 -> [2,3,18]` | 恢复 MatMul 原始 A 输入布局 |
+
+`Quantize` 和 `Dequantize` 的实际属性都是
+`dtype="mxint8", granularity="per_group", axis=1, group_size=32, block_size=32,
+scale_mode="e8m0_floor"`。MX 配置的默认 block size 及其 `group_size` 同步逻辑位于
+`simo/quantization/config.py:450-490`；这里的 `per_group` 描述的是 custom QDQ 算子的运行时属性，
+每个 `[1,32]` 行块共享一个 scale。
+
+这个静态案例的激活分支总共只有一个 `Shape`。`simo/onnx/onnx_quant.py:834-837` 可以直接从
+静态输入形状读取 `known_k=18`，所以 `needs_runtime_k` 为假，不会进入
+`simo/onnx/onnx_quant.py:916-930` 的额外 `Shape + Gather` 动态 K 分支。唯一的 `Shape` 只是保存
+`[2,3,18]`，并不用于求 K。
+
+源码在 `simo/onnx/onnx_quant.py:906-915` 先创建 `Shape`、再创建 `Flatten`。两者都只依赖 `X`，
+彼此没有先后数据依赖；`simo/onnx/onnx_quant.py:329-330` 的 cleanup、拓扑排序和导出可以改变它们
+在 ONNX 节点列表中的排列。本次实际导出中是 `Flatten` 在前、`Shape` 在后，这不表示多出或漏掉了
+任何节点。
+
+### 61.3 权重如何成为 UINT8 carrier initializer
+
+权重量化发生在模型转换期，而不是运行时图中的 `Quantize` 节点中：
+
+1. `simo/onnx/weight_quant.py:61-68` 对 MatMul 的原始 `W[18,4]` 取逻辑视图 `W.T[4,18]`，同时把
+   最终恢复排列记录为 `(1,0)`。
+2. 该 FP8 配置的两个轴和 `group_size=128` 被判定为 per-block；判定代码位于
+   `simo/quantization/config.py:229-237`。二维逻辑权重直接以连续 `[4,18]` 送入量化，不做图级
+   padding，相关分支位于 `simo/onnx/weight_quant.py:116-125`。
+3. `simo/onnx/weight_quant.py:136-138` 选择并调用 CUDA downcast kernel，得到 FP8 量化权重和
+   FP32 scale。对 `[4,18]` 和 128 x 128 block，逻辑 scale 形状是 `[1,1]`。
+4. `simo/onnx/weight_quant.py:139-144` 把量化权重和 scale 都按原始字节解释为 `torch.uint8`。
+   因此一个 FP32 scale 的 4 个字节表现为 `[1,4]`，并不是四个独立 scale。
+5. `simo/onnx/weight_quant.py:146-154` 将两个 carrier 及恢复元数据保存到 `QuantizedWeight`。
+
+插图时，`simo/onnx/onnx_quant.py:1020-1025` 分别创建
+`matmul_W_simo_q` 和 `matmul_W_simo_scale`；底层的 `gs.Constant` 创建点是
+`simo/onnx/onnx_quant.py:195-196`。GraphSurgeon 导出后，它们是以下两个 ONNX initializer：
+
+| initializer | ONNX 数据类型 | 导出形状 | 实际含义 |
+| --- | --- | --- | --- |
+| `matmul_W_simo_q` | `UINT8` | `[4,18]` | FP8 E4M3 权重的逐字节 carrier |
+| `matmul_W_simo_scale` | `UINT8` | `[1,4]` | 逻辑 FP32 scale `[1,1]` 的四个字节 |
+
+所以图中所谓的 weight load 和 scale uint8 load 实际是读取常量 initializer；它们不是 ONNX
+`Load` 算子，导出的图中也没有名为 `Load` 的节点。
+
+### 61.4 权重侧实际插入的两个算子
+
+| 算子 | 创建位置 | 导出的节点名 | 输入 -> 输出 | 用途 |
+| --- | --- | --- | --- | --- |
+| `Dequantize` | `simo/onnx/onnx_quant.py:1031-1039` | `matmul_weight_simo_dequant` | 两个 UINT8 initializer -> `matmul_weight_simo_weight_dq float32 [4,18]` | 按 `fp8_e4m3/per_block` 解释 carrier；属性包含 `original_shape=[18,4]`、`logical_shape=[4,18]`、`axes=[0,1]`、`group_size=128` |
+| `Transpose` | `simo/onnx/onnx_quant.py:1065-1072` | `matmul_weight_simo_transpose` | `[4,18] -> matmul_weight_simo_transpose [18,4]` | 使用 `perm=[1,0]` 恢复 MatMul 所需的原始 B 布局 |
+
+`simo/onnx/onnx_quant.py:1073` 最后把 `matmul_weight_simo_transpose` 接到原 `matmul` 的第二个输入。
+
+这条权重分支没有 `Reshape`、`Pad` 或 `Slice`。它本来就是二维 `[4,18]`，也没有设置
+`restore_shape` 或 `unpad_last_axis_to`。FP8 per-block CUDA 路径按向上取整得到边界 block 的 scale
+形状，见 `simo/ops/kernels/downcast/_downcast_to_flexpoint.py:145-151`；kernel 在
+`simo/ops/kernels/downcast/_downcast_to_flexpoint.py:206-225` 对超出 4 行或 18 列的元素使用边界
+mask，因此不需要为了 128 x 128 block 在 ONNX 权重分支中物理补齐。这个案例只需最后的 `(1,0)`
+恢复排列。
+
+### 61.5 完整数据流
+
+```text
+激活 A：
+X float32 [2,3,18]
+  +-> Shape -> int64 [3]，值 [2,3,18] ---------------------------+
+  |                                                               |
+  +-> Flatten(axis=-1) [6,18]                                    |
+      -> Pad(+14 on K) [6,32]                                    |
+      -> com.simo::Quantize                                      |
+           q uint8 [6,32], scale uint8 [6,1]                     |
+      -> com.simo::Dequantize float32 [6,32]                     |
+      -> Slice(K<18) float32 [6,18]                              |
+      -> Reshape <------------------------------------------------+
+           float32 [2,3,18]
+      -> matmul.input[0]
+
+权重 B：
+W float32 [18,4]
+  -> 转换期 W.T [4,18]
+  -> FP8 E4M3 per-block CUDA downcast
+  -> matmul_W_simo_q uint8 initializer [4,18] --------+
+     matmul_W_simo_scale uint8 initializer [1,4] -----+-> com.simo::Dequantize
+                                                          float32 [4,18]
+                                                       -> Transpose(perm=[1,0])
+                                                          float32 [18,4]
+                                                       -> matmul.input[1]
+
+MatMul: [2,3,18] @ [18,4] -> Y float32 [2,3,4]
+```
+
+第 43 节描述的是重构前的实现，其中的 `Reshape` 节点名、旧辅助函数和部分代码行号不再对应当前
+源码。本节的节点名称、连接、形状及所有“仓库相对路径 + 行号”均以当前实现和上述静态导出模型为准。
+
+## 62. SGLang W4A16 在 `temperature=0` 时未输出 `Paris` 的原因
+
+### 62.1 结论
+
+这次失败的直接原因不是随机采样，也没有证据表明 SGLang 的 INT4 解包或 greedy sampler 整体算错。
+直接触发点是：在这条包含两种互相竞争意图的长提示上，W4A16 量化误差和 SGLang 的 DeepSeek/MLA
+执行图共同改变了首 token 的 logits 排名，使填空 token `" _____"` 略高于 `" Paris"`。当
+`temperature=0` 时 SGLang 执行确定性 argmax，于是稳定选择填空 token；自回归生成再把首 token
+的差别扩展为整段不同文本。
+
+受控 top-logprobs 直接证明了这个判断：
+
+| 运行方式 | 长提示首选 | `log P(" Paris")` | `log P(" _____")` | 两者差值 |
+| --- | --- | ---: | ---: | ---: |
+| SGLang BF16，默认 attention backend | `" Paris"` | -1.119431 | -1.619431 | `Paris` 高 0.500 |
+| SGLang W4A16，默认 attention backend | `" _____"` | -1.335353 | -1.210353 | 填空高 0.125 |
+| SGLang W4A16，显式 `attention_backend="triton"` | `" _____"` | -1.493297 | -1.118297 | 填空高 0.375 |
+| vLLM W4A16，显式 `temperature=0` | `" Paris"` | -1.099223 | -1.974223 | `Paris` 高 0.875 |
+
+相反，对没有面试指令前缀的短提示 `The capital of France is`，SGLang BF16 和 W4A16 都选择
+`Paris`，其首 token logprob 分别为 `-0.352196` 和 `-0.358543`，非常接近。这排除了 tokenizer、
+`temperature=0` 实现、INT4 权重基本装载流程或整个模型已经损坏等解释。
+
+因此应把这次现象归类为“脆弱的单样本精确文本断言被量化后的近邻 token 翻转触发”，而不是仅凭
+这一条生成就认定 SGLang W4A16 存在系统性精度错误。
+
+### 62.2 原日志实际说明了什么
+
+SGLang 单配置日志在
+`temp/smoke.single.txt.2026_07_23___17_27_40:193-205` 中输出：
+
+```text
+Generated text:  ________.
+
+1. Can you describe your teaching philosophy and how it
+```
+
+这不是乱码、空输出或重复异常。它把 `The capital of France is` 处理成了问卷中的填空题，然后继续
+响应长前缀要求的面试问题。原提示在
+`tests/sglang_simo/e2e_test/test_basic_generate_single.py:165-180` 先要求“起草 10-15 个教师面试问题”，
+又要求“fulfill the following paragraph”，最后才拼接事实补全短句。这两个目标存在明显歧义，
+`" Paris"` 和 `" _____"` 都是上下文上合理的高分开头。
+
+全量日志也不支持“W4A16 运行链路崩坏”：`temp/smoke.txt:9-23` 的 13 个量化配置中有 11 个通过，
+只有 W4A16 INT4 和 W4A4 NVFP 在同一个 `Paris` 文本断言上失败；最终汇总见
+`temp/smoke.txt:548-551`。失败配置恰好更容易改变模型 logits，但都成功完成加载、prefill、decode
+和 detokenize。
+
+此外，这个配置没有启用 KV cache 量化。配置中的 `kv_cache_quant_algo` 为 `null`，见
+`simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json:22-25`；
+运行时也明确回退到标准 BF16 KV cache，见
+`temp/smoke.single.txt.2026_07_23___17_27_40:179-182`。所以本次首 token 分叉不能归因于 KV cache
+量化。
+
+### 62.3 `temperature=0` 为什么没有保证两个框架输出相同
+
+SGLang 在
+`sglang_kernel_src/python/sglang/srt/sampling/sampling_params.py:168-172` 把接近零的 temperature
+正规化为 `top_k=1`，也就是 greedy argmax。该行为本身符合预期：
+
+```text
+next_token = argmax(logits)
+```
+
+它保证的是“给定同一组 logits 时不随机抽样”，不保证 BF16、W4A16、不同 attention backend 或不同
+框架产生完全相同的 logits。量化前若 `Paris` 只领先另一个候选很小的 margin，INT4 per-group 舍入误差
+经过 27 层传播后就可能交换二者顺序。`temperature=0` 不会消除这个误差，反而会把交换后的第一名
+稳定选中。由于后续每一步又以已经不同的 token 为输入，文本会快速完全分叉。
+
+这里 `top_p=0.95` 也不是决定因素。`top_k=1` 后候选集合只有 argmax token，top-p 不会把第二名
+`Paris` 再选回来。
+
+W4A16 的实际数值路径也与这一解释一致：
+
+- 配置在
+  `simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json:10-20`
+  指定 INT4、`axis=-1`、`group_size=32`，没有激活量化配置，因此激活保持 BF16。
+- `simo/extensions/sglang_simo/quantization/quantization.py:931-988` 在加载浮点 checkpoint 时对每个命中的
+  权重执行 downcast，并保存 packed weight 与 scale。
+- `simo/extensions/sglang_simo/quantization/quantization.py:1042-1096` 为 packed weight 和
+  `GroupQuantScaleParameter` 分配参数。
+- `simo/extensions/sglang_simo/quantization/quantization.py:1120-1124` 在 forward 中恢复 BF16 权重，随后
+  `simo/extensions/sglang_simo/quantization/quantization.py:1194-1197` 执行矩阵乘。
+
+这是一条真实的 weight-only INT4 QDQ 路径，输出本来就不要求逐 bit 等于 BF16。
+
+### 62.4 原来的 vLLM 结果不是等条件对照
+
+首先，用户给出的 vLLM 日志实际没有使用 `temperature=0`。SGLang 测试在
+`tests/sglang_simo/e2e_test/test_basic_generate_single.py:163` 显式设置 0；vLLM 测试却在
+`tests/vllm_simo/e2e_test/test_basic_generate_single.py:189` 调用 `llm.get_default_sampling_params()`。
+日志 `temp/vllm.test_basic_generate_single.py.2026_07_23___17_50_21:363-368` 明确记录模型
+`generation_config.json` 把默认值覆盖成 `temperature=0.3, top_p=0.95`，随后输出 `Paris`。
+
+本次分析额外用 `vllm.SamplingParams(temperature=0.0, top_p=0.95, max_tokens=16)` 重跑后，vLLM
+仍然选择 `Paris`，所以采样参数不一致不是 vLLM 成功的唯一原因，但原日志不能直接作为
+`temperature=0` 的 A/B 证据。
+
+其次，两份名为 W4A16 的 JSON 只有数值格式相同，量化目标并不相同：
+
+| 项目 | SGLang | vLLM |
+| --- | --- | --- |
+| 配置位置 | `simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json:1-27` | `simo/extensions/vllm_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json:1-24` |
+| targets | 所有 `Linear` | `*attn*`、`*mlp*`、`*ffn*` |
+| excludes | `lm_head`、`re:.*kv_b_proj` | 空 |
+| `ReplicatedLinear` | SGLang 会量化 | vLLM 强制保持非量化 |
+
+SGLang 的选择逻辑见 `simo/extensions/sglang_simo/quantization/quantization.py:805-849`；原日志
+`temp/smoke.single.txt.2026_07_23___17_27_40:40-172` 显示每层量化了 `q_proj`、
+`kv_a_proj_with_mqa` 和 `o_proj`，没有量化 `kv_b_proj`。vLLM 在
+`simo/extensions/vllm_simo/quantization/quantization_config.py:253-271` 明确跳过所有
+`ReplicatedLinear`，因此不量化 `kv_a_proj_with_mqa`；其原日志则显示它量化了 `kv_b_proj`。
+
+这不是简单的 JSON 写法差别。SGLang MLA 的 post-load 路径在
+`sglang_kernel_src/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py:508-628`
+只专门处理 AWQ、FP8 和 INT8 的 `kv_b_proj`，没有 SIMO packed INT4 分支；随后把处理后的权重拆成
+`w_kc/w_vc`。普通路径又在
+`sglang_kernel_src/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:505-529`
+直接把 `w_kc` 传给 BMM。受控实验去掉 `kv_b_proj` exclusion 后，packed INT4 最终进入该 BMM，得到
+`expected scalar type BFloat16 but found Int`。因此当前 SGLang 配置排除 `kv_b_proj` 是必要的架构约束。
+
+vLLM 的 SIMO MLA 则显式识别 `kv_b_proj.quant_method`，见
+`simo/extensions/vllm_simo/v1/attention/backends/simo_mla.py:291-306`，并在 prefill 中通过正常的
+`self.kv_b_proj(...)` 调用量化 Linear，见
+`simo/extensions/vllm_simo/v1/attention/backends/simo_mla.py:368-377`。所以两边当前不能只换一个 JSON
+就获得完全相同的 DeepSeek MLA 权重执行图。
+
+最后，attention 参数也没有按测试名称生效。SGLang 测试接收 `attention_backend`，但
+`tests/sglang_simo/e2e_test/test_basic_generate_single.py:135-161` 构造 Engine 时没有传它；原日志实际
+使用默认 `fa3`。vLLM 则在 `tests/vllm_simo/e2e_test/test_basic_generate_single.py:178-187` 明确传入
+`TRITON_MLA`。受控实验给 SGLang 显式传 `triton` 后仍选择填空 token，因此这也是对照混杂项，而不是
+单独的根因或修复。
+
+### 62.5 受控排除结果
+
+本次使用同一模型目录、单请求、`max_new_tokens=16` 和显式 greedy 参数完成了以下检查：
+
+| 对照 | 结果 | 说明 |
+| --- | --- | --- |
+| SGLang BF16 + 原长提示 | ` Paris...` | BF16 基线通过原断言 |
+| SGLang W4A16 + 原长提示 | ` ________...` | 复现问题 |
+| SGLang BF16 + 纯事实短提示 | ` Paris...` | 通过 |
+| SGLang W4A16 + 纯事实短提示 | ` Paris...` | 通过，且与 BF16 的 `Paris` logprob 几乎相同 |
+| SGLang W4A16，额外排除 `kv_a` | ` ________...` | 不是单个 `kv_a` 量化导致 |
+| vLLM W4A16，显式 `temperature=0` | ` Paris...` | 原日志的 0.3 不是唯一差别 |
+| 两边都只量化 `q/o/MLP/MoE` | SGLang 填空，vLLM `Paris` | 量化覆盖差异不是唯一原因 |
+| SGLang 显式 `triton` | ` ________...` | 漏传 backend 不是唯一原因 |
+| vLLM 把 prefill 上限从 32 改为 8192 | ` Paris...` | chunked prefill 不是唯一原因 |
+
+这些结果把可支持的结论限定得很清楚：首 token 的框架差异是真实的，但它来自量化舍入、DeepSeek
+模型实现、MLA/Linear/MoE 执行路径等数值差异的累积；现有证据不能把它归因于某一个已经证明错误的
+SGLang kernel。特别是，匹配量化层集合、attention backend 或 prefill 分块中的任意单项，都没有让
+两边 logits 完全一致。
+
+任务级参考结果也不呈现整体损坏。DeepSeek W4A16 的 MMLU 参考分数在 SGLang/vLLM 中分别为
+`54.62/55.02`，见 `tests/sglang_simo/references_accuracy/mmlu.yaml:44-50` 和
+`tests/vllm_simo/references_accuracy/mmlu.yaml:54-81`；GSM8K 分别为 `58.68/57.32`，见
+`tests/sglang_simo/references_accuracy/gsm8k.yaml:43-49` 和
+`tests/vllm_simo/references_accuracy/gsm8k.yaml:54-81`。这比单条开放式生成的 exact substring 更能
+反映量化模型总体精度。
+
+### 62.6 测试应如何修改
+
+当前断言位于 `tests/sglang_simo/e2e_test/test_basic_generate_single.py:177-188`，建议按测试目标拆分：
+
+1. 基础 smoke test 直接使用无歧义短提示 `The capital of France is`，不要拼接教师面试长前缀。
+   本次实测 SGLang W4A16 对该短提示会输出 `Paris`。
+2. 两个框架都显式构造相同的 greedy 参数，不要在 vLLM 中调用
+   `get_default_sampling_params()`。同时统一 `max_tokens/max_new_tokens`、stop 条件和 prompt token ids。
+3. 修复 SGLang 测试中未传递 `attention_backend` 的问题，至少让测试名、参数和实际 backend 一致；
+   但不要把它描述成本次输出分叉的充分修复，因为实测显式 `triton` 仍会选择填空。
+4. 如果目标是比较 SGLang 与 vLLM 的量化数值，先明确共同量化层。当前 SGLang 不能直接把 SIMO
+   INT4 `kv_b_proj` 接入 MLA absorb BMM；在补齐该支持前，应在两边都排除 `kv_a/kv_b`，并记录这不是
+   原始两份配置的默认语义。
+5. 不要用一条自然语言生成的 `"Paris" in text` 作为量化正确性的唯一判据。更合适的层次是：
+   smoke 检查非空输出和无运行期错误；数值测试比较指定 token 的 rank/logprob 或中间张量；精度门禁使用
+   MMLU、GSM8K 等多样本指标及允许阈值。
+
+一句话概括：SGLang 并不是因为 `temperature=0` 而“失去 Paris”；它是在一个 `Paris` 与填空符号
+本就接近的歧义提示上，经 W4A16 和框架执行路径扰动后把填空符号排到了第一名，而 greedy decoding
+忠实且确定性地放大了这个首 token 选择。
+
+## 63. Llama-3.1-8B-Instruct W4A16 复测及双模型稳定输出 Paris 的设置
+
+### 63.1 直接结论
+
+使用用户指定的模型目录
+`/data/like/hf-models/Llama3.1-8B-Instruct/`，以及同一份
+`simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json:1-27`
+启动 SGLang SIMO 后，原测试的“教师面试长前缀 + `The capital of France is`”确实能够让 Llama
+以 `Paris` 作为首个生成 token：
+
+```text
+ Paris. This is a statement of fact, not a question. I will not ...
+```
+
+该请求连续执行 3 次结果相同。首 token 是 id `12366`，解码文本为带前导空格的 `" Paris"`；
+它的 logprob 为 `-0.2093`，第二名为 `-3.0843`，对应约 `2.875` 的 logit 间隔。因此，对问题
+“Llama-3.1-8B-Instruct 用同样 W4A16 时，SGLang SIMO 还能否得到 Paris 作为首 token”，答案是
+**可以**。
+
+不过，这不能说明原长提示本身适合作为跨模型测试。相同输入在 DeepSeek-V2-Lite-Chat W4A16
+上的第一名仍是填空 token `" ________"`，它只比 `" Paris"` 高 `0.375` logit。Llama 与
+DeepSeek 对一段相互冲突的续写上下文作出不同选择是正常的模型行为，不应通过调整采样参数来掩盖。
+
+### 63.2 受控复测结果
+
+本次两个模型均使用上述 W4A16 INT4 per-group 配置、`temperature=0`、`top_k=1`、
+`top_p=1.0` 和 `max_new_tokens=16`。`temperature=0` 在 SGLang 内部本来也会归一化为
+`top_k=1`，见
+`sglang_kernel_src/python/sglang/srt/sampling/sampling_params.py:168-172`。
+
+| 输入方式 | Llama-3.1-8B-Instruct | DeepSeek-V2-Lite-Chat |
+| --- | --- | --- |
+| 原教师面试长前缀 | 3/3 均以 ` Paris` 开头 | 3/3 均以 ` ________` 开头 |
+| 裸字符串 `The capital of France is` | 3/3 均以 ` a city...` 开头，稍后含 `Paris` | 3/3 均以 ` Paris` 开头 |
+| 各自 chat template + 明确单词回答指令 | 3/3 均为 `Paris.` | 3/3 均为 ` Paris` |
+| 同一 chat 请求组成 4 请求 batch | 4/4 均为 `Paris.` | 4/4 均为 ` Paris` |
+
+Llama 裸短提示的首选 `" a"` 只比第二名 `" Paris"` 高 `0.25` logit；所以“去掉长前缀”
+虽然能让输出中出现 `Paris`，却不能在 Llama 上保证它是首 token。真正适合两个 instruct/chat 模型
+的共同输入方式，是让各自 tokenizer 用自己的 chat template 格式化一条无歧义问题：
+
+```text
+What is the capital of France? Answer with exactly one word.
+```
+
+此时 Llama 的首 token 是 id `60704`、文本 `"Paris"`，相对第二名约高 `12.25` logits；
+DeepSeek 的首 token 是 id `8913`、文本 `" Paris"`，相对第二名约高 `4.875` logits。这两个间隔
+都远大于原 DeepSeek 长提示中只有 `0.375` 的反向间隔，因而对量化舍入和执行顺序的小扰动更稳健。
+
+### 63.3 推荐的自然生成设置
+
+两个模型可以共用同一套 Engine 构造和采样代码，但 **prompt 必须分别由各自 tokenizer 的 chat
+template 生成**。不要自己拼一个看似通用的 `User:`/`Assistant:` 字符串，也不要把与问题无关的教师
+面试前缀保留下来。
+
+下面的设置可直接用于这两个目录：
+
+```python
+import json
+
+import sglang as sgl
+from transformers import AutoTokenizer
+
+QUANT_CONFIG = (
+    "/share/users/like/package/simo_conda_sglang/simo/extensions/sglang_simo/"
+    "example/simo_quantization_config/online_quantization/"
+    "quant_config_w4a16_int4_per_group.json"
+)
+
+
+def run_one(model_path: str) -> str:
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "What is the capital of France? "
+                    "Answer with exactly one word."
+                ),
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    engine = sgl.Engine(
+        model_path=model_path,
+        quantization="simo",
+        json_model_override_args=json.dumps(
+            {"quantization_config_file": QUANT_CONFIG}
+        ),
+        mem_fraction_static=0.5,
+        log_level="info",
+    )
+    try:
+        output = engine.generate(
+            [prompt],
+            {
+                "temperature": 0.0,
+                "top_k": 1,
+                "top_p": 1.0,
+                "max_new_tokens": 16,
+            },
+        )[0]["text"]
+    finally:
+        engine.shutdown()
+
+    answer = output.strip().rstrip(".")
+    assert answer == "Paris", repr(output)
+    return output
+
+
+models = [
+    (
+        "/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/"
+        "DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights"
+    ),
+    "/data/like/hf-models/Llama3.1-8B-Instruct",
+]
+for model in models:
+    print(model, repr(run_one(model)))
+```
+
+为避免两个 Engine 的显存占用叠加，上面的 `finally` 会在切换模型前释放当前 Engine。
+实际测试若只运行一个模型，可以沿用
+`tests/sglang_simo/e2e_test/test_basic_generate_single.py:150-161` 的 Engine 生命周期，只替换
+`tests/sglang_simo/e2e_test/test_basic_generate_single.py:163-188` 中的采样参数、prompt 构造和断言。
+
+W4A16 配置本身不需要为 Llama 另写一份。它量化 `Linear` 的权重为 INT4、沿 `axis=-1` 每 32
+元素一组，并排除 `lm_head` 和 `kv_b_proj`，见
+`simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w4a16_int4_per_group.json:6-23`。
+Llama 没有 `kv_b_proj`，该正则不会额外影响它；DeepSeek 则必须保留这个 exclusion，原因见第
+62.4 节对 SGLang MLA 路径的分析。
+
+这里显式写 `top_k=1` 是为了让测试意图清晰，虽然 `temperature=0` 已经会触发同一 greedy
+归一化。`top_p=1.0` 避免引入额外过滤。对输出先 `strip()` 再去掉句号，是因为两个 tokenizer
+生成的首 token 空格形式不同，而模型给一词答案加句号也是合法行为。
+
+### 63.4 为什么不把 deterministic inference 当作修复
+
+`enable_deterministic_inference=True` 的定义是启用 batch-invariant operators，见
+`sglang_kernel_src/python/sglang/srt/server_args.py:2569-2575`；它还会调整 sampling backend、
+attention backend 等实现，见 `sglang_kernel_src/python/sglang/srt/server_args.py:6025-6095`。
+它解决的是同一输入在不同 batch 组织下的数值一致性问题，并不规定模型必须选择哪个语义答案。
+
+实测 DeepSeek W4A16 在该模式下运行原长提示三次，首次冷请求为填空，后续两个复用前缀缓存的请求为
+`Paris`；最后一次记录到 `Paris` 与填空 token 的 logprob 恰好同为 `-1.2311`。这再次表明原长
+提示处在决策边界附近，也说明 batch-invariant operators 不等于跨冷/缓存执行状态强制得到某个语义答案。
+deterministic inference 不能替代明确 prompt。推荐的 chat prompt 在不开启该选项时已经通过 3 次串行
+和 4 请求 batch 检查，因此不需要为了这个 smoke test 打开它。
+
+### 63.5 如果协议要求强制得到 Paris
+
+如果测试目标只是确认“请求经过 SGLang、量化模型和 detokenizer 后能返回指定字符串”，而不是检查模型
+是否知道法国首都，可以使用 grammar 约束。SGLang 的 `regex` 参数声明在
+`sglang_kernel_src/python/sglang/srt/sampling/sampling_params.py:102-104`。对原始长提示，下面的设置
+在两个模型上均实测只生成 `" Paris"`：
+
+```python
+forced = engine.generate(
+    [long_prefix + "The capital of France is"],
+    {
+        "temperature": 0.0,
+        "top_k": 1,
+        "max_new_tokens": 2,
+        "regex": " Paris",
+    },
+)[0]["text"]
+assert forced == " Paris"
+```
+
+也可以对首 token 加很大的正 bias。不要硬编码跨模型 token id，应由当前 tokenizer 计算：
+
+```python
+paris_ids = tokenizer.encode(" Paris", add_special_tokens=False)
+assert len(paris_ids) == 1
+
+forced = engine.generate(
+    [long_prefix + "The capital of France is"],
+    {
+        "temperature": 0.0,
+        "top_k": 1,
+        "max_new_tokens": 1,
+        "logit_bias": {str(paris_ids[0]): 100.0},
+    },
+)[0]["text"]
+assert forced == " Paris"
+```
+
+本次两个 id 分别是 DeepSeek 的 `8913` 和 Llama 的 `12366`。SGLang 在
+`sglang_kernel_src/python/sglang/srt/sampling/sampling_params.py:112-113` 接收 `logit_bias`，在
+`sglang_kernel_src/python/sglang/srt/sampling/sampling_batch_info.py:125-131` 构造逐请求 bias，并在
+`sglang_kernel_src/python/sglang/srt/sampling/sampling_batch_info.py:282-283` 加到 logits 上。
+
+`regex` 会从允许的字符序列上作硬约束；有限的 `+100` bias 是本次模型上足够大的实用强制值，但不是
+与模型 logits 无关的数学保证。更重要的是，这两种方式都把正确答案直接写进了解码约束，因而只能用于
+接口/链路 smoke test，**不能**再把成功输出 `Paris` 当作 W4A16 数值正确或模型知识正确的证据。
+
+最终建议按测试目的选择：事实回答 smoke test 使用“各自 chat template + 明确问题 + greedy”，这是
+两个模型自然且共同稳定的设置；协议层 exact-output test 才使用 `regex`；量化正确性仍应使用第 62.6
+节所述的 token rank/logprob、中间张量和多样本精度指标，而不是依靠一条被强制的字符串。
+
+## 64. `apply_chat_template` 与原 `list[str]` prompt 的区别
+
+### 64.1 两者不是同一维度的替代项
+
+最核心的区别是：
+
+- `apply_chat_template` 决定 **一条对话在送入模型前如何序列化**，即加入模型训练时约定的角色、分隔符、
+  BOS/EOS 和 assistant 起始标记。
+- 传给 `Engine.generate()` 的外层 `list` 决定 **一次提交多少条请求**。它只是 batch 容器，不会自动
+  把普通文本变成 chat prompt。
+
+因此，原代码中的：
+
+```python
+prompts = ["The capital of France is"]
+generating_prompts = [prefix + prompt for prompt in prompts]
+outputs = llm.generate(generating_prompts, sampling_params)
+```
+
+其类型和含义是：
+
+```text
+prompts / generating_prompts: list[str]  -> 一批普通文本续写请求
+```
+
+具体位置是 `tests/sglang_simo/e2e_test/test_basic_generate_single.py:164-182`。虽然这里只有一个
+字符串，外层仍表示 batch size 为 1。SGLang 的 `Engine.generate()` 明确接受单个 `str` 或
+`list[str]`，也接受单个 `list[int]` 或 batch 形式的 `list[list[int]]`，见
+`sglang_kernel_src/python/sglang/srt/entrypoints/engine.py:318-324`；请求归一化时，字符串被判定为单请求，
+字符串列表被判定为 batch，见 `sglang_kernel_src/python/sglang/srt/managers/io_struct.py:371-389`。
+
+而下面的 `messages`：
+
+```python
+messages = [
+    {
+        "role": "user",
+        "content": "What is the capital of France? Answer with exactly one word.",
+    }
+]
+```
+
+是 **一条对话的消息列表**，不是一批 prompt。`apply_chat_template` 把它转换成一个格式化字符串或一组
+token ids；转换完成后，仍需用外层 list 才组成 batch：
+
+```text
+list[dict]       -> 一条 conversation
+str              -> 格式化后的一条文本 prompt
+list[int]        -> 格式化并 tokenize 后的一条 token prompt
+list[str]        -> Engine 的文本 batch
+list[list[int]]  -> Engine 的 token-id batch
+```
+
+### 64.2 模型实际看到的内容不同
+
+原代码直接拼接 `prefix + prompt`。除 tokenizer 可能自动添加的 BOS 外，模型看到的就是这些普通文本；
+其中没有 user/assistant 边界，也没有“现在开始 assistant 回答”的控制 token。对 causal LM 而言，这更像
+“继续写前文”，所以原教师面试前缀会强烈影响它是续写面试问题、填空，还是回答法国首都。
+
+`apply_chat_template` 会读取当前模型 `tokenizer_config.json` 中的 `chat_template`。两个模型的模板不同：
+
+- DeepSeek-V2-Lite-Chat 大致渲染为
+  `BOS + "User: ...\n\nAssistant:"`。模板位于
+  `/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights/tokenizer_config.json:34`。
+- Llama-3.1-8B-Instruct 会加入 `<|begin_of_text|>`、system/user/assistant header 和
+  `<|eot_id|>` 等控制 token。模板位于
+  `/data/like/hf-models/Llama3.1-8B-Instruct/tokenizer_config.json:2053`。
+
+例如同一句问题，逻辑上分别接近：
+
+```text
+# DeepSeek
+<BOS>User: What is the capital of France? Answer with exactly one word.
+
+Assistant:
+
+# Llama
+<BOS><system-header>...<EOT><user-header>
+What is the capital of France? Answer with exactly one word.
+<EOT><assistant-header>
+```
+
+`add_generation_prompt=True` 的作用就是在末尾加入 assistant 消息的起始标记；它不生成答案，而是告诉
+chat/instruct 模型“下一段应当由 assistant 生成”。因此第 63 节中输出从临界或填空行为变为高 margin
+的 `Paris`，主要是 **输入语义和格式变得明确**，不是 `list`、W4A16 或 `temperature=0` 的含义改变了。
+
+### 64.3 `tokenize=False` 和 `tokenize=True`
+
+`apply_chat_template` 有两种常用返回方式：
+
+```python
+# 返回已经带角色/控制标记的 str
+rendered = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+)
+
+# 直接返回正确模板对应的 list[int]
+prompt_ids = tokenizer.apply_chat_template(
+    messages,
+    tokenize=True,
+    add_generation_prompt=True,
+    return_dict=False,
+)
+```
+
+当前 conda 环境中的 Transformers 实现在
+`/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/transformers/tokenization_utils_base.py:2991-3008`
+定义返回类型，在
+`/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/transformers/tokenization_utils_base.py:3030-3042`
+说明 `add_generation_prompt` 和 `tokenize`，并在
+`/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/transformers/tokenization_utils_base.py:3121-3128`
+对渲染结果使用 `add_special_tokens=False` 编码。这是因为模板本身已经负责放置 BOS/EOS 等控制 token。
+
+如果使用 `tokenize=False`，随后把字符串传给 `Engine.generate(prompt=...)`，SGLang 还会再次调用其内部
+tokenizer，见 `sglang_kernel_src/python/sglang/srt/managers/tokenizer_manager.py:793-832`。当前普通 tokenizer
+路径使用默认 `encode()`/`tokenizer()` 参数，见
+`sglang_kernel_src/python/sglang/srt/managers/tokenizer_manager.py:775-786`，这可能再次添加 BOS。
+
+本次对当前 editable SGLang 实际加载的 tokenizer 做 token 对照，结果是：
+
+| 模型 | `apply_chat_template(tokenize=True)` | 模板字符串再走默认 `encode()` |
+| --- | --- | --- |
+| Llama-3.1-8B-Instruct | 48 tokens，以 `[128000, 128006, ...]` 开头 | 49 tokens，以 `[128000, 128000, 128006, ...]` 开头 |
+| DeepSeek-V2-Lite-Chat | 20 tokens，以 `[100000, 5726, ...]` 开头 | 21 tokens，以 `[100000, 100000, 5726, ...]` 开头 |
+
+也就是说，第 63.3 节中 `tokenize=False` 后再传 `prompt=[prompt]` 的写法在这个简单问题上实测仍能输出
+`Paris`，但当前两种内部 tokenizer 都会多放一个 BOS。它适合说明 chat template 的语义效果，却不是做
+token 级可复现测试时最干净的路径。SGLang 自己的 OpenAI chat 实现也明确在模板渲染后用
+`add_special_tokens=False` 编码以避免 double BOS，见
+`sglang_kernel_src/python/sglang/srt/entrypoints/openai/serving_chat.py:854-875`。
+
+### 64.4 推荐写法：模板直接生成 ids
+
+对当前 `sgl.Engine` 测试，推荐让外部 tokenizer 一次性完成模板和 tokenization，再通过 `input_ids=`
+传入 Engine：
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+messages = [
+    {
+        "role": "user",
+        "content": "What is the capital of France? Answer with exactly one word.",
+    }
+]
+prompt_ids = tokenizer.apply_chat_template(
+    messages,
+    tokenize=True,
+    add_generation_prompt=True,
+    return_dict=False,
+)
+
+outputs = llm.generate(
+    input_ids=[prompt_ids],  # 外层 list 表示 batch size = 1
+    sampling_params={
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "max_new_tokens": 4,
+    },
+)
+generated_text = outputs[0]["text"]
+assert generated_text.strip().rstrip(".") == "Paris"
+```
+
+`Engine.generate()` 会把 `prompt=` 放入请求的 `text` 字段，把 `input_ids=` 放入同名字段，见
+`sglang_kernel_src/python/sglang/srt/entrypoints/engine.py:370-400`。TokenizerManager 检测到已有
+`input_ids` 后会直接使用，不再编码文本，见
+`sglang_kernel_src/python/sglang/srt/managers/tokenizer_manager.py:805-832`。SGLang 的 Ollama chat 入口也采用
+`apply_chat_template(tokenize=True)` 后传 `input_ids` 的方式，见
+`sglang_kernel_src/python/sglang/srt/entrypoints/ollama/serving.py:79-94`。
+
+该 token-id 写法已在两个 W4A16 模型上重新实测：Llama 输出 `Paris.`，DeepSeek 输出 ` Paris`。它与
+第 63 节的自然生成结论一致，同时去掉了额外 BOS。
+
+如果有多条对话，分别格式化后再组成 token-id batch：
+
+```python
+conversations = [
+    [{"role": "user", "content": "What is the capital of France?"}],
+    [{"role": "user", "content": "What is the capital of Japan?"}],
+]
+batch_input_ids = [
+    tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+    )
+    for messages in conversations
+]
+outputs = llm.generate(input_ids=batch_input_ids, sampling_params=sampling_params)
+```
+
+不要同时传 `prompt=` 和 `input_ids=`，也不要对已经包含 chat 控制 token 的字符串再次调用
+`apply_chat_template`。如果改用 SGLang 的 OpenAI `/v1/chat/completions` 接口，则直接发送结构化
+`messages`，server 会负责应用 chat template；客户端不应再预先套一遍模板。
+
+一句话总结：原来的 `list[str]` 是“把若干原始文本作为 completion batch”，而
+`apply_chat_template` 是“按当前 instruct 模型训练时的对话协议构造每条输入”；正确组合是先对每条
+conversation 应用模板，再把得到的字符串或 token ids 组成 batch。对当前 Engine 和这两个模型，优先
+使用 `tokenize=True` + `input_ids=[prompt_ids]`，可以同时获得正确对话格式和无重复 BOS 的 token 序列。
+
+## 65. 使用 SGLang 原生插件框架注册 `sglang_simo`
+
+### 65.1 结论
+
+SIMO 已使用 SGLang 的 general plugin 机制替代 `sitecustomize.py` 注册。需要注意
+`SGLANG_PLUGINS` 的作用：它不是 Python 模块路径，也不会直接执行环境变量中写出的函数。SGLang 先通过
+Python distribution metadata 查找 `sglang.srt.plugins` 组中的 entry point，再把
+`SGLANG_PLUGINS` 当作 **entry point 名称白名单**。实现位于
+`sglang_kernel_src/python/sglang/srt/plugins/__init__.py:35-86`；环境变量定义位于
+`sglang_kernel_src/python/sglang/srt/environ.py:974-976`。
+
+本次迁移已经完成两个部分：
+
+1. SIMO 的 `pyproject.toml` 已声明 SGLang entry point，安装后的 distribution metadata 中可以发现该插件；
+2. 启动 SGLang 前设置 `SGLANG_PLUGINS=sglang_simo_extensions`，由白名单选中它。
+
+当前配置在原有 vLLM entry point 后使用独立的 SGLang 组：
+
+```toml
+[project.entry-points."vllm.general_plugins"]
+vllm_simo_extensions = "simo.extensions.vllm_simo:register_simo_extensions"
+
+[project.entry-points."sglang.srt.plugins"]
+sglang_simo_extensions = "simo.extensions.sglang_simo:register_simo_extensions"
+```
+
+这里三个字段的含义分别是：
+
+| 字段 | 值 | 含义 |
+| --- | --- | --- |
+| entry point group | `sglang.srt.plugins` | SGLang general plugin loader 固定查询的组名 |
+| entry point name | `sglang_simo_extensions` | `SGLANG_PLUGINS` 中应填写的名字 |
+| entry point value | `simo.extensions.sglang_simo:register_simo_extensions` | `ep.load()` 要导入的模块和解析的函数 |
+
+不要写成下面任一种形式：
+
+```bash
+# 错误：环境变量匹配的是 entry point 左侧名称，不是模块路径或函数名
+export SGLANG_PLUGINS=simo.extensions.sglang_simo
+export SGLANG_PLUGINS=register_simo_extensions
+```
+
+正确写法是：
+
+```bash
+export SGLANG_PLUGINS=sglang_simo_extensions
+```
+
+如果要同时允许多个 general plugin，用逗号分隔其 entry point 名称，例如
+`SGLANG_PLUGINS=sglang_simo_extensions,another_plugin`。解析代码见
+`sglang_kernel_src/python/sglang/srt/plugins/__init__.py:51-70`。
+
+### 65.2 当前迁移状态与安装
+
+迁移后的状态如下：
+
+| 检查项 | 当前状态 |
+| --- | --- |
+| `pyproject.toml` | 已声明 `sglang.srt.plugins` / `sglang_simo_extensions` |
+| `setup.py` | 已删除 `py_modules=["sitecustomize"]`，未重复声明 entry point |
+| 仓库根目录 `sitecustomize.py` | 已删除 |
+| 安装元数据 | 已同时包含 SGLang 和 vLLM 两组 entry point |
+| Python 模块发现 | `importlib.util.find_spec("sitecustomize") is None` |
+
+entry point 属于安装元数据；即使 SIMO 使用 editable 安装，修改 `pyproject.toml` 后也必须重装。2026-07-24
+实际使用的安装命令为：
+
+```bash
+cd /share/users/like/package/simo_conda_sglang
+source /share/users/like/package/sglang_kernel_src/like-useful/env-build-pip.sh
+
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python -m pip uninstall -y simo
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python \
+  -m pip install -e ".[dev]" --no-build-isolation
+```
+
+当前仓库曾保留一份被 `.gitignore` 忽略的旧 `simo.egg-info`。新 editable wheel 的 `dist-info` 虽然正确，
+但从仓库根目录启动 Python 时，旧 `egg-info` 会优先遮蔽它。本次通过以下 setuptools 命令重新生成该构建
+元数据后，仓库内外查询结果一致：
+
+```bash
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python setup.py egg_info
+```
+
+不要手工修改 `simo.egg-info/entry_points.txt`；它是构建工具根据 `pyproject.toml` 生成的文件。
+
+### 65.3 `SGLANG_PLUGINS` 到 SIMO 函数的完整调用栈
+
+以用户代码中的 `sgl.Engine(...)` 为例，主进程调用链如下：
+
+```text
+用户代码
+  -> sgl.Engine(...)
+  -> sglang.srt.entrypoints.engine.Engine.__init__()
+       engine.py:204
+  -> load_plugins()
+       engine.py:210-212
+  -> load_plugins_by_group("sglang.srt.plugins", ...)
+       plugins/__init__.py:124-127
+  -> envs.SGLANG_PLUGINS.get()
+       plugins/__init__.py:51-55
+  -> os.getenv("SGLANG_PLUGINS")
+       environ.py:48-61
+  -> importlib.metadata.entry_points(group="sglang.srt.plugins")
+       plugins/__init__.py:57
+  -> 比较 ep.name 与 {"sglang_simo_extensions"}
+       plugins/__init__.py:67-70
+  -> ep.load()
+       plugins/__init__.py:79-82
+       导入 simo.extensions.sglang_simo
+       解析属性 register_simo_extensions
+  -> func()
+       plugins/__init__.py:129-134
+  -> simo.extensions.sglang_simo.register_simo_extensions()
+       simo/extensions/sglang_simo/__init__.py:11-32
+  -> HookRegistry.apply_hooks()
+       plugins/__init__.py:140-141
+  -> Engine 构造 ServerArgs
+       engine.py:214-223
+```
+
+其中 `ep.load()` 只负责导入模块并返回函数对象；真正调用
+`register_simo_extensions()` 的位置是 `func()`，两步不能混为一谈。
+
+`register_simo_extensions()` 不需要参数，返回值也不会被使用，因此它已经满足 general plugin 的调用
+约定。该函数执行后通过导入或显式调用完成以下注册：
+
+- `simo/extensions/sglang_simo/model_loader/loader.py:92-102` 注册 model loader 相关 patch；
+- `simo/extensions/sglang_simo/quantization/quantization_registry.py:8-15` 把 `simo` 加入量化映射；
+- `simo/extensions/sglang_simo/server_args.py:1-4` 加入 `simo` 和 `triton_simo` 参数选项；
+- `simo/extensions/sglang_simo/layers/attention/attention_backend.py:5-18` 注册
+  `triton_simo` attention backend；
+- `simo/extensions/sglang_simo/__init__.py:19-27` 加载 DeepSeek-V2 patch 并应用 memory-pool patch。
+
+SGLang 还会从其他入口调用同一个 loader：
+
+| 启动路径 | 首次调用位置 | 调用时机 |
+| --- | --- | --- |
+| `sglang serve ...` | `sglang_kernel_src/python/sglang/cli/serve.py:89-93` | 解析模型和 server 参数之前 |
+| `python -m sglang.launch_server ...` | `sglang_kernel_src/python/sglang/launch_server.py:64-68` | `prepare_server_args()` 之前 |
+| `sgl.Engine(...)` | `sglang_kernel_src/python/sglang/srt/entrypoints/engine.py:204-223` | `ServerArgs` 构造之前 |
+| Engine 主进程防御性调用 | `sglang_kernel_src/python/sglang/srt/entrypoints/engine.py:782-790` | 检查 server 参数之前 |
+| scheduler 子进程 | `sglang_kernel_src/python/sglang/srt/managers/scheduler.py:4281-4295` | scheduler 配置和构造之前 |
+
+`sglang_kernel_src/python/sglang/srt/plugins/__init__.py:31-32,119-122` 的 `_plugins_loaded` 保证同一进程中
+只执行一次。scheduler 是新进程，有自己的 `_plugins_loaded=False`，所以会再次发现并执行插件。这正是
+SIMO 所需要的：主进程要在参数校验前认识 `simo`/`triton_simo`，scheduler 进程也要在模型和 attention
+backend 初始化前应用对应注册及 patch。`SGLANG_PLUGINS` 必须在启动 Python 进程前设置，以便子进程继承；
+同一进程首次 `load_plugins()` 完成后再修改它不会重新加载插件。
+
+### 65.4 `setup.py` 和 `pyproject.toml` 的职责
+
+当前项目使用 `setuptools.build_meta`，见 `pyproject.toml:1-3`。SGLang entry point 只在
+`pyproject.toml` 中声明；`setup.py` 不再重复提供 `entry_points={...}`，避免出现两份配置源。
+
+旧自动导入路径已被彻底删除：`setup.py` 不再包含 `py_modules=["sitecustomize"]`，仓库根目录也不再有
+`sitecustomize.py`。因此 `SIMO_SGLANG_REGISTER` 和 `SIMO_DISABLE_SGLANG_REGISTER` 不再参与 SIMO 的
+SGLang 注册；实际入口统一为 SGLang loader 和 `SGLANG_PLUGINS`。
+
+这两项删除必须同时完成。仅从 packaging 配置移除 `sitecustomize`，但保留仓库根目录文件，仍可能导致从
+该目录启动 Python 时发生自动导入；仅删除源码文件，但保留旧安装或旧 metadata，也可能留下错误的模块
+映射。重新安装后应同时检查 entry point 和 `find_spec("sitecustomize")`。
+
+### 65.5 安装后如何验证
+
+先验证安装元数据和旧模块清理状态，不启动模型、不占用 GPU：
+
+```bash
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+import importlib.util
+from importlib.metadata import entry_points
+
+plugins = {
+    ep.name: ep.value
+    for ep in entry_points(group="sglang.srt.plugins")
+}
+print(plugins)
+assert plugins["sglang_simo_extensions"] == (
+    "simo.extensions.sglang_simo:register_simo_extensions"
+)
+assert importlib.util.find_spec("sitecustomize") is None
+PY
+```
+
+预期至少包含：
+
+```text
+{'sglang_simo_extensions': 'simo.extensions.sglang_simo:register_simo_extensions'}
+```
+
+再验证 SGLang 确实执行了函数，而不是只有元数据：
+
+```bash
+SGLANG_PLUGINS=sglang_simo_extensions \
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+from sglang.srt.plugins import load_plugins
+
+load_plugins()
+
+from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES, QUANTIZATION_CHOICES
+from sglang.srt.layers.quantization import BASE_QUANTIZATION_METHODS
+
+assert "simo" in QUANTIZATION_CHOICES
+assert "simo" in BASE_QUANTIZATION_METHODS
+assert "triton_simo" in ATTENTION_BACKEND_CHOICES
+print("sglang_simo plugin registration: OK")
+PY
+```
+
+实际启动方式为：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+SGLANG_PLUGINS=sglang_simo_extensions \
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python your_test.py
+```
+
+还需注意两个 loader 语义：
+
+- `SGLANG_PLUGINS` 未设置或为空时，`allowed_set` 为 `None`，SGLang 会加载所有已经安装的
+  `sglang.srt.plugins`，不是“一个也不加载”，见
+  `sglang_kernel_src/python/sglang/srt/plugins/__init__.py:51-70`。因此 entry point 安装后，即使不设置该变量，
+  SIMO 也会被自动发现和执行；显式设置它的价值是限定只加载指定插件。
+- 如果设置了一个不存在或拼错的名称，discovered entry point 会被跳过，但这里不会因为“白名单名称没有
+  命中”而主动抛错。插件导入或执行异常也会在
+  `sglang_kernel_src/python/sglang/srt/plugins/__init__.py:79-84,129-138` 被记录为日志。因此应保留上面的
+  metadata 和注册结果断言，不能只根据进程仍能启动就判定插件生效。
+
+### 65.6 四项 tokenizer smoke 结果
+
+`like-useful/test_basic_generate_tokenizer_prompt_all_in_one.py` 不再扫描配置目录，而是固定为两个模型和两个
+代表性量化配置，共四项：
+
+| 模型 | 量化配置 | `attention_backend` | 2026-07-24 结果 |
+| --- | --- | --- | --- |
+| DeepSeek-V2-Lite-Chat | `quant_config_kvquant_fp8_per_group.json` | `triton_simo` | PASS，`Paris` 断言通过 |
+| DeepSeek-V2-Lite-Chat | `quant_config_w4a16_int4_per_group.json` | 未显式传入 | PASS，`Paris` 断言通过 |
+| Llama-3.1-8B-Instruct | `quant_config_kvquant_fp8_per_group.json` | `triton_simo` | PASS，`Paris` 断言通过 |
+| Llama-3.1-8B-Instruct | `quant_config_w4a16_int4_per_group.json` | 未显式传入 | PASS，`Paris` 断言通过 |
+
+Llama 使用当前可访问的 `/data/like/hf-models/Llama3.1-8B-Instruct`；DeepSeek 使用
+`/data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights`。
+四项都保留模型 chat template、`temperature=0.0` 和生成文本必须包含 `Paris` 的断言。
+
+在一块空闲 H100（`CUDA_VISIBLE_DEVICES=7`）上串行执行：
+
+```bash
+source /share/users/like/package/sglang_kernel_src/like-useful/env-build-pip.sh
+CUDA_VISIBLE_DEVICES=7 \
+SGLANG_PLUGINS=sglang_simo_extensions \
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python -m pytest -q \
+  like-useful/test_basic_generate_tokenizer_prompt_all_in_one.py
+```
+
+pytest 明确收集 4 项，最终结果为 `4 passed, 2 warnings in 276.70s (0:04:36)`。两条 warning 是 SWIG
+类型的既有 `DeprecationWarning`；日志中没有旧 `sitecustomize` 注册错误。独立的 `load_plugins()` 验证还确认
+了 `simo` 量化选择、`simo` quantization method、`triton_simo` attention backend、DeepSeek attention
+替换和 SIMO memory-pool patch 均已生效。
+
+## 66. 为什么 INT8 per-tensor 激活在 ONNX Q/DQ 中被写成 per-channel
+
+### 66.1 直接结论
+
+这里没有把量化的数学语义从 per-tensor 改成真正的 per-channel。它做的是一次 lowering：先把整个激活
+张量展平成只有一行的二维张量，再用 `axis=0` 的 per-channel 内核处理这一行。因为 channel 维只有 1，
+内核最终仍只计算一个 scale；其结果与对原张量做 per-tensor 量化等价。
+
+因此需要区分两层含义：
+
+| 层次 | 本例中的值 | 含义 |
+| --- | --- | --- |
+| 用户配置和 `spec` | `per_tensor` | 整个激活共享一个量化 scale |
+| 写入 `com.simo::Quantize/Dequantize` 的属性 | `per_channel, axis=0` | 选择当前插件已有的 per-channel kernel ABI |
+| 传给 Q/DQ 的实际布局 | `[1, B*S*18]` | 只有一个 channel，所以仍只有一个 scale |
+
+换句话说，代码改的是自定义算子的内核选择属性，不是原始量化配置，也没有让每个 token 或每个 feature
+获得独立 scale。
+
+### 66.2 为什么这个 case 会进入 `single_row` 分支
+
+`like-useful/test_dynamic_qdq_runtime_debug-debug.py:1594-1612` 中该参数为：
+
+```python
+shape_id = "symbolic"
+dtype = "int8"
+input_shape = ["B", "S", 18]
+```
+
+测试在 `:1215-1217` 传入的激活配置实际只有 `{"dtype": "int8"}`，没有 `axis` 和 `group_size`。
+`get_quantize_granularity()` 在 `simo/quantization/config.py:229-233` 中把
+`axis is None and group_size is None` 判定为 `PER_TENSOR`。同时，
+`simo/onnx/onnx_quant.py:44` 的 `PER_TENSOR_CHANNEL_KERNEL_DTYPES` 包含 `int8`，所以
+`onnx_quant.py:760-762` 等价于：
+
+```python
+single_row = "int8" in {"fp8_e4m3", "int8"} and granularity == PER_TENSOR
+```
+
+结果必然为 `True`。这个条件根本没有读取 `shape_id` 或 `input_shape`；`symbolic` 不是分支触发原因，末维
+`18` 也不是。`shape_id` 在该测试中主要用于 case 名和 ONNX 快照文件名。
+
+### 66.3 图变换后为什么仍然是 per-tensor
+
+`single_row=True` 后，`onnx_quant.py:764-768` 设置：
+
+```python
+attribute_axis = 0
+attribute_granularity = "per_channel"
+flatten_axis = 0
+alignment = 1
+```
+
+随后 `onnx_quant.py:903-915,963-999` 构造 `Shape -> Flatten -> Q -> DQ -> Reshape`。对本例而言：
+
+```text
+X: [B, S, 18]
+  -> Shape(X) 保存运行时原始形状
+  -> Flatten(axis=0): [1, B*S*18]
+  -> Quantize(per_channel, axis=0)
+  -> Dequantize(per_channel, axis=0)
+  -> Reshape(Shape(X)): [B, S, 18]
+```
+
+per-channel `axis=0` 会保留第 0 维的每一行，并沿第 1 维求 absmax。展平后第 0 维恒为 1，因此：
+
+```text
+per_channel_scale[0]
+  = reduce_absmax(flatten(X)[0, :]) / quant_divisor
+  = reduce_absmax(X) / quant_divisor
+  = per_tensor_scale
+```
+
+量化范围、rounding 和 scale mode 也保持不变，所以逐元素 Q/DQ 结果相同。测试本身在
+`like-useful/test_dynamic_qdq_runtime_debug-debug.py:1223-1228` 也明确使用
+`_reference_int8_per_channel_qdq(tensor.reshape(1, -1)).reshape(tensor.shape)` 作为 INT8 per-tensor 的参考值。
+
+在指定的 `/share_data/users/like/miniconda3/envs/simo_sglang/` 环境中读取并执行该 symbolic ONNX 快照，
+运行时形状实际为：
+
+```text
+matmul_input_simo_rank2:       (1, 108), float32
+matmul_SimoQuantInput:         (1, 108), uint8
+matmul_SimoScale:              (1, 4),   uint8
+matmul_SimoDequantOutput:      (1, 108), float32
+matmul_input_simo_restore:     (2, 3, 18), float32
+```
+
+`matmul_SimoScale` 的 `(1, 4) uint8` 不表示 4 个 scale。插件把 FP32 scale 作为原始字节输出；
+`simo_qdq_ops.cc:176-190,204-210` 对一个 per-channel scale 分配 `sizeof(float) == 4` 个字节。因此这里在
+语义上仍然只有一个 FP32 scale。
+
+### 66.4 为什么不直接保留 `granularity="per_tensor"`
+
+原因是当前 embedded SM90 Q/DQ runtime 没有单独编译 FP8/INT8 per-tensor cubin。
+`simo/onnx/ort_plugin/build_qdq_cubins.py:294-303` 对这两种 dtype 只生成 `per_block` 和
+`per_channel` 两类 kernel；C++ resolver 又按 `dtype + granularity + scale_mode + quant range` 精确匹配
+runtime spec。若图中直接写 `granularity="per_tensor"`，当前 resolver 找不到对应 spec，custom op 会以
+unsupported semantic QDQ config 失败，而不是自动退回某个通用实现。
+
+复用 per-channel kernel 也与 SIMO 的 PyTorch CUDA 路径一致：
+`simo/ops/flex_api.py:777-793` 中的 `per_tensor_downcast_to_fp8_or_int8_cuda_impl()` 同样先执行
+`src_tensor.contiguous().view(1, -1)`，然后调用
+`per_channel_downcast_to_fp8_or_int8_triton(..., axis=0)`，最后恢复原形状。ONNX lowering 只是把这套运行时
+适配显式表达成图节点，使动态 shape 下也能工作，同时避免维护一份计算完全重复的 per-tensor cubin。
+
+### 66.5 symbolic shape 和末维 18 在这里的作用
+
+`B`、`S` 是 symbolic 不会影响等价性。`Shape(X)` 在运行时取得真实尺寸，`Flatten(axis=0)` 不需要预先知道
+`B*S`，最后的 `Reshape` 也使用运行时 shape 恢复。因此同一个模型可以接受不同的 `B` 和 `S`。
+
+末维 `18` 在 INT8 per-tensor 分支中也不会引发 padding。该分支把 `alignment` 强制设为 1；INT8
+per-channel kernel 可以用 mask 处理任意行长度，所以运行时的量化长度是完整的 `B*S*18`。测试名中的
+`with_padding` 同时覆盖 MXINT8 case；MXINT8 使用 block size 32，才需要对不对齐的末维 18 做 Pad/Slice。
+
+综上，这段代码更准确的描述是“把 per-tensor canonicalize 为 single-row per-channel kernel 调用”，而不是
+“把 per-tensor 强行改成多通道量化”。其正确性依赖三个条件必须成套保留：`Flatten(axis=0)`、
+`per_channel(axis=0)` 和 Q/DQ 后按原始运行时 shape 恢复。如果将来增加原生 per-tensor custom kernel，可以
+删除这层 lowering 并在节点属性中保留 `per_tensor`；在当前 kernel 支持矩阵下，现有实现是有意的内核复用。
