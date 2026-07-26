@@ -105,3 +105,16 @@ cute-gemm 仓库位于 /share/users/like/package/cute-gemm
 gemm-multi-stage-like.cu 240~278行进行手动模拟，ntile * nk 次循环 手动展开循环。
 描述循环内部if 语句判断情况，ismem_read, ik_next,itile_to_read,ismem_write,变量变化情况, G2S/S2R cute::copy 时源数据和目标数据所属分片下标，cute::gemm 所属分片的下标
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+
+/softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 17.2 十六次内层迭代的精确时间线这一节, `S2R 源 -> 目标；实际数据` 这一列左边加一列:S2R copy前已经就绪的shared memory的 最大tile id
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+
+对于交替 调用cp.async和 cp.async.wait_group 的情况。如下场景:
+
+10次调用 (cp.async then cp.async.commit_group)
+cp.async.wait_group 1
+
+再 10次调用 (cp.async then cp.async.commit_group)
+cp.async.wait_group 1
+第2次 cp.async.wait_group 1 结束，未完成的cp.async 有几组?
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md

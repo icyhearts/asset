@@ -660,26 +660,26 @@ register slot 0 = tile 0 / fragment 0   // S2R(0, stage 0 -> slot 0)
 
 ### 17.2 十六次内层迭代的精确时间线
 
-“写游标”一列记录 `(itile_to_read, ismem_write)`；`ismem_read` 则在“末片判断”列单独记录。每一行的操作顺序与源码一致：必要时先 wait/sync 并轮转 read stage，然后 S2R，再按条件 G2S 和 fence，最后执行 GEMM。
+“写游标”一列记录 `(itile_to_read, ismem_write)`；`ismem_read` 则在“末片判断”列单独记录。新增的“最大已就绪 tile id”列取 S2R copy 发起前、由 `cp_async_wait<1>()` 明确保证已经就绪的 shared-memory tile 上界；硬件可能提前完成但尚未被 wait 保证的更新 group 不计入。每一行的操作顺序与源码一致：必要时先 wait/sync 并轮转 read stage，然后 S2R，再按条件 G2S 和 fence，最后执行 GEMM。
 
-| # | `(itile,ik)`；`ik_next` | `ik==nk-1`；`ismem_read` 前后 | S2R 源 -> 目标；实际数据 | `ik==0`；`itile_to_read<ntile` | G2S / fence；写游标前后 | `cute::gemm` 实际消费 |
-|---:|---|---|---|---|---|---|
-| 1 | `(0,0)`；1 | 假；`0 -> 0` | `S2R(1,0 -> 1)`；tile 0/f1 | 真；`2<8` 真 | `G2S(2 -> 2)`；有数据 group；`(2,2) -> (3,0)` | tile 0/f0 |
-| 2 | `(0,1)`；0 | 真；wait/sync；`0 -> 1` | `S2R(0,1 -> 0)`；tile 1/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(3,0) -> (3,0)` | tile 0/f1 |
-| 3 | `(1,0)`；1 | 假；`1 -> 1` | `S2R(1,1 -> 1)`；tile 1/f1 | 真；`3<8` 真 | `G2S(3 -> 0)`；有数据 group；`(3,0) -> (4,1)` | tile 1/f0 |
-| 4 | `(1,1)`；0 | 真；wait/sync；`1 -> 2` | `S2R(0,2 -> 0)`；tile 2/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(4,1) -> (4,1)` | tile 1/f1 |
-| 5 | `(2,0)`；1 | 假；`2 -> 2` | `S2R(1,2 -> 1)`；tile 2/f1 | 真；`4<8` 真 | `G2S(4 -> 1)`；有数据 group；`(4,1) -> (5,2)` | tile 2/f0 |
-| 6 | `(2,1)`；0 | 真；wait/sync；`2 -> 0` | `S2R(0,0 -> 0)`；tile 3/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(5,2) -> (5,2)` | tile 2/f1 |
-| 7 | `(3,0)`；1 | 假；`0 -> 0` | `S2R(1,0 -> 1)`；tile 3/f1 | 真；`5<8` 真 | `G2S(5 -> 2)`；有数据 group；`(5,2) -> (6,0)` | tile 3/f0 |
-| 8 | `(3,1)`；0 | 真；wait/sync；`0 -> 1` | `S2R(0,1 -> 0)`；tile 4/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(6,0) -> (6,0)` | tile 3/f1 |
-| 9 | `(4,0)`；1 | 假；`1 -> 1` | `S2R(1,1 -> 1)`；tile 4/f1 | 真；`6<8` 真 | `G2S(6 -> 0)`；有数据 group；`(6,0) -> (7,1)` | tile 4/f0 |
-| 10 | `(4,1)`；0 | 真；wait/sync；`1 -> 2` | `S2R(0,2 -> 0)`；tile 5/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(7,1) -> (7,1)` | tile 4/f1 |
-| 11 | `(5,0)`；1 | 假；`2 -> 2` | `S2R(1,2 -> 1)`；tile 5/f1 | 真；`7<8` 真 | `G2S(7 -> 1)`；有数据 group；`(7,1) -> (8,2)` | tile 5/f0 |
-| 12 | `(5,1)`；0 | 真；wait/sync；`2 -> 0` | `S2R(0,0 -> 0)`；tile 6/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 5/f1 |
-| 13 | `(6,0)`；1 | 假；`0 -> 0` | `S2R(1,0 -> 1)`；tile 6/f1 | 真；`8<8` 假 | 无 G2S；提交空 group；`(8,2) -> (8,2)` | tile 6/f0 |
-| 14 | `(6,1)`；0 | 真；wait/sync；`0 -> 1` | `S2R(0,1 -> 0)`；tile 7/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 6/f1 |
-| 15 | `(7,0)`；1 | 假；`1 -> 1` | `S2R(1,1 -> 1)`；tile 7/f1 | 真；`8<8` 假 | 无 G2S；提交空 group；`(8,2) -> (8,2)` | tile 7/f0 |
-| 16 | `(7,1)`；0 | 真；wait/sync；`1 -> 2` | `S2R(0,2 -> 0)`；stage 2 中旧 tile 5/f0，结果不用 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 7/f1 |
+| # | `(itile,ik)`；`ik_next` | `ik==nk-1`；`ismem_read` 前后 | S2R 前最大已就绪 tile id | S2R 源 -> 目标；实际数据 | `ik==0`；`itile_to_read<ntile` | G2S / fence；写游标前后 | `cute::gemm` 实际消费 |
+|---:|---|---|---:|---|---|---|---|
+| 1 | `(0,0)`；1 | 假；`0 -> 0` | `0` | `S2R(1,0 -> 1)`；tile 0/f1 | 真；`2<8` 真 | `G2S(2 -> 2)`；有数据 group；`(2,2) -> (3,0)` | tile 0/f0 |
+| 2 | `(0,1)`；0 | 真；wait/sync；`0 -> 1` | `1` | `S2R(0,1 -> 0)`；tile 1/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(3,0) -> (3,0)` | tile 0/f1 |
+| 3 | `(1,0)`；1 | 假；`1 -> 1` | `1` | `S2R(1,1 -> 1)`；tile 1/f1 | 真；`3<8` 真 | `G2S(3 -> 0)`；有数据 group；`(3,0) -> (4,1)` | tile 1/f0 |
+| 4 | `(1,1)`；0 | 真；wait/sync；`1 -> 2` | `2` | `S2R(0,2 -> 0)`；tile 2/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(4,1) -> (4,1)` | tile 1/f1 |
+| 5 | `(2,0)`；1 | 假；`2 -> 2` | `2` | `S2R(1,2 -> 1)`；tile 2/f1 | 真；`4<8` 真 | `G2S(4 -> 1)`；有数据 group；`(4,1) -> (5,2)` | tile 2/f0 |
+| 6 | `(2,1)`；0 | 真；wait/sync；`2 -> 0` | `3` | `S2R(0,0 -> 0)`；tile 3/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(5,2) -> (5,2)` | tile 2/f1 |
+| 7 | `(3,0)`；1 | 假；`0 -> 0` | `3` | `S2R(1,0 -> 1)`；tile 3/f1 | 真；`5<8` 真 | `G2S(5 -> 2)`；有数据 group；`(5,2) -> (6,0)` | tile 3/f0 |
+| 8 | `(3,1)`；0 | 真；wait/sync；`0 -> 1` | `4` | `S2R(0,1 -> 0)`；tile 4/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(6,0) -> (6,0)` | tile 3/f1 |
+| 9 | `(4,0)`；1 | 假；`1 -> 1` | `4` | `S2R(1,1 -> 1)`；tile 4/f1 | 真；`6<8` 真 | `G2S(6 -> 0)`；有数据 group；`(6,0) -> (7,1)` | tile 4/f0 |
+| 10 | `(4,1)`；0 | 真；wait/sync；`1 -> 2` | `5` | `S2R(0,2 -> 0)`；tile 5/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(7,1) -> (7,1)` | tile 4/f1 |
+| 11 | `(5,0)`；1 | 假；`2 -> 2` | `5` | `S2R(1,2 -> 1)`；tile 5/f1 | 真；`7<8` 真 | `G2S(7 -> 1)`；有数据 group；`(7,1) -> (8,2)` | tile 5/f0 |
+| 12 | `(5,1)`；0 | 真；wait/sync；`2 -> 0` | `6` | `S2R(0,0 -> 0)`；tile 6/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 5/f1 |
+| 13 | `(6,0)`；1 | 假；`0 -> 0` | `6` | `S2R(1,0 -> 1)`；tile 6/f1 | 真；`8<8` 假 | 无 G2S；提交空 group；`(8,2) -> (8,2)` | tile 6/f0 |
+| 14 | `(6,1)`；0 | 真；wait/sync；`0 -> 1` | `7` | `S2R(0,1 -> 0)`；tile 7/f0 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 6/f1 |
+| 15 | `(7,0)`；1 | 假；`1 -> 1` | `7` | `S2R(1,1 -> 1)`；tile 7/f1 | 真；`8<8` 假 | 无 G2S；提交空 group；`(8,2) -> (8,2)` | tile 7/f0 |
+| 16 | `(7,1)`；0 | 真；wait/sync；`1 -> 2` | `7` | `S2R(0,2 -> 0)`；stage 2 中旧 tile 5/f0，结果不用 | 假；内层条件未求值 | 无 G2S，不 fence；`(8,2) -> (8,2)` | tile 7/f1 |
 
 最后一行的 `S2R(0,2 -> 0)` 不是 global tile 8 的读取。stage 2 最后一次真实写入的是 tile 5，所以这次统一流水路径重新读到旧 tile 5/f0；主循环随即结束，slot 0 不再传给任何 GEMM。
 
@@ -717,3 +717,46 @@ ismem_write   = 2
 ```
 
 16 次 `cute::gemm` 恰好消费 `(tile 0/f0, tile 0/f1, ..., tile 7/f0, tile 7/f1)`：8 个 K tile 的两个 fragment 各参与一次，完整且无重复地覆盖 `K[0,255]`。
+
+## 18. 交替调用 `cp.async` 和 `cp.async.wait_group 1` 时的剩余 group 数
+
+以下按一个执行线程的 per-thread async-group 序列分析。题设中的每个“`cp.async` 后立即 `cp.async.commit_group`”会建立一个只含 1 条 `cp.async` 的 group：
+
+```cpp
+// 第一批
+for (int i = 0; i < 10; ++i) {
+  cp.async(...);
+  cp.async.commit_group();       // G0, G1, ..., G9
+}
+cp.async.wait_group 1;
+
+// 第二批
+for (int i = 0; i < 10; ++i) {
+  cp.async(...);
+  cp.async.commit_group();       // G10, G11, ..., G19
+}
+cp.async.wait_group 1;
+```
+
+### 18.1 直接结论
+
+第二次 `cp.async.wait_group 1` 返回时，未完成的 group 数量是：
+
+```text
+最多 1 组；实际可能是 0 组或 1 组，不能断言恰好是 1 组。
+```
+
+如果把每个 group 中的 `cp.async` 数量也限定为题设中的 1 条，那么“未完成的 `cp.async` 数量”同样是 0 或 1 条。
+
+### 18.2 两次 wait 的状态变化
+
+| 时点 | 已提交的 group | `wait_group 1` 的保证 | wait 返回后允许未完成的 group |
+|---|---|---|---|
+| 第一次 wait 前 | G0--G9，共 10 组 | 除最多 1 个最近 group 外，其余完成 | G9 最多 1 组 |
+| 第一次 wait 后再提交第二批 | G0--G19，共 20 组 | 第二次 wait 不会把 group 计数器“重置”为第二批；它仍针对该线程此前提交的所有 group | 在第二次 wait 返回时，G0--G18 已完成，G19 最多 1 组 |
+
+因此第二次 wait 结束后不是“第一批留 1 组、第二批再留 1 组”，也不是把第一批残留的 1 组加上第二批的 10 组后留下 11 组。完成顺序按提交顺序推进；若确实还有 1 组未完成，只可能是最新的 G19。若 G19 在等待期间也完成，则返回时为 0 组未完成。
+
+`wait_group 1` 的 `1` 是“允许保留的最近 group 数上限”，不是 group 编号，也不是每次调用后固定留下 1 组。需要保证全部历史 copy 完成时，应使用 `cp.async.wait_group 0`（本仓库 `cute::cp_async_wait<0>()` 映射为 `cp.async.wait_all`）。此外，wait 的完成和可见性是 per-thread 的；若其他线程还要读取同一 shared-memory 数据，仍需按算法需要使用 `__syncthreads()` 等 CTA 级同步。
+
+上述语义对应 NVIDIA PTX ISA 对 `cp.async.commit_group` 和 `cp.async.wait_group N` 的定义：`commit_group` 为每个线程建立 group，`wait_group N` 等待到最近的至多 N 个 group 仍可 pending，而更早的 group 全部完成。参见 [NVIDIA PTX ISA：`cp.async.wait_group` / `cp.async.wait_all`](https://docs.nvidia.com/cuda/parallel-thread-execution/#cp-async-wait-group-cp-async-wait-all)。
