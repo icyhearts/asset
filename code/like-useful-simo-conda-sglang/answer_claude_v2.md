@@ -1359,3 +1359,787 @@ def _alloc_post_capture_buffers(self):
 | 不调用有什么后果？ | PD 分离模式下 KV 传输的 `lens`/`item_lens` 会被高估一倍；CUDA-VMM 分配的大小不正确。SIMO 在 `_create_buffers` 中重建了 uint8 缓冲区，如果不重建描述符，描述符仍然反映旧的 float16 buffer 形状，导致后续数据传输或内存操作出现 size mismatch |
 
 **一句话总结**：`self._kv_buffer_descs = self._build_kv_buffer_descs()` 在 SIMO 将 KV buffer 改为 uint8 量化存储后，重新构建缓冲区描述符列表，确保下游的 KV 传输（PD 分离）和 CUDA VMM 内存管理中字节跨度的计算基于正确的 `store_dtype`（uint8）和 buffer 形状（packed + scale 格式）。
+
+---
+
+## 35. DynamicQuantizeLSTM::Compute 计算过程详解（seq_len=5, batch_size=3）
+
+### 35.0 前置背景
+
+#### 35.0.1 调用链
+
+`test-onnx-dynamic-quant-lstm.py` 第 189 行执行：
+
+```python
+cpu_outputs = run_cases("CPU", cpu_session, cases)
+```
+
+遍历 `cases` 时，第一个 case 是 `seq_len=5, batch_size=3`。`session.run()` 触发 ONNX Runtime 执行 DynamicQuantizeLSTM 算子，其调用链如下：
+
+```
+ort.InferenceSession.run("output", "hn", "cn")
+  → DynamicQuantizeLSTM::Compute             (dynamic_quantize_lstm.cc:174)
+    → LSTMBase::ComputeImpl<float, uint8_t>  (lstm_base.cc:22)
+      → UniDirectionalLstm<float>::Compute<uint8_t>  (uni_directional_lstm.cc:626)
+        → UniDirectionalLstm<float>::ComputeImpl<uint8_t>  (uni_directional_lstm.cc:228)
+          → GateComputations                  (uni_directional_lstm.cc:463)
+          → ComputeGemm                       (rnn_helpers.cc:247, for uint8_t weights)
+```
+
+#### 35.0.2 输入张量的具体形状与数值含义
+
+| 输入 | 形状 | dtype | 说明 |
+|---|---|---|---|
+| `X` (input) | `[5, 3, 10]` | float32 | 5 个时间步 × 3 个 batch 元素 × 10 维特征 |
+| `W` (input weights) | `[1, 10, 80]` | **uint8** (量化后) | num_directions=1, input_size=10, 4×hidden_size=80 |
+| `R` (recurrence weights) | `[1, 20, 80]` | **uint8** (量化后) | num_directions=1, hidden_size=20, 4×hidden_size=80 |
+| `B` (bias) | `[1, 160]` | float32 | W 偏置(80) + R 偏置(80) = 160 |
+| `h0` (initial_h) | `[1, 3, 20]` | float32 | 初始隐藏状态 |
+| `c0` (initial_c) | `[1, 3, 20]` | float32 | 初始细胞状态 |
+| `w_scale` | `[1, 80]` | float32 | W 权重的 per-channel scale（80 列各有一个 scale） |
+| `w_zp` | `[1, 80]` | uint8 | W 权重的 per-channel zero_point |
+| `r_scale` | `[1, 80]` | float32 | R 权重的 per-channel scale |
+| `r_zp` | `[1, 80]` | uint8 | R 权重的 per-channel zero_point |
+
+注意：80 = 4 × 20 = hidden_size × 4（4 个门：Input, Output, Forget, Cell）。
+
+输出：
+
+| 输出 | 形状 | dtype | 说明 |
+|---|---|---|---|
+| `output` (Y) | `[5, 3, 20]` | float32 | 每个时间步的隐藏状态 `H_t` |
+| `hn` (Y_h) | `[1, 3, 20]` | float32 | 最后一个时间步的隐藏状态 = `output[4, :, :]` |
+| `cn` (Y_c) | `[1, 3, 20]` | float32 | 最后一个时间步的细胞状态 |
+
+#### 35.0.3 Weights 预打包 (PrePack)
+
+在第一次推理之前，`DynamicQuantizeLSTM::PrePack` 已经将 uint8 的 `W` 和 `R` 通过 `MlasGemmPackB` 预打包成 MLAS 内部格式（`packed_W_`, `packed_R_`），后续 GEMM 直接使用打包好的格式以获得更高性能。
+
+#### 35.0.4 量化参数总结
+
+量化公式（在 `ComputeGemm` 中完成）：
+
+```
+Y_fp32 = (a_scale × w_scale) × [ (A_uint8 - a_zp) × (W_uint8 - w_zp)^T ] + β × C_prev
+```
+
+- 激活 A (float32) → 动态量化 → A_uint8 + a_scale + a_zp（**每次 GEMM 前动态计算**）
+- 权重 W/R 已经预量化为 uint8 + per-channel scale + per-channel zero_point
+- GEMM 在 int32 中累积，最后乘以 scale 转回 float32
+
+---
+
+### 35.1 第一阶段：DynamicQuantizeLSTM::Compute — 参数准备
+
+**源码：** `dynamic_quantize_lstm.cc:174-251`
+
+```
+1. 获取打包后的权重 buffer：
+   - packed_W_.buffer_ 非空 → W = nullptr（使用预打包数据）
+   - packed_R_.buffer_ 非空 → R = nullptr（使用预打包数据）
+
+2. 获取 scale 和 zero_point：
+   - w_scale: [1, 80]，w_zp: [1, 80]   (per-channel)
+   - r_scale: [1, 80]，r_zp: [1, 80]   (per-channel)
+
+3. 验证 scale/zp 形状 (WeightCheck 宏)：
+   - W_scale_shape[0] == 1, W_scale_shape[1] == 80 == 4*hidden_size ✓
+   - 同理验证 R_scale, W_zp, R_zp
+
+4. 确定 signed/unsigned：
+   - is_W_signed = packed_W_.is_W_signed_ → uint8 量化 → false（unsigned）
+   - is_R_signed = packed_R_.is_R_signed_ → false
+
+5. 验证非对称量化的 zero_point (ZeroPointCheck 宏)：
+   - 对于 unsigned 权重，所有 80 列的 zp 必须相等（对 uint8 常量 zero_point 检查）
+   - 对于 signed 权重，zp 必须全为 0（对称量化）
+
+6. 构建量化参数对象：
+   QuantizationParameter quant_para_W_1(w_scale.Data, w_zp.Data, is_W_signed=false, scale_size=80)
+   QuantizationParameter quant_para_R_1(r_scale.Data, r_zp.Data, is_R_signed=false, scale_size=80)
+
+7. 计算每个方向的权重跨度：
+   W_size_per_direction = 10 * 80 = 800
+   R_size_per_direction = 20 * 80 = 1600
+
+8. 构建 GemmWeights 对象：
+   GemmWeights<uint8_t> W_1(0,  nullptr, W_size_per_direction=800,  packed_W_, &quant_para_W_1)
+   GemmWeights<uint8_t> R_1(0,  nullptr, R_size_per_direction=1600, packed_R_, &quant_para_R_1)
+
+   由于 packed_W_.buffer_ 非空，Init() 中：
+     is_prepacked_ = true
+     buffer_ = static_cast<uint8_t*>(packed_W_.buffer_.get()) + 800 * 0
+            = packed_W_.buffer_ 起始地址（direction 0）
+
+9. 单向 LSTM → 不需要 W_2, R_2，直接调用：
+   LSTMBase::ComputeImpl<float, uint8_t>(context, W_1, W_2, R_1, R_2)
+```
+
+---
+
+### 35.2 第二阶段：LSTMBase::ComputeImpl<float, uint8_t> — 输入/输出张量提取
+
+**源码：** `lstm_base.cc:22-178`
+
+```
+1. 提取输入：
+   X:     [5, 3, 10] → seq_length=5, batch_size=3, input_size=10
+   B:     [1, 160]   → bias，每方向 8*20=160
+   h0:    [1, 3, 20] → 初始隐藏状态
+   c0:    [1, 3, 20] → 初始细胞状态
+   P:     nullptr    → 无 peephole 权重
+
+2. 分配输出：
+   Y:   [5, 1, 3, 20]  → 完整的输出序列
+   Y_h: [1, 3, 20]     → 最终隐藏状态 hn
+   Y_c: [1, 3, 20]     → 最终细胞状态 cn
+
+3. 按方向拆分：
+   direction_ == kForward → 单向
+   bias_1 = bias[0:160]
+   initial_hidden_1 = initial_h[0:60]   (1*3*20=60)
+   initial_cell_1 = initial_c[0:60]
+
+4. 创建 UniDirectionalLstm<float> 对象（单向）：
+   UniDirectionalLstm<float> fw(
+     seq_length=5, batch_size=3, input_size=10, hidden_size=20,
+     direction=kForward, ...
+   )
+
+5. 调用 fw.Compute(input, seq_lens, num_directions=1, W_1, R_1, output_1, hidden_output_1, last_cell_1)
+```
+
+---
+
+### 35.3 第三阶段：UniDirectionalLstm::ComputeImpl<uint8_t> — 核心计算
+
+**源码：** `uni_directional_lstm.cc:228-457`
+
+这是 LSTM 计算的核心，下面逐步分解。
+
+#### 35.3.1 初始化
+
+```
+seq_length_ = 5, batch_size_ = 3, input_size_ = 10, hidden_size_ = 20
+direction_ = kForward
+hidden_size_x4 = 80
+total_rows = max_sequence_length * batch_size = 5 * 3 = 15
+
+output_iofc_ 缓冲区（预先分配）:
+  逻辑形状: {hidden_size_, 4, batch_size_, seq_length_} = {20, 4, 3, 5}
+  总元素数: 20 * 4 * 3 * 5 = 1200
+  用途: 按时间步顺序存储每个 step 的 X*W + H*R 结果
+
+分配量化缓冲区:
+  quantized_input_or_a_:  大小 max(5*3*10, 3*20) = max(150, 60) = 150 个 uint8
+  quantized_C_buffer_:    大小 3 * 4 * 20 = 240 个 int32
+```
+
+#### 35.3.2 步骤 A：批量 GEMM — 一次性计算所有时间步的 X*W
+
+```cpp
+// uni_directional_lstm.cc:287-293
+float alpha = 1.0f;
+float beta = 0.0f;   // 第一次 GEMM: 清零输出
+
+ComputeGemm(total_rows=15, hidden_size_x4=80, input_size=10,
+            alpha, inputs,  // A: X[15, 10]
+            input_weights,  // B: W[10, 80]  (uint8, pre-packed)
+            beta,
+            C: output_iofc_, ldc=80,  // C: output_iofc_[15, 80]
+            quantized_input_or_a_,
+            quantized_C_buffer_,
+            thread_pool, ...);
+```
+
+**这次 GEMM 的量化内部流程**（`rnn_helpers.cc:247-317`，`GemmWeights<uint8_t>` 重载）：
+
+```
+1. 动态量化 A 矩阵 (X[15, 10]):
+   a. GetQuantizationParameter(A, 150, a_scale, a_zero_point, thread_pool)
+      → 在 150 个 float 元素中找到 min/max
+      → 计算 a_scale = (max - min) / 255
+      → 计算 a_zero_point = round(-min / a_scale)
+
+   b. ParQuantizeLinearStd(A, quantized_A_buffer, 150, a_scale, a_zp)
+      → 将 150 个 float 元素量化为 uint8
+      → A_uint8[i] = clip(round(A[i]/a_scale) + a_zp, 0, 255)
+
+2. 计算 scale_multiplier (per-column, 80 个):
+   对于每列 s (0..79):
+     scale_multiplier[s] = a_scale * w_scale[s]
+
+3. beta = 0.0 → 使用 MLAS_QGEMM_OUTPUT_MODE::ZeroMode
+   → 输出 C 中先存 int32 累积结果，再乘以 scale 转回 float
+
+4. 调用 MlasGemm:
+   输入:  A_uint8 [15, 10]
+   权重:  W_uint8 [10, 80] (pre-packed)
+   输出:  C[15, 80] = Σ(A_uint8 - a_zp) × (W_uint8 - w_zp) × (a_scale × w_scale)
+```
+
+**结果：**
+
+```
+output_iofc_ = X_mat[15, 10] × W[10, 80]^T
+
+存储布局（一维展开）:
+  output_iofc_[0..239]    = step=0 的 3 个 batch × 80：X[0,0:3,:] * W^T
+  output_iofc_[240..479]  = step=1 的 3 个 batch × 80：X[1,0:3,:] * W^T
+  output_iofc_[480..719]  = step=2 的 3 个 batch × 80：X[2,0:3,:] * W^T
+  output_iofc_[720..959]  = step=3 的 3 个 batch × 80：X[3,0:3,:] * W^T
+  output_iofc_[960..1199] = step=4 的 3 个 batch × 80：X[4,0:3,:] * W^T
+
+每 80 列的组织 (4 个门，每个门 20 维):
+  offset 0..19:   Input Gate  pre-activation (i_gate)
+  offset 20..39:  Output Gate pre-activation (o_gate)
+  offset 40..59:  Forget Gate pre-activation (f_gate)
+  offset 60..79:  Cell Gate   pre-activation (c_gate, block input)
+```
+
+设置 `beta = 1.0f`，后续 `ComputeGemm` 调用将**累加**到已有数据（不再清零）。
+
+#### 35.3.3 步骤 B：确定并行策略
+
+```cpp
+// uni_directional_lstm.cc:306-311
+num_seq_to_compute = batch_size_;   // = 3 (batch_parallel_ 设为 true 但只有一个线程时保持 3)
+```
+
+假设单线程场景或 `num_threads_=1` → `batch_parallel_=true` 但 `num_seq_to_compute=3`，所以 `sequences_calculator(0, ttp)` 一次处理全部 3 个 batch 元素。
+
+#### 35.3.4 步骤 C：时间步循环 (sequences_calculator lambda)
+
+这是最核心的部分。Lambda 进入循环 `for (int step = 0; step < 5; step++)`。
+
+---
+
+##### **Token 0 (step=0)**
+
+```
+1. 获取当前时间步在 output_iofc_ 中的位置:
+   step_out_IOFC = output_iofc_.begin() + (0 * 3 + 0) * 80 = output_iofc_.begin()
+   → 指向 X[0,:]*W 的结果: 3 行 × 80 列
+
+2. 循环 GEMM: H_{t-1} × R → 累加到 X_t*W:
+   previous_state = batched_hidden0_ + 0*20  → 指向 h0[0,0:3,0:20]
+
+   ComputeGemm(num_seq=3, N=80, K=20,
+               alpha=1.0,
+               A: previous_state[3, 20],  // H_{t-1} = h0 (初始隐藏状态)
+               recurrent_weights: R[20, 80],  // 量化 uint8, pre-packed
+               beta=1.0,                 // ← 累加模式!
+               C: step_out_IOFC[3, 80],   // ← 已有 X_t*W
+               ldc=80,
+               quantized_A_buffer: quantized_input_or_a_[0..59],   // 3*20
+               quantized_C_buffer: quantized_C_buffer_[0..239]);   // 3*80
+
+   GEMM 量化内部流程:
+   a. 动态量化 A (H_{t-1}[3, 20]):
+      a_scale = (H_max - H_min) / 255
+      A_uint8[i] = clip(round(H[i]/a_scale) + a_zp, 0, 255)
+
+   b. 计算 per-column scale_multiplier[80]:
+      scale_multiplier[s] = a_scale * r_scale[s]
+
+   c. beta = 1.0 → AccumulateMode:
+      C_temp[3, 80] = int32_matmul   (写入 quantized_C_buffer)
+      C[3, 80] += C_temp × scale     (累加到原有的 X_t*W 上)
+
+   最终 step_out_IOFC[3, 80] = X_t*W + H_{t-1}*R  (对于 step=0 的所有 3 个 batch)
+
+3. 门计算 (GateComputations):
+   batch_output = outputs[0 * 3 * 20] = outputs[0, :, :]  (第一个时间步的输出)
+
+   对每个 batch 元素 b = 0, 1, 2:
+
+   a. 提取 4 个门 (LSTM 的 ONNX 门序为 I, O, F, C):
+      pi = step_out_IOFC[b*80 + 0..19]   (Input gate)
+      po = step_out_IOFC[b*80 + 20..39]  (Output gate)
+      pf = step_out_IOFC[b*80 + 40..59]  (Forget gate)
+      pc = step_out_IOFC[b*80 + 60..79]  (Cell gate / block input)
+
+   b. Input Gate:
+      pi[j] = clip(pi[j] + bias_WRi[j], -clip_, clip_)  // 加偏置并裁剪
+      pi[j] = sigmoid(pi[j])                              // sigmoid 激活
+
+   c. Forget Gate:
+      pf[j] = clip(pf[j] + bias_WRf[j], -clip_, clip_)
+      pf[j] = sigmoid(pf[j])
+
+   d. Cell Gate:
+      pc[j] = clip(pc[j] + bias_WRc[j], -clip_, clip_)
+      pc[j] = tanh(pc[j])
+
+   e. 更新细胞状态 C_t (in-place):
+      C_prev → C_t
+      C_t[j] = C_prev[j] * pf[j] + pi[j] * pc[j]
+
+   f. Output Gate:
+      po[j] = clip(po[j] + bias_WRo[j], -clip_, clip_)
+      po[j] = sigmoid(po[j])
+
+   g. 计算隐藏状态 H_t:
+      C_t_tanh[j] = tanh(C_t[j])
+      H_t[j] = po[j] * C_t_tanh[j]
+
+   h. 将 H_t 写入输出:
+      batch_output[b*20 + j] = H_t[j]
+      → 即 outputs[0, b, j]
+
+4. 更新 previous_state = batch_output + 0*20
+   → 指向 outputs[0, 0, 0] (step=0 的 H_t)
+
+   current state after step 0:
+     C_prev (batched_internal_memory_prev_): C_0  (in-place updated)
+     batched_internal_memory_clipped_[b, :]: tanh(C_0)
+     H_0: outputs[0, :, :]
+```
+
+##### **Token 1 (step=1)**
+
+```
+1. step_out_IOFC = output_iofc_.begin() + (1 * 3 + 0) * 80 = output_iofc_.begin() + 240
+   → 指向 X[1,:]*W 的结果 (已在上面的批量 GEMM 中算好)
+
+2. 循环 GEMM: H_0 × R 累加到 X_1*W:
+   previous_state = outputs[0, :, :] (上一步的 H_0)
+
+   ComputeGemm(3, 80, 20, alpha=1.0,
+               A: H_0[3, 20],         // 上一步的隐藏状态
+               recurrent_weights: R,
+               beta=1.0,
+               C: step_out_IOFC[3, 80])  // 累加到 X_1*W
+
+   结果: step_out_IOFC = X_1*W + H_0*R
+
+3. 门计算: 同上 → 生成 H_1, C_1
+   写入 outputs[1, :, :]
+
+4. previous_state = outputs[1, :, :]
+```
+
+##### **Token 2 (step=2)**
+
+```
+1. step_out_IOFC = output_iofc_.begin() + (2 * 3 + 0) * 80 = output_iofc_.begin() + 480
+
+2. 循环 GEMM: H_1 × R 累加到 X_2*W → 结果写回 step_out_IOFC[3, 80]
+
+3. 门计算 → H_2, C_2 → outputs[2, :, :]
+
+4. previous_state = outputs[2, :, :]
+```
+
+##### **Token 3 (step=3)**
+
+```
+1. step_out_IOFC = output_iofc_.begin() + (3 * 3 + 0) * 80 = output_iofc_.begin() + 720
+
+2. 循环 GEMM: H_2 × R 累加 → step_out_IOFC[3, 80] = X_3*W + H_2*R
+
+3. 门计算 → H_3, C_3 → outputs[3, :, :]
+
+4. previous_state = outputs[3, :, :]
+```
+
+##### **Token 4 (step=4)**
+
+```
+1. step_out_IOFC = output_iofc_.begin() + (4 * 3 + 0) * 80 = output_iofc_.begin() + 960
+
+2. 循环 GEMM: H_3 × R 累加 → step_out_IOFC[3, 80] = X_4*W + H_3*R
+
+3. 门计算 → H_4, C_4 → outputs[4, :, :]
+```
+
+循环结束（step=5 不满足 step < max_sequence_length=5）。
+
+#### 35.3.5 步骤 D：后处理
+
+```
+对于每个 batch 元素 i = 0, 1, 2:
+  seq_len = 5 (因为 sequence_lengths 未提供，默认全部 = seq_length_)
+
+  // 复制最后一个时间步的输出到 final_hidden_state (hn)
+  src = outputs[(5-1) * 3 * 20 + i * 20]  = outputs[4, i, :]
+  dst = final_hidden_state[i * 20]
+  gsl::copy(src, dst)  → Y_h[0, i, :] = H_4[i, :]
+
+// final_cell_state 已在时间步循环中维护:
+//   Y_c[0, i, :] = C_4[i, :]
+
+// max_sequence_length=5 == seq_length_=5 → 不需要 zero-padding
+```
+
+---
+
+### 35.4 计算全景图（数据流与内存布局）
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Phase A: 批量 GEMM                            │
+│                                                                      │
+│  X[5,3,10] ──reshape──> X_mat[15,10]                                 │
+│                           │                                          │
+│                    ┌──────┴──────┐                                    │
+│                    │ Quantize A  │  动态量化: float → uint8           │
+│                    └──────┬──────┘                                    │
+│                           ▼                                          │
+│       ┌───────────────────────────────────┐                           │
+│       │ MlasGemm (uint8 GEMM)             │                           │
+│       │  A_uint8[15,10] × W_uint8[10,80]  │  W 已预量化 + 预打包     │
+│       │  output = int32* + dequant         │                           │
+│       └───────────────┬───────────────────┘                           │
+│                       ▼                                              │
+│  output_iofc_[15, 80]  ← X[t]*W 的结果 (全部 5 步一次性算完)           │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Phase B: 时间步循环 (5 步)                        │
+│                                                                      │
+│  Step 0:                                                             │
+│    ┌─────────┐    ┌──────────────┐    ┌─────────────┐               │
+│    │ h0/c0   │───>│ H0*R + X0*W  │───>│ GateCompute │───> H0, C0   │
+│    │ [3,20]  │    │ (量化 GEMM)   │    │ I/O/F/C 门  │     [3,20]    │
+│    └─────────┘    └──────────────┘    └─────────────┘               │
+│                                                                      │
+│  Step 1:                                                             │
+│    ┌─────────┐    ┌──────────────┐    ┌─────────────┐               │
+│    │ H0, C0  │───>│ H1*R + X1*W  │───>│ GateCompute │───> H1, C1   │
+│    │ [3,20]  │    │ (累加模式)    │    │             │               │
+│    └─────────┘    └──────────────┘    └─────────────┘               │
+│                                                                      │
+│  Step 2-4: 同上, 依次计算 H2-H4, C2-C4                                │
+│                                                                      │
+│  每步的量化 GEMM 都动态量化 H_{t-1}，配合预量化的 R 权重做 int GEMM   │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                  Phase C: 输出                                        │
+│                                                                      │
+│  outputs (Y)   = [5, 3, 20]  ← 堆叠 H0, H1, H2, H3, H4              │
+│  hn (Y_h)      = [1, 3, 20]  ← outputs[4, :, :]  = H4               │
+│  cn (Y_c)      = [1, 3, 20]  ← C4 (最后一步的细胞状态)               │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 35.5 量化 GEMM 调用次数统计
+
+对于 seq_len=5, batch_size=3 的 case：
+
+| GEMM 调用 | 矩阵维度 | 次数 | 说明 |
+|---|---|---|---|
+| 批量 X*W | [15, 10] × [10, 80] | **1** | 一次性计算所有 5 步的 X_t*W |
+| 循环 H*R | [3, 20] × [20, 80] | **5** | 每步一次，累加到对应的 output_iofc_ 区块 |
+| **总计** | | **6** 次 uint8 量化 GEMM | |
+
+注意：是 **6 次** 量化 GEMM，不是 5 次。因为使用了两阶段策略——先用 1 次**大 GEMM** (M=15) 算完所有 X*W，然后在每步循环中用 **小 GEMM** (M=3) 累加上 H*R。这比每步都做 [3,10]×[10,80] + [3,20]×[20,80] 两个独立 GEMM 更高效（利用了更大的 M 维度的计算强度）。
+
+### 35.6 关键代码引用
+
+| 步骤 | 文件:行号 | 说明 |
+|---|---|---|
+| 量化参数构建与校验 | `dynamic_quantize_lstm.cc:190-231` | 验证 W_scale/zp, R_scale/zp 的形状和内容 |
+| GemmWeights 初始化 | `dynamic_quantize_lstm.cc:230-231` | 构建 int8/uint8 权重的 GemmWeights 包装 |
+| ComputeImpl 调用 | `dynamic_quantize_lstm.cc:250` | `LSTMBase::ComputeImpl<float, uint8_t>` |
+| LSTMBase 输入提取 | `lstm_base.cc:32-46` | X, B, h0, c0 的形状解析 |
+| UniDirectionalLstm 创建 | `lstm_base.cc:161-164` | 单向 LSTM 的构造和 Compute 调用 |
+| 批量 X*W GEMM | `uni_directional_lstm.cc:287-293` | 一次性算完所有时间步的 X*W，beta=0 清零 |
+| H*R 循环 GEMM | `uni_directional_lstm.cc:342-349` | 每步累加到对应的 output_iofc_ 区块，beta=1 |
+| 门计算 | `uni_directional_lstm.cc:463-601` | 每步的 I/O/F/C 门 + C_t 更新 + H_t 计算 |
+| 最终 hidden 复制 | `uni_directional_lstm.cc:415-427` | H_last → Y_h (hn 输出) |
+| 量化 GEMM (uint8) | `rnn_helpers.cc:247-317` | A 动态量化 + scale 计算 + MlasGemm |
+| 激活动态量化 | `rnn_helpers.cc:275-277` | GetQuantizationParameter + ParQuantizeLinearStd |
+
+### 35.7 量化精度路径总结
+
+```
+每次量化 GEMM 的数据流:
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 动态量化 A (float32 → uint8)                                 │
+│    A_fp32[i] → A_uint8[i] = clip(round(A_fp32[i]/a_scale)+a_zp) │
+│                                                                 │
+│ 2. GEMM 累积 (int32)                                            │
+│    C_int32[m,n] = Σ (A_uint8[m,k] - a_zp) × (B_uint8[k,n]      │
+│                          - b_zp)                                │
+│                                                                 │
+│ 3. 反量化输出 (int32 → float32)                                 │
+│    C_fp32[m,n] = C_int32[m,n] × (a_scale × b_scale[n])         │
+│                 + (beta × C_prev_fp32[m,n])                     │
+│                                                                 │
+│ 注意: int32 累加器有足够精度，不会溢出                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+整个 LSTM 的计算链路中：
+- **权重端**：W 和 R 在 PrePack 阶段已静态量化为 uint8（离线），scale/zp 固定
+- **激活端**：每次 GEMM 调用**动态**量化输入激活 (X 或 H_{t-1}) 为 uint8（在线）
+- **中间计算**：GEMM 在 int32 中累积，确保没有量化误差在累积过程中被放大
+- **输出**：反量化回 float32，门函数（sigmoid, tanh）在 float32 精度下计算
+
+---
+
+## 36. ONNX Runtime 三种自定义算子实现与注册方式对比
+
+### 36.1 三种方式总览
+
+| 维度 | 方式 A: LiteCustomOp (Struct) | 方式 B: CustomOpBase (Legacy) | 方式 C: ONNX_OPERATOR_TYPED_KERNEL_EX (Internal) |
+|---|---|---|---|
+| **文件** | `simo_qdq_ops.cc` | `simo_qdq_cpu_ops.cc` | `dynamic_quantize_lstm.cc` |
+| **算子名称** | `com.simo::Dequantize` (v2) | `com.simo::Dequantize CPU v1` | `com.microsoft::DynamicQuantizeLSTM` |
+| **Compute 签名** | `Ort::Status Compute(OrtKernelContext&, const Tensor<uint8_t>&, const Tensor<uint8_t>&, Tensor<T>&)` | `void Compute(OrtKernelContext* context)` | `Status Compute(OpKernelContext* context) const` |
+| **基类/基础设施** | `Ort::Custom::OrtLiteCustomStruct` | `Ort::CustomOpBase<Op, Kernel>` | `onnxruntime::OpKernel` |
+| **注册方式** | `Ort::Custom::CreateLiteCustomOp<DequantizeCustomOp<T>>()` + `domain.Add()` | 继承 `CustomOpBase`，`static` 实例化 + `domain.Add()` | `ONNX_OPERATOR_TYPED_KERNEL_EX` 宏 |
+| **Schema 定义** | **自动推断**（从 Compute 的强类型参数） | **手动实现**（GetName, GetInputType, ...） | **手动实现**（KernelDefBuilder + TypeConstraint） |
+| **构建方式** | external（独立 `.so`/`.dll` 或编译进 binary） | external（独立 `.so`/`.dll` 或编译进 binary） | **internal**（必须编译进 ONNX Runtime 源码树） |
+
+### 36.2 方式 C：`ONNX_OPERATOR_TYPED_KERNEL_EX` — Internal Kernel（不推荐用于自定义算子）
+
+```cpp
+// dynamic_quantize_lstm.cc
+Status DynamicQuantizeLSTM::Compute(OpKernelContext* context) const {
+    const Tensor* W = context->Input<Tensor>(1);
+    const Tensor* R = context->Input<Tensor>(2);
+    // ...
+    return LSTMBase::ComputeImpl<float, uint8_t>(*context, W_1, W_2, R_1, R_2);
+}
+
+ONNX_OPERATOR_TYPED_KERNEL_EX(
+    DynamicQuantizeLSTM,
+    kMSDomain, 1, float,
+    kCpuExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::GetTensorType<float>())
+        .TypeConstraint("T1", DataTypeImpl::GetTensorType<int32_t>())
+        .TypeConstraint("T2", {DataTypeImpl::GetTensorType<uint8_t>(),
+                               DataTypeImpl::GetTensorType<int8_t>()}),
+    DynamicQuantizeLSTM);
+```
+
+**这是 ONNX Runtime 内部 kernel 的注册方式**，不是给外部用户使用的。关键特征：
+
+1. **必须与 ONNX Runtime 一起编译**：代码放在 `onnxruntime/contrib_ops/cpu/` 等目录下，是 ORT 源码的一部分
+2. **使用 ORT 内部类型系统**：`OpKernelContext*`、`Tensor`、`TensorShape` 等都是 ORT 内部类，不是 C API
+3. **使用 ORT 内部内存管理**：可以直接使用 `IAllocator`、`AllocatorPtr` 等
+4. **Schema 通过宏定义**：`KernelDefBuilder().TypeConstraint(...)` 手动声明输入输出类型
+5. **生命周期由 ORT 内核管理**：不需要手动 new/delete kernel 实例
+6. **可以访问 ORT 内部功能**：如 PrePack、SharedPrePackedBuffers、ThreadPool 等
+
+**这是"内置算子"的方式，不是"自定义算子"的方式。** 如果你的代码在 ORT 仓库外编译（例如 SIMO 的 `simo_qdq_ops.cc`），就不能使用这种方式。
+
+### 36.3 方式 B：`CustomOpBase` — Legacy External Custom Op（不推荐新代码使用）
+
+```cpp
+// 定义 Op 元信息
+template <typename T>
+class DequantizeCpuDirectOp
+    : public Ort::CustomOpBase<DequantizeCpuDirectOp<T>,
+                                DequantizeCpuDirectKernel<T>, false> {
+ public:
+  DequantizeCpuDirectOp() {
+    this->version = kOrtApiVersion;
+    this->start_ver_ = 2;
+    this->end_ver_ = 2;
+  }
+  void* CreateKernel(const OrtApi& api, const OrtKernelInfo* info) const {
+    return new DequantizeCpuDirectKernel<T>(api, info);  // 手动 new
+  }
+  const char* GetName() const { return "Dequantize"; }
+  const char* GetExecutionProviderType() const { return "CPUExecutionProvider"; }
+  size_t GetInputTypeCount() const { return 1; }          // 手动声明
+  ONNXTensorElementDataType GetInputType(size_t) const { return IoDtype<T>::onnx_type; }
+  size_t GetOutputTypeCount() const { return 2; }         // 手动声明
+  ONNXTensorElementDataType GetOutputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8; }
+};
+
+// 定义 Kernel（实际的 Compute 逻辑）
+template <typename T>
+class DequantizeCpuDirectKernel {
+  void Compute(OrtKernelContext* context) {
+    // 手动通过 C API 获取输入
+    const OrtValue* value = nullptr;
+    Ort::GetApi().KernelContext_GetInput(context, 0, &value);
+    // ...
+  }
+};
+
+// 注册：static 实例 + domain.Add
+static const DequantizeCpuDirectOp<float> dequantize_fp32;
+domain.Add(const_cast<DequantizeCpuDirectOp<float>*>(&dequantize_fp32));
+```
+
+**这是 ORT 的第一代外部自定义算子 API**，基于 `OrtCustomOp` C 结构体。关键特征：
+
+1. **必须手动实现 schema 方法**：`GetName()`, `GetInputTypeCount()`, `GetInputType()`, `GetOutputTypeCount()`, `GetOutputType()` 等全部要手写
+2. **必须手动实现 kernel 生命周期**：`CreateKernel()` 中 `new`，`KernelDestroy` 中 `delete`
+3. **原始 C API 访问数据**：`Compute(OrtKernelContext* context)` 中通过 `Ort::GetApi().KernelContext_GetInput(...)` 等 C API 函数访问输入输出
+4. **Op 必须是 static/全局对象**：`static const DequantizeCpuDirectOp<float> dequantize_fp32;`
+5. **模板参数 `WithStatus=false`**：第 3 个模板参数控制 Compute 是否返回 `Ort::Status`（false → `void`）
+6. **可选的 shape inference**：通过 `static OrtStatusPtr InferOutputShape(Ort::ShapeInferContext&)` 静态方法
+
+**优点**：可以完全控制所有细节，EP 类型、版本号、input/output characteristic 等。
+
+**缺点**：
+- **大量样板代码**：每种 dtype 都要手动写 `GetInputType()` / `GetOutputType()`
+- **手动内存管理**：kernel 的 new/delete
+- **错误处理不统一**：`void Compute()` 模式下只能用异常或提前设置状态
+- **类型不安全**：通过 `KernelContext_GetInput(context, index, &value)` 手动按索引获取，容易写错索引
+
+### 36.4 方式 A：`OrtLiteCustomOp` (Struct-as-op) — 推荐方式
+
+```cpp
+// 一个 struct 包含 constructor + Compute method
+template <typename T>
+class DequantizeCustomOp {
+ public:
+  DequantizeCustomOp(const OrtApi*, const OrtKernelInfo* info) {
+    Ort::ConstKernelInfo kernel_info{info};
+    spec_ = SpecFromKernelInfo(QdqOp::kDequantize, IoDtype<T>::name, kernel_info);
+  }
+
+  // 静态 shape inference
+  static Ort::Status InferOutputShape(Ort::ShapeInferContext& ctx) {
+    return DequantizeShape(IoDtype<T>::name, IoDtype<T>::onnx_type, ctx);
+  }
+
+  // Compute 直接接收强类型参数
+  Ort::Status Compute(
+      OrtKernelContext& context,
+      const Tensor<uint8_t>& quantized,   // 输入0: uint8 tensor (自动解开)
+      const Tensor<uint8_t>& scale,       // 输入1: uint8 tensor (自动解开)
+      Tensor<T>& output) {                // 输出0: T tensor (自动分配)
+    // 直接使用 .Shape(), .Data() 等
+    const auto shape = quantized.Shape();
+    auto* output_data = output.Allocate({outer_dim, quant_dim});
+    // ...
+  }
+
+ private:
+  const QdqRuntimeSpec* spec_ = nullptr;
+};
+
+// 注册：一行代码
+static const std::array<std::unique_ptr<Ort::Custom::OrtLiteCustomOp>, 3> dequantize = {
+    std::unique_ptr<Ort::Custom::OrtLiteCustomOp>{
+        Ort::Custom::CreateLiteCustomOp<DequantizeCustomOp<float>>(
+            "Dequantize", "CUDAExecutionProvider", 2)},
+    // ... 其他 dtype
+};
+for (const auto& op : dequantize) {
+    op->version = kOrtApiVersion;
+    domain.Add(op.get());
+}
+```
+
+**这是 ORT 推荐的第二代外部自定义算子 API**（也称为 Lite Custom Op / V2 Custom Op）。关键特征：
+
+1. **Schema 自动推断**：输入输出类型从 `Compute()` 的参数类型自动推导
+   - `const Tensor<uint8_t>&` → 输入，uint8
+   - `Tensor<T>&` → 输出，`T`
+   - `std::optional<Tensor<T>>` → 可选输入
+2. **强类型 tensor 访问**：`Ort::Custom::Tensor<T>` 提供 `.Data()`, `.Shape()`, `.Allocate()` 等方法
+3. **状态保持**：struct 的成员变量在 kernel 生命周期内保持（`spec_` 等）
+4. **Constructor 接收 `OrtKernelInfo*`**：可以在构造时读取 op 属性
+5. **可选 shape inference**：通过同名静态方法 `InferOutputShape`
+6. **版本号通过注册参数指定**：`CreateLiteCustomOp("Dequantize", "CUDAExecutionProvider", 2)` — 第 3 个参数是 `start_ver`
+
+**LiteCustomOp 还有另一个子模式：Function-as-op (`OrtLiteCustomFunc`)**：
+
+```cpp
+// 如果不需要状态，直接用函数
+void Filter(const Ort::Custom::Tensor<float>& in, Ort::Custom::Tensor<float>& out) {
+    // ...
+}
+
+Ort::Custom::CreateLiteCustomOp("Filter", "CPUExecutionProvider", Filter);
+```
+
+这对无状态操作更加简洁。
+
+### 36.5 三种方式的函数签名为什么不同
+
+```cpp
+// 方式 A: 强类型封装，按参数位置自动映射到 input/output
+Ort::Status Compute(OrtKernelContext& context,
+                   const Tensor<uint8_t>& quantized,  // 第0个输入 → 自动 get_input(0)
+                   const Tensor<uint8_t>& scale,      // 第1个输入 → 自动 get_input(1)
+                   Tensor<T>& output);                // 第0个输出 → 自动 get_output(0)
+
+// 方式 B: 裸 C API，手动按索引获取
+void Compute(OrtKernelContext* context) {
+    KernelContext_GetInput(context, 0, &value);   // 手动指定索引 0
+    KernelContext_GetInput(context, 1, &value);   // 手动指定索引 1
+    KernelContext_GetOutput(context, 0, ...);     // 手动指定索引 0
+}
+
+// 方式 C: ORT 内部框架，使用 ORT 内部 Tensor 类
+Status Compute(OpKernelContext* context) const {
+    context->Input<Tensor>(1);    // 手动指定索引
+    context->Output(0, dims);     // 手动指定索引
+}
+```
+
+**方式 A 的参数都是 `Tensor<T>` 的自动包装**：`OrtLiteCustomStruct` 内部会：
+1. 解析 `Compute` 的签名，统计 input/output 数量和类型
+2. 在 `KernelCompute` lambda 中，按参数位置创建 `Ort::Custom::Tensor<T>` 实例，并传递给 `Compute`
+3. `const Tensor<T>&` = 输入；`Tensor<T>&` / `Tensor<T>*` = 输出
+
+**方式 B 需要手动调用 C API**：所有输入输出通过 `OrtKernelContext*` 和 ORT C API 手动管理。
+
+**方式 C 使用 ORT 内部 API**：`OpKernelContext*` 不是 C API，是 ORT 内部的 C++ 类。
+
+### 36.6 三种注册方式的本质区别
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    注册方式的本质区别                           │
+├──────────────┬─────────────────┬───────────────────────────────┤
+│ 方式 A       │ CreateLiteCustom │ 底层创建一个 OrtLiteCustomOp │
+│ (推荐)       │ Op<Struct>()     │ 对象，继承 OrtCustomOp C 结构│
+│              │ + domain.Add()   │ 体。Schema 自动推断。        │
+├──────────────┼─────────────────┼───────────────────────────────┤
+│ 方式 B       │ 继承 CustomOpBase │ 底层也是一个 OrtCustomOp C   │
+│ (旧，不推荐) │ static 实例     │ 结构体。Schema 手动实现。     │
+│              │ + domain.Add()   │                               │
+├──────────────┼─────────────────┼───────────────────────────────┤
+│ 方式 C       │ ONNX_OPERATOR_   │ 底层注册到 ORT 内部的         │
+│ (仅内部)     │ TYPED_KERNEL_EX  │ KernelRegistry。编译进 ORT    │
+│              │ 宏              │ binary。                      │
+└──────────────┴─────────────────┴───────────────────────────────┘
+```
+
+### 36.7 推荐建议
+
+| 场景 | 推荐方式 | 理由 |
+|---|---|---|
+| **新的外部自定义算子**（独立 `.so`/编译进 host binary） | **方式 A** (`CreateLiteCustomOp`) | Schema 自动推断、强类型、少样板代码 |
+| **已有大量 CustomOpBase 代码** | 保持方式 B，逐步迁移到方式 A | 避免一次性重写风险 |
+| **需要极端性能优化（如自定义 PrePack）** | **方式 C** (`OpKernel`) | 只有内部 kernel 能访问 PrePack/ThreadPool 等内部 API |
+| **集成到 ONNX Runtime 官方仓库** | **方式 C** (`ONNX_OPERATOR_TYPED_KERNEL_EX`) | 官方贡献的唯一方式 |
+| **无状态简单操作** | **方式 A 子模式** (`OrtLiteCustomFunc` — function-as-op) | 比 struct-as-op 更简洁 |
+
+**方式 A 内部还有一个小坑需要注意**：
+
+SIMO 的 `DequantizeCustomOp` 使用的是 `OrtLiteCustomStruct`（struct-as-op），其 `Compute` 方法第一个参数是 `OrtKernelContext& context`。这个 `context` 参数在**纯 `Tensor<T>` 参数**的情况下是多余的——只有在需要手动访问额外上下文时才有用。如果所有输入输出都通过强类型参数传递，可以省略 `OrtKernelContext&` 参数。
+
+例如，官方示例中的纯函数式写法：
+
+```cpp
+// 不需要 context 参数的精简版本
+void Compute(const Ort::Custom::Tensor<float>& in,
+             Ort::Custom::Tensor<float>& out) { ... }
+Ort::Status Compute(const Ort::Custom::Tensor<uint8_t>& in,
+                    Ort::Custom::Tensor<float>& out) { ... return Ort::Status{nullptr}; }
+```
+
+但 SIMO 的 `DequantizeCustomOp::Compute` 保留了 `OrtKernelContext& context` 参数，因为它需要把 context 传给 `LaunchQdqKernel` 以获取 CUDA stream。
+
+### 36.8 一句话总结
+
+> **方式 C（`ONNX_OPERATOR_TYPED_KERNEL_EX`）不是"自定义算子"而是"内置算子"的实现方式，只能用于编译进 ONNX Runtime 源码树的代码。方式 A（`CreateLiteCustomOp`）和方式 B（`CustomOpBase`）都是外部自定义算子的 API，底层都是 `OrtCustomOp` C 结构体，但方式 A 是 ORT 官方推荐的现代方式——它通过模板元编程自动从 C++ 函数签名推断 schema，消除了方式 B 需要手写的大量样板代码。**

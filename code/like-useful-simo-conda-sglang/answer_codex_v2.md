@@ -30,6 +30,7 @@ def _get_and_verify_dtype(config, dtype):
             torch_dtype = config_dtype    # 使用 config 中的 dtype
 ```
 
+
 DSv2-Lite 的 `config.json` 中 `torch_dtype=bfloat16`，所以 SGLang 运行时：
 - **激活值（hidden states）**: bf16
 - **权重**: bf16（未量化时）
@@ -9654,3 +9655,3359 @@ per-channel kernel 可以用 mask 处理任意行长度，所以运行时的量�
 “把 per-tensor 强行改成多通道量化”。其正确性依赖三个条件必须成套保留：`Flatten(axis=0)`、
 `per_channel(axis=0)` 和 Q/DQ 后按原始运行时 shape 恢复。如果将来增加原生 per-tensor custom kernel，可以
 删除这层 lowering 并在节点属性中保留 `per_tensor`；在当前 kernel 支持矩阵下，现有实现是有意的内核复用。
+
+## 67. `test_quant_onnx.sh` 的核心功能、Python 调用链、模型和数据集
+
+### 67.1 直接结论
+
+`/share_data/users/tangdehua/project/jdjv/silero_vad_clean/test_quant_onnx.sh` 的核心功能是：
+
+1. 读取 Silero VAD v5 的浮点 ONNX 模型；
+2. 按 W8A8 MXINT8 配置把模型改写成带 `com.simo::Quantize/Dequantize` 节点的 SIMO Q/DQ ONNX；
+3. 将 AISHELL-4 test 划成 24 个 shard，在 8 张 GPU 上最多并发运行 8 个评测子进程；
+4. 汇总每个 512-sample 音频 chunk 的 speech probability 和 RTTM 标签，计算 ROC-AUC 与
+   `threshold=0.11` 下的 chunk accuracy；
+5. 保存量化模型、分片日志/NPZ、运行元数据和最终 `summary.json`。
+
+因此它是一个“动态 Q/DQ ONNX 量化加多 GPU 精度评测”脚本，不是训练脚本，也不是校准脚本。AISHELL-4
+数据只用于量化后精度评测，不参与生成 scale 的离线校准；激活 scale 在模型运行时动态计算。
+
+完整调用链为：
+
+```text
+test_quant_onnx.sh
+  -> scripts/run_silero_onnx_float_sharded.py
+       -> prepare_model()
+            -> normalize_quant_config()
+            -> simo.onnx.onnx_dynamic_qdq.rewrite_dynamic_qdq()  # 脚本编写时使用的旧 API
+            -> onnx.save(quantized_model.onnx)
+       -> 24 x scripts/evaluate_silero_vad_onnx_float.py
+            -> evaluate_silero_vad_public_v5.SileroVadOnnx
+            -> iter_aishell4()/load_audio()/labels_from_segments()
+            -> ONNX Runtime CUDA 推理
+            -> 每个 shard 写一个 NPZ 和日志
+       -> aggregate_results()
+       -> summary.json
+```
+
+### 67.2 Shell 脚本具体传了什么参数
+
+`test_quant_onnx.sh:4-18` 的默认值如下：
+
+| 项目 | 默认值 | 含义 |
+| --- | --- | --- |
+| Python | `python` | 可通过 `PY` 覆盖；子进程继续使用同一个 `sys.executable` |
+| 主 Python | `scripts/run_silero_onnx_float_sharded.py` | 量化、分片调度和结果聚合 |
+| 浮点模型 | `onnx_float_baseline/silero_vad.onnx` | Silero VAD v5 ONNX |
+| 数据集 | `aishell4` | 只评测 AISHELL-4 test |
+| GPU | `0,1,2,3,4,5,6,7` | 8 张卡 |
+| shard | `24` | 文件按索引模 24 分片 |
+| worker | `8` | 最多同时运行 8 个 shard 子进程 |
+| 量化配置 | `quant_schema/w8a8_mx/w_mxint8_a_mxint8.json` | 权重和激活都使用 MXINT8 |
+| ORT custom op | `/tmp/simo_ort_plugin_build/libSimoOnnxCustomOps.so` | 执行 `com.simo` Q/DQ 节点 |
+| Triton manifest | `/tmp/simo_mxint8_cubins/simo_mxint8_sm90.manifest.tsv` | custom op 查找 SM90 kernel |
+| 输出目录 | `logs/onnx_quant_aishell4_24shards` | 模型、日志、NPZ 和汇总结果 |
+
+`test_quant_onnx.sh:20-24` 会先检查模型、配置、custom-op `.so` 和 manifest 是否存在，然后导出
+`SIMO_ONNX_TRITON_MANIFEST`。默认 `FORCE=--no-skip-existing`，所以已有 shard 结果也会重新计算。
+`MAX_FILES_PER_DATASET=0` 和 `LIMIT_SECONDS=0` 表示不限制文件数、不截短音频，即运行完整数据集。
+
+模型和 Python 脚本使用相对路径，而 shell 本身没有 `cd`，所以按默认值运行时当前目录应当是
+`/share_data/users/tangdehua/project/jdjv/silero_vad_clean`，否则最先执行的 `test -f "$MODEL"` 就可能失败。
+
+### 67.3 第一层 Python：量化、分片调度和聚合
+
+直接调用的是：
+
+```text
+/share_data/users/tangdehua/project/jdjv/silero_vad_clean/
+  scripts/run_silero_onnx_float_sharded.py
+```
+
+虽然文件名带 `float_sharded`，但它同时支持传入 `--quant-config`。本 shell 一定会传该参数，因此会先进入
+`prepare_model()`，而不是直接评测浮点模型。
+
+#### 量化模型准备
+
+`run_silero_onnx_float_sharded.py:134-161` 执行以下过程：
+
+1. 校验浮点 ONNX、量化 JSON 和 custom-op library；
+2. 将输出模型路径切换为 `logs/onnx_quant_aishell4_24shards/quantized_model.onnx`；
+3. 调用 `normalize_quant_config()`；
+4. 调用脚本编写时的 `rewrite_dynamic_qdq(source_model, config_path)`；
+5. 用 `onnx.save()` 保存改写后的模型。
+
+原始量化配置是：
+
+```text
+Conv2d/Conv3d:
+  input  = mxint8, dynamic, axis=1
+  weight = mxint8, dynamic, axis=1
+
+Linear:
+  input  = mxint8, dynamic
+  weight = mxint8, dynamic
+```
+
+`normalize_quant_config()` 会把 PyTorch 模块名转换为 ONNX op type：
+
+```text
+Conv1d/Conv2d/Conv3d -> Conv
+Linear               -> MatMul, Gemm
+```
+
+已有的 2026-07-03 量化产物显示，最终模型在 8 kHz 和 16 kHz 两个 `If` 分支中分别改写了 4 个
+`Conv`：encoder 的第 1、2、3 个卷积和 decoder 的输出卷积。每个分支有 4 个 activation
+`Quantize`、4 个 activation `Dequantize` 和 4 个 weight `Dequantize`，全模型合计：
+
+```text
+com.simo::Quantize   8
+com.simo::Dequantize 16
+```
+
+STFT Conv、encoder 第 0 个 Conv 没有出现在该量化产物的 Q/DQ 集合中；模型内部使用 ONNX `LSTM`，没有
+可匹配的 `MatMul/Gemm` 节点。因此“配置目标包含 Conv/MatMul/Gemm”不等于该具体模型中的所有计算都被量化。
+
+#### 分片与并发
+
+`build_tasks()` 创建 `shard_000` 到 `shard_023`，设备按 `index % 8` 分配。`run_task()` 为每个任务设置：
+
+```text
+CUDA_VISIBLE_DEVICES=<对应物理 GPU>
+```
+
+然后通过 `subprocess.run()` 调用 evaluator。`ThreadPoolExecutor(max_workers=8)` 只负责并发启动和等待子进程；
+真正的 ONNX 推理在子进程中完成。AISHELL-4 这里只有 20 个文件，所以 shard 0-19 各处理 1 个文件，
+shard 20-23 为空；使用 24 个 shard 并不会把单个长音频切成 24 份。
+
+每完成一个 shard，主进程都会更新 `shard_summary.json`。全部成功后，`aggregate_results()` 按数据集拼接
+各 NPZ 中的 `labels` 和 `scores`，重新计算全局指标并写入 `summary.json`。
+
+### 67.4 第二层 Python：单个 shard 的 ONNX VAD 评测
+
+每个 shard 实际调用：
+
+```text
+/share_data/users/tangdehua/project/jdjv/silero_vad_clean/
+  scripts/evaluate_silero_vad_onnx_float.py
+```
+
+它又导入同目录的 `evaluate_silero_vad_public_v5.py`，复用数据集、音频、标签和 ONNX wrapper。
+
+主要流程是：
+
+1. 以 `CUDAExecutionProvider, CPUExecutionProvider` 创建 ONNX Runtime session；
+2. 把 SIMO custom-op library 注册到 `SessionOptions`，从而加载量化模型中的 Q/DQ 节点；
+3. 遍历 AISHELL-4 文件，只处理满足 `file_index % num_shards == shard_index` 的文件；
+4. 加载音频、转单声道，并在需要时重采样到 16 kHz；
+5. 对每个文件重置 LSTM state 和上下文，逐窗口运行 Silero VAD；
+6. 从 RTTM speech interval 生成同长度的 chunk label；
+7. 保存每个 chunk 的布尔标签和浮点 probability 到 shard NPZ；
+8. 计算 ROC-AUC 和 `probability >= 0.11` 的 chunk accuracy。
+
+16 kHz 路径每次读取 512 个新采样点，即 32 ms；wrapper 在前面拼接 64 个历史 context sample，因此送入
+ONNX 的 `input` 长度是 576。显式 recurrent state 的形状初始化为 `(2, 1, 128)`，每次
+`session.run()` 后更新 state 和 64-sample context。末尾不足 512 samples 的音频会补零。
+
+注意：最终 JSON 的 `implementation` 固定写成 `onnxruntime_gpu_float_baseline_sharded`。这是复用浮点
+baseline runner 遗留的标签；本 shell 传了 `--quant-config` 后，实际 session 加载的是生成的量化模型，
+不能根据这个字段把本次运行误判成浮点评测。
+
+### 67.5 使用的模型
+
+输入模型是：
+
+```text
+/share_data/users/tangdehua/project/jdjv/silero_vad_clean/
+  onnx_float_baseline/silero_vad.onnx
+```
+
+本地核对结果：
+
+```text
+模型：   Silero VAD v5
+大小：   2,327,524 bytes
+SHA256： 2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f
+输入：   input(float), state(float), sr(int64)
+输出：   output speech probability, stateN
+采样率： 支持 8 kHz 和 16 kHz；本脚本默认使用 16 kHz
+```
+
+它与项目中的 `weights/silero_vad.onnx` 字节完全相同。配套 TorchScript archive 的根目录名是
+`VADr_v5`，项目恢复代码也明确将其描述为 Silero VAD v5，因此这里可以确定是 v5，而不是仅凭 evaluator
+文件名推测。模型结构包含 STFT convolution、四层 convolution encoder、128 hidden-size LSTM 和
+Conv/Sigmoid speech-probability decoder。
+
+真正参与评测的模型则是它经 W8A8 MXINT8 Q/DQ 改写后的：
+
+```text
+logs/onnx_quant_aishell4_24shards/quantized_model.onnx
+```
+
+已有产物的 SHA256 为 `611a851551aa7ad26ed3adc85cf5a5ce366856ed096f4d06887ded3a3011b477`。
+
+### 67.6 使用的数据集
+
+默认只使用 **AISHELL-4 test split**，不是 AISHELL-1，也不是多个数据集混跑。下载来源定义为 Hugging Face
+仓库 `AISHELL/AISHELL-4`，对应 OpenSLR 111 的公开 test split。本地目录是：
+
+```text
+/share/mtang/work/JD/test/silero/data/public_official_v5/
+  extracted/aishell4_hf/test/
+    wav/*.flac
+    TextGrid/*.rttm
+    TextGrid/*.TextGrid
+```
+
+本地数据规模为：
+
+```text
+音频文件：20 个 FLAC
+RTTM：    20 个
+TextGrid：20 个
+总时长：  12.7253036 小时
+```
+
+`iter_aishell4()` 优先读取同名 RTTM，把所有 speaker interval 合并成 VAD speech union；没有 RTTM 时才
+退回 TextGrid 的所有 tier union。音频若为多声道会先按通道求平均，随后重采样到 16 kHz。一个 512-sample
+chunk 只要与 speech interval 有重叠，就被标成 speech。该规则生成了 1,431,607 个 chunk 标签。
+
+### 67.7 已有运行结果说明
+
+项目中保留了一次 2026-07-03 的完整运行结果：
+
+| 模型 | 文件 | 小时 | chunks | ROC-AUC | Acc@0.11 | errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 浮点 ONNX | 20 | 12.7253 | 1,431,607 | 0.947480 | 0.835417 | 0 |
+| W8A8 MXINT8 Q/DQ ONNX | 20 | 12.7253 | 1,431,607 | 0.947213 | 0.834620 | 0 |
+
+这些是已有日志中的历史结果，不是本次重新执行全量 12.7 小时数据得到的结果。它们也说明该脚本关注的是
+量化后 VAD 精度；量化模型相对浮点模型的 ROC-AUC 和 accuracy 只发生了小幅下降。
+
+### 67.8 当前指定 conda 环境下的可运行性
+
+截至 2026-07-27，在用户指定的：
+
+```text
+/share_data/users/like/miniconda3/envs/simo_sglang/
+```
+
+中，`simo` 实际解析到：
+
+```text
+/share/users/like/package/simo_conda_sglang/simo/__init__.py
+```
+
+按当前状态直接运行这个 shell 会遇到两个阻塞：
+
+1. 默认的 `/tmp/simo_ort_plugin_build/libSimoOnnxCustomOps.so` 和
+   `/tmp/simo_mxint8_cubins/simo_mxint8_sm90.manifest.tsv` 当前均不存在，shell 会先在
+   `test_quant_onnx.sh:22-23` 退出；
+2. 当前 SIMO 已没有 `simo.onnx.onnx_dynamic_qdq`，所以旧导入
+   `from simo.onnx.onnx_dynamic_qdq import rewrite_dynamic_qdq` 无法成功。当前公开入口是
+   `simo.onnx.quantize()`，底层为 `simo.onnx.onnx_quant.apply_qdq_quantization()`；而且当前 API 明确拒绝
+   旧的 `targets_op_types` 字段，所以不能只改 import，还必须同步移除脚本的旧配置归一化方式。
+
+已有 2026-07-03 日志使用的是
+`/share_data/users/tangdehua/miniconda3/envs/vllm/bin/python`，且当时 `/tmp` 下的 custom-op 和 manifest
+仍然存在。因此，历史日志证明这套旧调用链曾经跑通，但不代表它在当前指定 conda 环境中仍可原样运行。
+
+综上，这个脚本的目标可以概括为：
+
+```text
+  Silero VAD v5 浮点 ONNX
+  -> SIMO W8A8 MXINT8 动态 Q/DQ 图改写
+  -> ONNX Runtime CUDA + SIMO custom ops
+  -> AISHELL-4 test 全量、多 GPU、24-shard 评测
+  -> ROC-AUC / Acc@0.11 汇总
+```
+
+## 68. 当前 editable SIMO 的 custom-op `.so` 与 `SIMO_ONNX_TRITON_MANIFEST`
+
+本节针对用户指定的环境和文件核对：
+
+```text
+Python 环境：/share_data/users/like/miniconda3/envs/simo_sglang/
+源码：      /share/users/like/package/simo_conda_sglang
+目标库：    /share_data/users/like/package/simo_conda_sglang/
+            simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+### 68.1 直接结论
+
+| 问题 | 结论 |
+| --- | --- |
+| 这个 `.so` 能否传给 `CUSTOM_OP_LIBRARY` | **可以**。它是当前 editable SIMO 生成的 sm90 ONNX Runtime custom-op library，路径可直接作为旧 shell 的 `CUSTOM_OP_LIBRARY` 值，也可传给 `SessionOptions.register_custom_ops_library()`。 |
+| 当前 SIMO 是否需要 `SIMO_ONNX_TRITON_MANIFEST` | **不需要**。当前 v2 构建把 Triton cubin 和 kernel resolver 嵌入 `.so`，运行时不查找 manifest、外部 cubin 或 Triton cache。 |
+| 当前版本怎样构建 manifest | **没有这个构建步骤**。`build_qdq_cubins.py` 生成的是临时的 `embedded_qdq_kernels_sm90.cc`，随后与 C++ custom-op 源码一起链接进 `.so`；它有意不生成 `*.manifest.tsv`。 |
+| 旧 `test_quant_onnx.sh` 中的 manifest 检查是否代表 SIMO 的真实要求 | 不代表。那是旧脚本自己的 `test -f` 和 `export`，不是当前 plugin 的运行时 ABI 要求。 |
+
+### 68.2 `.so` 的实际验证
+
+目标文件已存在，大小为 `6,185,008` bytes，SHA256 为：
+
+```text
+1e9ceb9ae10a2babce7ea63124dfbb4de050547af1da9840e46a99259ae2eb79
+```
+
+它是 x86-64 ELF shared object，动态依赖均可解析，并导出 ONNX Runtime 要求的：
+
+```text
+RegisterCustomOps@@VERS_1.0.0
+```
+
+当前机器上的 GPU 是 H100，compute capability 为 `9.0`，所以库名中的 `sm90` 与硬件匹配。
+`/share_data/users/like/package/...` 和 editable 源码显示的 `/share/users/like/package/...` 是同一设备、
+同一 inode 的两个挂载路径；因此 Python 返回的另一种路径前缀不是另一份库。
+
+在指定环境中实际执行下面的注册调用成功：
+
+```python
+import onnxruntime as ort
+
+options = ort.SessionOptions()
+options.register_custom_ops_library(
+    "/share_data/users/like/package/simo_conda_sglang/"
+    "simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so"
+)
+```
+
+因此旧 shell 的变量可以这样设置：
+
+```bash
+export CUSTOM_OP_LIBRARY=/share_data/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+需要区分两个变量的作用：`CUSTOM_OP_LIBRARY` 是 `test_quant_onnx.sh` 自己定义并通过
+`--custom-op-library` 传给 Python 的变量；SIMO 公共 runtime 直接读取的覆盖变量名称是
+`SIMO_ONNX_CUSTOM_OPS_LIBRARY`：
+
+```bash
+export SIMO_ONNX_CUSTOM_OPS_LIBRARY=/share_data/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+也可以显式使用当前 Python API：
+
+```python
+import onnxruntime as ort
+import simo.onnx as sx
+
+options = ort.SessionOptions()
+sx.register_custom_ops(
+    options,
+    library_path="/share_data/users/like/package/simo_conda_sglang/"
+    "simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so",
+)
+```
+
+### 68.3 重要的版本兼容性：能注册不等于能加载任意旧模型
+
+该库的注册入口可用，但它对应当前 SIMO ONNX QDQ **v2**。源码中的
+`simo/onnx/onnx_quant.py` 将 domain opset 设为 `com.simo` version `2`，当前 custom-op C++ 注册的
+`Quantize/Dequantize` 也只使用 version `2`。
+
+已有的旧 Silero 量化模型（2026-07-03 产物）导入的是：
+
+```text
+('', 16), ('com.simo', 1)
+```
+
+用当前 `.so` 加载它时，ORT 报：
+
+```text
+TypeInferenceError: com.simo:Dequantize(-1) is not a registered function/op
+```
+
+这说明以下两件事要分开看：
+
+```text
+CUSTOM_OP_LIBRARY 路径正确       -> ORT 能找到并注册 .so
+旧 v1 ONNX 图 + 当前 v2 .so      -> 版本不匹配，仍然不能运行
+```
+
+当前旧量化配置还存在两个迁移问题：
+
+1. `/share_data/tangdehua/.../w_mxint8_a_mxint8.json` 中的 weight `is_dynamic` 为 `true`，而当前
+   QDQ v2 要求 weight `is_dynamic` 必须为 `false`；
+2. 当前 API 拒绝 `targets_op_types`，统一使用 `targets`。旧脚本的配置归一化代码会生成这个已废弃字段。
+
+所以，仅把 `CUSTOM_OP_LIBRARY` 改成上述 `.so`，并不能使旧版
+`from simo.onnx.onnx_dynamic_qdq import rewrite_dynamic_qdq` 调用链恢复。正确迁移方向是使用当前
+`simo.onnx.quantize()` 重新生成 v2 ONNX 图。例如，配置迁移的最小原则是：
+
+```python
+for module in config["module_configs"]:
+    module["weight"]["is_dynamic"] = False
+    module.pop("targets_op_types", None)
+# 目标类型放在 module["targets"] 中
+```
+
+用这个原则生成的图包含 `('com.simo', 2)`，再注册上述 `.so` 后，已在当前 H100 上成功创建
+CUDA/CPU ORT session 并完成一次推理。也就是说，当前库和当前 v2 量化器是可配套工作的；旧 v1 图需要
+重新量化，不能靠 manifest 或改环境变量修复。
+
+### 68.4 当前版本的 Triton kernel 构建链
+
+当前代码的实际链路是：
+
+```text
+build_sm90_runtime(output_path)
+  -> 临时目录中调用 build_qdq_cubins(build_dir)
+  -> Triton AOT 编译 sm90 kernel
+  -> 生成 embedded_qdq_kernels_sm90.cc
+  -> 与 custom_op_library.cc、simo_qdq_ops.cc、
+     simo_qdq_cpu_ops.cc、triton_loader.cc 一起用 C++17 链接
+  -> 输出 libSimoOnnxCustomOps_sm90.so
+  -> 删除临时目录
+```
+
+生成的 C++ 文件中保存 cubin 字节数组、符号名、shared-memory/grid 元数据和精确的 runtime resolver。
+`triton_loader.cc` 运行时对内存中的 cubin 数据调用 CUDA Driver API 的 `cuModuleLoadData`，而不是按路径
+打开 `*.cubin` 或 `*.manifest.tsv`。
+
+仓库测试也把这个契约写死了：`test_qdq_cubin_build.py` 断言输出为
+`embedded_qdq_kernels_sm90.cc`，并断言临时目录中没有任何 `*.manifest.tsv` 和 `*.cubin`。README 的
+v2 scope 也明确写着：runtime packaging 不包含 manifest 或 external cubin paths。
+
+### 68.5 如果需要重建当前 `.so`
+
+editable 安装的标准做法是在源码根目录使用指定解释器重新安装：
+
+```bash
+cd /share/users/like/package/simo_conda_sglang
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python -m pip install -e . --no-build-isolation
+```
+
+`setup.py` 的 editable/inplace 分支会把结果写回：
+
+```text
+simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+只想调用 ONNX runtime builder 时也可以：
+
+```bash
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python - <<'PY'
+from simo.onnx.ort_plugin.build_runtime import build_sm90_runtime
+
+print(build_sm90_runtime(
+    "/share_data/users/like/package/simo_conda_sglang/"
+    "simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so"
+))
+PY
+```
+
+构建机需要 C++17 编译器、CUDA headers、Triton，以及可链接的 CUDA driver library；目标架构固定为
+sm90。这个过程仍然不会产生 manifest。当前目标文件已经存在且验证通过，没有必要为了设置
+`SIMO_ONNX_TRITON_MANIFEST` 再重复构建。
+
+### 68.6 旧 shell 应怎样修改
+
+`test_quant_onnx.sh` 目前有：
+
+```bash
+test -f "$SIMO_ONNX_TRITON_MANIFEST"
+export SIMO_ONNX_TRITON_MANIFEST
+```
+
+这两行以及变量默认值属于旧调用链。迁移到当前 SIMO 时应删除 manifest 变量、文件检查和 export，只保留
+custom-op library 检查，并把库路径传给当前量化/评测 Python 代码。例如 shell 层可以保留：
+
+```bash
+CUSTOM_OP_LIBRARY=/share_data/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+test -f "$CUSTOM_OP_LIBRARY"
+```
+
+然后在 Python 中改用 `simo.onnx.quantize()` 生成 v2 图，并通过
+`register_custom_ops(options, library_path=...)` 注册该库。不能只创建一个空的
+`simo_mxint8_sm90.manifest.tsv` 来绕过 shell 检查，因为当前旧 Python import、旧 v1 图和 v2 plugin
+仍然不兼容；空文件也不会提供任何 kernel 元数据。
+
+如果必须继续运行某个真正依赖 manifest 的历史 plugin，则必须同时找回与该 plugin、ONNX
+`com.simo` opset 版本和 Triton kernel ABI 匹配的旧源码及生成器。当前 checkout 中没有可调用的
+manifest 生成器，不能用当前 `build_qdq_cubins.py` 生成一个可供旧 plugin 使用的 manifest。
+
+### 68.7 最终判断
+
+```text
+当前 .so：       可以直接作为 CUSTOM_OP_LIBRARY
+当前 SIMO API：  可用 SIMO_ONNX_CUSTOM_OPS_LIBRARY 覆盖路径
+manifest：       当前 v2 不需要，也没有构建步骤
+旧 shell：       需删除 manifest 硬检查，并迁移旧 quantize/import/config
+旧 v1 ONNX：     不能直接配当前 v2 .so，必须重新生成
+```
+
+---
+ 
+## 69. Silero VAD 浮点与量化 ONNX 的 AISHELL-4 评测对比
+ 
+### 69.1 结论
+ 
+有模型评价指标，而且两个 24-shard 运行都成功完成。结果文件分别是：
+ 
+```text
+浮点: /share/users/like/package/jdjv/silero_vad_clean/logs/onnx_float_baseline_aishell4_24shards/summary.json
+量化: /share/users/like/package/jdjv/silero_vad_clean/logs/onnx_quant_aishell4_24shards/summary.json
+```
+ 
+两次运行使用相同的 AISHELL-4 数据、16 kHz、24 个 shard、阈值 0.11。逐 shard 合并后的标签数组完全一致，都是 20 个音频文件、12.725304 小时、1,431,607 个 chunk，且两次 errors 都为 0。因此下面的差异是模型输出差异，而不是数据或分片数量差异。
+ 
+| 模型 | ROC-AUC | Accuracy@0.11 | 文件 | 小时 | chunks | errors |
+|---|---:|---:|---:|---:|---:|---:|
+| 浮点 ONNX | 0.947480 (94.7480%) | 0.835417 (83.5417%) | 20 | 12.725304 | 1,431,607 | 0 |
+| 量化 ONNX | 0.946729 (94.6729%) | 0.828048 (82.8048%) | 20 | 12.725304 | 1,431,607 | 0 |
+ 
+简要判断：量化后 ROC-AUC 只下降 0.000751，即 0.0751 个百分点，排序能力几乎保持；固定阈值 0.11 下 Accuracy 下降 0.007369，即 0.7369 个百分点，属于可见但不大的损失。量化模型仍然可以正常执行 CUDA 和 com.simo Q/DQ custom ops。
+ 
+### 69.2 评测设置和产物核对
+ 
+- 浮点模型 SHA256：2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f
+- 量化模型 SHA256：ace6f9fdd081f014274d422d2e4c560d52219559a51029258a049aee37e7dbe2
+- 两次日志都显示 CUDAExecutionProvider 已激活。
+- 量化日志显式注册了 /share_data/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so。
+- 当前量化模型导入 com.simo opset 2，递归检查得到 12 个 com.simo::Quantize 和 24 个 com.simo::Dequantize 节点。
+- 只有 20 个 AISHELL-4 文件，所以 shard 20 到 23 没有文件是正常的空 shard；它们状态仍为 done，不是失败。
+ 
+量化目录里的 implementation 和 evaluator 输出中的 Backend: ONNXRuntime float baseline 是复用评测器留下的通用文案，不表示它加载了浮点模型。应以日志中的 ONNX model: 路径和 custom-op library 路径为准；量化运行实际加载的是 quantized_model.onnx。
+ 
+### 69.3 指标含义
+ 
+#### ROC-AUC
+ 
+这是不依赖某一个分类阈值的排序指标。脚本把每个 512-sample 窗口（16 kHz 下约 32 ms）的模型输出分数与参考语音片段重叠生成的二值标签进行比较，再计算 ROC 曲线下面积。
+ 
+直观地说，浮点模型 ROC-AUC=0.94748 表示随机抽取一个真实语音 chunk 和一个非语音 chunk 时，模型把语音 chunk 排在更高分的概率约为 94.75%（忽略并列分数的细节）。它不是“94.75% 的分类准确率”，也不对应某个固定阈值。
+ 
+量化模型的 0.946729 与浮点模型非常接近，说明量化主要保留了语音/非语音的相对排序；如果应用会重新选择阈值，AUC 通常比单个固定阈值的 Accuracy 更能反映模型本身的区分能力。
+ 
+#### Accuracy@0.11
+ 
+这是阈值相关的 chunk-level 准确率，脚本的计算式是：
+ 
+```text
+prediction = (model_score >= 0.11)
+Accuracy = 正确预测的 chunk 数 / 全部 chunk 数
+```
+ 
+浮点模型在该阈值下正确率为 83.5417%，量化模型为 82.8048%。这个值会受到阈值和语音/非语音类别比例影响，不能直接等同于 F1、precision、recall、DER，也不是按文件取平均的准确率；长音频包含的 chunk 更多，会对总体值贡献更多。
+ 
+#### errors
+ 
+errors=0 表示音频读取、ONNX 推理和结果写入过程中没有异常。它不是预测错误数，也不能替代 Accuracy 或 AUC。
+
+summary.json 原生保存的预测指标是 roc_auc 和 accuracy；precision、recall、F1 不会直接写入 summary，本节 69.4 的混淆矩阵和派生指标是从 shard NPZ 的 labels/scores 按同一阈值计算得到的。
+
+日志中的 official_roc_auc=0.94 和 official_accuracy=0.85 是代码内置的 AISHELL-4 参考值。尤其官方 Accuracy 使用了私有验证集选择的阈值，而本次脚本固定使用 0.11，所以这些数值只能作为方向性参考，不能当作完全同协议的严格复现基准。
+ 
+### 69.4 量化损失的具体表现
+ 
+在相同 1,431,607 个 chunk 上比较 NPZ：
+ 
+| 指标 | 浮点 | 量化 | 量化 - 浮点 |
+|---|---:|---:|---:|
+| ROC-AUC | 0.947480001 | 0.946729208 | -0.000750793 (-0.0751 pp) |
+| Accuracy@0.11 | 0.835417122 | 0.828047781 | -0.007369341 (-0.7369 pp) |
+| score 平均值 | 0.621341 | 0.611784 | -0.009557 |
+| 浮点/量化 score 相关系数 | - | 0.999094 | - |
+| 阈值判定不同的 chunk | - | 11,966 / 1,431,607 (0.8358%) | - |
+ 
+按阈值 0.11 展开混淆矩阵后：
+ 
+```text
+                 TP         TN       FP       FN       Recall      Precision
+浮点         1,073,279   122,710    7,185   228,433    82.4513%     99.3350%
+量化         1,062,251   123,188    6,707   239,461    81.6041%     99.3726%
+```
+ 
+量化后 FP 减少 478 个，但 FN 增加 11,028 个，所以固定阈值下整体 Accuracy 下降；这也说明量化分数整体略向下，模型变得稍微更保守。Precision 略升、Recall 下降，是这次 Accuracy 损失的主要形态，而不是所有类别都同等变差。
+ 
+### 69.5 使用建议
+ 
+如果目标是保持当前阈值和召回率，量化模型需要针对部署数据重新做 threshold sweep，并重点观察 Recall、F1 或业务真正关心的漏检率；不能只看 AUC。若目标是压缩/加速且允许不到 1 个百分点的固定阈值 Accuracy 损失，那么本次结果显示该量化模型与浮点基线相当接近，可以作为候选版本继续做更大范围数据和真实业务阈值验证。
+
+---
+
+## 70. `test_quant_onnx.sh` 在哪里保存和加载量化 ONNX
+
+### 70.1 直接结论
+
+`test_quant_onnx.sh` 本身既不调用 `onnx.save()`，也不调用 ONNX Runtime。它负责确定文件路径并启动 Python；真正的保存和加载分别发生在 SIMO 与评测器中：
+
+| 动作 | 文件名 + 行号 + 函数名 | 关键代码 |
+|---|---|---|
+| 指定量化模型输出路径 | `test_quant_onnx.sh:37`，脚本顶层主命令（该 shell 没有定义函数） | `--quantized-model "$OUTPUT_DIR/quantized_model.onnx"` |
+| 调用 SIMO 量化并传入输出路径 | `scripts/run_silero_onnx_float_sharded.py:160`，`prepare_model()` | `simo.onnx.quantize(..., output_path=args.quantized_model)` |
+| **真正把量化模型写入磁盘** | `simo/onnx/api.py:24`，`quantize()` | `onnx.save(rewritten, output_path)` |
+| 将量化模型交给分片 evaluator | `scripts/run_silero_onnx_float_sharded.py:96-97`，`command_for_task()` | `--model` 后面传入 `str(args.model)` |
+| evaluator 创建模型封装 | `scripts/evaluate_silero_vad_onnx_float.py:212-219`，`main()` | `public_v5.SileroVadOnnx(args.model, ...)` |
+| **真正由 ORT 加载量化 ONNX** | `scripts/evaluate_silero_vad_public_v5.py:105-109`，`SileroVadOnnx.__init__()` | `ort.InferenceSession(str(model_path), ...)` |
+
+所以最短答案是：
+
+```text
+实际保存：simo/onnx/api.py:24，quantize()
+实际加载：scripts/evaluate_silero_vad_public_v5.py:105-109，SileroVadOnnx.__init__()
+```
+
+### 70.2 保存调用链
+
+#### 第一步：shell 决定输出文件名
+
+`test_quant_onnx.sh:19`，脚本顶层主命令（无函数）定义默认输出目录：
+
+```bash
+OUTPUT_DIR=${OUTPUT_DIR:-$SCRIPT_DIR/logs/onnx_quant_${DATASETS}_${NUM_SHARDS}shards}
+```
+
+`test_quant_onnx.sh:33-44`，脚本顶层主命令启动分片 runner；其中 `test_quant_onnx.sh:37` 传入：
+
+```bash
+--quantized-model "$OUTPUT_DIR/quantized_model.onnx"
+```
+
+在默认 `DATASETS=aishell4`、`NUM_SHARDS=24` 时，目标文件是：
+
+```text
+/share/users/like/package/jdjv/silero_vad_clean/logs/onnx_quant_aishell4_24shards/quantized_model.onnx
+```
+
+这里仅仅是把路径放进命令行参数，还没有写 ONNX 文件。
+
+#### 第二步：runner 准备并量化模型
+
+`scripts/run_silero_onnx_float_sharded.py:460`，`main()` 是 runner 入口；`scripts/run_silero_onnx_float_sharded.py:465`，`main()` 调用：
+
+```python
+prepare_model(args)
+```
+
+`scripts/run_silero_onnx_float_sharded.py:135-160`，`prepare_model()` 完成量化准备。关键行是：
+
+- `scripts/run_silero_onnx_float_sharded.py:151`，`prepare_model()`：若 shell 没传 `--quantized-model`，则回退到 `args.output_dir / "quantized_model.onnx"`。
+- `scripts/run_silero_onnx_float_sharded.py:152`，`prepare_model()`：执行 `args.model = args.quantized_model`，把后续评测模型从原始浮点模型切换为量化模型。
+- `scripts/run_silero_onnx_float_sharded.py:159`，`prepare_model()`：创建量化模型的父目录。
+- `scripts/run_silero_onnx_float_sharded.py:160`，`prepare_model()`：调用 editable 安装的 SIMO 公共接口，并通过 `output_path` 传入目标路径。
+
+```python
+simo.onnx.quantize(source_model, config_path, output_path=args.quantized_model)
+```
+
+#### 第三步：SIMO 真正序列化并保存文件
+
+当前 conda 环境中的 editable import 已解析到源码目录：
+
+```text
+/share/users/like/package/simo_conda_sglang/simo/onnx/api.py
+```
+
+`simo/onnx/api.py:15-25`，`quantize()` 的逻辑是：
+
+```python
+rewritten = apply_qdq_quantization(model, config, simplify=simplify)
+if output_path is not None:
+  onnx.save(rewritten, output_path)
+return rewritten
+```
+
+其中 `simo/onnx/api.py:22`，`quantize()` 生成插入 Q/DQ 节点后的 `ModelProto`；`simo/onnx/api.py:24`，`quantize()` 的 `onnx.save(...)` 才是实际写出 `.onnx` 文件的代码。由于 runner 在第 160 行明确传了 `output_path`，保存分支一定会执行；保存失败也会直接抛出异常，在开始 shard 评测前终止。
+
+### 70.3 加载调用链
+
+#### 第一步：把量化路径变成评测模型路径
+
+`scripts/run_silero_onnx_float_sharded.py:152`，`prepare_model()` 执行：
+
+```python
+args.model = args.quantized_model
+```
+
+这是保存链和加载链的连接点。没有这次赋值，后续 `command_for_task()` 仍会把原始浮点 `--model` 传给 evaluator。
+
+#### 第二步：为每个 shard 传递量化模型
+
+`scripts/run_silero_onnx_float_sharded.py:92-132`，`command_for_task()` 构造 evaluator 命令；其中第 96-97 行是：
+
+```python
+"--model",
+str(args.model),
+```
+
+此时 `args.model` 已在 `prepare_model()` 中改为 `quantized_model.onnx`。
+
+`scripts/run_silero_onnx_float_sharded.py:223-264`，`run_task()` 负责运行一个 shard；第 230 行调用 `command_for_task()`，第 244-251 行通过 `subprocess.run(...)` 启动 `evaluate_silero_vad_onnx_float.py` 子进程。
+
+#### 第三步：evaluator 把路径传给 ONNX Runtime 封装
+
+`scripts/evaluate_silero_vad_onnx_float.py:200-250`，`main()` 是单 shard evaluator 的入口：
+
+- `scripts/evaluate_silero_vad_onnx_float.py:202`，`main()` 先确认 `args.model` 文件存在。
+- `scripts/evaluate_silero_vad_onnx_float.py:212-219`，`main()` 用 `args.model` 创建 `public_v5.SileroVadOnnx`。
+- `scripts/evaluate_silero_vad_onnx_float.py:216`，`main()` 同时传入 custom-op library，因为量化图含有 `com.simo` Q/DQ 节点。
+
+#### 第四步：ORT 真正打开并加载 ONNX
+
+`scripts/evaluate_silero_vad_public_v5.py:75-125`，`SileroVadOnnx.__init__()` 初始化 ONNX Runtime：
+
+- `scripts/evaluate_silero_vad_public_v5.py:88`，`SileroVadOnnx.__init__()` 创建 `ort.SessionOptions()`。
+- `scripts/evaluate_silero_vad_public_v5.py:96`，`SileroVadOnnx.__init__()` 先通过 `register_custom_ops_library(...)` 注册 SIMO custom-op 动态库。
+- `scripts/evaluate_silero_vad_public_v5.py:105-109`，`SileroVadOnnx.__init__()` 调用 `ort.InferenceSession(str(model_path), ...)`；这一步才是真正读取、解析并加载量化 ONNX。
+
+注册 custom-op library 必须发生在 `InferenceSession` 创建之前，否则 ORT 在解析量化图中的 `com.simo::Quantize` / `com.simo::Dequantize` 节点时无法找到对应实现。
+
+### 70.4 完整时序和运行次数
+
+```text
+test_quant_onnx.sh:37（脚本顶层主命令）
+  --quantized-model .../quantized_model.onnx
+    -> run_silero_onnx_float_sharded.py:465，main()
+       调用 prepare_model(args)
+         -> run_silero_onnx_float_sharded.py:160，prepare_model()
+            调用 simo.onnx.quantize(..., output_path=...)
+              -> simo/onnx/api.py:24，quantize()
+                 onnx.save(...)，量化模型保存一次
+         -> run_silero_onnx_float_sharded.py:152，prepare_model()
+            args.model 切换为量化模型路径
+    -> run_silero_onnx_float_sharded.py:96-97，command_for_task()
+       每个 shard 的 --model 都使用量化模型路径
+      -> evaluate_silero_vad_onnx_float.py:212-219，main()
+         创建 SileroVadOnnx(args.model, ...)
+        -> evaluate_silero_vad_public_v5.py:105-109，SileroVadOnnx.__init__()
+           ort.InferenceSession(...)，每个 shard 子进程各加载一次
+```
+
+量化发生在 `main()` 创建分片任务之前，因此整个 `test_quant_onnx.sh` 运行只生成并保存一次量化 ONNX。之后每个 shard 是独立 Python 子进程，每个子进程都会建立自己的 ORT Session，并各自加载同一个 `quantized_model.onnx`。默认 24 shards 时会创建 24 个独立 Session，但 `WORKERS=8` 表示最多同时运行 8 个 shard。
+
+现有运行结果也验证了这条链路：量化文件确实位于上述默认路径，大小为 4,225,143 bytes；`logs/onnx_quant_aishell4_24shards/summary.json:3` 的 `model` 字段以及各个 `shards/shard_*.log:2,5` 都记录了同一个 `quantized_model.onnx` 路径。
+
+---
+
+## 71. `run_silero_onnx_float_sharded.py` 的 git diff 主要修改
+
+### 71.1 修改范围和总体目的
+
+对 `/share/users/like/package/jdjv/silero_vad_clean/scripts/run_silero_onnx_float_sharded.py` 执行 `git diff` 的结果是 **55 行新增、28 行删除**，修改集中在量化准备和量化配置迁移；数据分片、子进程调度和指标汇总没有被重写。
+
+总体目的，是把旧版 SIMO ONNX 动态 QDQ 调用链迁移到当前 editable SIMO 提供的 ONNX QDQ v2 公共接口，同时保持原有命令行和评测流程：
+
+```text
+浮点 ONNX + 外部旧格式配置
+  -> 生成独立的 QDQ v2 配置
+  -> 当前 simo.onnx.quantize()
+  -> quantized_model.onnx
+  -> 原有 shard evaluator / CUDA / custom-op 流程
+```
+
+### 71.2 `prepare_model()`：替换旧量化 API
+
+函数位置：`scripts/run_silero_onnx_float_sharded.py:135-160`，函数名 `prepare_model()`。
+
+保留的前置检查仍在 `scripts/run_silero_onnx_float_sharded.py:139-149`，函数名 `prepare_model()`：检查浮点源模型、量化配置和 custom-op library，并允许通过 `SIMO_ONNX_CUSTOM_OPS_LIBRARY` 环境变量补充库路径。
+
+关键变化如下：
+
+- 旧代码 `scripts/run_silero_onnx_float_sharded.py:155-161`（旧版本，函数 `prepare_model()`）导入 `onnx` 和已不存在的 `simo.onnx.onnx_dynamic_qdq.rewrite_dynamic_qdq`，先改写出 `ModelProto`，再由 runner 自己调用 `onnx.save()`。
+- 新代码 `scripts/run_silero_onnx_float_sharded.py:156`（函数 `prepare_model()`）改为延迟导入 `simo.onnx`。只有传入 `--quant-config` 时才需要 SIMO，纯浮点评测路径仍然在 `scripts/run_silero_onnx_float_sharded.py:136-137`（函数 `prepare_model()`）直接返回。
+- `scripts/run_silero_onnx_float_sharded.py:151-152`（函数 `prepare_model()`）继续确定 `quantized_model.onnx` 路径，并把 `args.model` 切换到该路径，保证后续 shard evaluator 使用量化模型。
+- `scripts/run_silero_onnx_float_sharded.py:158`（函数 `prepare_model()`）先调用新的配置迁移函数；`scripts/run_silero_onnx_float_sharded.py:159`（函数 `prepare_model()`）创建输出父目录。
+- **真正的量化调用**现在是 `scripts/run_silero_onnx_float_sharded.py:160`（函数 `prepare_model()`）：
+
+  ```python
+  simo.onnx.quantize(source_model, config_path, output_path=args.quantized_model)
+  ```
+
+  这把量化实现交给当前 SIMO 公共 API，并明确让 API 将结果写到 `args.quantized_model`；不再依赖旧的 `rewrite_dynamic_qdq`。
+
+### 71.3 `normalize_quant_config()`：迁移到 QDQ v2 配置
+
+函数位置：`scripts/run_silero_onnx_float_sharded.py:163-220`，函数名 `normalize_quant_config()`。
+
+这是本次 diff 中新增逻辑最多的部分。它不覆盖外部原始 JSON，而是生成独立文件 `$OUTPUT_DIR/onnx_quant_config.json`。
+
+#### 输入结构校验和外层解包
+
+- `scripts/run_silero_onnx_float_sharded.py:164-166`（函数 `normalize_quant_config()`）读取 JSON，并要求顶层是对象。
+- `scripts/run_silero_onnx_float_sharded.py:167-169`（函数 `normalize_quant_config()`）兼容可选的 `quantization_config` 外层；迁移后的文件使用内部配置对象作为根，不再保留这个旧包装层。
+- `scripts/run_silero_onnx_float_sharded.py:171-173`（函数 `normalize_quant_config()`）要求 `module_configs` 是非空列表，避免把空配置交给 SIMO 后才得到不明确的错误。
+
+#### 构造只包含当前 API 支持内容的配置
+
+- `scripts/run_silero_onnx_float_sharded.py:175-180`（函数 `normalize_quant_config()`）新建 `migrated` 配置，只保留 `module_configs`，并在格式合适时复制 `excludes` 和 `algorithm`。
+- `scripts/run_silero_onnx_float_sharded.py:182-194`（函数 `normalize_quant_config()`）定义允许从 input/weight spec 复制的字段白名单，例如 `dtype`、`block_size`、`group_size`、`is_symmetric` 和 `scale_mode`；旧 API 不认识或当前 QDQ v2 不需要的字段不会继续传递。
+- 新增的模块级 `import copy` 位于 `scripts/run_silero_onnx_float_sharded.py:7`，用于下面各处的深拷贝，避免迁移过程复用或改写输入对象。
+
+#### 保留 `targets`，删除旧的 `targets_op_types` 路径
+
+- `scripts/run_silero_onnx_float_sharded.py:195-202`（函数 `normalize_quant_config()`）逐个校验 module，并保留 `targets` 列表。
+- 新配置不再生成 `targets_op_types`。旧版本的 `module_targets_to_onnx_ops()`（旧文件 `scripts/run_silero_onnx_float_sharded.py:181-193`，函数名 `module_targets_to_onnx_ops()`）曾把 `Conv1d`/`Linear` 等模块名手工映射为 ONNX `Conv`/`MatMul`/`Gemm`；这个 helper 已删除，因为当前 SIMO QDQ v2 入口直接接受 `targets`，并由 SIMO 自己处理目标别名。
+- 因此，`targets` 的语义仍然保留，但旧的“同时传模块目标和 ONNX op 类型”双字段不再进入当前 API。
+
+#### 将 activation/input 统一，并强制动态性符合 v2 约束
+
+- `scripts/run_silero_onnx_float_sharded.py:203-204`（函数 `normalize_quant_config()`）优先读取 `input`，并兼容旧配置中的 `activation` 键，把它迁移为 v2 的 `input`。
+- `scripts/run_silero_onnx_float_sharded.py:204-215`（函数 `normalize_quant_config()`）分别处理 input 和 weight spec，只复制白名单字段。
+- `scripts/run_silero_onnx_float_sharded.py:214`（函数 `normalize_quant_config()`）强制 `input.is_dynamic = True`，因为运行时输入的量化参数需要动态计算。
+- 同一行逻辑对 weight 使用 `field_name == "input"` 的结果为 `False`，因此强制 `weight.is_dynamic = False`，符合当前 SIMO ONNX QDQ v2 的静态权重量化约束；即使旧 JSON 错误地写成 `true`，迁移后的配置也会纠正它。
+- 旧配置中的 `output` spec 不再复制到迁移结果；当前 ONNX QDQ v2 迁移只为 evaluator 所需的 input/weight QDQ 生成必要字段。
+
+#### 独立输出配置，不修改原始配置
+
+- `scripts/run_silero_onnx_float_sharded.py:218-220`（函数 `normalize_quant_config()`）固定把迁移结果写到 `output_dir / "onnx_quant_config.json"`，并返回这个新路径。
+- 与旧版本 `scripts/run_silero_onnx_float_sharded.py:167-178`（旧函数 `normalize_quant_config()`）相比，新实现不再“没有变化就返回外部原配置”，也不在原始对象上追加 `targets_op_types`；每次量化都使用明确、可审计的副本配置。
+
+### 71.4 哪些量化评测逻辑没有变化
+
+本次 diff 没有改变以下职责：
+
+- `scripts/run_silero_onnx_float_sharded.py:92-132`（函数 `command_for_task()`）仍只向每个 evaluator 传 `--model`、数据集/分片参数和 `--custom-op-library`；没有重新引入旧 manifest 参数。
+- `scripts/run_silero_onnx_float_sharded.py:223-264`（函数 `run_task()`）仍按设备设置 `CUDA_VISIBLE_DEVICES`、启动 shard 子进程并读取 NPZ 结果。
+- `scripts/run_silero_onnx_float_sharded.py:283-310`（函数 `split_npz_by_dataset()`）、`scripts/run_silero_onnx_float_sharded.py:313-341`（函数 `summarize_arrays()`）和 `scripts/run_silero_onnx_float_sharded.py:344-400`（函数 `aggregate_results()`）仍负责原来的分片合并、ROC-AUC 和阈值准确率计算。
+- `scripts/run_silero_onnx_float_sharded.py:460-523`（函数 `main()`）仍先准备模型，再运行 shards，最后写 `run_metadata.json`、`shard_summary.json` 和 `summary.json`；量化迁移没有改变采样率、阈值、state 输入或指标定义。
+
+### 71.5 修改前后对照
+
+| 项目 | diff 之前 | diff 之后 |
+|---|---|---|
+| 量化入口 | `rewrite_dynamic_qdq`（旧内部 API） | `simo.onnx.quantize`（当前公开 API） |
+| ONNX 写盘位置 | runner 中直接 `onnx.save` | SIMO `quantize(..., output_path=...)` 内部保存 |
+| 配置目标字段 | 手工生成 `targets_op_types` | 保留 `targets`，由 SIMO 处理别名 |
+| activation 字段 | 保留旧 `activation` 形态 | 迁移为 `input` |
+| weight 动态性 | 可能沿用旧 JSON 的 `true` | 强制 `weight.is_dynamic=false` |
+| 配置文件 | 可能直接返回原配置路径 | 始终输出 `$OUTPUT_DIR/onnx_quant_config.json` |
+| 分片和指标 | 原有流程 | 保持不变 |
+
+因此，这个 git diff 的本质不是更换评测算法，而是修复量化接口和配置 schema 的版本兼容性：让当前 editable SIMO 能够生成 `com.simo` QDQ v2 ONNX，同时尽量不改变原有 Silero AISHELL-4 分片评测行为。
+
+---
+
+## 72. main 分支新提交 `5b7571c` 与 `7c17fd9` 分别实现了什么
+
+### 72.1 总览
+
+这两个提交解决的是两类不同的问题：
+
+| 提交 | 主要模块 | 核心功能 |
+|---|---|---|
+| `5b7571c1a03f1d4dcac2df65a7bead6fb5a69aa8` | `simo.accuracy_debug` / ONNX | 将 ONNX 精度调试从“只抓标准域 MatMul/Gemm/Conv 的输出”扩展为“可选择算子、domain、输入/输出及 initializer 的通用张量抓取和比较” |
+| `7c17fd98217132583a97a0891526cacce3cdd767` | vLLM SIMO 量化线性层 / Gluon GEMM | 为 Hopper 增加 MXFP4×FP8、MXFP4×MXFP8、MXFP4×MXFP4 三种 Gluon GEMM 快速路径，并引入可扩展的量化 GEMM backend 注册、加载期准备和逐层 QDQ 回退机制 |
+
+### 72.2 提交 `5b7571c`：扩展 ONNX accuracy debug 的张量抓取
+
+提交标题是 `[feat] Extend ONNX accuracy debug tensor capture`，修改 4 个文件，净效果是把原来面向少数计算节点输出的专用工具泛化为 ONNX 节点张量调试工具。
+
+#### 1. 新增通用张量抓取模型和 API
+
+`simo/accuracy_debug/onnx_runner.py` 新增 `OnnxTensorCapture`，记录：
+
+- 节点名、`op_type` 和 ONNX domain；
+- 实际 tensor 名；
+- tensor 是节点 `input` 还是 `output`；
+- tensor 在节点输入或输出列表中的索引；
+- 用于报告和模型间对齐的 capture 名。
+
+同时新增两个主要 API：
+
+- `find_onnx_tensor_captures()`：从图中筛选需要观察的节点输入/输出；
+- `collect_onnx_tensors()`：临时把选中的 tensor 加到图输出，通过 ONNX Runtime 执行模型并收集 tensor 或统计摘要。
+
+原有 `find_onnx_compute_outputs()` 和 `collect_onnx_compute_outputs()` 没有删除，而是保留为兼容接口；后者内部转到新的通用实现。因此，已有只比较 MatMul/Gemm/Conv 输出的调用方式仍可继续使用。
+
+#### 2. 支持选择输入、输出和 initializer
+
+抓取角色由 `AccuracyDebugConfig.capture` 控制，可选择：
+
+- `("output",)`：只抓节点输出，仍是默认行为；
+- `("input",)`：只抓节点输入；
+- `("input", "output")`：同时抓输入和输出。
+
+节点输入若来自 initializer，默认不抓取，避免把所有静态权重和 scale 都加入运行输出；设置 `capture_initializers=True` 后可一起抓取。实现还会根据 initializer 的 dtype 和 shape 构造 `ValueInfo`，使静态权重也能作为临时图输出交给 ORT。
+
+命名规则保持首个输出与旧报告兼容：节点的 `output0` 仍直接使用节点名；其他张量使用 `node:input0`、`node:input1`、`node:output1` 等名称。
+
+#### 3. 支持按算子类型和 domain 选择节点
+
+旧实现只处理标准 ONNX domain 中的 `MatMul`、`Gemm` 和 `Conv`。新实现同时接受 `op_types` 和 `domains`，并提供四组 preset：
+
+| preset | 选择内容 |
+|---|---|
+| `compute` | 标准域的 `MatMul`、`Gemm`、`Conv` |
+| `simo_qdq` | `com.simo` 域的 `Quantize`、`Dequantize`、`DequantizeFloat16`、`DequantizeBFloat16` |
+| `quantized_compute` | 标准计算节点、SIMO Q/DQ 节点，以及量化图常见的 `Transpose`、`Flatten`、`Pad`、`Slice`、`Reshape` |
+| `all` | 标准域和 `com.simo` 域中的所有 op type |
+
+`include` / `exclude` glob 也不再只匹配节点名，而会同时检查节点名、op type、`domain::op_type`、输入 tensor 名和输出 tensor 名。这使用户可以按诸如 `com.simo::Quantize` 或某个中间 tensor 名定位量化路径。
+
+#### 4. 泛化模型比较和扫描
+
+`compare_onnx_models()` 与 `scan_onnx_model()` 都切换到新的通用抓取逻辑：
+
+- 参考模型和实际模型均可抓输入、输出或 initializer；
+- 可分别为两边注册 SIMO ORT custom ops；
+- 仍支持按名称或拓扑顺序对齐；
+- 按顺序对齐时，现在会同时校验 domain、op type、input/output 角色和 tensor 索引，防止把语义不同的 tensor 错配；
+- 原有误差计算和 JSON/Markdown 报告生成流程保持不变。
+
+图插桩从 `_instrument_model_outputs()` 泛化为 `_instrument_tensor_outputs()`：先尝试 ONNX shape inference，再复用已有 `ValueInfo`；若仍没有类型信息，才退回未知 shape 的 float tensor 描述。
+
+#### 5. 命令行和公共导出同步扩展
+
+`examples/accuracy_debug/run_compare_onnx.py` 新增：
+
+- `--domain`；
+- `--op-preset`；
+- `--capture input,output`；
+- `--capture-initializers`；
+- 任意 `--op-type`，不再限定为 MatMul/Gemm/Conv。
+
+`simo/accuracy_debug/__init__.py` 公开导出了 `ONNX_OP_PRESETS`、`find_onnx_tensor_captures` 和 `collect_onnx_tensors`。
+
+测试新增了四类覆盖：节点输入/输出抓取、initializer 抓取、`com.simo` QDQ preset，以及参考/实际模型的输入和输出联合比较。换言之，这个提交的直接用途是精确观察量化前后模型在 Q、DQ、布局变换和计算节点之间从哪里开始产生数值差异。
+
+### 72.3 提交 `7c17fd9`：增加三种 Gluon 低比特 GEMM 及 vLLM backend 调度
+
+提交标题是 `[feat] add w4a8_mxfp4_fp8/w4a8_mxfp4_mxfp8/w4a4_mxfp4_mxfp4 gluon GEMM impl`。它新增约 4,855 行，主要面向 `SIMOLinearMethod` 的量化 Linear；该提交没有改造 `SIMOFusedMoEMethod` 的 MoE GEMM 路径。
+
+#### 1. 三种新增 GEMM 路径
+
+三种路径的权重均为 packed MXFP4 E2M1：`uint8 [N, K/2]`，每个 byte 保存两个 FP4 值；权重 scale 是沿 K 每组 32 个元素一个 E8M0 scale。
+
+| 路径 | 激活格式 | 主要执行策略 |
+|---|---|---|
+| W4A8 MXFP4×FP8 | FP8 E4M3，per-token/per-row scale | Gluon TMA + WGMMA；小 M 使用 split-K，大 M 使用 dense；满足形状条件时使用加载期准备的 PRMT 权重路径 |
+| W4A8 MXFP4×MXFP8 | FP8 E4M3 payload，沿 K 每 32 个元素一个 E8M0 scale | `M <= 32` 直接从 packed W 走 split-K；较大 M 使用预展开的 FP8 权重，并按 activation group 对 FP32 partial accumulator 施加 scale |
+| W4A4 MXFP4×MXFP4 | 激活也是 packed MXFP4，group size 32 | 每次调用先把动态激活展开为 E5M2；静态权重在加载期展开为 E4M3；随后执行 FP8×FP8 WGMMA，并在 epilogue 恢复行/列 scale |
+
+三个 kernel 都使用 Gluon/Triton 的 Hopper TMA、shared-memory pipeline 和 WGMMA，生产输出主要支持 FP16/BF16，并以 FP32 accumulator 处理缩放或 split-K 汇总。入口会检查 CUDA device、rank、dtype、packed K 维、scale shape 和 group size 等约束。
+
+#### 2. 静态权重的加载期准备和精确性保护
+
+MXFP4×MXFP8 与 MXFP4×MXFP4 路径会在 `process_weights_after_loading()` 阶段尝试把静态 MXFP4 权重展开为 `[N, K]` 的 E4M3，并保存每个输出 row 的 FP32 base scale：
+
+- 这样推理热路径不必在每次 GEMM 内重复解包和处理权重 group scale；
+- 准备后的 tensor 注册为 layer 的非持久 buffer，能跟随 vLLM 的权重迁移并避开以 `data_ptr` 为 key 的 eager cache，适合 `torch.compile` 和 CUDA graph capture；
+- 代价是快速路径额外占用约 `N*K` bytes 显存；
+- 只有每个权重 row 的 E8M0 exponent span 不超过 14 时，才能无损折叠到 E4M3；不满足时该 layer 标记为 backend 未准备好，自动回到原 QDQ 路径。
+
+MXFP4×FP8 路径的加载期优化不同：对较大的合适权重形状，预先生成 T2/PRMT 重排权重和 per-row E8M0 分解 scale；不满足 PRMT 条件时并不放弃 Gluon backend，而是继续走普通 Gluon dense/split-K 实现。
+
+#### 3. 新增可扩展的 GEMM backend registry
+
+新文件 `simo/extensions/vllm_simo/quantization/gemm_backends.py` 定义了 `QuantGemmBackend` 协议，backend 负责三件事：
+
+- `matches(method)`：判断 weight/input quant spec、granularity、硬件和可选依赖是否匹配；
+- `prepare_layer(method, layer)`：在权重加载完成后、compile/CUDA graph capture 前准备静态 buffer；
+- `apply(...)`：执行对应的量化 GEMM。
+
+三个 Gluon 实现都注册为名为 `gluon` 的 backend，由各自的 `matches()` 根据 spec 组合区分。当前匹配还要求 CUDA 可用且设备 compute capability 主版本为 9，即 Hopper 路径；导入 Gluon kernel 失败时不会阻断普通 QDQ 初始化。
+
+`SIMOLinearMethod` 的变化是：
+
+1. 初始化时通过 `SIMO_GEMM_BACKEND` 选择 backend；未设置或设为 `auto` 时按注册顺序选择第一个匹配实现，`gluon` 强制尝试 Gluon，`qdq` 显式禁用所有快速路径，未知名称会报错。
+2. `process_weights_after_loading()` 调用 backend 的加载期准备，并把成功与否写到 `layer.simo_gemm_backend_ready`。
+3. `apply()` 仍先用现有 downcast kernel 生成量化激活；backend 可用、该 layer 准备成功且 K 可按 group size 整除时调用快速 GEMM，否则执行原有的“激活反量化 + 权重反量化 + `torch.matmul`”路径。
+4. GEMM 之后原有的 padded shard 裁剪、global scale、bias 和输出 shape/dtype 恢复逻辑保持不变。
+
+代码通过 `torch.ops.simo` 注册了三个带 fake implementation 的 CUDA custom op，隔离 Gluon DSL，使调用可以出现在 `torch.compile` 图中并继续支持 CUDA graph capture：
+
+- `simo::gluon_w4a8_gemm`；
+- `simo::gluon_w4a8_mxfp8_gemm`；
+- `simo::gluon_w4a4_mxfp4_gemm`。
+
+需要注意的是，`gemm_backends.py` 顶部说明文字提到兼容旧的 `SIMO_W4A8_BACKEND`，但这个提交中 `SIMOLinearMethod.__init__()` 的实际代码只读取 `SIMO_GEMM_BACKEND`，没有读取旧环境变量。因此按实际实现，应使用 `SIMO_GEMM_BACKEND=auto|gluon|qdq`。
+
+#### 4. 离线调优配置进入安装包
+
+提交为三种 kernel 分别加入 sm90 离线调优 JSON：
+
+- `gluon_mxfp4_fp8_configs.json`；
+- `gluon_mxfp4_mxfp8_configs.json`；
+- `gluon_mxfp4_mxfp4_configs.json`。
+
+配置按 GPU 架构、输出 dtype、N、K 和 M bucket 选择 block 大小、stage、warp 数及 split-K 参数。生产路径不在首次请求或 CUDA graph warmup 时运行在线 autotune：没有精确 M bucket 时选同一 shape 最近的 bucket，shape 完全未覆盖时告警并使用保守固定配置。
+
+`setup.py` 同时把 `simo.ops.kernels.gemm/configs/*.json` 加入 package data，确保安装 wheel 后仍能读取这些调优表。
+
+### 72.4 两个提交的关系
+
+它们没有直接调用关系，但都服务于量化模型的可用性：
+
+- `7c17fd9` 负责让 vLLM 中三种 MXFP4 组合在 Hopper 上走真正的低比特 Gluon GEMM 快速路径，并在不满足精确性或硬件条件时保留 QDQ 回退；
+- `5b7571c` 负责在 ONNX 侧更细粒度地抓取和比较原模型、SIMO Q/DQ 节点及其输入输出，定位量化误差来自量化、反量化、布局处理还是后续计算。
+
+因此，前者是推理执行和性能能力，后者是模型数值诊断能力。
+
+---
+
+## 73. 当前 `simo.onnx.quantize()` 在插入 QDQ 前会做常量折叠吗
+
+### 73.1 结论
+
+**默认不会。** 当前 `simo/onnx/api.py` 中 `quantize()` 的 `simplify` 参数默认是 `False`，所以普通调用：
+
+```python
+simo.onnx.quantize(model, config)
+```
+
+不会在插入 QDQ 前运行常量折叠。
+
+只有显式调用：
+
+```python
+simo.onnx.quantize(model, config, simplify=True)
+```
+
+才会在 QDQ 插入前尝试运行 ONNXSlim。ONNXSlim 的默认优化流程包含常量折叠，但这只是“尝试”：ONNXSlim 未安装、执行失败，或者某个常量子图不在它的可折叠范围内时，SIMO 会继续使用原模型插入 QDQ，而不会保证该子图已经折叠。
+
+| 调用方式 | QDQ 插入前的行为 |
+|---|---|
+| `quantize(... )` | 不运行 ONNXSlim，不做图级常量折叠 |
+| `quantize(..., simplify=False)` | 同上 |
+| `quantize(..., simplify=True)` 且 ONNXSlim 成功 | 先执行包含常量折叠的模型简化，再插入 QDQ |
+| `quantize(..., simplify=True)` 但 ONNXSlim 缺失或失败 | 记录 warning，退回原模型，然后继续插入 QDQ |
+
+### 73.2 实际调用顺序
+
+`simo/onnx/api.py:15-25` 中，公共 API 本身只做两件事：
+
+```python
+rewritten = apply_qdq_quantization(model, config, simplify=simplify)
+if output_path is not None:
+  onnx.save(rewritten, output_path)
+```
+
+`onnx.save()` 只负责保存，不会优化或折叠模型。是否简化完全由 `apply_qdq_quantization()` 的 `simplify` 参数控制。
+
+`simo/onnx/onnx_quant.py:264-328` 中的顺序是：
+
+```text
+加载 ONNX / 复制 ModelProto
+  -> 校验 GraphSurgeon 能否无损处理相关字段
+  -> 加载并校验量化配置
+  -> simplify=True 时调用 simplify_onnx_model()
+  -> 将简化后或原始 graph 导入 GraphSurgeon
+  -> 识别可量化节点和静态权重
+  -> 插入 activation QDQ 与 weight DQ
+```
+
+因此，如果启用了简化，常量折叠明确发生在权重静态性判断和 QDQ 插入之前。
+
+### 73.3 `simplify=False` 时哪些权重仍会被当作常量
+
+默认不做图级常量折叠，并不表示 SIMO 只能读取 graph initializer。`simo/onnx/onnx_quant.py:781-796` 的 `_constant_array()` 原地识别两种已经显式存在的静态值：
+
+1. ONNX initializer；导入 GraphSurgeon 后表现为 `gs.Constant`。
+2. 直接由标准 ONNX `Constant` 节点产生的 tensor。
+
+这是读取现成常量值，不是执行常量传播或常量折叠。比如：
+
+```text
+initializer ---------------------------> MatMul/LSTM W    可识别为静态权重
+Constant ------------------------------> MatMul/LSTM W    可识别为静态权重
+Constant -> Transpose -----------------> MatMul/LSTM W    默认不能识别
+initializer -> Reshape ----------------> MatMul/LSTM W    默认不能识别
+Constant + Constant -> Add/Concat -----> MatMul/LSTM W    默认不能识别
+```
+
+后三类虽然从数学上仍是常量子图，但 `_constant_array()` 不会递归执行 `Transpose`、`Reshape`、`Add`、`Concat` 等算子；在 `simplify=False` 下，它们会被视为动态算子输出。
+
+### 73.4 ONNXSlim 路径及失败回退
+
+`simo/onnx/onnx_quant.py:483-495` 的 `simplify_onnx_model()` 会先复制模型，然后调用：
+
+```python
+slim(candidate, skip_fusion_patterns=["FusionGemm"])
+```
+
+`FusionGemm` 被跳过，是为了避免简化过程改变 Gemm 目标结构；这不会关闭 ONNXSlim 的常量折叠。ONNXSlim 的官方优化实现默认会调用 GraphSurgeon 的 `fold_constants()`，然后再做 cleanup 和其他图优化，参见 [ONNXSlim 官方实现](https://github.com/inisis/OnnxSlim/blob/main/onnxslim/core/__init__.py)。
+
+SIMO 对整个导入和简化过程使用了宽泛的 `except Exception`：
+
+```python
+except Exception as exc:
+  logger.warning("ONNXSlim failed; continuing with the original model: %s", exc)
+  return model
+```
+
+所以 `simplify=True` 不是“折叠失败就终止量化”，而是“尽力简化，失败则无简化继续量化”。测试 `test_apply_qdq_quantization_simplify_skips_gemm_and_warns_on_failure()` 覆盖了这个回退；`test_apply_qdq_quantization_does_not_simplify_by_default()` 则明确验证默认不会调用 ONNXSlim。
+
+当前 `pyproject.toml` 的 `onnx` optional dependency 声明了 `onnxslim>=0.1.84,<0.2`，但本次检查的 `/share_data/users/like/miniconda3/envs/simo_sglang/bin/python` 环境中实际没有安装 `onnxslim`。因此在这个环境中，即使传入 `simplify=True`，当前结果也是记录“ONNXSlim failed” warning 并使用原图，不会完成常量折叠。
+
+### 73.5 GraphSurgeon 的 cleanup 不是常量折叠
+
+QDQ 插入完成后，`simo/onnx/onnx_quant.py:375-376` 调用：
+
+```python
+graph.cleanup(recurse_functions=False).toposort(recurse_functions=False, mode="nodes")
+edited = gs.export_onnx(graph, do_type_check=False)
+```
+
+`cleanup()` 只删除不再连接到图输出的无用节点和 tensor，`toposort()` 只重新排列拓扑顺序；两者都不会调用 `graph.fold_constants()`。因此这一步可能删除已经被量化权重替换掉的旧 `Constant` 节点，但不能把一个常量计算子图求值成 initializer，也不存在 QDQ 插入后的第二次常量折叠。
+
+### 73.6 对当前 LSTM QDQ 的直接影响
+
+LSTM 的 W 和 R 都通过 `_constant_array()` 检查：
+
+- W、R 都是 initializer 或直接 `Constant`：可以离线拆 gate 并量化。
+- W 或 R 任一个仍是 `Transpose`、`Reshape`、`Concat` 等节点的输出：该 LSTM 记录 `skipped:dynamic_weight`，整节点不插入 QDQ。
+- 使用 `simplify=True` 且 ONNXSlim 成功把这类常量子图折叠后，W/R 才可能转为可识别的静态值；是否能折叠取决于具体算子、shape 信息和 ONNXSlim 支持范围，SIMO 本身不提供额外的递归常量求值保证。
+
+最终可简化为一句话：**当前 `quantize()` 默认不做常量折叠；`simplify=True` 时会在插入 QDQ 前交给 ONNXSlim 尝试折叠，但失败会记录 warning 后回退到“无折叠继续量化”的路径。**
+
+---
+
+## 74. `kws_simo_quant/test_quant_onnx.sh:59` 的 `case` 语法
+
+### 74.1 所在函数和代码
+
+这段语句位于 `/share/users/like/package/jdjv/kws_simo_quant/test_quant_onnx.sh:55-81`，函数名是 `run_one_config()`：
+
+```bash
+run_one_config() {
+  local raw_config=$1
+  local output_dir=$2
+  local quant_config=$raw_config
+  case "$quant_config" in
+    /*) ;;
+    *) quant_config="$CONFIG_DIR/$quant_config" ;;
+  esac
+  ...
+}
+```
+
+### 74.2 `case` 的一般语法
+
+`kws_simo_quant/test_quant_onnx.sh:59-62`，函数 `run_one_config()` 使用的是 Bash 的模式匹配分支：
+
+```bash
+case 要匹配的值 in
+  模式1)
+    模式1匹配时执行的命令
+    ;;
+  模式2)
+    模式2匹配时执行的命令
+    ;;
+esac
+```
+
+含义是：先展开并读取 `case` 后面的值，按从上到下的顺序用 shell 通配模式匹配；第一个匹配成功的分支执行完后，由 `;;` 结束整个 `case`。`esac` 是 `case` 反写形式，表示语句结束。
+
+这里的模式是 shell glob，不是正则表达式：
+
+- `*` 表示任意长度的字符串，包括空字符串。
+- `/*` 表示以 `/` 开头、后面跟任意字符的字符串。
+- `*)` 是兜底模式，匹配前面模式都没有匹配的情况。
+
+### 74.3 逐行解释
+
+- `kws_simo_quant/test_quant_onnx.sh:56`，函数 `run_one_config()`：`local raw_config=$1` 保存函数第一个参数，也就是用户传入的配置路径。
+- `kws_simo_quant/test_quant_onnx.sh:57`，函数 `run_one_config()`：`local output_dir=$2` 保存当前配置的结果目录。
+- `kws_simo_quant/test_quant_onnx.sh:58`，函数 `run_one_config()`：复制一份 `raw_config` 到 `quant_config`，后面只修改这份待解析路径。
+- `kws_simo_quant/test_quant_onnx.sh:59`，函数 `run_one_config()`：开始检查 `quant_config` 的路径形式。
+- `kws_simo_quant/test_quant_onnx.sh:60`，函数 `run_one_config()`：`/*)` 匹配绝对路径。分支体为空，随后立即用 `;;` 结束，所以这是“什么都不做，保持原路径”的分支。
+- `kws_simo_quant/test_quant_onnx.sh:61`，函数 `run_one_config()`：`*)` 匹配其他路径，通常就是相对路径；将其改成 `CONFIG_DIR/相对路径`。
+- `kws_simo_quant/test_quant_onnx.sh:62`，函数 `run_one_config()`：`esac` 结束 `case`。
+
+第 60 行的 `;;` 容易混淆：
+
+```bash
+/*) ;;
+```
+
+这里的两个分号合起来是 Bash `case` 的分支结束符；由于 `)` 和 `;;` 之间没有命令，所以该分支为空。它等价于写成带空命令的形式：
+
+```bash
+/*)
+  :
+  ;;
+```
+
+其中 `:` 是 Bash 的 no-op 命令。
+
+### 74.4 两种输入的实际结果
+
+`kws_simo_quant/test_quant_onnx.sh:16`，脚本顶层变量 `CONFIG_DIR` 默认是 `/share_data/mtang/simo_quant_config`。因此：
+
+```text
+调用：run_one_config /tmp/custom.json results/custom
+匹配：/*)
+结果：quant_config=/tmp/custom.json
+
+调用：run_one_config w8a8/w_mxint8_a_mxint8.json results/mxint8
+匹配：*)
+结果：quant_config=/share_data/mtang/simo_quant_config/w8a8/w_mxint8_a_mxint8.json
+```
+
+也就是说，同一个脚本参数既可以是完整绝对路径，也可以是相对于 `CONFIG_DIR` 的配置文件名。该语句不会检查文件是否存在；真正的存在性检查在 `kws_simo_quant/test_quant_onnx.sh:64`，函数 `run_one_config()`：
+
+```bash
+test -f "$quant_config"
+```
+
+如果路径不存在，`set -e`（`kws_simo_quant/test_quant_onnx.sh:2`，脚本顶层执行环境）会使脚本在启动 Python runner 前退出。
+
+### 74.5 为什么要这样写
+
+`kws_simo_quant/test_quant_onnx.sh:69-80`，函数 `run_one_config()` 最终把解析后的 `quant_config` 传给 Python：
+
+```bash
+"$PY" "$SCRIPT" \
+  --quant-config "$quant_config" \
+  ...
+```
+
+如果不做 `case` 判断而无条件拼接：
+
+```bash
+quant_config="$CONFIG_DIR/$quant_config"
+```
+
+那么输入 `/tmp/custom.json` 会错误地变成：
+
+```text
+/share_data/mtang/simo_quant_config//tmp/custom.json
+```
+
+因此，这个 `case` 的核心功能是**规范化配置路径，同时兼容绝对路径和配置目录下的相对路径**；它不负责量化、不读取 JSON，也不改变配置内容。
+
+---
+
+## 75. `kws_simo_quant/test_quant_onnx.sh:83` 的 `if` 语句
+
+### 75.1 所在位置和结构
+
+代码位于 `/share/users/like/package/jdjv/kws_simo_quant/test_quant_onnx.sh:83-89`，属于脚本顶层执行逻辑：
+
+```bash
+if [[ -n "${QUANT_CONFIG:-}" ]]; then
+  run_one_config "$QUANT_CONFIG" "${OUTPUT_DIR:-results/onnx_quant_${NUM_SHARDS}shards}"
+else
+  for entry in "${DEFAULT_CONFIGS[@]}"; do
+    run_one_config "${entry%%|*}" "$OUTPUT_ROOT/onnx_quant_${entry##*|}_${NUM_SHARDS}shards"
+  done
+fi
+```
+
+Bash 的一般形式是 `if [[ 条件 ]]; then ... else ... fi`：`then` 后是条件为真时执行的分支，`else` 后是条件为假时执行的分支，`fi` 结束整个 `if`。两个分支只会执行一个。
+
+### 75.2 第 83 行条件
+
+`kws_simo_quant/test_quant_onnx.sh:83`，脚本顶层逻辑使用：
+
+```bash
+[[ -n "${QUANT_CONFIG:-}" ]]
+```
+
+逐部分理解：
+
+- `[[ ... ]]` 是 Bash 条件表达式语法，这里不会启动外部命令。
+- `-n` 判断字符串长度是否大于 0，即判断字符串是否非空。
+- `${QUANT_CONFIG:-}` 表示变量未设置或为空时使用空字符串，否则使用 `QUANT_CONFIG` 的值。
+- `kws_simo_quant/test_quant_onnx.sh:2`，脚本顶层执行环境启用了 `set -u`；`${QUANT_CONFIG:-}` 可以避免变量未设置时直接展开 `$QUANT_CONFIG` 导致脚本退出。
+
+所以第 83 行的条件等价于：
+
+- `QUANT_CONFIG` 非空：运行用户指定的单个配置。
+- `QUANT_CONFIG` 未设置或为空：遍历 `DEFAULT_CONFIGS` 批量运行。
+
+### 75.3 true 分支：单配置模式
+
+`kws_simo_quant/test_quant_onnx.sh:84`，脚本顶层逻辑调用 `run_one_config()` 一次：
+
+```bash
+run_one_config "$QUANT_CONFIG" "${OUTPUT_DIR:-results/onnx_quant_${NUM_SHARDS}shards}"
+```
+
+`kws_simo_quant/test_quant_onnx.sh:55-81`，函数 `run_one_config()` 接收两个参数：第一个参数 `$1` 是配置路径，第二个参数 `$2` 是输出目录。
+
+`${OUTPUT_DIR:-results/onnx_quant_${NUM_SHARDS}shards}` 表示优先使用非空 `OUTPUT_DIR`，否则使用默认输出目录。`NUM_SHARDS` 的默认值在 `kws_simo_quant/test_quant_onnx.sh:11`，是 `32`。
+
+例如：
+
+```text
+QUANT_CONFIG=/tmp/custom.json OUTPUT_DIR=results/custom
+  -> run_one_config /tmp/custom.json results/custom
+  -> 只运行 custom.json
+```
+
+配置路径随后由 `kws_simo_quant/test_quant_onnx.sh:59-62`，函数 `run_one_config()` 解析；`kws_simo_quant/test_quant_onnx.sh:69-80`，函数 `run_one_config()` 再把它传给 Python runner。
+
+### 75.4 false 分支：批量运行默认配置
+
+`kws_simo_quant/test_quant_onnx.sh:85-89`，脚本顶层逻辑执行：
+
+```bash
+for entry in "${DEFAULT_CONFIGS[@]}"; do
+  run_one_config "${entry%%|*}" "$OUTPUT_ROOT/onnx_quant_${entry##*|}_${NUM_SHARDS}shards"
+done
+```
+
+`DEFAULT_CONFIGS` 在 `kws_simo_quant/test_quant_onnx.sh:20-32`，脚本顶层变量定义，是一个 Bash 数组。使用 `"${DEFAULT_CONFIGS[@]}"` 会让数组中的每个完整元素分别成为一次循环值。
+
+每个元素用 `|` 分成配置路径和输出短名，例如：
+
+```text
+w8a8/w_mxint8_a_mxint8.json|w8a8_mxint8
+```
+
+#### `${entry%%|*}`：取左侧配置路径
+
+`kws_simo_quant/test_quant_onnx.sh:87`，脚本顶层逻辑中的 `${entry%%|*}` 使用 Bash 后缀删除：`${变量%%模式}` 从末尾删除匹配模式的最长后缀。模式 `|*` 从分隔符开始匹配到字符串末尾，因此结果是：
+
+```text
+entry = w8a8/w_mxint8_a_mxint8.json|w8a8_mxint8
+entry%%|* = w8a8/w_mxint8_a_mxint8.json
+```
+
+这个结果作为 `run_one_config()` 的第一个参数。
+
+#### `${entry##*|}`：取右侧输出短名
+
+同一行的 `${entry##*|}` 使用 Bash 前缀删除：`${变量##模式}` 从开头删除匹配模式的最长前缀。模式 `*|` 删除到最后一个分隔符，因此结果是：
+
+```text
+entry = w8a8/w_mxint8_a_mxint8.json|w8a8_mxint8
+entry##*| = w8a8_mxint8
+```
+
+于是输出目录变成 `$OUTPUT_ROOT/onnx_quant_${entry##*|}_${NUM_SHARDS}shards`。`OUTPUT_ROOT` 的默认规则在 `kws_simo_quant/test_quant_onnx.sh:17`，脚本顶层变量定义：优先使用 `OUTPUT_ROOT`，否则使用 `OUTPUT_DIR`，再否则使用 `results_0708`。
+
+默认配置的一个结果目录示例是：
+
+```text
+results_0708/onnx_quant_w8a8_mxint8_32shards
+```
+
+### 75.5 整体控制流
+
+```text
+test_quant_onnx.sh:83，脚本顶层逻辑
+  |-- QUANT_CONFIG 非空
+  |     -> test_quant_onnx.sh:84，脚本顶层逻辑
+  |        -> run_one_config() 一次
+  |           -> test_quant_onnx.sh:69-80，run_one_config()
+  |              -> Python runner 一个配置
+  |
+  `-- QUANT_CONFIG 未设置或为空
+        -> test_quant_onnx.sh:86-88，脚本顶层逻辑
+           -> 遍历 DEFAULT_CONFIGS
+              -> 拆出配置路径和输出短名
+              -> run_one_config() 一次
+              -> Python runner 一个配置
+```
+
+因此，第 83 行的 `if` 不是判断量化是否成功，而是在选择运行模式：有 `QUANT_CONFIG` 时运行一个配置；没有时批量运行 `DEFAULT_CONFIGS`。实际的路径检查、参数拼接和 Python 启动都集中在 `kws_simo_quant/test_quant_onnx.sh:55-81`，函数 `run_one_config()` 中。
+
+## 76. Silero ONNX：LSTM 量化与无 LSTM 量化的精度对比
+
+### 24.1 数据与可比性
+
+比较的日志是：
+
+- LSTM 量化：`silero_vad_clean/temp/test_quant_onnx.sh.log.siplify.lstm.loop.2026_07_29___11_19_17`
+- 无 LSTM 量化：`silero_vad_clean/temp/test_quant_onnx.sh.log.siplify.no-lstm.loop.2026_07_29___11_28_31`
+
+两组测试都使用 `aishell4`，20 个文件、1,431,607 个 chunks、24 个 shards，`threshold=0.11`，所有 shard 都完成且 `errors=0`。FP32 baseline 为：
+
+```text
+ROC-AUC  = 0.947480
+Accuracy = 0.835417
+```
+
+两套 JSON 的实际差异已核对：`quant_schema_no_lstm` 只是删除了对应的 `LSTM` module 配置，Conv/Linear 配置没有变化。LSTM 日志中的量化插入统计为 `targets=14, inserted_by_op={"Conv": 12, "LSTM": 2}`；无 LSTM 日志为 `targets=12, inserted_by_op={"Conv": 12}`。
+
+### 24.2 逐格式结果
+
+下表的差值定义为 `LSTM - no-LSTM`，accuracy 差值单位是百分点：
+
+| 格式 | LSTM ROC-AUC | 无 LSTM ROC-AUC | Delta AUC | LSTM accuracy | 无 LSTM accuracy | Delta accuracy |
+|---|---:|---:|---:|---:|---:|---:|
+| `mxfp4_e2m1` | 0.930555 | 0.927574 | +0.002982 | 0.700299 | 0.633507 | **+6.679** |
+| `mxfp6_e2m3` | 0.942664 | 0.941489 | +0.001175 | 0.767670 | 0.766768 | +0.090 |
+| `mxfp6_e3m2` | 0.935991 | 0.936454 | -0.000463 | 0.711028 | 0.729514 | **-1.849** |
+| `int8 per-channel/per-channel` | 0.946326 | 0.946673 | -0.000347 | 0.826529 | 0.828686 | -0.216 |
+| `int8 per-channel/per-tensor` | 0.947174 | 0.947514 | -0.000340 | 0.852185 | 0.853845 | -0.166 |
+| `int8 per-tensor/per-tensor` | 0.946199 | 0.945295 | +0.000904 | 0.833215 | 0.831788 | +0.143 |
+| `fp8 2d-block/1d-block` | 0.946602 | 0.947480 | -0.000878 | 0.832431 | 0.835417 | -0.299 |
+| `mxfp8_e4m3` | 0.942702 | 0.941704 | +0.000998 | 0.764326 | 0.765563 | -0.124 |
+| `mxfp8_e5m2` | 0.939033 | 0.938949 | +0.000084 | 0.749316 | 0.767449 | **-1.813** |
+| `mxint8` | 0.946483 | 0.946729 | -0.000246 | 0.825363 | 0.828048 | -0.268 |
+
+结论分两层看：
+
+1. 如果看 ROC-AUC，也就是整体排序能力，差异不大。最大差值是 `mxfp4_e2m1` 的约 0.003，其他格式都不超过约 0.0012。
+2. 如果看固定阈值 `0.11` 下的 accuracy，差异确实存在。明显格式是 `mxfp4_e2m1`，其次是 `mxfp6_e3m2` 和 `mxfp8_e5m2`。其余格式的差异不大，均不超过 0.3 个百分点。
+
+因此，最大的影响首先表现为 score calibration/阈值位置变化，而不是分类排序能力完全崩溃。不能只根据 accuracy 差异推断 AUC 同样程度地恶化。
+
+### 24.3 `mxfp4_e2m1`：6.679 个百分点差异的具体表现
+
+`mxfp4_e2m1` 是最极端的格式：E2M1 只有 1 个 mantissa bit，配置默认 block size 是 32，scale mode 是 `e8m0_sipu`。它同时量化 Conv 和 Linear，量化误差已经很大；LSTM 是否再经过 QDQ 会改变误差进入 recurrent state 的方式。
+
+从全部 1,431,607 个 score 计算混淆矩阵：
+
+| 版本 | TP | FN | TN | FP |
+|---|---:|---:|---:|---:|
+| LSTM 量化 | 875,652 | 426,060 | 126,901 | 2,994 |
+| 无 LSTM 量化 | 779,080 | 522,632 | 127,853 | 2,042 |
+
+LSTM 量化版本少了 96,572 个 FN，但多了 952 个 FP，净增加 95,620 个正确判断，正好对应约 6.679 个百分点的 accuracy 提升。这个差异不是由少量边界样本造成的：两版本 score 的平均绝对差为约 `0.0621`，95 分位绝对差约 `0.2386`；相对于 FP32 baseline，LSTM/no-LSTM 的平均绝对 score 误差分别约为 `0.2250/0.2783`。
+
+正类 score 也显示出明显的整体偏移：
+
+| 版本 | 正类平均 score | 正类 score 中位数 |
+|---|---:|---:|
+| LSTM 量化 | 0.437817 | 0.279197 |
+| 无 LSTM 量化 | 0.377944 | 0.159844 |
+
+所以在这个实验中，反直觉的结果是：量化 LSTM 反而把正类 score 整体推高，减少了大量 FN。不能将其解释为“LSTM 量化普遍更准确”；更准确的解释是，低精度 Conv 输出进入 recurrent 网络后，无 LSTM QDQ 路径的 score 被明显压低，而额外的 LSTM 动态 QDQ/权重 QDQ 改变了 scale、舍入和 gate 输入，使最终 score calibration 恰好更接近 baseline。这个方向是格式和模型相关的，后面的 `mxfp6_e3m2`、`mxfp8_e5m2` 正好表现为相反方向。
+
+### 24.4 `mxfp6_e3m2` 与 `mxfp8_e5m2`：LSTM 量化造成向下偏移
+
+这两个格式的 ROC-AUC 几乎没有变化，但 LSTM 量化后的 accuracy 分别低 1.849 和 1.813 个百分点。score 统计显示两者都有约 `-0.024` 的整体 LSTM-minus-no-LSTM 平均偏移：
+
+| 格式 | LSTM/no-LSTM 平均 score 差 | 平均绝对差 | 95 分位绝对差 |
+|---|---:|---:|---:|
+| `mxfp6_e3m2` | -0.02422 | 0.02884 | 0.12333 |
+| `mxfp8_e5m2` | -0.02404 | 0.02867 | 0.12133 |
+
+对应的正类混淆矩阵为：
+
+| 格式 | 版本 | TP | FN | TN | FP |
+|---|---|---:|---:|---:|---:|
+| `mxfp6_e3m2` | LSTM | 891,242 | 410,470 | 126,671 | 3,224 |
+| `mxfp6_e3m2` | no-LSTM | 917,971 | 383,741 | 126,407 | 3,488 |
+| `mxfp8_e5m2` | LSTM | 946,649 | 355,063 | 126,077 | 3,818 |
+| `mxfp8_e5m2` | no-LSTM | 973,042 | 328,670 | 125,644 | 4,251 |
+
+这里 LSTM 量化少了一些 FP，却多了约 26k FN，因此固定阈值下的总 accuracy 下降。AUC 仍接近，说明主要是 score 的幅度/偏置变化，而不是正负样本排序被完全打乱。两个格式都只有 2 个 mantissa bits，经过 block size 32 的 `e8m0_sipu` MX 量化后，LSTM 输入、W/R gate 权重和 recurrent state 的舍入误差会通过 sigmoid/tanh gate 以及时间递推放大；不同指数/尾数布局决定了最终偏移方向和大小。
+
+### 24.5 为什么“无 LSTM 量化”不一定更准确
+
+无 LSTM 配置只意味着 ONNX `LSTM` 节点及其 W/R 权重不插入 QDQ，并不意味着整个 LSTM 输入是 FP32 baseline。它前面的 Conv 仍然已经被 MX/INT8 量化，LSTM 接收到的是量化 Conv 的输出。
+
+当前 SIMO ONNX 实现也不是把 ONNX LSTM 替换为一个独立的低精度 recurrent kernel：
+
+- `simo/onnx/onnx_quant.py:296-326` 会遍历主图和 subgraph，为目标节点插入 activation QDQ，并为权重插入 dequant 节点。
+- `simo/onnx/onnx_quant.py:808-945` 对 LSTM 的 W/R 按四个 gate 切分并分别量化。
+- `simo/onnx/onnx_quant.py:1305-1345` 再把量化后的 gate 权重拼回 ONNX LSTM 的输入。
+
+也就是说，LSTM 量化版本仍然执行 ONNX LSTM，但其输入、W 和 R 都经过量化/反量化；无 LSTM 版本保留原始 LSTM W/R，但仍承受上游低精度 Conv 的误差。对于 recurrent 模型，误差会影响 gate、hidden state 和 cell state 的连续递推，因此“保留 LSTM FP32”不是一个能保证最终 VAD score 更接近 baseline 的充分条件。
+
+### 24.6 `fp8 2d-block/1d-block` 是一个有用的对照组
+
+该配置有特殊的实现限制。日志显示：
+
+```text
+LSTM:    targets=14 inserted=2  skip_reasons={"conv_fp8_per_block": 12}
+no-LSTM: targets=12 inserted=0  skip_reasons={"conv_fp8_per_block": 12}
+```
+
+无 LSTM 版本的 12 个 Conv 也因为 `conv_fp8_per_block` 被跳过，LSTM 又没有配置，因此实际上没有插入量化 QDQ，结果与 FP32 baseline 完全相同：ROC-AUC `0.947480`、accuracy `0.835417`。LSTM 版本只量化 2 个 LSTM，所以相对 baseline 只下降到 `0.946602/0.832431`。这个对照组直接证明，当前差异来自实际插入的 LSTM QDQ，而不是日志目录或评测数据不一致。
+
+### 24.7 `w6a6` 的输出目录覆盖问题
+
+默认列表中的以下两项使用了相同的输出短名：
+
+```text
+w6a6/w_mxfp6_e2m3_a_mxfp6_e2m3_scale_int_sipu.json|w_mxfp6_e3m2_a_mxfp6_e3m2_scale_int_sipu
+w6a6/w_mxfp6_e3m2_a_mxfp6_e3m2_scale_int_sipu.json|w_mxfp6_e3m2_a_mxfp6_e3m2_scale_int_sipu
+```
+
+因此两次运行都写入 `onnx_quant_w_mxfp6_e3m2_a_mxfp6_e3m2_scale_int_sipu_aishell4_24shards`。当前该目录的 `summary.json` 是第二个 `e3m2` 配置的结果；第一个 `e2m3` 的结果只能从 loop 日志读取，不能再从独立 summary/npz 中复核。日志中的数值是：
+
+- `e2m3`：LSTM `0.942664/0.767670`，no-LSTM `0.941489/0.766768`。
+- `e3m2`：LSTM `0.935991/0.711028`，no-LSTM `0.936454/0.729514`。
+
+后续复测必须给两个配置不同的短名或不同 `OUTPUT_ROOT`，否则 10 次循环只会留下 9 个独立结果目录。
+
+### 24.8 跨机器归因限制
+
+本机和 `bjh5` 已确认都是 8 张 H100 80GB，Python 环境版本也一致：NumPy `2.3.5`、ONNX `1.22.0`、ONNXRuntime `1.27.0`、Torch `2.11.0+cu130`；两端都从 `/share/users/like/package/simo_conda_sglang/simo` 加载 editable SIMO，custom-op `.so` 的 SHA256 也一致。
+
+但两台机器的 NVIDIA driver 不同：
+
+```text
+本机   590.48.01
+bjh5   595.71.05
+```
+
+因此上表严格来说是“本机 LSTM 量化”和“bjh5 无 LSTM 量化”的差异，不能把所有数值差异无条件归因于 LSTM 配置。CUDA driver、ONNXRuntime provider 或 custom kernel 的算法选择/舍入差异，尤其可能影响 MX QDQ 和 recurrent 路径。
+
+最终归因建议：在同一台机器、同一个 driver 下，用同一份模型和同一份数据分别运行 `quant_schema` 与 `quant_schema_no_lstm`；同时修复两个 `w6a6` 输出短名冲突。比较时除了固定阈值 accuracy，还应报告 ROC-AUC，并在同一验证集重新选择阈值，否则 score calibration 偏移会把一个相对温和的排序差异放大成几个百分点的 accuracy 差异。
+
+## 77. `DynamicQuantizeLSTM` 的两个矩阵乘法和 MLAS GEMM 数据类型
+
+结论：对于每个门，`X_t W_g^T` 和 `H_{t-1} R_g^T` 这两个矩阵乘法都走了整数 QGEMM；不是只量化 W 或只量化其中一个 matmul。但是，整个 LSTM 并不是整数执行：QGEMM 的结果会立即反量化为 `float`，之后的 peephole、bias、sigmoid/tanh、cell state 和 hidden state 更新仍然在浮点路径中。
+
+### 77.1 四个 gate 实际上是两个融合 GEMM
+
+ONNX 文档中的 `i/f/c/o` 四组公式，在 ORT 中不是分别发起 8 个小矩阵乘法。`UniDirectionalLstm::ComputeImpl` 把四个 gate 沿输出列拼成一个宽矩阵，令 `N = 4 * hidden_size`：
+
+- 第一次 GEMM 一次计算所有时间步的 `X * W[iofc]^T`，对应 `ComputeGemm(total_rows, 4*hidden_size, input_size, ...)`。
+- 每个时间步再计算一次 `H_{t-1} * R[iofc]^T`，对应 `ComputeGemm(batch_rows, 4*hidden_size, hidden_size, ...)`。
+
+因此，`it`、`ft`、`ct`、`ot` 的 X-W 项和 H-R 项都包含在这两个 4-gate fused GEMM 中，四个 gate 的对应切片都会经过同样的整数 GEMM 和 scale 处理。双向 LSTM 对两个 direction 分别使用各自的 W/R 和量化参数。
+
+### 77.2 哪些部分量化，哪些部分没有量化
+
+`DynamicQuantizeLSTM::Compute` 接收已经量化的 W/R（类型约束为 `uint8` 或 `int8`），并为它们设置 scale/zero point；权重还可能在 `PrePack` 中被 MLAS 打包。对激活侧，`ComputeGemm` 每次调用都会：
+
+1. 用 `GetQuantizationParameter` 从当前 float A 计算动态 scale 和 zero point；
+2. 用 `ParQuantizeLinearStd` 把 A 写成 `uint8`；
+3. 用 A 的动态 scale 与 W/R 的权重 scale 相乘，交给 MLAS 输出处理器把 int32 累加结果转换回 float。
+
+所以四个公式可按下表理解：
+
+| 公式部分 | 是否经过整数 QGEMM | 说明 |
+|---|---|---|
+| `X_t*(Wi/Wf/Wc/Wo)^T` | 是 | X 动态量化为 uint8，W 为 uint8/int8；四个 gate 在一个 fused GEMM 中计算 |
+| `H_{t-1}*(Ri/Rf/Rc/Ro)^T` | 是 | 每个时间步将当前 H 动态量化为 uint8，R 为 uint8/int8；结果累加到前一项 |
+| `Pi(.)Ct-1`、`Po(.)Ct-1`、bias 项 | 否 | 由 LSTM 的 gate/state 浮点逻辑处理 |
+| `Ct`、`Ht` 更新及 sigmoid/tanh | 否 | QGEMM 输出已经回到 float 后再执行 |
+
+第一次 GEMM 用 `beta=0` 生成 `XW`；后续 `H R` GEMM 用 `beta=1`，在输出处理阶段将 `HR` 的反量化结果加到已有的 float `XW` 上。因此“两个 matmul 全部量化”准确地说是“两个矩阵乘法的乘法和 int32 累加都量化执行”，不是“门公式中的所有加法、乘法和激活都变成整数”。
+
+### 77.3 MLAS integer GEMM 的输入、累加器和输出
+
+在 `onnxruntime/core/providers/cpu/rnn/rnn_helpers.cc` 的量化 `ComputeGemm` 中，传给 `MlasGemm` 的类型是：
+
+- A：`const uint8_t*`。`MLAS_GEMM_QUANT_SHAPE_PARAMS::AIsSigned` 保持默认 `false`，X/H 都由 `ParQuantizeLinearStd` 量化成无符号 8 bit。
+- B：`const void*`，实际为 W 或 R 的 `uint8_t`/`int8_t`。`BIsSigned` 由 `weights.quant_para_->is_signed` 指示；因此支持 U8xU8 和 U8xS8 等对应的 MLAS kernel。
+- C：`int32_t*`。这是 8-bit 乘积的整数累加器，`MlasGemm` 的量化接口明确以 `int32` 保存 C。
+- 输出处理器：`MLAS_QGEMM_SCALE_BIAS_OUTPUT_PROCESSOR` 读取 int32 C，乘以 `a_scale * weight_scale`，并把结果写入 `float* output_iofc`。第一次调用覆盖输出，后续调用用 `AccumulateMode` 加到已有 float 输出上。
+
+因此，如果“GEMM 输出”指 MLAS integer kernel 的原始 C，答案是 `int32`；如果指 `ComputeGemm` 返回给 LSTM gate 计算的结果，答案是 `float`。其数据流可写成：
+
+```text
+float X/H --dynamic quantize--> uint8 A
+uint8/int8 W/R ----------------> B
+                 MLAS QGEMM
+             int32 accumulator C
+                       |
+       scale (a_scale * w_scale/r_scale)
+                       v
+                 float XW/HR
+                       |
+          float gate/state computation
+```
+
+这里的“动态”主要针对 X 和 H 的运行时量化参数；W/R 的量化数据和 scale/zero point 是 DynamicQuantizeLSTM 的输入，而不是在每个时间步重新从 float 权重计算。
+
+### 77.4 按函数追踪完整调用链
+
+下面的文件名和行号均相对于 `/softhome/like/package/onnxruntime/` 这个 ONNX Runtime codebase；行号对应当前 checkout。
+
+#### (1) `DynamicQuantizeLSTM` 的输入契约
+
+- `onnxruntime/core/graph/contrib_ops/quantization_defs.cc:657-758`，`ONNX_MS_OPERATOR_SET_SCHEMA(DynamicQuantizeLSTM, 1)`：
+  - 输入 0 `X` 使用类型约束 `T`，而 `T` 被限制为 `tensor(float)`；
+  - 输入 1 `W`、输入 2 `R` 使用 `T2`，而 `T2` 被限制为 `tensor(uint8)` 或 `tensor(int8)`；
+  - 输入 3 `B`、输入 5 `initial_h`、输入 6 `initial_c`、输入 7 `P` 仍使用 `T=float`；
+  - 输入 4 `sequence_lens` 是 `int32`；输入 8-11 是 W/R 的 scale 和 zero point。
+- `onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc:238-248`，`ONNX_OPERATOR_TYPED_KERNEL_EX(... DynamicQuantizeLSTM ...)`：再次注册同样的类型约束。因此这个 Microsoft 域的 `DynamicQuantizeLSTM` 不是“接收 float W/R 后在算子内部首次量化”的接口，而是接收已经是 8 bit 的 W/R；它与标准 ONNX `LSTM` 的 float W/R 接口不同。
+
+标准 LSTM 的公式和标准 W/R 形状仍可在 ONNX codebase 的 `docs/Operators.md:17332-17423`，`LSTM` 文档中看到。DynamicQuantizeLSTM 的自定义 schema 在 `quantization_defs.cc:692-700` 使用了内部 GEMM 友好的 W/R 布局 `[num_directions, input_size/hidden_size, 4*hidden_size]`，阅读实现时应以这个自定义 schema 和后面的 `ComputeGemm` 调用为准，不能只按标准 LSTM 文档的 float W/R 形状推断内存布局。
+
+#### (2) 入口如何把 W/R 交给 LSTM 内核
+
+- `onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc:94-118`，`DynamicQuantizeLSTM::PrePack`：当输入编号为 1 或 2 时，分别为 W 或 R 调用 `TryPackWeights`。
+- `onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc:41-87`，`DynamicQuantizeLSTM::TryPackWeights`：
+  - 在第 57 行读取 `weights.IsDataType<int8_t>()`，记录 B 是否有符号；
+  - 第 58 行调用 `MlasGemmPackBSize(N, K, false /*AIsSigned*/, is_weight_signed, ...)`；
+  - 第 80 行调用 `MlasGemmPackB(..., false /*AIsSigned*/, is_weight_signed, ...)`。
+  这里明确了激活矩阵 A 固定按无符号处理，而 W/R 由 `is_weight_signed` 决定是 uint8 还是 int8。预打包只改变 B 的存储格式，不把 W/R 变成 float，也不在每个时间步重新量化 W/R。
+- `onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc:166-236`，`onnxruntime::contrib::DynamicQuantizeLSTM::Compute`：
+  - 第 168-178 行取得 W/R 和四个 scale/zero-point 输入；
+  - 第 190-206 行确定 W/R 的 signedness，并构造 `QuantizationParameter`；
+  - 第 215-216 行构造 `GemmWeights<uint8_t> W_1/R_1`。这里的模板参数 `uint8_t` 是内部“8 bit 权重”的封装类型，不意味着底层 B 一定是无符号；底层实际 signedness 仍由 `QuantizationParameter::is_signed` 和 MLAS 的 `BIsSigned` 字段表达；
+  - 第 224-232 行在双向情况下建立 direction 1 的 W/R carrier，并把第二个 direction 的 scale/zero-point 指针向后移动；
+  - 第 235 行调用 `LSTMBase::ComputeImpl<float, uint8_t>`。
+
+因此，权重路径可以概括为：
+
+```text
+uint8/int8 W/R + W/R scale/zp
+        -> PrePack/TryPackWeights（可选的 B 预打包）
+        -> GemmWeights<uint8_t> + QuantizationParameter
+        -> LSTMBase::ComputeImpl<float, uint8_t>
+```
+
+#### (3) `LSTMBase` 如何分别处理 direction 和可选输入
+
+- `onnxruntime/core/providers/cpu/rnn/lstm_base.cc:23-27`，`LSTMBase::ComputeImpl<InputT, WeightT>`：DynamicQuantizeLSTM 实例化的是 `InputT=float, WeightT=uint8_t`。
+- 同一函数第 32-39 行读取 X、B、`sequence_lens`、`initial_h`、`initial_c`、P；第 79-88 行把 B 和 P 转成 `gsl::span<const InputT>`，也就是 float span。
+- 第 146-159 行创建 forward/reverse 两个 `UniDirectionalLstm<float>` 并分别调用 `fw.Compute(..., W_1, R_1, ...)` 和 `bw.Compute(..., W_2, R_2, ...)`；第 161-167 行是单向路径。也就是说，双向并不会把两个方向拼成一个有符号性不同的 GEMM，而是对两个 direction 重复同一套 X/W、H/R 量化 GEMM 流程。
+- 第 50-58 行创建 Y、Y_h、Y_c 输出；这些输出的 `InputT` 也是 float。
+
+#### (4) 第一次 GEMM：一次生成所有时间步的 `X·W`
+
+- `onnxruntime/core/providers/cpu/rnn/uni_directional_lstm.cc:626-634`，`UniDirectionalLstm<T>::Compute<WeightT>` 只是把参数转发给 `ComputeImpl`；CPU 动态量化实例在第 654-659 行显式实例化了 `UniDirectionalLstm<float>::Compute<uint8_t>`。
+- `onnxruntime/core/providers/cpu/rnn/uni_directional_lstm.cc:228-293`，`UniDirectionalLstm<T>::ComputeImpl<WeightT>`：
+  - 第 281 行设置 `hidden_size_x4 = 4 * hidden_size_`；
+  - 第 282 行设置 `total_rows = max_sequence_length * batch_size_`；
+  - 第 287-293 行调用 `ComputeGemm(total_rows, hidden_size_x4, input_size_, ..., inputs, input_weights, beta=0, output_iofc, ...)`。
+
+这一次不是为 i/f/c/o 各调用一次 GEMM，而是把四个 gate 的输出列合并成 `N=4H`。逻辑上它同时产生：
+
+```text
+XW_i, XW_f, XW_c, XW_o
+```
+
+具体的物理 gate 切片由 `GateComputations` 使用。`onnxruntime/core/providers/cpu/rnn/uni_directional_lstm.cc:490-495` 将 4H 宽的行切成 `pi/po/pf/pc` 四个 float 指针，`595-598` 的调试输出也明确按 i/o/f/c 四段查看。这里的 gate 融合只影响内存布局，不改变“每个 gate 的 X-W 项都经过同一个整数 QGEMM”的结论。
+
+#### (5) 第二次 GEMM：每个时间步生成 `H_{t-1}·R`
+
+- `onnxruntime/core/providers/cpu/rnn/uni_directional_lstm.cc:333-351` 位于 `UniDirectionalLstm<T>::ComputeImpl<WeightT>` 的时间步循环中。
+- 第 342-349 行调用：
+
+```text
+ComputeGemm(num_seq_to_compute_adjusted,
+            4 * hidden_size_,
+            hidden_size_,
+            ..., previous_state, recurrent_weights,
+            beta=1, step_out_IOFC,
+            ..., quantized_C_buffer_)
+```
+
+这里 `previous_state` 的模板类型 T 是 float，也就是 `H_{t-1}` 在进入量化 `ComputeGemm` 前仍是 float；第 297 行已经把 beta 改为 1，表示这次要把 `H R` 项加入已经保存的 `X W` 项。第 370-372 行随后调用 `GateComputations`。
+
+因此，用户问题中的四个式子应逐项理解为：
+
+| ONNX 公式中的项 | ORT 实际路径 |
+|---|---|
+| `Xt*(Wi^T)`、`Xt*(Wf^T)`、`Xt*(Wc^T)`、`Xt*(Wo^T)` | 第一次 `ComputeGemm` 的同一个 `N=4H` fused QGEMM |
+| `Ht-1*(Ri^T)`、`Ht-1*(Rf^T)`、`Ht-1*(Rc^T)`、`Ht-1*(Ro^T)` | 时间步循环中的第二次 `ComputeGemm`，同一个 `N=4H` fused QGEMM |
+| `Pi(.)Ct-1`、`Pf(.)Ct-1`、`Po(.)Ct` | `GateComputations` 中的 float elementwise product，第 505-508、519-521、560-563 行 |
+| `Wb/Rb` bias | 构造函数 `UniDirectionalLstm<T>::UniDirectionalLstm` 第 48-90 行加载；`LoadBias` 第 180-193 行把 Wb 与 Rb 相加，之后由 `clip_with_bias_ptr_` 在 `GateComputations` 第 510-534、524-568 行处理 |
+| sigmoid/tanh、`Ct`、`Ht` | `GateComputations` 第 510-585 行的 float activation、`merge_lstm_gates_to_memory` 和 H 输出 |
+
+#### (6) `ComputeGemm` 中真正发生的动态量化
+
+- `onnxruntime/core/providers/cpu/rnn/rnn_helpers.cc:247-317`，量化权重的 `ComputeGemm(..., const GemmWeights<uint8_t>& weights, ...)` 是关键函数：
+  - 第 271-273 行调用 `GetQuantizationParameter(A, M*K, a_scale, a_zero_point, ...)`；
+  - 第 275-276 行调用 `ParQuantizeLinearStd(A, quantized_A_buffer, M*K, a_scale, a_zero_point, ...)`；
+  - 第 278-284 行读取 W/R 的 signedness 和 scale，并构造 `scale_multiplier[s] = a_scale * weights_scale[s]`；
+  - 第 286-296 行准备 C 缓冲区和输出处理器；
+  - 第 298-316 行填充 `MLAS_GEMM_QUANT_SHAPE_PARAMS`/`MLAS_GEMM_QUANT_DATA_PARAMS` 并调用 `MlasGemm`。
+- `onnxruntime/core/util/qmath.h:50-110`，`GetQuantizationParameter<QType>` 通过当前 A 的 min/max 计算 scale 和 zero point；这里的 A 是整个本次 GEMM 的输入，不是单独为 i/f/c/o 四个 gate 各算一套 activation scale。
+- `onnxruntime/core/util/qmath.h:122-135`，`ParQuantizeLinearStd<OutputType>` 把 float 输入逐元素写入量化输出。当前调用传入的 `quantized_A_buffer` 类型是 `uint8_t*`，所以这里的 `OutputType` 为 `uint8_t`。
+
+动态量化的粒度因此是：
+
+- 第一次 X-W GEMM：A 的元素数是 `M*K = total_rows * input_size`，通常覆盖当前 direction 的所有有效时间步和 batch 行；
+- 每个 H-R GEMM：A 的元素数是 `M*K = num_seq_to_compute_adjusted * hidden_size`，每次时间步/批次分块重新根据 H 的 min/max 求一套 scale/zero point；
+- W/R 的 scale 来自 DynamicQuantizeLSTM 输入 8/10，若是二维 scale，则 `scale_size=4H`，在 `ComputeGemm` 中作为 per-column scale multiplier；若是一维 scale，则是 per-matrix scale。
+
+这里没有“先把 X 量化成一个图中的 uint8 输出再交给标准 LSTM”的过程。量化 buffer 是 ORT CPU kernel 的临时内存：`AllocateQuantizeBuffers` 位于 `uni_directional_lstm.cc:215-224`，X/H 共用 uint8 buffer，`quantized_C_buffer_` 是 H-R beta=1 路径使用的 int32 临时 buffer。
+
+#### (7) MLAS QGEMM 的精确输入/输出类型
+
+- `onnxruntime/core/mlas/inc/mlas.h:613-620`，`MLAS_GEMM_QUANT_SHAPE_PARAMS` 描述 M/N/K 和 A/B signedness；其中 `AIsSigned` 默认是 `false`，`BIsSigned` 由调用方设置。
+- `onnxruntime/core/mlas/inc/mlas.h:622-634`，`MLAS_GEMM_QUANT_DATA_PARAMS` 的字段直接给出类型：
+  - `A` 是 `const uint8_t*`；
+  - `B` 是 `const void*`，实际由 `BIsSigned` 解释为 uint8 或 int8；
+  - `C` 是 `int32_t*`；
+  - `ZeroPointA/ZeroPointB` 是 uint8 zero point 指针/值；
+  - `OutputProcessor` 是对 int32 C 的后处理器。
+- `onnxruntime/core/mlas/inc/mlas.h:656-664`，`MlasGemm(const MLAS_GEMM_QUANT_SHAPE_PARAMS&, const MLAS_GEMM_QUANT_DATA_PARAMS&, ...)` 只是把单个 GEMM 转发给 `MlasGemmBatch`。
+- `onnxruntime/core/mlas/lib/qgemm.cpp:134-202`，`MlasGemmBatch` 做线程切分；`onnxruntime/core/mlas/lib/qgemm.cpp:37-115`，`MlasGemmQuantThreaded` 根据 `Shape->AIsSigned` 和 `Shape->BIsSigned` 选择具体的整数 kernel，并根据 `Data->BIsPacked` 选择预打包或未打包 B。
+
+所以 MLAS integer kernel 这一层看到的是：
+
+```text
+A = uint8 activation
+B = uint8/int8 weight
+C = int32 accumulator
+```
+
+但要注意 `ComputeGemm` 的两个 beta 分支：
+
+- `onnxruntime/core/providers/cpu/rnn/rnn_helpers.cc:286-288`，量化重载 `ComputeGemm`：先把 `C` 视为 `int32_t*`；beta=0 时它指向 `output_iofc` 的同一块存储；
+- `onnxruntime/core/providers/cpu/rnn/rnn_helpers.cc:288-291`，同一个量化重载 `ComputeGemm`：beta=1 时改用 `quantize_agg_C_buffer`，避免直接覆盖已经由第一次 GEMM 写入的 float `output_iofc`；
+- `onnxruntime/core/providers/cpu/rnn/rnn_helpers.cc:293-296`，同一个量化重载 `ComputeGemm`：构造 `MLAS_QGEMM_SCALE_BIAS_OUTPUT_PROCESSOR`，beta=0 使用 `ZeroMode`，beta=1 使用 `AccumulateMode`；
+- `onnxruntime/core/providers/cpu/rnn/rnn_helpers.cc:304-316`，同一个量化重载 `ComputeGemm`：把这两个 C 指针作为 `gemm_params.C` 传入 `MlasGemm`。
+
+#### (8) 为什么 MLAS 的“输出”最终是 float
+
+- `onnxruntime/core/mlas/lib/qpostprocessor.cpp:19-101`，`MLAS_QGEMM_SCALE_BIAS_OUTPUT_PROCESSOR::Process` 根据 ZeroMode/AccumulateMode 和 per-matrix/per-column 分派到 `ProcessImpl`。
+- `onnxruntime/core/mlas/lib/qpostprocessor.cpp:106-190`，`ProcessImpl` 读取 `const int32_t* C`，把整数 C 转成 float，乘以 scale；
+- `onnxruntime/core/mlas/lib/qpostprocessor.cpp:197-231` 的标量路径明确实现了：`result = float(c[offset]) * ScaleValue`，ZeroMode 写入 `c_out`，AccumulateMode 执行 `c_out += result`。
+
+因此第二个 `H R` GEMM 不是把两个 int32 GEMM 结果直接相加。实际顺序是：
+
+```text
+第一次：QGEMM(uint8 X, uint8/int8 W) -> int32 C_XW
+        -> scale(a_X * scale_W) -> float output_iofc = XW
+
+第二次：QGEMM(uint8 H, uint8/int8 R) -> int32 C_HR
+        -> scale(a_H * scale_R) -> float output_iofc += HR
+
+最后：float output_iofc
+      -> peephole/bias/activation/state update
+      -> float Y/Y_h/Y_c
+```
+
+这就是“两个 matmul 都量化”与“整个 LSTM 都是整数”的边界：乘法和整数累加在 QGEMM 中完成，但每个矩阵乘法的结果在进入 gate 逻辑前已经被还原为 float；最终 `Y/Y_h/Y_c` 也由 `onnxruntime/core/providers/cpu/rnn/lstm_base.cc:50-58`，`LSTMBase::ComputeImpl` 以 `InputT=float` 分配。
+
+## 78. Silero 日志中的 ROC-AUC、Acc@0.11、overall 与 aishell4
+
+### 78.1 这些指标到底在评测什么
+
+本次脚本不是按整段音频直接给一个标签，而是把每个音频切成连续的 512-sample chunk。当前采样率是 16 kHz，所以一个 chunk 约为 32 ms。`SileroVadOnnx.predict_proba()` 对每个 chunk 输出一个分数；AISHELL-4 的 RTTM（没有 RTTM 时才回退到 TextGrid）被合并为 speech 时间区间，再映射成同样长度的二值标签：与 speech 区间相交的 chunk 标为 `True`，其余标为 `False`。
+
+因此日志中的 ROC-AUC 和 Accuracy 都是“chunk 级别”的指标，不是文件级别的指标，也不是直接测量最终语音切分段数的指标。模型输出虽然在代码变量中叫 `probs`，但下面的 ROC-AUC 只把它当作可排序的 speech score；它不保证这个分数已经是严格校准的概率。
+
+### 78.2 ROC-AUC 的业务含义
+
+ROC-AUC 是模型在所有可能阈值下区分 speech 和 non-speech 的整体排序能力。它可以直观理解为：随机取一个真实 speech chunk 和一个真实 non-speech chunk，模型把前者打分得更高的概率；例如 `ROC-AUC=0.94748` 大致表示这个概率为 94.748%（忽略分数相同的细节）。
+
+它对业务的含义是：
+
+- 衡量 VAD 的基础区分能力，而不绑定某个固定阈值；
+- 当下游可以根据场景重新选择阈值，或需要在漏检和误检之间做不同权衡时，AUC 更适合比较模型/量化格式；
+- AUC 越接近 1，通常说明 speech 分数和 non-speech 分数的排序重叠越少。
+
+ROC-AUC 不是“94.748% 的分类准确率”，也不直接告诉我们在阈值 0.11 下漏检多少、误报多少。一个量化模型可能保持相近的 AUC，却因为所有 score 整体偏高或偏低，使某个固定阈值下的结果明显变化。
+
+### 78.3 `Acc@0.11` 的业务含义
+
+脚本中的定义是：
+
+```text
+prediction = (score >= 0.11)
+Acc@0.11 = count(prediction == reference_label) / count(all_chunks)
+```
+
+所以 `Acc@0.11=0.835417` 的含义是：在当前 AISHELL-4 测试集的所有 1,431,607 个 32 ms chunk 上，固定使用 0.11 作为决策阈值时，约 83.5417% 的 chunk 被判对。它更接近“当前部署阈值下的总体命中率”，而不是模型在全部阈值上的能力。
+
+这个指标有几个业务限制：
+
+- 它强依赖阈值 0.11；阈值改变，Accuracy 也会改变；
+- 它是所有 chunk 合并后的 micro accuracy，不是每个文件 Accuracy 的平均值，长文件的权重更大；
+- 语音与非语音 chunk 的比例会影响 Accuracy，因此不能只看 Accuracy 判断漏检和误报；
+- 它不等同于 precision、recall、F1、DER 或端点延迟。实际 VAD 业务还应同时看 confusion matrix、speech recall、non-speech false alarm，以及阈值变化下的曲线。
+
+例如，若 ROC-AUC 基本不变但 `Acc@0.11` 下降，通常先检查 score calibration 是否发生整体偏移，并在同一验证集重新选择部署阈值；这不一定意味着模型的 speech/non-speech 排序能力同等幅度地恶化。
+
+### 78.4 `aishell4` 是什么
+
+`aishell4` 是本次评测明确请求的数据集名称，对应 AISHELL-4 test 数据。当前运行中它包含 20 个音频文件、约 12.7253 小时音频和 1,431,607 个 chunk。脚本对每个文件运行有状态的 Silero VAD，并使用该文件的 RTTM speaker 区间合并成 speech union 作为参考标签。
+
+summary 中的 `per_dataset` 部分会列出一行：
+
+```text
+dataset = aishell4
+```
+
+这一行回答的是“模型在 AISHELL-4 上表现如何”，并且该数据集有代码内置的参考值 `official_roc_auc=0.94`、`official_accuracy=0.85`。这两个 official 数值是基准参考，不应与本次固定阈值 0.11 的结果当作完全相同的评测协议；尤其官方 Accuracy 的阈值/选择过程不一定就是本次的 0.11。
+
+### 78.5 `overall` 是什么
+
+`overall` 不是另一份数据，也不是官方指标。聚合脚本会先分别合并每个请求数据集的所有 shard，然后把所有数据集的 labels 和 scores 拼接起来，在拼接后的全部 chunk 上重新计算：
+
+```text
+overall ROC-AUC  = pooled labels/scores 的 ROC-AUC
+overall Accuracy = 全部数据集正确 chunk 数 / 全部数据集 chunk 数
+```
+
+因此它是按 chunk 汇总的整体指标，而不是各数据集 AUC 的算术平均。多个数据集时，数据量更大的数据集会在 Accuracy 中贡献更多 chunk；AUC 也会在合并后的样本池上计算，可能与各数据集 AUC 的简单平均不同。`overall` 没有对应的 `official_*` 参考值，所以 summary 里通常为 `null`。
+
+本次命令只传了 `DATASETS=aishell4`，所以 `overall` 和 `aishell4` 实际包含完全相同的 20 个文件、相同的 chunk、labels 和 scores；两行的 ROC-AUC、`Acc@0.11`、文件数、小时数和 errors 应当完全一致。只有把命令改成例如 `DATASETS=aishell4,voxconverse` 时，`overall` 才会代表两个数据集拼接后的整体结果，而 `aishell4` 仍只代表 AISHELL-4。
+
+### 78.6 阅读当前日志的建议
+
+1. 先用 `overall` 比较同一批数据、同一阈值下的整体结果；在本次单数据集运行中，它与 `aishell4` 可视为同一个数。
+2. 用 ROC-AUC 判断量化是否破坏了整体排序能力。
+3. 用 `Acc@0.11` 判断当前固定部署阈值下的实际 chunk 决策变化。
+4. 当两者结论不一致时，进一步检查 score 分布、阈值下的 TP/FN/FP/TN，并重新调阈值，而不要把 AUC 直接当成 Accuracy。
+
+## 79. 在本机从源码编译并安装 CUDA 13 版 ONNX Runtime
+
+### 79.1 本机已核对的版本和路径
+
+以下路径和版本已经在本机核对过：
+
+| 项目 | 当前值 |
+| --- | --- |
+| ORT 源码 | `/softhome/like/package/onnxruntime/`（git 实际路径解析为 `/share_data/users/like/package/onnxruntime`） |
+| ORT checkout | `branch-v1.27.0`，commit `8f0278c77b`，版本 `1.27.0` |
+| Python 环境 | `/share_data/users/like/miniconda3/envs/simo_sglang/`，Python 3.12.12 |
+| CUDA Toolkit | `/share_data/users/like/opt/cuda-13.0`，nvcc `13.0.48` |
+| cuDNN | conda 环境的 `site-packages/nvidia/cudnn`，cuDNN `9.19.0.56`，包含 `include/cudnn.h` 和 `lib/libcudnn.so.9` |
+| CMake / Ninja | conda 环境中分别为 `4.2.0` / `1.13.0` |
+| GPU / driver | H100 80GB（sm90），driver `590.48.01` |
+
+这个 checkout 的 CMake 已包含 CUDA 13 的处理：最低 CUDA 版本为 12.0，并对 CUDA 13 设置编译前端、runtime library 和 FP4/FP8 编译选项。因此应使用这份本地源码，而不是换成未带这些改动的普通 v1.27.0 tag。
+
+`/softhome/like/package/onnx` 这份独立 ONNX 源码不是本次构建的输入。ONNX Runtime 会使用 `cmake/external/onnx` 中由 git submodule 固定的版本；只有该 submodule 缺失时才需要初始化 submodule，而不是把独立 ONNX checkout 手工塞进构建目录。
+
+当前环境安装的是 `onnxruntime-gpu==1.27.0`，它同时公开了 `TensorrtExecutionProvider`、`CUDAExecutionProvider` 和 `CPUExecutionProvider`。下面的命令只启用 `--use_cuda`，因此新 wheel 只包含 CUDA/CPU EP；若直接安装它，当前 TensorRT EP 将消失。若业务依赖 TensorRT，先在独立环境验证，或另行准备匹配 CUDA 13 的 TensorRT 后加 `--use_tensorrt --tensorrt_home <TensorRT 根目录>` 构建。
+
+### 79.2 推荐方式：构建 wheel 后覆盖安装
+
+不建议把 ONNX Runtime 作为 editable package 安装。标准且可复现的路径是：使用 ORT 自带 `tools/ci_build/build.py` 生成 `onnxruntime_gpu` wheel，再将 wheel 安装到指定 conda 环境。SIMO 可以继续保持 editable 安装，两者互不要求改动 SIMO 源码。
+
+首次构建前，先确认 ORT submodule 已就绪：
+
+```bash
+ORT_SRC=/softhome/like/package/onnxruntime
+git -C "$ORT_SRC" submodule status --recursive
+```
+
+如果输出中有以 `-` 开头的条目，表示 submodule 尚未检出；此时在确认允许同步源码依赖后执行：
+
+```bash
+git -C "$ORT_SRC" submodule update --init --recursive
+```
+
+不要使用已有的通用 `build/` 目录来切换 CUDA 版本。CMake 会缓存 CUDA、cuDNN、编译器和 generator；下列流程使用独立目录，避免复用 CUDA 12 或旧 generator 的 cache。
+
+### 79.3 准备干净的 CUDA 13 构建环境
+
+在同一个 shell 中执行：
+
+```bash
+set -euo pipefail
+
+ENV_ROOT=/share_data/users/like/miniconda3/envs/simo_sglang
+PY="$ENV_ROOT/bin/python"
+ORT_SRC=/softhome/like/package/onnxruntime
+CUDA_HOME=/share_data/users/like/opt/cuda-13.0
+CUDNN_HOME="$ENV_ROOT/lib/python3.12/site-packages/nvidia/cudnn"
+BUILD_DIR=/share_data/users/like/build/onnxruntime-v1.27.0-cuda13
+
+export CUDA_HOME CUDNN_HOME
+export CUDNN_PATH="$CUDNN_HOME"
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+export PATH="$ENV_ROOT/bin:$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+test -x "$PY"
+test -x "$ENV_ROOT/bin/cmake"
+test -x "$ENV_ROOT/bin/ninja"
+test -x "$CUDA_HOME/bin/nvcc"
+test -f "$CUDA_HOME/include/cuda.h"
+test -f "$CUDNN_HOME/include/cudnn.h"
+test -f "$CUDNN_HOME/lib/libcudnn.so.9"
+```
+
+`CUDNN_HOME` 必须指向包含 `include/` 和 `lib/` 的目录，而不能只传 `.../nvidia/cudnn/lib`。ORT 的 build driver 在 Linux 上会显式检查 `--cuda_home` 和 `--cudnn_home` 是否存在；CMake 随后从该根目录查找头文件和 `libcudnn.so.9`。
+
+构建和运行时都应让 CUDA 13 的 `$CUDA_HOME/lib64` 排在库搜索路径前面。不要混用 `/usr/local/cuda-12.8` 的库与该 CUDA 13 编译产物，否则同一进程可能加载不同版本的 `cudart`、`cublas`、`curand` 或 cuDNN，导致加载失败或不稳定结果。
+
+### 79.4 构建 CUDA EP wheel
+
+```bash
+cd "$ORT_SRC"
+
+"$PY" tools/ci_build/build.py \
+  --config Release \
+  --update \
+  --build \
+  --build_dir "$BUILD_DIR" \
+  --cmake_path "$ENV_ROOT/bin/cmake" \
+  --cmake_generator Ninja \
+  --parallel 16 \
+  --nvcc_threads 1 \
+  --use_cuda \
+  --cuda_version 13.0 \
+  --cuda_home "$CUDA_HOME" \
+  --cudnn_home "$CUDNN_HOME" \
+  --build_wheel \
+  --skip_tests
+```
+
+参数含义如下：
+
+- `--update --build`：生成/更新 CMake 构建树后编译；该脚本在 native build 下默认也会这样做，这里显式写出以避免歧义。
+- `--build_wheel`：生成名为 `onnxruntime_gpu-1.27.0-...whl` 的 Python wheel；`--use_cuda` 会使 wheel 包名为 `onnxruntime-gpu`。
+- `--parallel 16 --nvcc_threads 1`：限制并发和每个 CUDA 编译任务的内部并发，降低 H100 主机上 CUDA 模板编译的峰值内存。资源充足时可以逐步提高 `--parallel`，不要一开始用 `--parallel 0`（所有 CPU 核）。
+- `--skip_tests`：先完成构建和最小运行验证。需要完整 C++/Python test 时删除该参数，或者后续使用相同 `BUILD_DIR` 重新执行 `--test`。
+- 未传 `--use_tensorrt`：明确构建 CUDA-only EP。这是最小且最适合先验证 SIMO 的配置。
+
+如果以前曾在同一个 `$BUILD_DIR` 使用过其他 CUDA、cuDNN 或 generator，先删除这个专用构建目录再重新执行上面的命令：
+
+```bash
+rm -rf "$BUILD_DIR"
+```
+
+该命令只应作用于上文新建的 `onnxruntime-v1.27.0-cuda13` 目录，不能对 ORT 源码目录或不明的共享 build 目录执行。
+
+### 79.5 安装生成的 wheel
+
+构建成功后，不依赖固定的目录层级，直接查找产物并强制覆盖当前同版本的 `onnxruntime-gpu`：
+
+```bash
+WHEEL=$(find "$BUILD_DIR" -type f -path '*/dist/onnxruntime_gpu-*.whl' -print -quit)
+test -n "$WHEEL"
+printf 'wheel=%s\n' "$WHEEL"
+
+"$PY" -m pip install --force-reinstall --no-deps "$WHEEL"
+```
+
+`--no-deps` 的目的不是跳过 CUDA 本体，而是避免 pip 为这个本地 wheel 重装或降级当前 conda 环境中的 NumPy、protobuf、flatbuffers 等已验证依赖。CUDA Toolkit 和 cuDNN 仍是动态链接依赖，必须保留第 79.3 节的运行时库路径或使用 `onnxruntime.preload_dlls()` 加载它们。
+
+安装会替换当前的 `onnxruntime-gpu==1.27.0` 文件。开始前可记录当前 wheel 信息以便回退：
+
+```bash
+"$PY" -m pip show onnxruntime-gpu
+```
+
+若需要回退，重新安装此前保存的官方 wheel；不要在同一环境同时安装 `onnxruntime`（CPU 包）和 `onnxruntime-gpu`，两者会向同一 `onnxruntime` Python package 写文件。
+
+### 79.6 最小验证：确认实际创建 CUDA session
+
+下面的验证不只看 `get_available_providers()` 的编译期列表，还会对已有的 Silero 浮点 ONNX 创建 session，从而触发 CUDA EP 和动态库加载：
+
+```bash
+export MODEL=/share/users/like/package/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx
+
+"$PY" - <<'PY'
+import os
+import onnxruntime as ort
+from onnxruntime.capi import build_and_package_info
+
+ort.preload_dlls(cuda=True, cudnn=True)
+print("onnxruntime:", ort.__version__)
+print("wheel CUDA:", getattr(build_and_package_info, "cuda_version", None))
+print("available:", ort.get_available_providers())
+
+session = ort.InferenceSession(
+    os.environ["MODEL"],
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+print("active:", session.get_providers())
+assert "CUDAExecutionProvider" in session.get_providers()
+PY
+```
+
+成功标准是 `active:` 中包含 `CUDAExecutionProvider`。CUDA-only 重编译后不应再期待 `TensorrtExecutionProvider` 出现在列表中。可额外检查最终链接的库版本：
+
+```bash
+ORT_CAPI=$(
+  "$PY" -c 'import onnxruntime.capi.onnxruntime_pybind11_state as s; from pathlib import Path; print(Path(s.__file__).resolve().parent)'
+)
+ldd "$ORT_CAPI/libonnxruntime_providers_cuda.so" | rg 'cudart|cublas|cudnn|curand|cufft'
+```
+
+其中 CUDA 13 库应解析到 `$CUDA_HOME`，cuDNN 应解析到 `$CUDNN_HOME/lib`。如果显示 `libcudnn.so.9 => not found`，优先检查当前 shell 的 `LD_LIBRARY_PATH` 和 `ort.preload_dlls(cuda=True, cudnn=True)`，而不是重新编译。
+
+### 79.7 与 SIMO editable 安装的关系
+
+SIMO 的 ONNX custom-op library 是 editable 安装时在 `simo/onnx/ort_plugin/` 下编译的；其构建代码使用随 SIMO 打包的 ONNX Runtime public headers，并只链接 CUDA driver library。因为本次 ORT 源码和当前安装版本同为 `1.27.0`，可以先直接运行现有 SIMO/Silero 测试验证，不需要预先重装 SIMO。
+
+如果 `SessionOptions.register_custom_ops_library()` 报 ABI、符号或加载错误，或者同时修改了 ORT custom-op headers，再在相同 CUDA 13 环境下重建 editable SIMO：
+
+```bash
+cd /share/users/like/package/simo_conda_sglang
+CUDA_HOME=/share_data/users/like/opt/cuda-13.0 \
+  /share_data/users/like/miniconda3/envs/simo_sglang/bin/python -m pip install -e . --no-build-isolation
+```
+
+然后用已有的 `test_quant_onnx.sh` 做小规模 smoke test，再运行完整 24-shard 精度测试。这样可以将“ORT CUDA EP 能否加载”和“SIMO custom op 能否加载”分两步定位，避免一次完整评测后才发现动态库路径或 ABI 问题。
+
+## 80. CUDA 13 ORT wheel 运行失败：cuDNN 8/9 链接错配
+
+### 80.1 直接结论
+
+本次失败的第一根因不是量化模型，也不是 SIMO 的 `Dequantize` 实现，而是新编译的 CUDA provider 动态库链接到了 cuDNN 8：
+
+```text
+libonnxruntime_providers_cuda.so: undefined symbol: cudnnGetLastErrorString
+```
+
+随后 ORT 打印：
+
+```text
+Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 13.*.
+```
+
+因为 CUDA EP 没有创建成功，ORT 只剩 CPU provider；量化 ONNX 中的 `Dequantize(2)` 节点又没有可用的 CPU 实现，于是最后出现：
+
+```text
+NOT_IMPLEMENTED: Could not find an implementation for Dequantize(2)
+```
+
+这个 `Dequantize(2)` 是 CUDA provider 加载失败后的连带错误，不是本次最先需要修复的问题。应先修复 `libonnxruntime_providers_cuda.so` 的 cuDNN 依赖。
+
+### 80.2 证据链
+
+失败 shard 日志 `/share/users/like/package/jdjv/silero_vad_clean/logs/out_no_lstm/onnx_quant_w_mxfp4_e2m1_a_mxfp4_e2m1_scale_int_sipu_aishell4_24shards/shards/shard_023.log` 中的顺序很明确：
+
+1. `TryGetProviderInfo_CUDA` 加载 `libonnxruntime_providers_cuda.so` 失败；
+2. 未定义符号是 `cudnnGetLastErrorString`；
+3. CUDAExecutionProvider 创建失败；
+4. session 初始化阶段才报告 `Dequantize(2)` 无实现。
+
+安装后的 `readelf` 也直接显示该 provider 的 NEEDED 项是：
+
+```text
+libcublasLt.so.13
+libcublas.so.13
+libcufft.so.12
+libcudart.so.13
+libcudnn.so.8
+```
+
+而当前 conda 环境中的 cuDNN 9 库是：
+
+```text
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.9
+```
+
+`ldd` 显示的实际加载对象是系统库：
+
+```text
+libcudnn.so.8 => /lib/x86_64-linux-gnu/libcudnn.so.8
+```
+
+该系统库是 cuDNN `8.9.7`，而 `cudnnGetLastErrorString` 是 cuDNN 9 中使用的符号；当前系统 cuDNN 8 只有旧的 `cudnnGetErrorString`。因此，动态 loader 找到了名为 `libcudnn.so.8` 的文件，却无法从其中解析编译代码所需要的 cuDNN 9 符号。
+
+### 80.3 为什么编译时会得到 `libcudnn.so.8`
+
+问题来自 CMake cache 中的两个不一致变量。当前构建目录 `/share_data/users/like/build/onnxruntime-v1.27.0-cuda13/Release/CMakeCache.txt` 显示：
+
+```text
+CUDNN_INCLUDE_DIR:PATH=/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/nvidia/cudnn/include
+cudnn_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/libcudnn.so
+onnxruntime_CUDNN_HOME:UNINITIALIZED=/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/nvidia/cudnn
+```
+
+也就是说：
+
+- 编译器看到的是 conda cuDNN 9 的头文件，所以生成了对 `cudnnGetLastErrorString` 的引用；
+- linker 使用的是 CMake 之前缓存的系统 `/usr/lib/.../libcudnn.so`，该 symlink 指向 cuDNN 8；
+- 最终生成了“cuDNN 9 headers + cuDNN 8 NEEDED”的错误混合物。
+
+仅仅在构建脚本中设置 `CUDNN_HOME`，不能覆盖已经存在的 `cudnn_LIBRARY` CMake cache。`--update` 会复用这个 cache，不会自动清除已经选中的系统库。
+
+此外，当前 `build-cuda.sh` 还有一个独立的 shell 参数错误：
+
+```bash
+--cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=86;90;120
+```
+
+未加引号的分号会被 Bash 当作命令分隔符，所以日志中出现：
+
+```text
+like-useful/build-cuda.sh: line 42: 90: command not found
+```
+
+构建本身实际只收到 `CMAKE_CUDA_ARCHITECTURES=86`，之后 shell 才尝试执行命令 `90` 并以返回码 127 退出。这个问题不是 cuDNN 错配的根因，但说明这次 build script 最终是失败的，即使 wheel 已经生成。
+
+### 80.4 正确修复：新 build directory + 强制 cuDNN 9 library
+
+不要给 `libcudnn.so.8` 建指向 `libcudnn.so.9` 的软链接，也不要用 `patchelf` 直接改 NEEDED。cuDNN 8 和 cuDNN 9 不是可以这样替换的 ABI，正确做法是让 CMake 从干净 cache 开始，并显式指定同一套 cuDNN 9 头文件和库。
+
+先准备变量：
+
+```bash
+set -euo pipefail
+
+ENV_ROOT=/share_data/users/like/miniconda3/envs/simo_sglang
+PY="$ENV_ROOT/bin/python"
+ORT_SRC=/share/users/like/package/onnxruntime
+CUDA_HOME=/share_data/users/like/opt/cuda-13.0
+CUDNN_HOME="$ENV_ROOT/lib/python3.12/site-packages/nvidia/cudnn"
+BUILD_DIR=/share_data/users/like/build/onnxruntime-v1.27.0-cuda13-cuDNN9
+
+export CUDA_HOME CUDNN_HOME
+export CUDNN_PATH="$CUDNN_HOME"
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+export PATH="$ENV_ROOT/bin:$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+test -f "$CUDNN_HOME/include/cudnn.h"
+test -f "$CUDNN_HOME/include/cudnn_version.h"
+test -f "$CUDNN_HOME/lib/libcudnn.so.9"
+```
+
+然后使用独立目录编译。H100 是 `sm90`，本机所有 GPU 相同，因此只编译 `90` 即可；如果确实需要多个架构，必须把整个值放在引号中：
+
+```bash
+rm -rf "$BUILD_DIR"
+cd "$ORT_SRC"
+
+"$PY" tools/ci_build/build.py \
+  --config Release \
+  --update \
+  --build \
+  --build_dir "$BUILD_DIR" \
+  --cmake_path "$ENV_ROOT/bin/cmake" \
+  --cmake_generator Ninja \
+  --parallel 16 \
+  --nvcc_threads 1 \
+  --use_cuda \
+  --cuda_version 13.0 \
+  --cuda_home "$CUDA_HOME" \
+  --cudnn_home "$CUDNN_HOME" \
+  --build_wheel \
+  --skip_tests \
+  --cmake_extra_defines \
+    "CMAKE_CUDA_ARCHITECTURES=90" \
+    "CUDNN_INCLUDE_DIR=$CUDNN_HOME/include" \
+    "cudnn_LIBRARY=$CUDNN_HOME/lib/libcudnn.so.9"
+```
+
+这里使用小写的 `cudnn_LIBRARY` 是因为这份 ORT 源码的 `cmake/external/cuDNN.cmake` 使用的 cache 变量名就是 `cudnn_LIBRARY`。`CUDNN_INCLUDE_DIR` 和 `cudnn_LIBRARY` 必须成对指定，避免 headers 和 library 再次来自不同版本。
+
+如果想保留多个架构，写法必须是：
+
+```bash
+--cmake_extra_defines \
+  'CMAKE_CUDA_ARCHITECTURES=86;90;120' \
+  "CUDNN_INCLUDE_DIR=$CUDNN_HOME/include" \
+  "cudnn_LIBRARY=$CUDNN_HOME/lib/libcudnn.so.9"
+```
+
+但对于当前全是 H100 的机器，`90` 更快、更明确。`parallel=100` 也没有必要，建议先用 16；它不是当前 cuDNN 错误的原因，但会明显提高编译内存压力。
+
+### 80.5 安装前检查 wheel，避免再次安装错误产物
+
+编译完成后，先检查 CMake cache 和构建产物，确认 NEEDED 已经变成 cuDNN 9：
+
+```bash
+rg -n 'CUDNN_INCLUDE_DIR|cudnn_LIBRARY|CMAKE_CUDA_ARCHITECTURES' \
+  "$BUILD_DIR/Release/CMakeCache.txt"
+
+CUDA_PROVIDER=$(find "$BUILD_DIR/Release" -name libonnxruntime_providers_cuda.so -type f -print -quit)
+test -n "$CUDA_PROVIDER"
+readelf -d "$CUDA_PROVIDER" | rg 'NEEDED.*cudnn|RPATH|RUNPATH'
+```
+
+预期结果应类似：
+
+```text
+CUDNN_INCLUDE_DIR=.../site-packages/nvidia/cudnn/include
+cudnn_LIBRARY=.../site-packages/nvidia/cudnn/lib/libcudnn.so.9
+CMAKE_CUDA_ARCHITECTURES=90
+Shared library: [libcudnn.so.9]
+```
+
+如果这里仍然显示 `/usr/lib/x86_64-linux-gnu/libcudnn.so` 或 `libcudnn.so.8`，不要安装 wheel，说明 cache 或 `--cmake_extra_defines` 仍未生效。
+
+确认无误后再安装：
+
+```bash
+WHEEL=$(find "$BUILD_DIR" -type f -path '*/dist/onnxruntime_gpu-*.whl' -print -quit)
+test -n "$WHEEL"
+
+"$PY" -m pip install --force-reinstall --no-deps "$WHEEL"
+```
+
+安装后检查的预期是：
+
+```bash
+ORT_CAPI=$(
+  "$PY" -c 'import onnxruntime.capi.onnxruntime_pybind11_state as s; from pathlib import Path; print(Path(s.__file__).resolve().parent)'
+)
+ldd "$ORT_CAPI/libonnxruntime_providers_cuda.so" | rg 'cudart|cublas|cudnn|cufft'
+```
+
+其中必须看到：
+
+```text
+libcudart.so.13 => .../cuda-13.0/...
+libcublas.so.13 => .../cuda-13.0/...
+libcudnn.so.9 => .../site-packages/nvidia/cudnn/lib/...
+```
+
+`ldd` 如果仍解析到 `libcudnn.so.8`，说明安装的还是旧 wheel 或新 wheel 仍然错误链接；不要继续运行完整量化测试。
+
+### 80.6 重新运行前的最小 provider 验证
+
+先在包含 CUDA 13 和 cuDNN 9 的同一 shell 中创建一个真正的 CUDA session：
+
+```bash
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export MODEL=/share/users/like/package/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx
+
+"$PY" - <<'PY'
+import os
+import onnxruntime as ort
+
+ort.preload_dlls(cuda=True, cudnn=True)
+print("version:", ort.__version__)
+print("available:", ort.get_available_providers())
+session = ort.InferenceSession(
+    os.environ["MODEL"],
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+print("active:", session.get_providers())
+assert "CUDAExecutionProvider" in session.get_providers()
+PY
+```
+
+只有当 `active:` 中包含 `CUDAExecutionProvider` 后，才重新运行 `test_quant_onnx.sh`。否则量化模型会再次因为 CPU provider 不支持 SIMO `Dequantize` 而报告误导性的 `Dequantize(2)` 错误。
+
+### 80.7 本次构建问题总结
+
+| 现象 | 实际原因 | 修复 |
+| --- | --- | --- |
+| `undefined symbol: cudnnGetLastErrorString` | cuDNN 9 头文件与 cuDNN 8 动态库混用 | 清理 CMake cache，显式指定 `cudnn_LIBRARY=.../libcudnn.so.9` |
+| `ldd` 显示 `libcudnn.so.8 => /lib/...` | provider 的 DT_NEEDED 已经写死为 `.so.8`，且系统库被加载 | 重新链接；只改 `LD_LIBRARY_PATH` 不足以把 `.8` 变成 `.9` |
+| `Dequantize(2) NOT_IMPLEMENTED` | CUDA EP 先加载失败，CPU EP 无该量化节点实现 | 修复 CUDA EP 后再判断模型/custom op 问题 |
+| `line 42: 90: command not found` | `CMAKE_CUDA_ARCHITECTURES=86;90;120` 的分号未引用 | 写成 `"CMAKE_CUDA_ARCHITECTURES=90"` 或整体单引号包裹 |
+| build log 显示 `cmake_extra_defines=['CMAKE_CUDA_ARCHITECTURES=86']` | shell 只把 `86` 传给 build.py | 使用 H100 的 `90`，并检查 `CMakeCache.txt` |
+
+## 81. `build-cuda-verbose.sh` 审查与本地 `_deps` 复用
+
+### 81.1 结论
+
+`/share/users/like/package/onnxruntime/like-useful/build-cuda-verbose.sh` 的 CUDA/cuDNN 核心修复是正确的：
+
+- `CUDNN_INCLUDE_DIR` 和小写 `cudnn_LIBRARY` 都显式指向 conda 环境的 cuDNN 9；
+- `CMAKE_CUDA_ARCHITECTURES=86;90;120` 已整体加引号，不会再被 Bash 拆成 `90`、`120` 两个命令；
+- `bash -n build-cuda-verbose.sh` 已通过；
+- `like_debug_verbose=1` 会触发本地对 `tools/ci_build/build.py` 的修改，使 `cmake --build` 带 `--verbose`，这与脚本名称一致。
+
+但是，不建议把旧目录的整个 `_deps` 直接复制到新 build tree。应复用其中的 `*-src` 下载源码，不能复用 `*-build`、`*-subbuild` 和 `*-populate-prefix` 等生成目录。最稳妥的方式甚至不需要复制：通过 CMake 的 `FETCHCONTENT_SOURCE_DIR_<NAME>` 直接让新 build tree 使用旧 `_deps` 中已经下载好的源码。
+
+### 81.2 脚本检查结果
+
+脚本当前关键部分等价于：
+
+```bash
+--cmake_extra_defines \
+  "CMAKE_CUDA_ARCHITECTURES=86;90;120" \
+  "CUDNN_INCLUDE_DIR=$CUDNN_HOME/include" \
+  "cudnn_LIBRARY=$CUDNN_HOME/lib/libcudnn.so.9"
+```
+
+这三项会作为三个独立的 `-D` CMake cache 定义传给 `build.py`，语法正确。相对于上次脚本，cuDNN 8/9 混用和未引用分号这两个问题都已修正。
+
+仍有以下注意点：
+
+| 级别 | 位置 | 问题和建议 |
+| --- | --- | --- |
+| 中 | 文件首行 | 没有 `#!/usr/bin/env bash`。用 `bash build-cuda-verbose.sh` 可以运行；若直接执行 `./build-cuda-verbose.sh` 会得到 exec format error。建议添加 shebang。 |
+| 中 | 第 36 行 | `--parallel 100` 会让 100 个编译任务并发，CUDA 模板编译的内存压力很高。首次验证建议 `--parallel 16 --nvcc_threads 1`，确认内存余量后再增加。 |
+| 低 | 第 45 行 | 本机 GPU 全部是 H100（sm90）；`86;90;120` 会显著增加 CUDA 编译时间和 wheel 大小。只服务本机时使用 `"CMAKE_CUDA_ARCHITECTURES=90"`。确有 Ada/Blackwell 部署需求时才保留多架构列表。 |
+| 低 | 第 2、28 行 | `set -x` 加上 `like_debug_verbose=1` 会输出 shell 展开结果和所有编译命令，日志会很大，但不影响正确性。`like_debug_verbose` 依赖当前对 `tools/ci_build/build.py` 的本地修改；没有该修改时它只是无效环境变量。 |
+| 中 | 构建完成后 | 脚本未自动检查最终 provider 是否 `NEEDED libcudnn.so.9`。在安装 wheel 前仍应执行第 80.5 节的 `readelf` 与 `CMakeCache.txt` 检查。 |
+
+源码仓库的 git submodule 已全部检出。若确认不希望 `build.py --update` 额外执行 git submodule 同步，可增加 `--skip_submodule_sync`；不要在 submodule 缺失时添加该参数。
+
+### 81.3 为什么不能整目录复制 `_deps`
+
+旧目录是：
+
+```text
+/share/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps
+```
+
+新目录是：
+
+```text
+/share/users/like/package/onnxruntime/build/onnxruntime-v1.27.0-cuda13/Release/_deps
+```
+
+两者虽然都位于同一个 NFS 文件系统上（`/share/users/like/build` 和 `/share_data/users/like/build` 经 `stat` 验证为同一个目录），但它们是不同的 CMake build directory。
+
+旧 `_deps` 约 586 MiB，除下载源码外还包含各依赖的 build output、populate subbuild 和 CMake cache。例如旧 `cutlass-subbuild/CMakeCache.txt` 中记录了：
+
+```text
+CMAKE_CACHEFILE_DIR=/share_data/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps/cutlass-subbuild
+CMAKE_HOME_DIRECTORY=/share_data/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps/cutlass-subbuild
+```
+
+这些绝对路径、generator、编译器和先前的 CMake 选择不能移植到新目录。更关键的是旧 build 的顶层 cache 正是 cuDNN 错配的来源：它缓存了 `/usr/lib/x86_64-linux-gnu/libcudnn.so`（cuDNN 8）。整树复制会把该错误状态和旧构建产物一同带入新 build。
+
+可复用的是纯源码目录：
+
+```text
+*-src
+```
+
+不能复制或复用的是：
+
+```text
+*-build
+*-subbuild
+*-populate-prefix
+顶层 CMakeCache.txt、CMakeFiles、wheel、已编译 .so/.a
+```
+
+当前目标 `_deps` 中已经有 17 个同名 `*-src` 目录，但并非全部完整。最明显的是：
+
+```text
+旧 cutlass-src: 165 MiB
+新 cutlass-src:   4 KiB
+```
+
+其余常见依赖源码（abseil、onnx、protobuf、flatbuffers、Eigen 等）大小已基本一致。`_deps_copy` 当前是空目录，不能作为可用缓存。
+
+### 81.4 推荐方案：不复制，直接指定本地 FetchContent 源码
+
+CMake 的官方 `FETCHCONTENT_SOURCE_DIR_<UPPERCASE_NAME>` 变量会让 FetchContent 使用指定的本地目录，并且不进行 download 或 update；每个依赖的 binary directory 仍会在新的 `$BUILD_DIR` 内生成。这正好符合“复用已下载源码、但不继承旧 cache”的需求。
+
+先在脚本中定义旧源码缓存和自动生成的 CMake 定义：
+
+```bash
+DEPS_SOURCE=/share/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps
+
+FETCHCONTENT_DEFINES=()
+for source_dir in "$DEPS_SOURCE"/*-src; do
+  test -f "$source_dir/CMakeLists.txt"
+  dependency_name=${source_dir##*/}
+  dependency_name=${dependency_name%-src}
+  dependency_name=${dependency_name^^}
+  FETCHCONTENT_DEFINES+=(
+    "FETCHCONTENT_SOURCE_DIR_${dependency_name}=$source_dir"
+  )
+done
+```
+
+这会生成例如：
+
+```text
+FETCHCONTENT_SOURCE_DIR_CUTLASS=.../_deps/cutlass-src
+FETCHCONTENT_SOURCE_DIR_PROTOBUF=.../_deps/protobuf-src
+FETCHCONTENT_SOURCE_DIR_EIGEN3=.../_deps/eigen3-src
+```
+
+然后把原来的 `--cmake_extra_defines` 替换为下面这一段。H100-only 的 `90` 也一并采用：
+
+```bash
+"$PY" tools/ci_build/build.py \
+  --config Release \
+  --update \
+  --build \
+  --build_dir "$BUILD_DIR" \
+  --cmake_path "$ENV_ROOT/bin/cmake" \
+  --cmake_generator Ninja \
+  --parallel 16 \
+  --nvcc_threads 1 \
+  --use_cuda \
+  --cuda_version 13.0 \
+  --cuda_home "$CUDA_HOME" \
+  --cudnn_home "$CUDNN_HOME" \
+  --build_wheel \
+  --skip_tests \
+  --skip_submodule_sync \
+  --cmake_extra_defines \
+    "CMAKE_CUDA_ARCHITECTURES=90" \
+    "CUDNN_INCLUDE_DIR=$CUDNN_HOME/include" \
+    "cudnn_LIBRARY=$CUDNN_HOME/lib/libcudnn.so.9" \
+    "${FETCHCONTENT_DEFINES[@]}"
+```
+
+使用这个方案前，新 build directory 应没有顶层 CMake cache。当前 target directory 没有顶层 `Release/CMakeCache.txt`，但有不完整的 `_deps` 生成状态；为完全隔离旧状态，可删除仅属于新 build 的 `Release` 目录后再运行：
+
+```bash
+rm -rf "$BUILD_DIR/Release"
+```
+
+这不会删除 `DEPS_SOURCE` 中的旧下载源码，因为两者是不同目录。CMake 会从 `DEPS_SOURCE/*-src` 读取源码，并在新的 `Release` 目录重新生成所有 `*-build`/`*-subbuild`。
+
+不要在首次新配置时依赖 `FETCHCONTENT_FULLY_DISCONNECTED=ON`。当前 CMake 的 FetchContent 文档明确说明，该开关不适合作为 first configure 的“禁止网络”手段；`FETCHCONTENT_SOURCE_DIR_*` 是官方提供的本地源码覆盖机制，更可靠。
+
+### 81.5 备选方案：只同步 `*-src`
+
+如果要求新 build tree 完全自包含，可以复制源码目录，但只复制 `*-src`。不要执行 `cp -a "$DEPS_SOURCE" "$BUILD_DIR/Release/"` 或直接复制整个 `_deps`。
+
+```bash
+DEPS_SOURCE=/share/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps
+DEPS_TARGET=/share/users/like/package/onnxruntime/build/onnxruntime-v1.27.0-cuda13/Release/_deps
+
+mkdir -p "$DEPS_TARGET"
+for source_dir in "$DEPS_SOURCE"/*-src; do
+  target_dir="$DEPS_TARGET/${source_dir##*/}"
+  rsync -a --delete "$source_dir/" "$target_dir/"
+done
+```
+
+上述命令会修复当前不完整的 `cutlass-src`，并保持每个依赖源码与旧缓存一致。复制完成后，仍要使用第 81.4 节的 `FETCHCONTENT_SOURCE_DIR_*` 定义，只需把 `DEPS_SOURCE` 改成 `$DEPS_TARGET`。这样 CMake 不会尝试重新下载或更新它们。
+
+如果只想补齐目前确认缺失的 CUTLASS，以下命令足够：
+
+```bash
+rsync -a --delete \
+  /share/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps/cutlass-src/ \
+  /share/users/like/package/onnxruntime/build/onnxruntime-v1.27.0-cuda13/Release/_deps/cutlass-src/
+```
+
+但“直接引用旧 `DEPS_SOURCE`”更省空间，也更不容易把半完成目录误当作有效依赖。
+
+### 81.6 运行前检查
+
+在安装 wheel 前，至少确认以下四项：
+
+```bash
+rg -n 'CUDNN_INCLUDE_DIR|cudnn_LIBRARY|CMAKE_CUDA_ARCHITECTURES' \
+  "$BUILD_DIR/Release/CMakeCache.txt"
+
+CUDA_PROVIDER=$(find "$BUILD_DIR/Release" -name libonnxruntime_providers_cuda.so -type f -print -quit)
+readelf -d "$CUDA_PROVIDER" | rg 'NEEDED.*cudnn'
+```
+
+预期为：
+
+```text
+CUDNN_INCLUDE_DIR=.../nvidia/cudnn/include
+cudnn_LIBRARY=.../nvidia/cudnn/lib/libcudnn.so.9
+CMAKE_CUDA_ARCHITECTURES=90
+Shared library: [libcudnn.so.9]
+```
+
+只有这四项成立后，才安装新 wheel 并用第 80.6 节的真实 CUDA session 验证。这样可以在耗时的 Silero 24-shard 运行之前，排除 cuDNN 链接、下载缓存和 GPU 架构配置问题。
+
+## 82. 在 ONNX Runtime C++ 代码中打日志
+
+### 82.1 先区分两种代码位置
+
+当前工程有两套不同的日志接口，不能混用：
+
+| 修改位置 | 推荐接口 | 原因 |
+| --- | --- | --- |
+| `/softhome/like/package/onnxruntime/onnxruntime/...` 内部 ORT C++/CUDA host 代码 | `LOGS`、`LOGF`、`LOGS_IF` | 使用 ORT 私有的 `onnxruntime::logging::Logger`，能进入 session/default logger。 |
+| `simo/onnx/ort_plugin/*.cc` 外部 custom-op 动态库 | `Ort::Logger`、`ORT_CXX_LOG*_NOEXCEPT` | 使用稳定的 ORT C/C++ public API，不依赖 ORT 内部 logging ABI。 |
+
+内部宏定义在 `include/onnxruntime/core/common/logging/logging.h` 和 `macros.h`；外部 custom-op 的公开 logger 定义在 `include/onnxruntime/core/session/onnxruntime_cxx_api.h`。即使 SIMO wheel 中带有部分 ORT internal header，也不应让外部 `.so` 依赖内部 `LOGS` 实现。
+
+### 82.2 ORT 核心源码：使用 `LOGS`
+
+在 ORT 内部 `.cc` 或 `.cu` 的 host 代码中包含：
+
+```cpp
+#include "core/common/logging/logging.h"
+```
+
+优先传递已有的 `const logging::Logger&`，而不是自行取默认 logger：
+
+```cpp
+common::Status CheckSomething(const Node& node,
+                              const logging::Logger& logger) {
+  LOGS(logger, INFO) << "SIMO debug: node=" << node.Name()
+                     << ", op=" << node.OpType();
+
+  LOGS_IF(node.InputDefs().empty(), logger, WARNING)
+      << "SIMO debug: node has no inputs: " << node.Name();
+
+  if (node.OpType() == "Conv") {
+    LOGF(logger, INFO, "SIMO debug: Conv node index=%d",
+         static_cast<int>(node.Index()));
+  }
+  return common::Status::OK();
+}
+```
+
+常用宏如下：
+
+| 宏 | 用途 |
+| --- | --- |
+| `LOGS(logger, INFO) << ...` | 流式日志，最常用。 |
+| `LOGF(logger, INFO, "x=%d", x)` | printf 风格；内部实现的格式化日志消息上限约为 2 KiB。 |
+| `LOGS_IF(condition, logger, WARNING) << ...` | 条件日志，避免 stream-style 宏与未加花括号的 `if/else` 结合时的语法歧义。 |
+| `LOGS_CATEGORY(logger, INFO, "simo.qdq") << ...` | 指定自定义 category；默认 category 是 `onnxruntime`。 |
+| `LOGS_USER(...)` / `LOGF_USER(...)` | 可能含用户数据或 PII 时使用，sink 可按 user-data policy 过滤。 |
+
+如果当前类没有 logger 参数，但已处于正常 ORT 生命周期中，可以使用：
+
+```cpp
+LOGS_DEFAULT(INFO) << "SIMO debug: CUDA provider initialized";
+```
+
+`LOGS_DEFAULT` 依赖一个有效的 `LoggingManager::DefaultLogger()`。它适合 provider 初始化等已有默认 ORT environment 的位置；在可获得 session、graph 或 execution-provider logger 时，仍应优先使用显式 logger。当前 CUDA EP 本身也采用这个模式，例如 `cuda_execution_provider.cc` 在启动时用 `LOGS_DEFAULT(INFO)` 输出 cuDNN 版本，在 capability/graph 路径中使用传入的 `logger` 或 `*GetLogger()`。
+
+### 82.3 等级、过滤与 `VLOGS` 陷阱
+
+内部等级从低到高为：
+
+```text
+VERBOSE = 0, INFO = 1, WARNING = 2, ERROR = 3, FATAL = 4
+```
+
+logger 的 severity 是“最低输出等级”。默认通常是 `WARNING`，因此新增的 `INFO` 和 `VERBOSE` 日志默认看不到，而 `WARNING`/`ERROR` 可见。
+
+不要把希望在当前 Release wheel 中看到的日志写成：
+
+```cpp
+VLOGS(logger, 1) << "...";
+```
+
+`VLOGS`/`VLOGF` 只在非 `NDEBUG` 的 Debug build 中生效；Release build 的宏会在编译时丢弃日志表达式。对于需要在 Release 中按日志等级打开的调试信息，使用：
+
+```cpp
+LOGS(logger, VERBOSE) << "SIMO debug: qdq shape=" << outer_dim << "x" << quant_dim;
+```
+
+然后在调用方将 severity 设为 `VERBOSE`。只有在专门编译 Debug ORT 并需要分级 VLOG 时，再同时设置 verbosity level，例如 `VLOGS(logger, 1)` 需要 logger 的 max vlog level 至少为 1，并且 severity 为 `VERBOSE`。
+
+不要在每个 kernel、每个 audio chunk 或每次 QDQ 调用无条件打印 INFO/VERBOSE。当前 Silero 全量评测有 1,431,607 个 chunk；这种日志会严重拖慢推理并淹没关键错误。应通过环境变量、首 N 次计数或特定 node name 进行 gate，并只记录 shape、dtype、spec、stream/device 等必要元数据，不记录完整 tensor 内容。
+
+### 82.4 让内部日志在 C++ 调用方可见
+
+一个独立 C++ 调用方可以在创建 Env 和 SessionOptions 时设置日志级别：
+
+```cpp
+#include <onnxruntime_cxx_api.h>
+
+Ort::Env env{ORT_LOGGING_LEVEL_VERBOSE, "simo-debug"};
+Ort::SessionOptions options;
+options.SetLogSeverityLevel(ORT_LOGGING_LEVEL_VERBOSE);
+
+// 此版本 C++ wrapper 没有 SetLogVerbosityLevel 包装；直接调用 C API。
+Ort::ThrowOnError(
+    Ort::GetApi().SetSessionLogVerbosityLevel(options, 1));
+```
+
+`Ort::SessionOptions` 可隐式转换为 `OrtSessionOptions*`，所以上述 C API 调用可以直接传入 `options`。若只用 `LOGS(..., INFO/VERBOSE)` 而没有 `VLOGS`，verbosity level 无需设置，关键是 severity 必须为 0。
+
+如需把日志写入自己的 sink，可在创建 Env 时传入 `OrtLoggingFunction`：
+
+```cpp
+static void ORT_API_CALL MyOrtLog(
+    void* /*param*/, OrtLoggingLevel severity, const char* category,
+    const char* logid, const char* code_location, const char* message) {
+  std::fprintf(stderr, "[ORT %d][%s][%s] %s: %s\n",
+               static_cast<int>(severity), category, logid, code_location, message);
+}
+
+Ort::Env env{ORT_LOGGING_LEVEL_VERBOSE, "simo-debug", MyOrtLog, nullptr};
+```
+
+日志回调不能抛出异常，也不应在回调中再次调用可能触发 ORT 日志的 API，以免递归。 
+
+### 82.5 当前 Python Silero 评测器如何显示 C++ 日志
+
+当前 `evaluate_silero_vad_public_v5.py` 的 `SileroVadOnnx.__init__()` 会创建：
+
+```python
+opts = ort.SessionOptions()
+```
+
+实际检查得到这个对象默认 `log_severity_level == -1`、`log_verbosity_level == 0`。`-1` 表示继承默认 logger，而默认环境等级通常是 `WARNING`。为了让当前脚本中 ONNX Runtime C++ 的 `INFO`/`VERBOSE` 日志进入每个 shard 日志，应在创建 `opts` 后、`InferenceSession` 前加入：
+
+```python
+ort.set_default_logger_severity(0)
+ort.set_default_logger_verbosity(1)  # 仅 Debug ORT 的 VLOGS 需要
+
+opts.log_severity_level = 0
+opts.log_verbosity_level = 1         # 仅 Debug ORT 的 VLOGS 需要
+```
+
+只关心普通 `LOGS(..., INFO)` 时，`opts.log_severity_level = 0` 已足够；`log_verbosity_level` 不会让 Release 中的 `VLOGS` 重新出现。修改该 Python 脚本后，24 个 shard 子进程会各自把 ORT C++ 日志写入对应的 `shards/shard_*.log`，因为调度脚本已将子进程 stdout/stderr 重定向到这些文件。
+
+也可以仅在试验入口最早处执行：
+
+```python
+import onnxruntime as ort
+ort.set_default_logger_severity(0)
+```
+
+由于当前 SessionOptions 默认 severity 为 `-1`，它会继承这个默认等级；但显式设置 `opts.log_severity_level = 0` 更清晰，也不会依赖环境默认值。
+
+### 82.6 SIMO 外部 custom op：使用公开 `Ort::Logger`
+
+`simo/onnx/ort_plugin/simo_qdq_ops.cc` 不是 ORT 内部目标，而是通过 `RegisterCustomOps` 加载的外部 shared library。应使用公开 C++ API：
+
+```cpp
+Ort::KernelContext kernel_context{&context};
+const Ort::Logger logger = kernel_context.GetLogger();
+
+ORT_CXX_LOGF_NOEXCEPT(
+    logger, ORT_LOGGING_LEVEL_VERBOSE,
+    "com.simo::Quantize: outer=%lld K=%lld packed=%lld block=%lld",
+    static_cast<long long>(outer_dim),
+    static_cast<long long>(quant_dim),
+    static_cast<long long>(packed_dim),
+    static_cast<long long>(spec_->block_size));
+```
+
+这里的 `context` 是当前 `QuantizeCustomOp::Compute(OrtKernelContext& context, ...)` 或 `DequantizeCustomOp::Compute(...)` 参数，所以 `&context` 可以直接传给 `Ort::KernelContext`。`KernelContext::GetLogger()` 最终调用公开的 `OrtApi::KernelContext_GetLogger`，得到与本次 session/run 相同的 logger。
+
+在 custom-op `Compute` 内优先用 `ORT_CXX_LOG_NOEXCEPT` 或 `ORT_CXX_LOGF_NOEXCEPT`。普通 `ORT_CXX_LOG*` 在底层日志 API 返回错误或格式化失败时会抛出 `Ort::Exception`；`NOEXCEPT` 版本会忽略日志自身的失败，不会让调试输出改变推理控制流。
+
+若需要在 kernel 构造阶段记录静态属性，可从现有的：
+
+```cpp
+Ort::ConstKernelInfo kernel_info{info};
+```
+
+取得：
+
+```cpp
+const Ort::Logger logger = kernel_info.GetLogger();
+ORT_CXX_LOG_NOEXCEPT(
+    logger, ORT_LOGGING_LEVEL_INFO,
+    "com.simo QDQ kernel created");
+```
+
+不要把这个 logger 保存到超过 kernel/session 生命周期的全局对象中。构造阶段日志适合记录 semantic QDQ config；运行阶段日志必须限制频率。更稳妥的做法是在 `Compute` 里按当前 context 取得 logger，并用一个明确的环境变量（例如 `SIMO_ONNX_LOG_QDQ=1`）控制是否打印。
+
+### 82.7 CUDA device 代码的边界
+
+`LOGS` 和 `Ort::Logger` 都只能从 host C++ 路径调用，不能在 `__global__`/`__device__` CUDA kernel 内调用。排查 device kernel 时：
+
+- 优先在 launch 前后用 host 日志输出 grid、block、shape、stream、runtime spec 和 `CUresult`；
+- 临时使用 CUDA device `printf` 只适合极小输入和短期调试，必须在 host 侧同步 stream 后才能稳定看到输出，且会明显影响性能；
+- 不要把 device `printf` 留在量化或 Silero 全量评测代码中；
+- CUDA API 失败应返回/传播 `Ort::Status`，并在 host 侧记录错误码和 `cuGetErrorString`，当前 `SyncAfterLaunchIfRequested()` 已是这种模式。
+
+### 82.8 重新编译边界
+
+- 修改 ORT 内部 `onnxruntime/...` C++/CUDA 代码后：重新构建并安装 ONNX Runtime wheel；只有安装后的 `libonnxruntime*.so` 才会包含日志改动。
+- 修改 `simo/onnx/ort_plugin/*.cc` 后：重新执行 editable SIMO 安装或其 wheel 构建，使 `libSimoOnnxCustomOps_sm90.so` 重编译；不需要为了这类插件日志重编译 ORT。
+- 运行日志先用一个文件、一个 shard 的小规模测试验证，再启动完整 24-shard 作业，避免每个子进程同时输出大量调试信息。
+
+## 83. 2026-07-31：仅修改 `dynamic_quantize_lstm.cc` 后，为什么 Debug 构建仍编译大量其他文件
+
+### 83.1 结论
+
+这不是正常的“修改一个 `.cc`，因此它的所有 C++ 源文件都必须重编译”，也不是 CUDA 架构、Debug/Release 或编译参数变化导致的。根因是 **Ninja build tree 放在 `/share` 的 NFS4 挂载上后，构建期间的输出时间戳记录不一致**。Ninja 因而无法可靠判断输出是否新于输入，出现了大面积误判 dirty、重复编译、以及构建结束后仍需重链接的现象。
+
+`--update` 确实会让 `build.py` 每次重新执行 CMake 和 submodule sync，增加了触发面和时间成本；但它不是本次 859 个 C/C++ 编译的直接依赖原因。日志中同一普通 CPU 源文件在两次构建的完整编译命令完全一致，Ninja 的 command hash 也相同。若是正常 CMake 配置或 flags 改变，二者不会相同。
+
+因此，当前 NFS 上的 Debug build tree 不应再作为可复现的增量构建基础。应在本机本地磁盘 `/data` 重建 Debug build tree；`/share_data` 不是替代方案，因为它和 `/share` 实际是同一个 NFS export。
+
+### 83.2 两次日志的事实
+
+两次命令都使用相同脚本、相同 `BUILD_CONFIG=Debug`、相同 CUDA/cuDNN/FetchContent 参数：
+
+```bash
+BUILD_CONFIG=Debug bash like-useful/build-cuda-verbose.sh > temp/build.verbose.debug.log.`nowstr.sh` 2>&1 &
+```
+
+| 构建 | 日志 | Ninja 总步骤 | 实际 C/C++ 编译命令数 | 结果 |
+|---|---|---:|---:|---|
+| 第一次 | `build.verbose.debug.log.2026_07_31___14_38_22` | 2,352 | 2,222 | 初次完整 Debug 构建，14:54:02 显示 `Build complete` |
+| 第二次 | `build.verbose.debug.log.2026_07_31___15_20_12` | 982 | 859 | 不是全量，但远大于只应重编译的 `dynamic_quantize_lstm.cc` |
+
+第二次构建确实编译了目标文件本身，日志第 445 个 Ninja task 是：
+
+```text
+... -o CMakeFiles/onnxruntime_providers.dir/.../dynamic_quantize_lstm.cc.o \
+    -c .../onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc
+```
+
+同时它还重新编译了大部分 CPU/provider/graph/optimizer/session/test 目标，例如：
+
+| target | 第二次重新编译的对象数 |
+|---|---:|
+| `onnxruntime_providers` | 222 |
+| `onnxruntime_provider_test` | 227 |
+| `onnxruntime_optimizer` | 96 |
+| `onnxruntime_test_all` | 83 |
+| `onnxruntime_framework` | 58 |
+| `onnxruntime_graph` | 37 |
+| `onnxruntime_session` | 33 |
+
+反过来，第一次构建中的 CUDA 编译对象没有在第二次重编译：第一次有 `onnxruntime_providers_cuda` 528 个、`onnxruntime_providers_cuda_flash_attention` 48 个；第二次没有这些 CUDA source compile 命令，只发生了后续 provider `.so` 链接。这说明第二次不是 clean build，也说明“加一个 CPU 日志导致 CUDA 全部重编译”的解释不成立。
+
+对未修改的 `onnxruntime/core/providers/cpu/activation/activations.cc`，两次日志中完整 `/usr/bin/c++ ... -c ...` 命令的 SHA-256 都是：
+
+```text
+423126ab022cc6ab3ec3deb3f268f22b029a1f2e0db75469f4e63aef3cb644f6
+```
+
+`dynamic_quantize_lstm.cc` 的改动也仅为包含 `core/common/logging/logging.h` 及一条 `LOGS_DEFAULT(INFO)`，Git worktree 没有显示其他受影响的 `.cc`/`.h` 改动。因此常见的“公共头文件被修改”原因可以排除。
+
+### 83.3 直接证据：Ninja 的输出时间戳已经不可信
+
+实际 build tree 是：
+
+```text
+/share/users/like/package/onnxruntime/build/onnxruntime-v1.27.0-cuda13/Debug
+```
+
+`findmnt` 显示它位于：
+
+```text
+10.97.128.245:/share  nfs4  rw,...,local_lock=none,...
+```
+
+`/share_data` 也解析到同一 `10.97.128.245:/share` NFS4 export。因此把 `BUILD_DIR` 从 `/share/...` 改成 `/share_data/...` 不会消除这个问题。
+
+第二次构建的 `.ninja_log` 有 **981 个不同输出** 被记录成完全同一个 mtime：
+
+```text
+1785482423594883374  # 2026-07-31 15:20:23.594883374 +0800
+```
+
+其中既有早期的 `libonnxruntime_providers_shared.so`、Abseil 静态库，也有最终的 `onnxruntime_pybind11_state.so`、`onnxruntime_provider_test`。这些命令显然不可能在数分钟构建中全部得到同一个纳秒级文件 mtime。
+
+进一步检查时，Ninja 自己给出了典型的错误状态：静态库的“recorded mtime”早于它所依赖对象的 mtime，例如：
+
+```text
+recorded mtime of libonnxruntime_common.a older than most recent input
+CMakeFiles/onnxruntime_common.dir/.../logging.cc.o
+(1785482423594883374 vs 1785482468212143635)
+```
+
+这会让下一次 `ninja` 即使不再编辑源代码，仍计划额外的链接或生成任务。它也解释了为什么第二次构建里能看到大量 archive/link 命令：Ninja 用不一致的 metadata 安排了图中的 dirty edges。这个现象不能通过“CMake 没有增量编译”来概括；CMake 生成的是正确的依赖图，而 Ninja 获取到的 NFS 元数据使该图的时间戳判断失真。
+
+NFS 的 attribute cache/close-to-open 一致性不适合存放大量、高并发、频繁替换输出文件的 Ninja build tree。此脚本还设置了 `--parallel 100`，会同时创建、删除和 `stat` 大量 `.o`、`.a`、`.so`，显著放大这一问题。
+
+### 83.4 `--update` 与 `--skip_tests` 的实际含义
+
+当前 `like-useful/build-cuda-verbose.sh` 固定传入：
+
+```bash
+--update \
+--build \
+--build_wheel \
+--skip_tests
+```
+
+在 `tools/ci_build/build.py` 中：
+
+- `--update` 会执行 `git submodule sync --recursive`、`git submodule update --init --recursive`，随后执行 `generate_build_tree()`，即每次都重新调用 CMake；
+- `--build` 才调用 `cmake --build <BUILD_DIR>/Debug`；
+- `--build_wheel` 在 `--build` 成功后打包 wheel；
+- `--skip_tests` 只是不运行测试，**不等于不构建默认 `all` target 中的测试可执行文件**。
+
+所以即使没有本次 NFS 元数据问题，该“更新、构建全部目标、打 wheel”的命令也不适合每加一行日志就执行一次。它适合首次配置和最终发布 wheel；编辑-编译-观察日志的循环应复用已配置的本地 build tree，并避免 `--update`。
+
+### 83.5 推荐修复：把 build output 放到本机 `/data`
+
+本机检查结果：
+
+```text
+/data  ext4  约 12T 可用
+/share 和 /share_data  均为 10.97.128.245:/share nfs4
+当前 Debug build tree 大小约 19G
+```
+
+因此 `/data` 有足够容量，且是本地 ext4。保留源码和下载缓存仍在 NFS 没有问题，关键是 CMake/Ninja 的 build output、`.ninja_log`、`.ninja_deps`、对象文件和临时 archive 必须在本地磁盘。
+
+建议把脚本中的硬编码：
+
+```bash
+BUILD_DIR=$ORT_SRC/build/onnxruntime-v1.27.0-cuda13
+```
+
+改为可由环境覆盖的本地默认路径：
+
+```bash
+BUILD_DIR=${BUILD_DIR:-/data/like/build/onnxruntime-v1.27.0-cuda13}
+```
+
+并先从干净的本地 Debug tree 开始。旧的 NFS Debug tree 时间戳已经不自洽，不应复制其中的 `Debug/_deps/*-build`、`CMakeCache.txt`、`.ninja_*` 或对象文件到新目录。可继续复用只读依赖源码：
+
+```bash
+DEPS_SOURCE=/share/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps
+```
+
+即当前脚本生成的 `FETCHCONTENT_SOURCE_DIR_<NAME>=.../*-src` 参数可以保留；这些只是 source override，新的 `_deps/*-build` 仍会在本机 `$BUILD_DIR/Debug` 中生成。
+
+第一次本地配置/构建使用：
+
+```bash
+BUILD_CONFIG=Debug \
+BUILD_DIR=/data/like/build/onnxruntime-v1.27.0-cuda13 \
+bash like-useful/build-cuda-verbose.sh
+```
+
+建议同时把 `--parallel 100` 改为先用 `--parallel 16`。这不是 NFS 问题的根本修复，但能明显减少 Debug/CUDA 编译的内存、文件系统和调度压力。确认稳定后再逐步提高。
+
+若还要消除 NFS 源文件属性缓存带来的干扰，进一步把工作源码也放到 `/data/like/src/onnxruntime`，再定期从 NFS 工作树同步；但优先移动 build tree 已能消除本次最关键的 `.ninja_log`/输出 mtime 问题。
+
+### 83.6 日常改一行 C++ 的构建方式
+
+首次成功配置后，普通 `.cc` 日志改动不需要重新运行 FetchContent、submodule sync 或完整 CMake configure。先对本地 build tree 只构建 Python runtime 所需目标：
+
+```bash
+BUILD_DIR=/data/like/build/onnxruntime-v1.27.0-cuda13
+cmake --build "$BUILD_DIR/Debug" \
+  --target onnxruntime_pybind11_state \
+  -- -j16
+```
+
+这个 target 会沿依赖关系重编译 `dynamic_quantize_lstm.cc`、重新归档 `libonnxruntime_providers.a`，并重链接 Python binding/核心 runtime；不会因为默认 `all` target 去重新构建无关的测试程序。
+
+需要产出 wheel 时，再调用 `build.py` 的构建和打包阶段，但去掉 `--update`。需要保留同一 CUDA 参数以便 wheel 正确包含 CUDA provider，例如：
+
+```bash
+"$ENV_ROOT/bin/python" tools/ci_build/build.py \
+  --config Debug \
+  --build \
+  --build_dir "$BUILD_DIR" \
+  --cmake_path "$ENV_ROOT/bin/cmake" \
+  --cmake_generator Ninja \
+  --parallel 16 \
+  --use_cuda \
+  --cuda_version 13.0 \
+  --cuda_home "$CUDA_HOME" \
+  --cudnn_home "$CUDNN_HOME" \
+  --build_wheel \
+  --skip_tests
+```
+
+这一步仍会构建默认 target 后再打 wheel，但在健康的本地 Ninja tree 中，它只应重建被修改源文件及必要的归档/链接链，而不会重复数百个无关 CPU 源。若这一步仍出现大量不相关 `.cc` 编译，先执行：
+
+```bash
+ninja -C "$BUILD_DIR/Debug" -d explain -n
+```
+
+检查每个 dirty reason；不要先假定是 CMake 的正常行为。对 NFS tree 不建议用这个命令去“修复”，因为它本身可能继续推进不可靠的构建图。
+
+### 83.7 无法立即迁移到本地磁盘时
+
+临时方案是删除该 **专用 Debug build directory** 后做一次完整单线程或低并发重建，例如 `-j8`，并且每次改动后用 `ninja -d explain -n` 核实原因。它能降低复现概率，但不提供可靠保证；NFS build output 仍可能再次产生时间戳错序。
+
+不要：
+
+- 通过 `touch` 全部对象、静态库或 `build.ninja` 来“校正”时间戳；这会掩盖依赖关系并可能得到包含旧对象的 wheel；
+- 从当前 NFS Debug 目录复制 `.ninja_log`、`.ninja_deps`、`CMakeCache.txt` 或 `*-build` 到本地；这些正是被污染的状态；
+- 仅把 build tree 从 `/share` 改到 `/share_data`；两者在本机是同一个 NFS4 挂载；
+- 把 `--parallel 100` 当作增量构建问题的唯一原因。降低并发有帮助，但主因仍是 NFS 输出元数据不可靠。
+
+## 84. `seq_len=5, batch_size=3` 时 `DynamicQuantizeLSTM::Compute` 的执行过程
+
+### 84.1 本节分析的确切 case
+
+`like-useful/test-onnx-dynamic-quant-lstm.py` 的第 189 行：
+
+```python
+cpu_outputs = run_cases("CPU", cpu_session, cases)
+```
+
+会依次运行 `VERIFY_SHAPES` 中的三个 case。第一个正是 `(seq_len, batch_size) = (5, 3)`。`make_input_cases()` 用固定 seed `20260720` 生成：
+
+```text
+X / input : float32 [5, 3, 10]
+h0        : float32 [1, 3, 20]
+c0        : float32 [1, 3, 20]
+```
+
+这里的 `5` 是时间步数，不是一个 batch 里只有 5 个标量 token。更精确地说：
+
+- 有 5 个时间片 `X[0]` 到 `X[4]`；每个时间片都是 `[3, 10]`；
+- batch 中有 3 条互不串状态的序列，记为 `b=0,1,2`；
+- 因而本次调用实际消费 15 个输入向量 `X[t,b,:]`，每个向量长度为 10；
+- 每条 batch 序列各自沿 `t=0 -> 4` 递归，不能把同一条序列的五个时间步并行化。
+
+下面的源码路径以 `/share/users/like/package/onnxruntime` 表示；当前它与提问中的 `/softhome/like/package/onnxruntime` 指向同一个文件（inode 与 SHA-256 都相同），所以代码结论对应同一份工作树。
+
+### 84.2 实际量化 ONNX 图，而不是泛化的 LSTM 假设
+
+用当前 `temp/test-lstm-quant.onnx` 检查得到，该图只有一个真正执行 LSTM 的节点：
+
+```text
+com.microsoft::DynamicQuantizeLSTM
+  inputs:
+    0  input                         [seq_len, batch, 10] float32
+    1  onnx::LSTM_89_quantized       [1, 10, 80] int8
+    2  onnx::LSTM_90_quantized       [1, 20, 80] int8
+    3  onnx::LSTM_91                 [1, 160] float32    # B
+    4  ""                                             # sequence_lens 不提供
+    5  h0                            [1, batch, 20]
+    6  c0                            [1, batch, 20]
+    7  ""                                             # P / peephole 不提供
+    8  W_scale                       [1, 80] float32
+    9  W_zero_point                  [1, 80] int8
+    10 R_scale                       [1, 80] float32
+    11 R_zero_point                  [1, 80] int8
+  outputs: internal_Y, hn, cn
+  attribute: hidden_size = 20
+
+ai.onnx::Squeeze(internal_Y, axis=1) -> output
+```
+
+所以 `80 = 4 * hidden_size`。该节点本身内部产生的 `Y` 是 ONNX LSTM 规范形状 `[5, 1, 3, 20]`；随后 `Squeeze` 去掉单向 LSTM 的 direction 轴，才成为 Python 看到的 `output [5, 3, 20]`。
+
+图中没有 `direction` 属性，故为默认单向 forward；没有 `input_forget`、`activations`、`clip` 属性，故使用标准的输入门/遗忘门/输出门 `sigmoid`、候选门和输出状态 `tanh`，且 clip 等价于不限制。`sequence_lens` 和 peephole `P` 均为空，因此三条序列的有效长度全是 5，没有跳步、掩码或尾部置零的分支。
+
+量化脚本使用：
+
+```python
+quantize_dynamic(..., weight_type=QuantType.QInt8, per_channel=True)
+```
+
+实际保存的 `W_scale` 与 `R_scale` 都是 `[1,80]`，80 个 scale 均不相同；对应的 int8 zero point 全为 0。换言之，权重是按输出列（也就是 80 个 I/O/F/C gate channel）做对称 per-channel INT8 量化。虽然 C++ 中包装类型写成 `GemmWeights<uint8_t>`，那只是原始字节的承载类型；`is_W_signed_`/`is_R_signed_` 和 MLAS 的 `BIsSigned` 会把本模型正确作为 signed INT8 权重处理。
+
+### 84.3 从 Python 到 C++ 的一次调用路径
+
+对这个 first case，一次 `session.run(["output", "hn", "cn"], feeds)` 只调用 **一次** `DynamicQuantizeLSTM::Compute`，并不是五个 ONNX 节点或五次外层 `Compute`。调用链为：
+
+```text
+run_cases()
+  -> InferenceSession.run()
+     -> CPUExecutionProvider 上的 com.microsoft::DynamicQuantizeLSTM
+        -> DynamicQuantizeLSTM::Compute()
+           -> LSTMBase::ComputeImpl<float, uint8_t>()
+              -> UniDirectionalLstm<float>::Compute<uint8_t>()
+                 -> UniDirectionalLstm<float>::ComputeImpl()
+                    -> for (step = 0; step < 5; ++step) { ... }
+```
+
+`DynamicQuantizeLSTM::Compute` 位于 `onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc:174-250`。它自身不写时间步循环，职责是：
+
+1. 取得或使用已 prepack 的 `W`/`R`，再读取 scale 和 zero point；
+2. 校验 scale/zero-point 的形状；此 case 均为 `[1,80]`；
+3. 创建 direction 0 的 `GemmWeights<uint8_t> W_1` 和 `R_1`；
+4. 调用 `LSTMBase::ComputeImpl<float, uint8_t>`，把真正的序列计算交给公共 LSTM 实现。
+
+由于 `W` 与 `R` 都是 graph initializer，session 初始化时会尝试调用该 kernel 的 `PrePack()`：`TryPackWeights()` 按 `K=10,N=80` 和 `K=20,N=80` 调用 `MlasGemmPackB`，使后续 GEMM 可以直接使用 packed B。是否成功 prepack 不改变数学结果，只改变运行时读取的是 initializer 还是 packed buffer。当前在 `Compute` 入口添加的 `packed_W_.buffer_` / `packed_R_.buffer_` 日志正可验证此点：非空表示本次运行走 packed-weight 路径。
+
+### 84.4 进入 `LSTMBase` 后的状态、偏置与输出缓冲区
+
+`LSTMBase::ComputeImpl` 在 `onnxruntime/core/providers/cpu/rnn/lstm_base.cc:23-177` 中解出：
+
+```text
+seq_length = 5
+batch_size = 3
+input_size = 10
+hidden_size = 20
+num_directions = 1
+```
+
+并分配：
+
+```text
+Y   : [5, 1, 3, 20]
+Y_h : [1, 3, 20]
+Y_c : [1, 3, 20]
+```
+
+随后构造一个 `UniDirectionalLstm<float>`。其构造函数会把输入 `h0[0,:,:]` 复制到内部的 `batched_hidden0_ [3,20]`，把 `c0[0,:,:]` 复制到 `batched_internal_memory_prev_ [3,20]`（`uni_directional_lstm.cc:131-144`）。因此本例并非默认全零初始状态，而是每条 batch 序列各自使用测试脚本生成的随机 `h0`/`c0`。
+
+`B [1,160]` 含有 8H 个 float 偏置：前 4H 是 W 的 bias，后 4H 是 R 的 bias。构造 `UniDirectionalLstm` 时，`LoadBias()` 已把同一 gate 的两半相加，得到四个 `[20]` 的 float bias：`bias_WRi_`、`bias_WRo_`、`bias_WRf_`、`bias_WRc_`。偏置和 cell/hidden state 保持 float32，并没有作为持久张量再量化。
+
+### 84.5 动态量化实际发生在哪里
+
+这是最容易被“每个 token 动态量化一次”的直觉误导的部分。这里有两类 QGEMM，动态量化粒度不同。
+
+#### 输入权重乘法：先对整个 5x3 序列做一次 QGEMM
+
+`UniDirectionalLstm::ComputeImpl` 先设定：
+
+```text
+hidden_size_x4 = 80
+total_rows = max_sequence_length * batch_size = 5 * 3 = 15
+```
+
+然后在时间循环之前执行一次：
+
+```text
+X_flat [15,10]  x  W_q [10,80]  ->  output_iofc [15,80]
+```
+
+也就是说，`X[0]` 到 `X[4]` 的 15 个输入向量在同一次 `ComputeGemm(M=15,N=80,K=10)` 中完成 `X * W`。`rnn_helpers.cc:271-316` 先对这 150 个 float 值整体计算一组 `a_scale`、`a_zero_point`，量化为临时 uint8 A，再由 MLAS 的 QGEMM 直接输出 float `output_iofc`。它不是每个时间步各算一次 `X_t * W`，也不是每个 batch 行单独算一次该输入 GEMM。
+
+对第 `j` 个输出列，其数值含义可近似写为：
+
+```text
+sum_k (qA[m,k] - zpA) * (qW[k,j] - zpW[j]) * (scaleA * scaleW[j])
+```
+
+本模型 `zpW[j] = 0`，`scaleW[j]` 随列 `j=0..79` 变化。MLAS 的 output processor 在量化整数累加后应用该 scale，故 `output_iofc` 仍是 float32，可以继续与 R 路径相加。
+
+#### 循环权重乘法：每个时间步都要做，并动态量化当前 `H`
+
+在时间循环内，每次使用上一时刻的 hidden state：
+
+```text
+H_prev [M,20]  x  R_q [20,80]  ->  [M,80]
+```
+
+该调用的 `beta=1`，所以它把 `H_prev * R` 加到已经存在的 `X * W` 对应行上。因为 `H_prev` 是上一时刻刚算出的 float 值，它必须在每次调用 QGEMM 前重新计算动态 `a_scale/a_zero_point` 并量化为临时 uint8。因此：
+
+- 输入路径：本 case 的 `X * W` 是 1 次 `M=15,N=80,K=10` QGEMM；
+- 循环路径：逻辑上有 5 个时间步的 `H * R`，总覆盖 `5 * 3` 行、每行 `K=20,N=80`；
+- 若 batch 被线程池切成多个工作组，某个时间步的循环 QGEMM 会按工作组拆为多次调用，因此动态 `H` 的 scale 是“每个实际 GEMM 工作组”而非必然“每个单独 batch 行”一组；数学上仍是相同的三条独立 LSTM 轨迹。
+
+这里的“动态”指运行时激活量化，不表示权重每一步重做量化。`W_q/R_q`、80 个 per-channel scale 和 zero point 是模型内固定 initializer；临时 `qX/qH`、`scaleA/zpA` 随本次输入或当前 hidden state 变化。
+
+### 84.6 5 个时间步如何循环
+
+把输入的 `h0`/`c0` 记成 `H[-1]`/`C[-1]`，这样第 `t` 次循环的状态关系最清楚：
+
+| `step` | 本时间片 | 读入状态 | 写出状态 | 输出位置 |
+| --- | --- | --- | --- | --- |
+| 0 | `X[0,:,:] [3,10]` | `H[-1]=h0[0]`、`C[-1]=c0[0]` | `H[0]`、`C[0]` | `Y[0,0,:,:]=H[0]` |
+| 1 | `X[1,:,:] [3,10]` | `H[0]`、`C[0]` | `H[1]`、`C[1]` | `Y[1,0,:,:]=H[1]` |
+| 2 | `X[2,:,:] [3,10]` | `H[1]`、`C[1]` | `H[2]`、`C[2]` | `Y[2,0,:,:]=H[2]` |
+| 3 | `X[3,:,:] [3,10]` | `H[2]`、`C[2]` | `H[3]`、`C[3]` | `Y[3,0,:,:]=H[3]` |
+| 4 | `X[4,:,:] [3,10]` | `H[3]`、`C[3]` | `H[4]`、`C[4]` | `Y[4,0,:,:]=H[4]` |
+
+实际循环就是 `uni_directional_lstm.cc:332-404` 的：
+
+```cpp
+for (int step = 0; step < max_sequence_length; step++) {
+  // 1. 从 output_iofc 的 step 对应 [batch,80] 行取得已经算好的 X*W
+  // 2. 计算并累加 H_prev*R
+  // 3. 对每个 batch 行调用 GateComputations，原地更新 C，并写出 H
+  // 4. 把本步 H 作为下一 step 的 previous_state
+}
+```
+
+因为本例没有 `sequence_lens`，内部补出的长度数组是 `[5,5,5]`，所以 `max_sequence_length=5`、`min_sequence_length=5`；循环恰好是 `step=0,1,2,3,4`，不会进入“已超过某行 sequence length，输出置零”的分支。
+
+在一个 step 中，`output_iofc[(step * 3 + b), :]` 的 80 个 float 先是对应 `X[step,b,:] * W_q` 的结果；加上 `H[step-1,b,:] * R_q` 后，就是四个 gate 的未激活输入。每个 batch 行 `b` 都使用自己的上一状态，没有 `b=0` 到 `b=1` 的状态传递。
+
+### 84.7 每个 step 的四个 gate 计算
+
+ONNX LSTM 的融合 gate 列顺序是 **I/O/F/C**。代码也明确把一个 `[80]` 行切为：
+
+```text
+pi = [0 : 20]     # input gate I
+po = [20 : 40]    # output gate O
+pf = [40 : 60]    # forget gate F
+pc = [60 : 80]    # cell candidate C（下式记为 G）
+```
+
+这与 `test-lstm.py` 中 PyTorch 参数的 I/F/G/O 存储顺序不同；ONNX 导出器已经完成了对应重排。因此不能拿 PyTorch 原始 tensor 的连续分块顺序直接解释量化 ONNX 中的 80 个列。对任意 `t,b`，令四段矩阵/偏置均已取出正确的 ONNX I/O/F/C 列，则数学过程为：
+
+```text
+z_i, z_o, z_f, z_g
+  = X[t,b,:] * W_{i,o,f,g} + H[t-1,b,:] * R_{i,o,f,g}
+    + (Wb_{i,o,f,g} + Rb_{i,o,f,g})
+
+i = sigmoid(z_i)
+f = sigmoid(z_f)
+g = tanh(z_g)
+C[t,b,:] = f * C[t-1,b,:] + i * g
+o = sigmoid(z_o)
+H[t,b,:] = o * tanh(C[t,b,:])
+```
+
+`GateComputations()` 位于 `uni_directional_lstm.cc:463-601`：
+
+- `clip_with_bias_ptr_` 对 I/F/G/O 的线性结果加融合 bias 后再做 clip；本图没有有效 clip 限制；
+- `merge_lstm_gates_to_memory()` 按 `C = C_prev * f + i * g` 直接原地覆盖内部的 `C_prev` buffer；
+- `activation_h_` 使用刚更新的 C 和 output gate，写出当前 H；
+- 没有 `P`，故所有 peephole 分支不执行；`input_forget=false`，故 forget gate 不是 `1-i` 的耦合模式。
+
+因此，误差传播的时间顺序也很明确：本步的 INT8 GEMM 近似会影响 `i/f/g/o`，继而影响 `C[t]` 与 `H[t]`；`H[t]` 又是下一步循环量化和 `H*R` 的输入，故量化误差可以沿 5 个 step 递归累积。cell/hidden 不是 INT8 常驻状态，仍以 float 保存；每一步只是为了矩阵乘法临时量化当前 activation。
+
+### 84.8 batch 并行不会打破时间依赖
+
+本例 `batch_size=3`、`hidden_size=20`，满足 `SetNumThreads()` 的 batch-parallel 条件：`num_rows >= 2 && num_columns <= 256`。实际工作组大小还取决于 session thread pool 的线程数：可能是一个组处理三个 batch 行，也可能拆成若干组并发处理。
+
+不过每个工作组的 lambda 都是“先完整执行 `step=0..4`，再结束”。所以允许的并行是：
+
+```text
+batch 0 的五步  ||  batch 1 的五步  ||  batch 2 的五步
+```
+
+而不是：
+
+```text
+同一 batch 的 step 0 || step 1 || ... || step 4
+```
+
+后者不成立，因为 `step+1` 需要前一 step 计算出的 `H` 和 `C`。不同的线程调度只会改变各 batch 行的执行先后，不应改变输出数值语义。
+
+### 84.9 最终三个 Python 输出如何得到
+
+循环结束后，`UniDirectionalLstm` 从每条序列的最后有效时间步拷贝最终 hidden state：
+
+```text
+output : Squeeze(Y, direction axis) = [5, 3, 20]
+hn     : [1, 3, 20]，且 hn[0,b,:] = H[4,b,:]
+cn     : [1, 3, 20]，且 cn[0,b,:] = C[4,b,:]
+```
+
+其中 `output[4,b,:]` 与 `hn[0,b,:]` 是同一最终 hidden state；`cn` 是最终 cell state，不等同于 `output`。第 189 行的 `run_cases()` 仅检查这些输出的形状和有限性；后续 `compare_outputs()` 才用于 CPU 与 CUDA 路径的数值比较。
+
+若要在 C++ 调试器或日志中观察这个 case，最有价值的断点/日志位置依次是：
+
+```text
+dynamic_quantize_lstm.cc:174   # 一次外层 Compute，检查 W/R 是否 prepack
+uni_directional_lstm.cc:286    # 一次完整 X[0:5] * W 的 QGEMM
+uni_directional_lstm.cc:333    # 五次 step 循环入口
+uni_directional_lstm.cc:342    # 每个 step 的 H_prev * R QGEMM
+uni_directional_lstm.cc:370    # I/O/F/C 激活、C/H 更新
+```
+
+这样观察到的次数应是：外层 `Compute` 1 次；输入路径 QGEMM 1 次；逻辑时间步 5 次；每条 batch 轨迹的状态更新 5 次。若 batch 并行把 batch 拆成多个工作组，`H*R` 的底层 QGEMM 调用次数会比 5 多，但每条轨迹仍只有这 5 次严格有序的状态更新。
+
+## 85. `context.Output()` 如何决定 Tensor 在 CPU 还是 GPU 上分配
+
+### 85.1 先给结论
+
+`lstm_base.cc` 中的：
+
+```cpp
+Tensor* Y = context.Output(/*index*/ 0, Y_dims);
+```
+
+并不根据 `Y_dims`、Tensor 的数据类型，或者当前机器是否有 GPU，临时判断“这次放 CPU 还是 GPU”。`Y_dims` 只描述形状；真正的内存位置在 session 建立执行计划时已经决定，`context.Output()` 执行时只是按照该计划找到/创建对应的 `OrtValue`。
+
+对当前代码，决定链可以概括为：
+
+```text
+图节点被分配给哪个 Execution Provider
+  -> 该 EP 选择的 KernelDef
+     -> KernelDef 的 output memory type
+        -> SequentialPlanner 为该输出记录 OrtDevice
+           -> ExecutionFrame 按 allocation plan 获取该 device 的 allocator
+              -> Tensor::InitOrtValue() 绑定这块 CPU/GPU 内存
+```
+
+因此，判断输出位置的核心问题不是“`context.Output()` 看到了什么”，而是“这个节点最后绑定了哪个 EP，以及该 kernel 声明的 output memory type 是什么”。
+
+### 85.2 `context.Output()` 的直接调用链
+
+`OpKernelContext::Output(int, const TensorShape&)` 的实现位于 `onnxruntime/core/framework/op_kernel.cc:44-47`：
+
+```cpp
+Tensor* OpKernelContext::Output(int index, const TensorShape& shape) {
+  auto p_ml_value = OutputMLValue(index, shape);
+  return p_ml_value ? p_ml_value->GetMutable<Tensor>() : nullptr;
+}
+```
+
+随后 `OutputMLValue()` 在同一个文件的 `72-84` 行调用：
+
+```cpp
+execution_frame_->GetOrCreateNodeOutputMLValue(
+    index, GetOutputArgIndex(index), &shape, p_ml_value, kernel_->Node());
+```
+
+这里发生了两个索引转换：
+
+1. `index=0` 是当前算子的第 0 个输出，即 LSTM 的 `Y`；
+2. `GetOutputArgIndex(0)` 把它转换成 `ExecutionFrame` 中的 graph value index；
+3. `NodeIndexInfo` 再把 graph value index 映射到 `all_values_` 中的 `OrtValue`。
+
+`GetOrCreateNodeOutputMLValue()` 位于 `execution_frame.cc:144-219`。它先处理特殊情况：
+
+- 如果该输出是未使用的 optional output，返回 `nullptr`；
+- 如果调用者在 `Run()` 前已经提供了预分配的输出 `OrtValue`，并且 shape 匹配，则复用调用者的 buffer；
+- 否则调用 `CreateNodeOutputMLValueImpl()`，按照 session 的 allocation plan 分配。
+
+所以，严格来说，预分配输出是一个例外：调用者提供的 buffer 及其 `OrtMemoryInfo` 已经决定了位置，ORT 只验证 shape 是否匹配，不会因为 `context.Output()` 再把它从 CPU 搬到 GPU 或反过来。普通 Python `session.run()` 不提供这种预分配输出时，走的是 ORT 的 allocation plan。
+
+### 85.3 allocation plan 中的 device 从哪里来
+
+session finalize 阶段由 `SequentialPlanner::ComputeValueLocation()` 为每个 graph value 计算位置。`allocation_planner.cc:766-778` 明确写着，节点的输出位置由“绑定到该节点的 OpKernel”决定：
+
+```cpp
+const KernelCreateInfo& kernel_create_info = ...;
+const auto* p_kernel_def = kernel_create_info.kernel_def.get();
+auto exec_provider = execution_providers_.Get(*pnode);
+```
+
+对每个输出，核心代码是 `allocation_planner.cc:907-937`：
+
+```cpp
+OrtDevice output_device = exec_provider->GetOrtDeviceByMemType(
+    p_kernel_def->OutputMemoryType(i));
+plan_.SetLocation(static_cast<size_t>(index), output_device);
+```
+
+也就是：
+
+```text
+output_device = 当前节点 EP.GetOrtDeviceByMemType(KernelDef.OutputMemoryType(i))
+```
+
+如果输出设备是 CPU-accessible memory，planner 还可能查看下游 consumer 对 CPU input 的建议，在 CPU、host-accessible 等位置之间选择更少拷贝的设备；这部分在 `allocation_planner.cc:916-935`。但对于当前 CPU LSTM，初始 `output_device` 已经是 CPU，通常不会改变结论。
+
+`plan_.SetLocation()` 写入的是该 graph value 的 `AllocPlanPerValue.location`。之后 `ExecutionFrame::AllocateAsPerAllocationPlan()` 在 `execution_frame.cc:752-834` 取出：
+
+```cpp
+const auto& per_alloc_plan = alloc_plan[ort_value_index];
+const auto& alloc_info = per_alloc_plan.location;
+```
+
+再根据 `alloc_kind` 选择自有分配、复用已有 buffer 或共享 `OrtValue`。自有分配最终进入 `AllocateMLValueTensorSelfOwnBufferHelper()`，在 `execution_frame.cc:615-634` 执行：
+
+```cpp
+alloc = GetAllocator(location);
+Tensor::InitOrtValue(element_type, shape, std::move(alloc), ort_value);
+```
+
+因此，`context.Output()` 传入的 `shape` 只影响需要分配多少 bytes；`location` 来自预先计算的 allocation plan，`allocator` 再由该 location 查找。
+
+### 85.4 `OrtMemTypeDefault` 到底代表什么
+
+这里容易产生一个误解：`OrtMemTypeDefault` 并不永远等于 CPU。它的含义是“当前 Execution Provider 的默认设备内存”。
+
+`KernelDef::OutputMemoryType()` 在 `include/onnxruntime/core/framework/kernel_def_builder.h:91-95` 中，如果没有针对某个 output 单独设置 memory type，就返回 `default_outputs_mem_type_`；默认值在同一文件 `159-161` 是 `OrtMemTypeDefault`。
+
+Execution Provider 再把这个 memory type 转换成自己的 `OrtDevice`。公共实现位于 `include/onnxruntime/core/framework/execution_provider.h:439-444`：CPU input/output 类型返回 CPU device，其他情况返回该 EP 的 `default_device_`。
+
+因此通常可以这样理解：
+
+| 节点绑定的 EP | KernelDef output memory type | `GetOrtDeviceByMemType()` 的典型结果 | 输出位置 |
+| --- | --- | --- | --- |
+| CPU EP | `OrtMemTypeDefault` | `OrtDevice::CPU` | CPU 内存 |
+| CUDA EP | `OrtMemTypeDefault` | CUDA device，例如 GPU 0 | GPU 显存 |
+| CUDA EP | `OrtMemTypeCPUOutput` | host-accessible CPU device | CPU 可访问内存 |
+| CPU EP | `OrtMemTypeCPUOutput` | CPU device | CPU 内存 |
+
+“Default”是相对于 EP，而不是相对于整台 ORT session。一个 session 同时有 CPU EP 和 CUDA EP 时，必须先知道节点属于哪个 EP，单独看到 `OrtMemTypeDefault` 仍不足以判断 CPU/GPU。
+
+### 85.5 当前 `DynamicQuantizeLSTM` 的实际结果
+
+当前 `dynamic_quantize_lstm.cc:253-263` 的 kernel 注册是：
+
+```cpp
+ONNX_OPERATOR_TYPED_KERNEL_EX(
+    DynamicQuantizeLSTM,
+    kMSDomain,
+    1,
+    float,
+    kCpuExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::GetTensorType<float>())
+        ...,
+    DynamicQuantizeLSTM);
+```
+
+这段注册有两个直接结论：
+
+1. 当前这份 `DynamicQuantizeLSTM` kernel 属于 CPU EP；
+2. `KernelDefBuilder` 没有调用 `OutputMemoryType(...)` 或 `SetDefaultOutputMemoryType(...)`，所以三个输出使用 `OrtMemTypeDefault`。
+
+CPU EP 在 `cpu_execution_provider.cc:61-66` 创建的 preferred allocator 是 `CPUAllocator`。它的默认 `OrtDevice` 是 CPU，且 CPU EP 没有把 `OrtMemTypeDefault` 改成 GPU device。因此当前 `LSTMBase::ComputeImpl` 中：
+
+```cpp
+Tensor* Y   = context.Output(0, Y_dims);
+Tensor* Y_h = context.Output(1, Y_h_dims);
+Tensor* Y_c = context.Output(2, Y_c_dims);
+```
+
+在这个 CPU kernel 中得到的三个 Tensor 都是 CPU Tensor。`Y` 的 shape 是 `[seq, num_directions, batch, hidden]`，但它的 shape 与 CPU/GPU 无关；决定位置的是该 value 对应的 `AllocPlanPerValue.location`。
+
+### 85.6 为什么 CUDA session 中它仍可能在 CPU
+
+如果 Python 创建：
+
+```python
+ort.InferenceSession(
+    model,
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
+并不意味着所有节点都在 CUDA 上。ORT 会先尝试把节点分区/绑定给 CUDA EP；如果 CUDA EP 没有 `com.microsoft::DynamicQuantizeLSTM` 的 kernel，就会把该节点回退给 CPU EP（前提是允许 CPU fallback）。此时：
+
+```text
+DynamicQuantizeLSTM -> CPU EP -> Y/Y_h/Y_c 在 CPU
+```
+
+CUDA session 中的其他 CUDA 节点如果把输出放在 GPU，那么跨 EP 的边上会插入或执行数据拷贝，使 CPU LSTM 能读到 CPU 输入；LSTM 输出再根据下游节点需要复制到 GPU。这个复制发生在节点之间，不是 `context.Output()` 把本节点的输出“自动选成 GPU”。
+
+因此，“session 使用 CUDA EP”和“某一个 kernel 的输出在 GPU”是两个不同问题。必须查看实际节点 provider/profile，或者在 kernel 中直接打印 `Y->Location()`。
+
+### 85.7 如何在源码中验证实际位置
+
+`Tensor` 在 `include/onnxruntime/core/framework/tensor.h:199-202` 提供：
+
+```cpp
+const OrtMemoryInfo& Tensor::Location() const;
+```
+
+在 `Y` 分配完成后可以临时加入类似日志：
+
+```cpp
+Tensor* Y = context.Output(/*index*/ 0, Y_dims);
+LOGS_DEFAULT(WARNING)
+    << "Y location=" << Y->Location().ToString()
+    << ", shape=" << Y->Shape()
+    << ", data=" << Y->DataRaw();
+```
+
+预期结果大致是：
+
+```text
+CPU EP:   Y location=Cpu;0;... 或对应 CPU OrtMemoryInfo
+CUDA EP:  Y location=Cuda;0;... 或对应 CUDA OrtMemoryInfo
+```
+
+具体字符串格式取决于 `OrtMemoryInfo::ToString()`，不要只根据 `Y->DataRaw()` 的指针地址判断位置；CPU 虚拟地址和 CUDA 映射地址都只是地址，可靠信息是 `Y->Location()`。
+
+如果要打印 kernel provider，需要在持有 `OpKernel`/`OpKernelContext` 的外层代码中访问 kernel info；`LSTMBase::ComputeImpl` 本身不能直接访问 `OpKernelContext` 的私有 `kernel_` 成员。但在 `LSTMBase::ComputeImpl` 中通常没有必要通过 kernel provider 再推断，因为 `Tensor::Location()` 已经是最终实际绑定的 memory info。
+
+### 85.8 与临时 workspace allocator 的区别
+
+不要把 `context.Output()` 和 `context.GetTempSpaceAllocator()` 混为一谈。
+
+`GetTempSpaceAllocator()` 在 `op_kernel.cc:95-100` 中通过：
+
+```cpp
+GetAllocator(kernel_->GetDevice(OrtMemTypeDefault))
+```
+
+直接取得当前 kernel device 的临时 allocator。LSTM 使用它来申请内部的 hidden/cell 临时 buffer、packed weight 等 workspace；这些也会跟随当前 kernel 的 EP。
+
+而 `context.Output()` 走的是 `ExecutionFrame -> allocation plan -> per-value location`，因为输出 tensor 还要考虑 graph value 的生命周期、内存复用、memory pattern、下游 consumer、用户预分配输出等因素。
+
+两条路径在当前 CPU `DynamicQuantizeLSTM` 上都会得到 CPU memory，但原因和控制层次不同：
+
+```text
+GetTempSpaceAllocator()
+  -> 当前 kernel 的 device
+
+context.Output()
+  -> 当前 graph value 的 allocation plan location
+  -> 对应 device 的 allocator
+```
+
+最终可以用一句话概括：`context.Output(0, Y_dims)` 不负责选择 CPU/GPU；图分区和 kernel 的 memory type 先决定 `Y` 的 `OrtDevice`，`ExecutionFrame` 再用该 device 的 allocator 创建 Tensor。对当前只注册 CPU kernel 的 `DynamicQuantizeLSTM`，`Y`、`Y_h`、`Y_c` 的实际分配位置是 CPU；只有真正执行 CUDA kernel 且其 output memory type 映射到 CUDA default device 时，类似代码才会得到 GPU Tensor。
+
+## 86. 三种 `Compute` / 注册方式：应选择哪一种自定义算子实现
+
+结论先说：这不是三种等价的“自定义算子”接口，而是两个**外部 ORT Custom Op API 层次**，加上一个**ORT 源码内部 OpKernel 层次**。
+
+对 `simo` 这种由 `RegisterCustomOps` 导出的独立共享库，新的 `com.simo` 算子默认应使用第 1 种 Lite Custom Op：`Ort::Custom::CreateLiteCustomOp`。第 2 种 `Ort::CustomOpBase` 仍是受支持的低层 C++ 包装，适合需要手工控制 `OrtCustomOp` 回调的场景或保持已有实现；并非已经失效。第 3 种 `ONNX_OPERATOR_TYPED_KERNEL_EX` 不是外部插件 API，只有把实现合入并编译 ONNX Runtime 本体（或其内部 Execution Provider）时才应使用。
+
+本节中的 `simo/...` 路径相对于 `/share/users/like/package/simo_conda_sglang`，`onnxruntime/...` 和 `include/...` 路径相对于 `/softhome/like/package/onnxruntime`；行号对应当前 checkout。
+
+### 86.1 三个 `Compute` 签名的真正区别
+
+| 实现 | 源码中的 `Compute` | API 层次 | 谁将输入/输出交给实现 | 错误返回 |
+| --- | --- | --- | --- | --- |
+| CUDA QDQ | `DequantizeCustomOp<T>::Compute(OrtKernelContext&, const Ort::Custom::Tensor<uint8_t>&, const Ort::Custom::Tensor<uint8_t>&, Ort::Custom::Tensor<T>&)` | 外部插件的 Lite C++ API | Lite 框架按函数签名构造类型安全的 `Tensor<T>` wrapper | `Ort::Status` |
+| CPU QDQ | `DequantizeCpuDirectKernel<T>::Compute(OrtKernelContext*)` | 外部插件的经典 `OrtCustomOp` C ABI 的 C++ 包装 | 实现自行调用 `OrtApi::KernelContext_GetInput/GetOutput` 等函数取值、分配输出 | `void`；当前代码以 C++ exception 报错 |
+| `DynamicQuantizeLSTM` | `DynamicQuantizeLSTM::Compute(OpKernelContext*) const` | ORT 内部 C++ `OpKernel` | ORT 内核执行器传入私有的 `OpKernelContext` | 内部 `onnxruntime::Status` |
+
+第一项的实现在 `simo/onnx/ort_plugin/simo_qdq_ops.cc:507-569`，函数为 `DequantizeCustomOp<T>::Compute`，实际签名见 `:518-522`。`quantized`、`scale` 被声明为 const typed tensor，`output` 是可分配的 typed tensor；因此 `output.Allocate({outer_dim, quant_dim})` 在 `:548` 分配输出。它在 `:523-564` 中直接用 wrapper 读 shape、data，失败则返回 `Ort::Status`。这正是 Lite API 的核心价值：算子的输入数、输出数和 ONNX element type 不需要在另一个 `GetInputType*`/`GetOutputType*` 实现中再写一遍。
+
+这个多参数签名只是作者面对的 C++ 层接口，不是 ORT 二进制 ABI 中直接调用的函数类型。`include/onnxruntime/core/session/onnxruntime_lite_custom_op.h:1028-1047` 的 `Ort::Custom::OrtLiteCustomStruct<CustomOp>::SetCompute` 会把成员函数签名解析为 input/output 类型，然后生成统一的 `OrtCustomOp::KernelCompute` 或 `KernelComputeV2` 回调；其中 `CreateTuple(...)` 将一个 `OrtKernelContext*` 及其输入/输出转换为 `Tensor<T>` 参数，最后再调用 `custom_op_->Compute(...)`。返回 `Ort::Status` 的版本走 `KernelComputeV2`，见该函数 `:1039-1047`。也就是说，底层仍然有一个 context 指针，只是 Lite adapter 替 `simo` 做了取输入、分配 output 和 status 传递。
+
+第二项的实现位于 `simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:1072-1135`，函数 `DequantizeCpuDirectKernel<T>::Compute` 的签名在 `:1081`。它在 `:1083` 调用本文件函数 `KernelInputShape`，在 `:1108-1109` 调用 `KernelInputData<uint8_t>`，在 `:1111` 调用 `KernelOutputData<T>`。这些 helper 的定义在同一文件 `:53-85`，内部逐个调用 C API 的 `KernelContext_GetInput`、`KernelContext_GetOutput` 和 `GetTensorMutableData`。所以参数个数少，不表示它没有两个 input 和一个 output；恰好相反，input/output 的编号、类型和输出 shape 全部由函数体手工管理。
+
+其 `void` 返回值也不等价于“不可能报告错误”。当前 `DequantizeCpuDirectKernel<T>::Compute` 在 shape 或 runtime 检查失败时 `throw std::runtime_error`，例如 `simo_qdq_cpu_ops.cc:1085-1107`、`:1126-1128`。但错误不能从 `Compute` 的返回值显式传回。`Ort::CustomOpBase<..., false>` 的 `false` 正是 void callback 模式：`include/onnxruntime/core/session/onnxruntime_cxx_api.h:3214-3263` 中的 `CustomOpBase` 在 `:3255-3262` 将其桥接为 `OrtCustomOp::KernelCompute(void*, OrtKernelContext*)`，并调用 `TKernel::Compute(context)`。若选用 `CustomOpBase<..., true>`，该模板要求的是另一套 `CreateKernelV2` / `ComputeV2`，其回调返回 `OrtStatusPtr`，见同一文件 `:3244-3254`；不是把现有 `void Compute` 简单改为 `Ort::Status Compute` 即可。
+
+第三项位于 `onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc:19-47`。类 `DynamicQuantizeLSTM` 直接继承 ORT 内部的 `OpKernel`，函数声明在 `:32`，定义为 `DynamicQuantizeLSTM::Compute(OpKernelContext*) const` 在 `:174-251`。`OpKernelContext`、`Tensor`、`Status`、`LSTMBase` 都是 ORT 内部 C++ 实现类型，不是面向独立 custom-op `.so` 的稳定扩展 ABI。因此它的参数、`const` 限定和返回类型都不应与前两种作一一对应比较。
+
+可以把三条实际调用路径概括为：
+
+```text
+Lite Custom Op
+ORT 的 OrtCustomOp::KernelComputeV2(void*, OrtKernelContext*)
+  -> Lite adapter 将 context 展开为 Typed Tensor 参数
+  -> DequantizeCustomOp<T>::Compute(context, quantized, scale, output)
+
+CustomOpBase（当前 CPU 实现）
+ORT 的 OrtCustomOp::KernelCompute(void*, OrtKernelContext*)
+  -> DequantizeCpuDirectKernel<T>::Compute(context)
+  -> 实现自行按 index 0/1/0 取 input、input、output
+
+ORT 内部 kernel
+KernelRegistry 选中 OpKernel factory
+  -> DynamicQuantizeLSTM::Compute(OpKernelContext*) const
+```
+
+因此，`Compute` 的参数类型和个数反映的是**封装层是否替你解析 tensor 参数**，并不是性能等级或算子能力的排序。前两者进入 ORT 时都以公开 `OrtCustomOp` 回调为边界；第三者则从始至终留在 ORT 内部。
+
+### 86.2 三种“注册”实际注册了什么
+
+第 1 种中，`Ort::Custom::CreateLiteCustomOp` 不是把 kernel 直接注册到 ORT 全局 registry；它是构造一个 `OrtLiteCustomOp`，而该类型继承公开 C struct `OrtCustomOp`。实现可见 `include/onnxruntime/core/session/onnxruntime_lite_custom_op.h:402-411` 与 `:1028-1096`：前者说明其作为 `OrtCustomOp` bridge，后者的 `CreateLiteCustomOp<CustomOp>` 返回该对象。`OrtLiteCustomOp` 会设置 `GetName`、EP type、input/output type、callback 等 function pointer；构造过程可见 `:764-865`。
+
+当前 CUDA QDQ 正是这一模式。`simo/onnx/ort_plugin/simo_qdq_ops.cc` 的函数 `RegisterQdqOps` 在 `:573-605` 中，分别在 `:576-594` 调用 `CreateLiteCustomOp<...>`，然后在 `:597-604` 以 `domain.Add(op.get())` 加入 `com.simo` domain。`static const std::array<std::unique_ptr<...>>` 很重要：`CustomOpDomain::Add` 只登记指针，不接管 op 对象的生命周期；这可由公开 C++ API 声明 `include/onnxruntime/core/session/onnxruntime_cxx_api.h:1457-1467` 验证。
+
+第 2 种中，`DequantizeCpuDirectOp<T>` 的实际对象类型不是“一个指向 `CustomOpBase` 的指针”，而是它自身的对象，**继承自** `Ort::CustomOpBase<DequantizeCpuDirectOp<T>, DequantizeCpuDirectKernel<T>, false>`；定义在 `simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:1172-1205`。`CustomOpBase` 又继承公开的 `OrtCustomOp`，并在构造函数中填写 C function table，见 `include/onnxruntime/core/session/onnxruntime_cxx_api.h:3214-3265`。所以 `domain.Add(...)` 最终接收的仍是 `const OrtCustomOp*`，只是这次 function table 由 `CustomOpBase` 填充，而不是 Lite API 填充。
+
+`RegisterCpuQdqOps` 在 `simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc:1209-1222` 中创建 static 的 op 对象并加入同一个 domain。现有的 `const_cast<DequantizeCpuDirectOp<T>*>(&dequantize_...)` 不是必要的注册机制，也不改变语义：`CustomOpDomain::Add` 的参数本来就是 `const OrtCustomOp*`。它只是在把 `static const` 对象转换成非 const 指针后又隐式转回 const；对象不会也不应在注册后被修改。
+
+第 1、2 种最后共享完全相同的插件装载入口。`simo/onnx/ort_plugin/custom_op_library.cc` 的函数 `QdqDomain` 在 `:13-25` 根据 `SIMO_ONNX_QDQ_PROVIDER` 选择 `RegisterCpuQdqOps` 或 `RegisterQdqOps`；导出的 `RegisterCustomOps` 在 `:29-44` 获取 API v17（`simo/onnx/ort_plugin/simo_qdq_ops.h:11`）、调用 `session_options.Add(QdqDomain())`。公开 C API 对这条流程的定义是“创建 `OrtCustomOpDomain` -> 加每个 `OrtCustomOp` -> 将 domain 加入 session options”，见 `include/onnxruntime/core/session/onnxruntime_c_api.h:7492-7496`。应用侧从共享库加载时推荐 `RegisterCustomOpsLibrary_V2`；旧的 `RegisterCustomOpsLibrary` 已标记 deprecated，见同一头文件 `:1658-1674` 和 `:4472-4488`。
+
+第 3 种的 `ONNX_OPERATOR_TYPED_KERNEL_EX` 则根本不操作 `OrtCustomOpDomain`。当前调用在 `onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc:253-263`：它描述 `DynamicQuantizeLSTM`、`kMSDomain`、opset 1、`kCpuExecutionProvider` 以及输入类型约束。宏定义在 `include/onnxruntime/core/framework/op_kernel.h:273-285`，其效果是生成 `BuildKernelCreateInfo<...>()` 的显式特化，创建一个含 `KernelDef` 和 `std::make_unique<DynamicQuantizeLSTM>(info)` factory 的 `KernelCreateInfo`。之后 ORT 的内部 `KernelRegistry` 才以 op/domain/provider/type constraints 查找它；registry 的职责和查找 API 见 `include/onnxruntime/core/framework/kernel_registry.h:20-50`。
+
+另外，宏也**不注册算子 schema**。`com.microsoft::DynamicQuantizeLSTM` 的 schema、输入输出和类型约束是独立定义的，位于 `onnxruntime/core/graph/contrib_ops/quantization_defs.cc:657-758`，宏中的 kernel 注册仅为这个 schema 提供 CPU 实现。若要在 ORT 源码中新增同类内部 op，通常至少需要 schema、一个继承 `OpKernel` 的实现、kernel 注册和相应构建目标改动；这与制作可由 `SessionOptions::RegisterCustomOpsLibrary` 加载的外部 `.so` 是两条不同的集成路径。
+
+### 86.3 对 `simo` 的推荐选择
+
+| 目标 | 推荐实现 | 推荐注册 |
+| --- | --- | --- |
+| 新增或重写独立 `com.simo` CPU/CUDA 算子 | Lite Custom Op，typed `Tensor<T>` 参数，必要时首参保留 `OrtKernelContext&` | `CreateLiteCustomOp` -> `Ort::CustomOpDomain::Add` -> 导出的 `RegisterCustomOps`；应用侧 `RegisterCustomOpsLibrary_V2` |
+| 已有低层实现，或需要手写 function table、input memory type / input-output characteristic 等 Lite 默认策略之外的精细控制 | `CustomOpBase`（或直接 C `OrtCustomOp`） | 仍是 `CustomOpDomain::Add` 和 `RegisterCustomOps` |
+| 修改 ORT 内置或 contrib CPU/CUDA Execution Provider | `OpKernel`，`Status Compute(OpKernelContext*) const` | schema + `ONNX_OPERATOR_*_KERNEL*` 宏 + ORT 内部构建/registry |
+
+所以，对当前代码最实用的建议是：继续把 `simo_qdq_ops.cc` 的 Lite 方式作为新实现的默认范式；CPU 的 `DequantizeCpuDirectKernel` 不是“错误写法”，但它承担了 Lite 已经封装的参数解析、类型声明和错误通道工作。只要目标运行时支持当前随插件发布的 Lite Custom Op header/API，CPU QDQ 可以逐步统一到 Lite 风格，行为上仍可通过首个 `OrtKernelContext&` 访问低层 API。不要为了让 `DynamicQuantizeLSTM` 的签名看起来一致而将 `simo` QDQ 改成 `OpKernel` 宏注册：那会把独立插件变成必须重编 ONNX Runtime 的内部 fork，破坏外部插件的版本隔离和部署方式。

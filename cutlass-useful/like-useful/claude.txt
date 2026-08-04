@@ -411,3 +411,85 @@ cutlass code base test/unit/cute/core/swizzle_layout_like.cpp  增加了第4个�
 对这个例子的 print_tensor 的结果进行解释
 
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude.md  里面
+cutlass code base 位于 /share/users/like/package/cutlass/
+对 cutlass code base 的 examples/cute/tutorial/hopper/wgmma_tma_sm90.cu 进行讲解。
+它有没有用到 warp specizlize技术 ？
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+}
+{ 修改examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu
+1.  main函数里面,
+  thrust::host_vector<TA> h_A(m*k);
+  thrust::host_vector<TB> h_B(n*k);
+  thrust::host_vector<TC> h_C(m*n);
+3个 host tensor 不再来自随机数据，而是参考 examples/cute/tutorial/sgemm_1_ref_np.cu, 来自 npy 文件.
+2. 参考 examples/cute/tutorial/sgemm_1_ref_np.cu, main函数里面， gpu matmul结果要和 npy 文件里面的 结果做数值比对
+3. 不要多次运行计算 GFlop/s, 只运行一次 matmul, 和 npy 结果做一次数值对比就可以了。
+}
+{
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu  gemm_nt 用到了 ：
+  auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
+  auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
+
+Layout_MN_SW128_Atom这个类型的功能是什么? tile_to_shape 的实现在哪里？有什么功能?
+为什么名字里面有个 128 数字?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+}
+{
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN,GMMA::Major::MN>{});:
+打印出来结果, PermutationMNK: (_,_,_), 为什么 PermutationMNK 没有数据？这个 TiledMMA 能够处理的 MMA 数据规模是多大?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+ }
+ {
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+gemm_nt中
+```
+  dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
+               round_up(size(ceil_div(n, bN)), dimCluster.y));
+```
+对这个 dimGrid的计算过程进行讲解。还有，为什么要把 dimCluster.x设置成2?
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+ }
+ {
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+gemm_nt中
+```
+  Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));
+  Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN,bK));
+```
+如何解释日志中 tmaA/tmaB 的打印结果?
+tmaA/tmaB 的值和 mA, sA, bM,bN,bK有什么关系?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+ }
+
+
+ {
+ /softhome/like/asset/code/tma_demo/tma_demo.cu 132行 phase参数有什么作用？它是输入参数还是输出参数 ？
+  引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+ }
+
+ {
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+有如下打印:
+```
+    print(tAgA); printf("\n\n");
+    print(tAsA); printf("\n\n");
+    print(tBgB); printf("\n\n");
+    print(tBsB); printf("\n\n");
+```
+对打印结果进行解释.
+为什么 tAgA= (((_64,_8),(_2,_8)),32):(((_1@0,_1@1),(_64@0,_8@1)),_64@1)?
+为什么 tAsA=((_512,_16),(_1,_3)):((_1,_512),(_0,_8192))?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+ }
+{
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu
+      ProducerBarType::init(&producer_mbar[pipe],   1);
+      ConsumerBarType::init(&consumer_mbar[pipe], 128);
+这两个 init 传的参数为什么是  1 和 128?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
+}

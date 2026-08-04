@@ -181,6 +181,7 @@ def try_cuda(
 def main() -> None:
   quantize_model()
   cases = make_input_cases()
+  # ort.set_default_logger_severity(0)
 
   cpu_session = ort.InferenceSession(
     str(MODEL_QUANT), providers=["CPUExecutionProvider"]

@@ -2663,25 +2663,39 @@ def validate_graphsurgeon_conversion(model: ModelProto) -> None:
 权重后面插入 Dequantize, Transpose 2个算子，分别是在哪行代码插入的?
 把答案追加到 like-useful/answer_codex_v2.md
 
-## LSTM 量化
+}
+{ ##
+LSTM 量化
 conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
 conda 环境已经安装 onnx, onnxruntime, GraphSurgeon
 
 /share/users/like/package/onnx/ 有完整的 onnx 源码，和conda 环境的 通过 pip 安装的包，是相同的版本。
 /share/users/like/package/onnxruntime/ 有完整的 onnxruntime 源码，和conda 环境的 通过 pip 安装的包，是相同的版本。
 
-
 onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
 
-参考  simo/onnx/onnx_quant.py 对于 MatMul/Conv QDQ 量化，实现 onnx LSTM QDQ 量化.
-* /share/users/like/package/onnx/docs/Operators.md 显示， ONNX LSTM 的输入个数: Inputs (3 - 8), 只对 input 1,input 2,input 3进行量化，其他input不用管
-* input 1, The input sequences, 对于激活值，完全参考 MatMul 的量化做法，插入 Flatten, Pad, Quantize, Dequantize,  Slice,  Reshape, Shape 等算子
-* input 2, The weight tensor for the gates. Concatenation of `W[iofc]` and `WB[iofc]` (if bidirectional) along dimension 0. The tensor has shape `[num_directions, 4*hidden_size, input_size]`. 这个权重在 onnx 中是 W[iofc] 的 Concatenation, 在量化权重的时候，要先把 input 2 拆开.
- ** 单向 lstm 拆成 W[iofc] 4个矩阵， 分别调用 simo 量化 kernel，得到4个 权重 carrier和4个 scale, 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为输入。
- ** 双向 lstm 拆成 W[iofc] 4个矩阵 + WB[iofc] 4个，总共8个矩阵， 分别调用 simo 量化 kernel，得到8个 权重 carrier和8个 scale, 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为输入。
+参考  simo/onnx/onnx_quant.py 对于 MatMul/Conv 的量化，实现 onnx LSTM 算子的量化.
+以下是一些细节:
+* /share/users/like/package/onnx/docs/Operators.md 显示， ONNX LSTM 的输入个数: Inputs (3 - 8), 只对 input 1(X),input 2(W),input 3(R)进行量化，其他input不用管
+* input 1 X, The input sequences, 对于激活值，完全参考 MatMul 的量化做法，根据需要插入 Flatten, Pad, Quantize, Dequantize,  Slice,  Reshape, Shape 等算子
+* input 2 W, The weight tensor for the gates. Concatenation of `W[iofc]` and `WB[iofc]` (if bidirectional) along dimension 0. The tensor has shape `[num_directions, 4*hidden_size, input_size]`. 这个权重在 onnx 中是 W[iofc] 的 Concatenation, 在量化权重的时候，要先把 input 2 拆开.
+ ** 对于单向 lstm 拆成 W[iofc] 4个矩阵， 分别调用 simo 量化 kernel，得到4个 权重 uint8 carrier和 4个 uint8 scale carrier , 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为 input 2。
+ ** 对于双向 lstm 拆成 W[iofc] 4个矩阵 + WB[iofc] 4个，总共8个矩阵， 分别调用 simo 量化 kernel，得到8个 权重 uint8 carrier和8个 uint8 scale, 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为 input 2。
 
-* input 3,  The recurrence weight tensor. Concatenation of `R[iofc]` and `RB[iofc]` (if bidirectional) along dimension 0. This tensor has shape `[num_directions, 4*hidden_size, hidden_size]`.
-* 要有完善的单元测试,  在 simo/onnx/tests/test_dynamic_qdq_runtime_debug.py 中插入 LSTM 的量化测试。
+* input 3 R,  The recurrence weight tensor. Concatenation of `R[iofc]` and `RB[iofc]` (if bidirectional) along dimension 0. This tensor has shape `[num_directions, 4*hidden_size, hidden_size]`. 
+ ** 对于单向 lstm,  input 3是 R[iofc] 4个矩阵的 Concatenation,  要把 input 3 拆成 R[iofc] 4个矩阵，分别调用 simo 量化 kernel，得到4个 权重 uint8 carrier和 4个 uint8 scale carrier , 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为input 3。
+ ** 对于双向 lstm, input 3 是 `R[iofc]` and `RB[iofc]` 的 Concatenation,  把 input 3拆成  8 个矩阵: R[iofc]/RB[iofc]，分别调用 simo 量化 kernel，得到8个 权重 uint8 carrier和 8个 uint8 scale, 在图里面插入 Dequantize, 再 concat 成一个 权重，concat 的结果给 lstm 作为 input 3。
+* input 2(W) 和 input 3(R) 的定位都是权重， 共享同一个 量化 spec,比如
+{
+  "targets": ["LSTM"],
+  "input": {"dtype": "mxint8", "axis": 1},
+  "weight": {"dtype": "mxint8", "axis": 1, "block_size": 32},
+}
+input 1(X) 使用 input 对应的配置，input 2(W) 和 input 3(R) 都使用 'weight' 对应的配置，
+
+* 要有完善的单元测试,  双向 lstm和 单向 lstm 都要测试到，在 simo/onnx/tests/test_dynamic_qdq_runtime_debug.py 中追加 LSTM 的量化测试。
+* 对于 LSTM 权重不是常量的情况，参考 Matmul/Gemm 的做法。
+写代码前先把执行计划写入 like-useful/PLAN_LSTM.md
 }
 
 
@@ -2820,4 +2834,319 @@ shape_id, dtype, input_shape 分别是 ('symbolic', 'int8', ['B', 'S', 18])
 simo/onnx/onnx_quant.py 765 行if=True的时候，为什么要把 per tensor的粒度强行改成 per channel?
 把答案追加到 like-useful/answer_codex_v2.md
 
+}
+
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+ /share_data/users/tangdehua/project/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx 是一个嵌套子图的模型，里面有一些 LSTM 算子，但是很多 LSTM 的权重不是常量，比如 name=If_0_else_branch__Inline_0__/decoder/rnn_1/LSTM 的节点，input 2 和 input 3 这两个权重， 都来自其他算子的计算结果.
+这个onnx文件，所有的LSTM 都是这样吗？权重都来自其他算子输出吗？
+写一个 python 代码 like-useful/const_fold_lstm.py ，实现常量折叠，并把常量折叠后的onnx模型保存到新的路径，并打印所有的拥有常量权重input 2/input 3的LSTM算子的name, 不要原地修改 onnx文件。
+
+}
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+/share_data/users/tangdehua/project/jdjv/silero_vad_clean/test_quant_onnx.sh 这个脚本完成的核心功能是什么?它会调用什么 python代码？该代码的核心功能是什么？使用哪个模型？使用什么数据集？
+把答案追加到 like-useful/answer_codex_v2.md
+
+}
+
+
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo 以 editable 方式安装。
+/share_data/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so 这个文件可以  传给  CUSTOM_OP_LIBRARY 吗？
+SIMO_ONNX_TRITON_MANIFEST 这个需要的文件怎么构建？它是必须的吗？
+把答案追加到 like-useful/answer_codex_v2.md
+
+}
+
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo 已经以 editable 方式安装。
+我把 /share_data/users/tangdehua/project/jdjv/silero_vad_clean copy 成 /share/users/like/package/jdjv/silero_vad_clean，不想修改 /share_data/users/tangdehua/project/jdjv/silero_vad_clean.
+你帮我修改  /share/users/like/package/jdjv/silero_vad_clean/test_quant_onnx.sh 及它调用的 python脚本，让这个脚本能够在 当前 conda 环境运行。
+}
+
+{
+把 simo/onnx/tests/test_dynamic_qdq_runtime_debug.py copy 成 like-useful/test_dynamic_qdq_runtime_debug-debug_lstm.py
+修改  like-useful/test_dynamic_qdq_runtime_debug-debug_lstm.py
+1. like-useful/test_dynamic_qdq_runtime_debug-debug_lstm.py 中关于 lstm的测试，把 pytest 测试的参数手动展开，在 main函数中用展开的参数调用被测函数，其中 temp_path 使用 "temp/test_dynamic_qdq_runtime_debug-lstm" 目录
+2. 把 lstm 模型 插入 simo QDQ节点前的模型保存下来，插入 QDQ 节点后的模型也保存下来，保存在 temp/test_dynamic_qdq_runtime_debug-lstm 目录
+}
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+工作目录位于 /share/users/like/package/jdjv/silero_vad_clean.
+/share/users/like/package/jdjv/silero_vad_clean/test_float.sh 运行相关日志位于  /share/users/like/package/jdjv/silero_vad_clean/logs/onnx_float_baseline_aishell4_24shards/,   /share/users/like/package/jdjv/silero_vad_clean/logs/onnx_float_baseline_aishell4_24shards/, 有没有模型的精度或者得分或者评价指标？如何解释模型精度指标？ 
+/share/users/like/package/jdjv/silero_vad_clean/test_quant_onnx.sh 运行相关日志位于  /share/users/like/package/jdjv/silero_vad_clean/logs/onnx_quant_aishell4_24shards/,  /share/users/like/package/jdjv/silero_vad_clean/logs/onnx_quant_aishell4_24shards/,      有没有模型的精度或者得分或者评价指标？如何解释模型精度指标？ 
+量化模型精度和浮点模型的精度对比, 结果如何？
+把答案追加到 /share/users/like/package/simo_conda_sglang/like-useful/answer_codex_v2.md
+}
+
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+simo 以 editable 方式安装在 conda 环境。
+工作目录位于 /share/users/like/package/jdjv/silero_vad_clean.
+/share/users/like/package/jdjv/silero_vad_clean/test_quant_onnx.sh 是在哪一行代码保存量化后的onnx文件的？又是在哪里加载量化后的 onnx文件?
+要求: 讲解代码的时候，要以 文件名+行号 + 函数名  的形式, 把答案追加到 /share/users/like/package/simo_conda_sglang/like-useful/answer_codex_v2.md
+
+}
+{
+
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+simo 以 editable 方式安装在 conda 环境。
+工作目录位于 /share/users/like/package/jdjv/silero_vad_clean.
+
+/share/users/like/package/jdjv/silero_vad_clean/ 这个项目目录的 scripts/run_silero_onnx_float_sharded.py的 git diff, 主要完成了什么修改 ？
+要求: 讲解代码的时候，要以 文件名+行号 + 函数名  的形式, 把答案追加到 /share/users/like/package/simo_conda_sglang/like-useful/answer_codex_v2.md
+}
+{
+main分支有新提交。已经rebase了main分支。
+5b7571c1a03f1d4dcac2df65a7bead6fb5a69aa8 和 7c17fd98217132583a97a0891526cacce3cdd767 这两个提交，分别实现了哪些功能 ？
+把答案追加到 /share/users/like/package/simo_conda_sglang/like-useful/answer_codex_v2.md
+}
+{
+当前  simo/onnx/api.py 里面的 quantize 函数会，在插入 QDQ 节点前，会对模型做常量折叠吗?
+把答案追加到 /share/users/like/package/simo_conda_sglang/like-useful/answer_codex_v2.md
+}
+{
+把 /share/users/like/package/jdjv/quant_schema 里面所有 json配置都改成 新的 simo 支持的格式，比如 weight的 is_dynamic 要修改。
+并在 所有配置中加上LSTM的量化配置，参考 w8a8_mx/w_mxint8_a_mxint8_lstm.json,  LSTM 的 input/weight 的格式和 Linear 的 input/weight 的格式，保持一致。
+}
+{
+在脚本   /share/users/like/package/jdjv/silero_vad_clean/test_quant_onnx.sh  里面加一个环境变量 SIMPLIFY ， 默认=false, 让它能够控制 /share/users/like/package/jdjv/silero_vad_clean/scripts/run_silero_onnx_float_sharded.py:prepare_model   调用 simo.onnx.quantize  时候传入 simplify参数的值.
+}
+{
+把 /share/users/like/package/jdjv/quant_schema/ copy 成 /share/users/like/package/jdjv/quant_schema_no_lstm，   把/share/users/like/package/jdjv/quant_schema_no_lstm 里面所有的量化配置，去掉 LSTM的 量化。
+}
+{
+如何判断 这个硬盘是 raid0 还是raid1?
+/dev/md1p1                              ext4    14T  1.2T   13T   9% /data
+把答案追加到 /data/like//answer_codex_v2.md
+}
+{
+
+
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+simo 以 editable 方式安装在 conda 环境。
+
+在本机,工作目录位于 /share/users/like/package/jdjv/silero_vad_clean
+以下命令进行带 lstm 量化的测试。
+MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/out_lstm SIMPLIFY=true bash test_quant_onnx.sh > temp/test_quant_onnx.sh.log.siplify.lstm.loop.`nowstr.sh` 2>&1
+日志位于 /share/users/like/package/jdjv/silero_vad_clean/temp/test_quant_onnx.sh.log.siplify.lstm.loop.2026_07_29___11_19_17
+日志打印了粗略的 模型精度
+不同量化结果位于 logs/out_lstm 各子目录下的 summary.json
+比如 logs/out_lstm/onnx_quant_w_fp8_2d_block_a_fp8_1d_block_aishell4_24shards/summary.json
+
+
+在 bjh5 机器上,工作目录位于 /share/users/like/package/jdjv/silero_vad_clean
+以下命令进行不带 lstm 量化的测试。
+CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_no_lstm/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/out_no_lstm SIMPLIFY=true bash test_quant_onnx.sh > temp/test_quant_onnx.sh.log.siplify.no-lstm.loop.`nowstr.sh` 2>&1
+日志位于 /share/users/like/package/jdjv/silero_vad_clean/temp/test_quant_onnx.sh.log.siplify.no-lstm.loop.2026_07_29___11_28_31
+日志打印了粗略的 模型精度
+不同量化结果位于 logs/out_no_lstm/  各子目录下的 summary.json
+比如 logs/out_no_lstm/onnx_quant_w_fp8_2d_block_a_fp8_1d_block_aishell4_24shards/summary.json
+
+本机和 bjh5 的gpu配置相同，/share/ 和 /share_data  位于 nfs, 两台机器共享挂载nfs.
+
+ssh bjh5 "nvidia-smi" 可以看到gpu相同。
+
+分析 有 lstm 量化 和无 lstm 量化的日志，对于每种量化数据格式，有没有 lstm 量化的精度表现差异大吗？分析差异大的数据格式的精度相差巨大的原因.
+把答案追加到 /share/users/like/package/simo_conda_sglang/like-useful/answer_codex_v2.md
+
+}
+ {
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+onnx 代码位于 /softhome/like/package/onnx
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+onnxruntime  DynamicQuantizeLSTM 算子的实现位于 /softhome/like/package/onnxruntime/onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc
+
+onnxruntime  DynamicQuantizeLSTM 算子的实现中,
+it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi), 两个矩阵乘法，是2个 matmul 全部量化还是只量化了一部分?
+ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf), 两个矩阵乘法，是2个 matmul 全部量化还是只量化了一部分?
+ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc), 两个矩阵乘法，是2个 matmul 全部量化还是只量化了一部分?
+ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo), 两个矩阵乘法，是2个 matmul 全部量化还是只量化了一部分?
+DynamicQuantizeLSTM 调用MLAS integer GEMM , GEMM 的输入输出分别是什么数据类型 ？
+把答案追加到 like-useful/answer_codex_v2.md
+ }
+ {
+你对 like-useful/answer_codex_v2.md ## 77. `DynamicQuantizeLSTM` 的两个矩阵乘法和 MLAS GEMM 数据类型的讲解，需要进一步详细一些。
+讲解时 函数要指明 相对codebase 的文件名+行号+函数名.
+ }
+{
+
+
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/,
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+simo 以 editable 方式安装在 conda 环境。
+
+在本机,工作目录位于 /share/users/like/package/jdjv/silero_vad_clean
+以下命令进行带 lstm 量化的测试。
+MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/out_lstm SIMPLIFY=true bash test_quant_onnx.sh > temp/test_quant_onnx.sh.log.siplify.lstm.loop.`nowstr.sh` 2>&1
+日志位于 /share/users/like/package/jdjv/silero_vad_clean/temp/test_quant_onnx.sh.log.siplify.lstm.loop.2026_07_29___11_19_17
+日志打印了粗略的 模型精度
+不同量化结果位于 logs/out_lstm 各子目录下的 summary.json
+比如 logs/out_lstm/onnx_quant_w_fp8_2d_block_a_fp8_1d_block_aishell4_24shards/summary.json
+
+日志中的 ROC-AUC 和 Acc@0.11 分别有什么业务上的含义？overall和aishell4又分别是什么?
+
+把答案追加到 /share/users/like/package/simo_conda_sglang/like-useful/answer_codex_v2.md
+
+}
+
+ {
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+onnx 代码位于 /softhome/like/package/onnx
+nvcc: /share_data/users/like/opt/cuda-13.0/bin//nvcc
+cmake: /share_data/users/like/miniconda3/envs/simo_sglang/bin/cmake
+如果我想在本机源码编译安装 onnxruntime CUDA版本，应该如何做？
+
+把答案追加到 like-useful/answer_codex_v2.md
+ }
+
+
+ {
+编译 onnxruntime 脚本 ：/share//users/like/package/onnxruntime/like-useful/build-cuda.sh
+日志位于: /share/users/like/package/onnxruntime/temp/build.log.2026_07_31___10_48_39
+安装wheel 命令: pip install --force-reinstall --no-deps /share_data/users/like/build/onnxruntime-v1.27.0-cuda13/Release/./dist/onnxruntime_gpu-1.27.0-cp312-cp312-linux_x86_64.whl
+/share/users/like/package/jdjv/silero_vad_clean 目录执行 
+ CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_no_lstm/  MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/out_no_lstm SIMPLIFY=true bash test_quant_onnx.sh > temp/test_quant_onnx.sh.log.siplify.no-lstm.loop.`nowstr.sh` 2>&1 &
+
+日志 temp/test_quant_onnx.sh.log.siplify.no-lstm.loop.2026_07_31___11_26_14
+
+其中 logs/out_no_lstm/onnx_quant_w_mxfp4_e2m1_a_mxfp4_e2m1_scale_int_sipu_aishell4_24shards/shards/shard_023.log 显示了真正的错误
+
+ldd 显示 
+ldd /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime_providers_cuda.so
+        linux-vdso.so.1 (0x00007ffdf07fe000)
+        libcublasLt.so.13 => /share_data/users/like/opt/cuda-13.0/lib64/libcublasLt.so.13 (0x00007f0123000000)                               libcublas.so.13 => /share_data/users/like/opt/cuda-13.0/lib64/libcublas.so.13 (0x00007f011fa00000)
+        libcufft.so.12 => /share_data/users/like/opt/cuda-13.0/lib64/libcufft.so.12 (0x00007f010e000000)
+        libcudart.so.13 => /share_data/users/like/opt/cuda-13.0/lib64/libcudart.so.13 (0x00007f010dc00000)                                   libcudnn.so.8 => /lib/x86_64-linux-gnu/libcudnn.so.8 (0x00007f010d800000)
+        libstdc++.so.6 => /lib/x86_64-linux-gnu/libstdc++.so.6 (0x00007f010d5d4000)
+        libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f0122f19000)                                                                    libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007f0148a29000)
+        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f010d3ab000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007f014de90000)
+        librt.so.1 => /lib/x86_64-linux-gnu/librt.so.1 (0x00007f0148a24000)
+        libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0 (0x00007f0148a1d000)                                                        libdl.so.2 => /lib/x86_64-linux-gnu/libdl.so.2 (0x00007f0148a18000)
+
+分析运行失败原因？
+为什么 /share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime_providers_cuda.so 会依赖 libcudnn.so.8?
+
+如何修复?
+把答案追加到 like-useful/answer_codex_v2.md
+ }
+
+
+/share//users/like/package/onnxruntime/like-useful/build-cuda-verbose.sh 是新的脚本，检查有没有问题
+当前机器下载非常慢，可以 /share/users/like/build/onnxruntime-v1.27.0-cuda13/Release/_deps 里面的依赖直接 copy 到 /share/users/like/package/onnxruntime/build/onnxruntime-v1.27.0-cuda13/Release/ 吗？
+把答案追加到 like-useful/answer_codex_v2.md
+{
+ {
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+onnx 代码位于 /softhome/like/package/onnx
+onnxruntime c++ 代码中应该如何打日志?
+
+把答案追加到 like-useful/answer_codex_v2.md
+ }
+}
+{
+/share/users/like/package/onnxruntime 是工作目录.
+BUILD_CONFIG=Debug bash like-useful/build-cuda-verbose.sh > temp/build.verbose.debug.log.`nowstr.sh` 2>&1 &
+第1次 构建日志 /share/users/like/package/onnxruntime/temp/build.verbose.debug.log.2026_07_31___14_38_22
+在  onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc 加入一行日志，
+BUILD_CONFIG=Debug bash like-useful/build-cuda-verbose.sh > temp/build.verbose.debug.log.`nowstr.sh` 2>&1 & 
+构建日志位于 /share/users/like/package/onnxruntime/temp/build.verbose.debug.log.2026_07_31___15_20_12
+
+/share/users/like/package/onnxruntime/temp/build.verbose.debug.log.2026_07_31___15_20_12 为什么显示， onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc 之外的其他文件也重新编译了？ cmake 为什么没有执行增量编译？ 我并没有修改其他 c++ 代码
+把答案追加到 like-useful/answer_codex_v2.md
+}
+{
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+onnxruntime code base ./onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc
+DynamicQuantizeLSTM::Compute 函数的 LOGS_DEFAULT 日志改成 有条件打印.
+条件如下:
+先读取环境变量 "debug_env_file", debug_env_file 的值，期望是一个文件名。
+如果 debug_env_file 变量被设置，并且 debug_env_file 的value，是一个真实存在的文件，读取文件内容。
+debug_env_file 是纯文本格式, 每行以 
+debug_Compute=0
+}
+{
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+like-useful/test-onnx-dynamic-quant-lstm.py 在运行过程中，会调用 onnxruntime code base ./onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc DynamicQuantizeLSTM::Compute 函数 。
+以 like-useful/test-onnx-dynamic-quant-lstm.py 189行 cpu_outputs = run_cases("CPU", cpu_session, cases)，
+seq_len, batch_size = (5, 3), 这个 case 为例， 把 DynamicQuantizeLSTM::Compute 的计算过程详细讲解，包括如何循环处理 seq_len=5, 5个token如何循环的.
+把答案追加到 like-useful/answer_claude_v2.md
+把答案追加到 like-useful/answer_codex_v2.md
+
+}
+
+{
+## conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+onnxruntime/core/providers/cpu/rnn/lstm_base.cc  LSTMBase::ComputeImpl 
+ Tensor* Y = context.Output(/*index*/ 0, Y_dims) 这里 context.Output 是如何决定内存是分配在cpu还是gpu上?
+把答案追加到 like-useful/answer_codex_v2.md
+
+}
+{
+## 
+把答案追加到 like-useful/answer_codex_v2.md
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+1.
+simo/onnx/ort_plugin/simo_qdq_ops.cc DequantizeCustomOp::Compute 的函数签名是
+```
+  Ort::Status Compute(
+      OrtKernelContext& context,
+      const Tensor<uint8_t>& quantized,
+      const Tensor<uint8_t>& scale,
+      Tensor<T>& output) {
+```
+算子注册是 Ort::Custom::CreateLiteCustomOp函数
+2.
+simo/onnx/ort_plugin/simo_qdq_cpu_ops.cc DequantizeCpuDirectKernel::Compute 函数签名是
+```
+  void Compute(OrtKernelContext* context)
+```
+算子注册是 DequantizeCpuDirectOp 类型指针，表面上是 CustomOpBase 类型指针
+
+3.
+onnxruntime code base ./onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc DynamicQuantizeLSTM::Compute(OpKernelContext* context) 函数签名是
+```
+Status DynamicQuantizeLSTM::Compute(OpKernelContext* context) const
+```
+算子注册是 ONNX_OPERATOR_TYPED_KERNEL_EX 宏的调用
+
+3 种自定义算子，Compute 函数的参数类型不同，参数个数不同，到底哪种才是推荐的实现自定义算子的方法？
+3种自定义算子，用了3种注册方法，到底哪种才是推荐的注册自定义算子的方法 ？
+ 
+
+把答案追加到 like-useful/answer_claude_v2.md
+}
+{
+把答案追加到 like-useful/answer_codex_v3.md
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /softhome/like/package/onnxruntime/
+当前项目如何编译 Debug版本?比如 simo/onnx/ort_plugin/simo_qdq_ops.cc  要debug版本。
 }

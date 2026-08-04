@@ -118,3 +118,28 @@ cp.async.wait_group 1
 cp.async.wait_group 1
 第2次 cp.async.wait_group 1 结束，未完成的cp.async 有几组?
 要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+
+第13步提交空group,第14步 cp.async.wait_group 1 的时候，真的会等吗？第14步 cp.async.wait_group 1, 只允许一个最近提交未完成，这个未完成的就是 13步提交的空group吗？这就是第14步 S2R 前最大已就绪 tile id=7的原因吗？
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+
+{
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md
+cute-gemm代码位于 /share/users/like/package/cute-gemm
+对cute-gemm code base gemm-multi-stage-like.cu 280-343行代码进行讲解.
+运行日志位于 /share/users/like/package/cute-gemm/run.gemm-multi-stage-like.log
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+}
+{
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md
+cute-gemm代码位于 /share/users/like/package/cute-gemm
+运行日志位于 /share/users/like/package/cute-gemm/run.gemm-multi-stage-like.log
+323-343的循环中，循环16次，其中 R2S copy: cute::copy(r2s_tiled_copy_c, t, tCsC_r2s(_, 0, 0, j));
+source tensor t 有 8个 half float,  R2SCopyAtomC=Copy_Atom<UniversalCopy<int>, T>, atom只能复制32bit, 如何完成 8个half的copy?
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+}
+{
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md
+R2SCopyAtomC=Copy_Atom<UniversalCopy<int>, T>, atom只能复制32bit=2个half, 要copy 8个half, 需要4次展开，这是否意味 cute::copy(r2s_tiled_copy_c, t, tCsC_r2s(_, 0, 0, j)) 内部会循环 4次？是串行地执行4次 r2s copy?
+要求:把答案追加到 /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md
+
+}

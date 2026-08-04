@@ -1,8 +1,8 @@
-## `thrust::device_vector<TA> d_A = h_A;` 会发生 host-to-device copy 吗？
+## 1. `thrust::device_vector<TA> d_A = h_A;` 会发生 host-to-device copy 吗？
 
 **会。** 这行代码会将 `h_A`（`host_vector`）中的数据从 host memory 拷贝到 device memory。
 
-### 调用链分析
+### 1.1 调用链分析
 
 `h_A` 的类型是 `thrust::host_vector<TA>`，`d_A` 的类型是 `thrust::device_vector<TA>`。
 `thrust::device_vector<TA> d_A = h_A;` 是 copy initialization，调用的构造函数是：
@@ -46,7 +46,7 @@ device_vector(const detail::vector_base<OtherT, OtherAlloc>& v)
    Thrust 的跨系统拷贝分发机制检测到源是 host、目标是 device，
    最终调用 **`cudaMemcpy(..., cudaMemcpyHostToDevice)`** 完成数据传输。
 
-### 总结
+### 1.2 总结
 
 ```
 device_vector(host_vector)
@@ -63,15 +63,15 @@ device_vector(host_vector)
 
 ---
 
-## 为什么 ldA 在 No Transpose 时等于 m，ldB 在 No Transpose 时等于 k？
+## 2. 为什么 ldA 在 No Transpose 时等于 m，ldB 在 No Transpose 时等于 k？
 
 **是的，这里假设矩阵在内存中以 column-major 存储。** 这沿用了 BLAS/LAPACK 的惯例。
 
-### 什么是 leading dimension
+### 2.1 什么是 leading dimension
 
 Leading dimension (ld) 是矩阵在内存中**相邻两列之间的元素间距**（仅对 column-major 而言）。换句话说，元素 `A(i, j)` 的地址是 `A + i + j * ldA`。
 
-### Column-major 下的 A 矩阵 (m x k)
+### 2.2 Column-major 下的 A 矩阵 (m x k)
 
 矩阵 A 逻辑上是 m 行 k 列。Column-major 存储意味着**同一列的元素在内存中连续**：
 
@@ -92,17 +92,17 @@ A(m-1,0)   A(m-1,1)   A(m-1,2)       A(m-1,k-1)
 
 从第 j 列的起始位置到第 j+1 列的起始位置，间距是 **m** 个元素。所以 `ldA = m`。
 
-### Column-major 下的 B 矩阵 (k x n)
+### 2.3 Column-major 下的 B 矩阵 (k x n)
 
 同理，B 逻辑上是 k 行 n 列，column-major 下每列有 k 个连续元素，列间距为 **k**。所以 `ldB = k`。
 
-### Transpose 的情况
+### 2.4 Transpose 的情况
 
 当 `transA == 'T'` 时，运算需要的是 A^T（k x m 的矩阵，作为 GEMM 的左矩阵）。但**内存中存储的实际上是一个 k x m 的矩阵**（k 行 m 列，column-major），只是在 GEMM 语义上它被视为 m x k 矩阵的转置。此时每列有 k 个元素，所以 `ldA = k`。
 
 同理 `transB == 'T'` 时，内存中存的是 n x k 矩阵（column-major），每列 n 个元素，`ldB = n`。
 
-### 代码验证：看 CuTe stride 如何使用 ld
+### 2.5 代码验证：看 CuTe stride 如何使用 ld
 
 在 `gemm_nt` 函数（`sgemm_1.cu:246`）中，`transA='N', transB='T'`：
 
@@ -131,7 +131,7 @@ auto dB = make_stride(ldB, Int<1>{});   // (dN, dK)
   即 `A(i,j) = A[i * ldA + j * 1]`，这是 row-major 的寻址——也就是对原始 column-major 矩阵做了转置。
 - **B 的 stride = (ldB, 1)**：同理。
 
-### 总结
+### 2.6 总结
 
 | 情况 | 内存中实际存储 | GEMM 语义上的矩阵 | ld 值 | CuTe stride |
 |------|---------------|-------------------|-------|-------------|
@@ -144,7 +144,7 @@ auto dB = make_stride(ldB, Int<1>{});   // (dN, dK)
 
 ---
 
-## `gemm_device` kernel 的 Shared Memory Tiling 流程详解
+## 3. `gemm_device` kernel 的 Shared Memory Tiling 流程详解
 
 以 `gemm_nt`（transA='N', transB='T'）的具体参数为例：
 
@@ -157,7 +157,7 @@ tC = Layout<(16,16)>   // 256 threads, 用于计算 C tile
 
 整个 kernel 分为四个阶段：**构造全局 Tensor → Tiling 与 Partition → K 维主循环（搬运+计算）→ Epilogue 写回**。
 
-### 阶段一：构造全局 Tensor 并按 CTA 切分
+### 3.1 阶段一：构造全局 Tensor 并按 CTA 切分
 
 ```cpp
 // :98-100  构造指向 global memory 的完整矩阵
@@ -196,7 +196,7 @@ Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M, 
      每次迭代搬一个 (128×8) 的 tile 到 smem
 ```
 
-### 阶段二：分配 Shared Memory 并 Partition 给线程
+### 3.2 阶段二：分配 Shared Memory 并 Partition 给线程
 
 **Shared Memory 分配：**
 
@@ -261,7 +261,7 @@ Tensor tCrC = make_tensor_like(tCgC);                               // (THR_M, T
    即 C 矩阵中一个 8×8 的子块
 ```
 
-### 阶段三：K 维主循环（搬运 + 计算）
+### 3.3 阶段三：K 维主循环（搬运 + 计算）
 
 ```cpp
 // :194-229
@@ -306,7 +306,7 @@ for (int k = 0; k < 8; ++k) {          // BLK_K = 8
 - 第一个（copy 之后）：确保所有线程都把数据搬到了 smem，才能开始读 smem 做计算。
 - 第二个（gemm 之后）：确保所有线程都读完了 smem，才能在下一次迭代中安全覆盖 smem 中的数据。
 
-### 阶段四：Epilogue 写回
+### 3.4 阶段四：Epilogue 写回
 
 ```cpp
 // :237
@@ -316,7 +316,7 @@ axpby(alpha, tCrC, beta, tCgC);
 
 K 维循环结束后，每个线程的 `tCrC` 寄存器中已经积累了完整的 8×8 结果（所有 K-tile 的贡献之和）。`axpby` 将结果经 alpha/beta 缩放后直接写回 global memory 中 C 矩阵对应的位置。
 
-### 完整数据流总结
+### 3.5 完整数据流总结
 
 ```
                      每个 k_tile 迭代
@@ -346,7 +346,7 @@ K 维循环结束后，每个线程的 `tCrC` 寄存器中已经积累了完整�
   (C 矩阵)                    (8 × 8 per thread)
 ```
 
-### 为什么需要两套不同的线程 Partition？
+### 3.6 为什么需要两套不同的线程 Partition？
 
 搬运和计算对线程布局的需求不同：
 
@@ -360,9 +360,9 @@ K 维循环结束后，每个线程的 `tCrC` 寄存器中已经积累了完整�
 
 ---
 
-## `local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{})` 详解
+## 4. `local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{})` 详解
 
-### 代码上下文
+### 4.1 代码上下文
 
 ```cpp
 // sgemm_1.cu:97-106
@@ -376,7 +376,7 @@ Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{});   // (BLK_M
 
 问题：`cta_tiler` 是三维 `(128, 128, 8)` 的，但 `mA` 只有二维 `(M, K)`。它们维度不匹配，怎么办？这正是第四个参数 `Step<_1, X, _1>` 的作用——**投影**（projection），从三维的 tiler/coord 中过滤掉不相关的维度，使之与二维的 tensor 匹配。
 
-### 第一步：`dice` 投影——从三维筛选到二维
+### 4.2 第一步：`dice` 投影——从三维筛选到二维
 
 `local_tile` 的四参数重载（`tensor_impl.hpp:1057-1069`）：
 
@@ -420,7 +420,7 @@ local_tile(mA, (128, 8), (blockIdx.x, _))
 `cta_tiler` 中的第二维 `BLK_N=128` 被丢弃了，因为 A 矩阵 `(M,K)` 和 N 维无关。
 `cta_coord` 中的 `blockIdx.y`（N 方向索引）也一并丢弃。
 
-### 为什么用 `_1` 和 `X`？
+### 4.3 为什么用 `_1` 和 `X`？
 
 **`_1`（Int<1>）** 和 **`X`（Underscore）** 不是"值"，而是编译期的**标签**：
 
@@ -442,7 +442,7 @@ if constexpr (is_underscore<A>::value) {
 
 所以 `Step<_1, X, _1>` 的语义是："保留第 0 维、丢弃第 1 维、保留第 2 维"。
 
-### 第二步：`inner_partition`——zipped_divide + 切片
+### 4.4 第二步：`inner_partition`——zipped_divide + 切片
 
 三参数 `local_tile` 调用 `inner_partition`（`tensor_impl.hpp:984-1000`）：
 
@@ -459,7 +459,7 @@ auto inner_partition(Tensor&& tensor, Tiler const& tiler, Coord const& coord)
 }
 ```
 
-#### ① `zipped_divide(mA, (128, 8))`
+#### 4.4.1 ① `zipped_divide(mA, (128, 8))`
 
 `zipped_divide` 对 `mA` 的每个维度独立切分：
 
@@ -486,7 +486,7 @@ zipped_divide( (M, K), (128, 8) )
 - **模式 0**（tile）：`(128, 8)` = 一个 tile 内部的局部坐标
 - **模式 1**（rest）：`(40, 512)` = tile 在整体矩阵中的网格坐标
 
-#### ② 用 `coord = (blockIdx.x, _)` 索引 rest 维度
+#### 4.4.2 ② 用 `coord = (blockIdx.x, _)` 索引 rest 维度
 
 ```cpp
 tensor_tiled(repeat<R0>(_), append<R1>(coord, _))
@@ -508,7 +508,7 @@ tensor_tiled( (_, _),  (blockIdx.x, _) )
 BLK_M BLK_K   k       ← 即注释中的 (BLK_M, BLK_K, k)
 ```
 
-### 完整数据流图
+### 4.5 完整数据流图
 
 ```
 mA: (M, K)   global memory 全矩阵
@@ -536,7 +536,7 @@ gA: (128, 8, k)     k = ceil(K/8)
      tile内部坐标  主循环迭代维度
 ```
 
-### 对称地理解 gB 和 gC
+### 4.6 对称地理解 gB 和 gC
 
 三个矩阵共用同一个 `cta_tiler = (128, 128, 8)` 和 `cta_coord = (blockIdx.x, blockIdx.y, _)`，通过不同的 `Step` 投影出各自需要的维度：
 
@@ -550,14 +550,14 @@ gA: (128, 8, k)     k = ceil(K/8)
 
 ---
 
-## `make_shape(M, N, K)` 的返回类型 与 `cute::eso::ESO` 的关系
+## 5. `make_shape(M, N, K)` 的返回类型 与 `cute::eso::ESO` 的关系
 
-### 结论
+### 5.1 结论
 
 `make_shape(M, N, K)`（三个 `int` 参数）的返回类型是 `Shape<int, int, int>`。
 而 `Shape<int, int, int>` 经过层层 type alias 展开后，底层的数据存储类型就是 cuda-gdb 中看到的 `cute::eso::ESO<false, false, int, int, int>`。
 
-### 完整的类型别名链
+### 5.2 完整的类型别名链
 
 ```
 make_shape(int, int, int)
@@ -576,7 +576,7 @@ eso::ESO_t<int, int, int>
 eso::ESO<false, false, int, int, int>     ← cuda-gdb 看到的就是这个
 ```
 
-### 逐层源码解析
+### 5.3 逐层源码解析
 
 **第一层：`make_shape` → `Shape`**（`layout.hpp:47-67`）
 
@@ -680,7 +680,7 @@ $3 = {
 
 gdb 输出中的 `__b_N4cute3eso3ESOILb0ELb0EJiiiEEE` 是 `cute::tuple` 继承自 `ESO` 的基类子对象的 mangled name。
 
-### ESO 的四种特化
+### 5.4 ESO 的四种特化
 
 ESO 根据 first 和 rest 是否为空类型，有四种特化：
 
@@ -693,7 +693,7 @@ ESO 根据 first 和 rest 是否为空类型，有四种特化：
 
 这就是为什么编译期常量（如 `Int<128>{}`）不占内存——它们会命中 `true` 的特化，对应成员直接不存在。比如 `Shape<Int<128>, Int<8>>` 就是 `ESO<true, true, Int<128>, Int<8>>`，是一个 empty struct，sizeof 为 1（C++ 空类最小 1 字节），不存储任何数据。
 
-### 实际访问方式
+### 5.5 实际访问方式
 
 通过 `cute::get<N>()` 访问 tuple 元素，底层调用 `eso::getr`（`tuple.hpp:136-148`）：
 
@@ -713,9 +713,9 @@ CUTE_HOST_DEVICE constexpr R getr(S&& s) noexcept
 
 ---
 
-## `cute::is_empty` 的实现与工作原理
+## 6. `cute::is_empty` 的实现与工作原理
 
-### 实现位置
+### 6.1 实现位置
 
 `cute::is_empty` 定义在 `include/cute/util/type_traits.hpp:156`：
 
@@ -736,7 +736,7 @@ using CUTE_STL_NAMESPACE::is_empty_v;
 
 所以 `cute::is_empty` 就是 `std::is_empty`（普通编译路径）或 `cuda::std::is_empty`（NVRTC 路径）。它不是 CuTe 自己实现的，而是直接引用 C++ 标准库的 type trait。
 
-### `std::is_empty<T>` 的判定规则
+### 6.2 `std::is_empty<T>` 的判定规则
 
 C++ 标准规定，`std::is_empty<T>::value == true` 当且仅当 `T` 满足**以下全部条件**：
 
@@ -747,7 +747,7 @@ C++ 标准规定，`std::is_empty<T>::value == true` 当且仅当 `T` 满足**�
 
 简单来说：一个类只有类型信息、没有运行时数据，就是 empty type。
 
-### 在 CuTe 中的关键应用
+### 6.3 在 CuTe 中的关键应用
 
 CuTe 的编译期整数常量 `C<v>`（`Int<v>` 是 `C<v>` 的别名）定义在 `include/cute/numeric/integral_constant.hpp:42-48`：
 
@@ -779,7 +779,7 @@ using _2 = Int<2>;       // :145
 
 而 `int` 有 4 字节的运行时数据，所以 `std::is_empty<int>::value == false`。
 
-### ESO 如何利用 `is_empty`
+### 6.4 ESO 如何利用 `is_empty`
 
 回到 `tuple.hpp:81-87`：
 
@@ -838,7 +838,7 @@ struct {
 
 这就是 ESO 的核心设计：**编译期已知的值不占运行时空间**。对于 GEMM kernel 中的 tile 大小（如 `BLK_M=128, BLK_N=128, BLK_K=8`），它们是编译期常量，作为 kernel 参数传递时不占任何 register 或参数空间。而问题大小 `(M, N, K)` 是运行时值，必须实际存储。
 
-### CuTe 中 `is_static` 与 `is_empty` 的关系
+### 6.5 CuTe 中 `is_static` 与 `is_empty` 的关系
 
 CuTe 用 `is_static` 来判断一个值是否完全由类型决定（`integral_constant.hpp:91-92`）：
 
@@ -851,9 +851,9 @@ struct is_static : bool_constant<is_empty<T>::value> {};
 
 ---
 
-## C++17 Fold Expression 详解——以 `is_rest_empty_v` 为例
+## 7. C++17 Fold Expression 详解——以 `is_rest_empty_v` 为例
 
-### CuTe 中的代码
+### 7.1 CuTe 中的代码
 
 ```cpp
 // include/cute/container/tuple.hpp:83-84
@@ -863,7 +863,7 @@ static constexpr bool is_rest_empty_v = (cute::is_empty<Rest>::value && ...);
 
 `(cute::is_empty<Rest>::value && ...)` 就是一个 **C++17 unary right fold expression**。
 
-### Fold Expression 的语法
+### 7.2 Fold Expression 的语法
 
 C++17 fold expression 对一个参数包（parameter pack）施加二元运算符，将包中所有元素"折叠"成一个值。有四种形式：
 
@@ -876,7 +876,7 @@ C++17 fold expression 对一个参数包（parameter pack）施加二元运算�
 
 其中 `op` 可以是大多数 C++ 二元运算符：`+`, `-`, `*`, `/`, `%`, `&&`, `||`, `&`, `|`, `^`, `<`, `>`, `<<`, `>>`, `==`, `!=`, `,` 等。
 
-### `is_rest_empty_v` 的展开过程
+### 7.3 `is_rest_empty_v` 的展开过程
 
 当 `Rest... = int, int, int` 时：
 
@@ -902,7 +902,7 @@ cute::is_empty<Int<128>>::value && cute::is_empty<Int<8>>::value
 
 当 `Rest...` 为空包时（只有一个模板参数 `First`，没有 `Rest`）：`(&&...)` 对空包展开为 `true`（`&&` 运算符的空包默认值）。这符合语义——"没有剩余元素"意味着"剩余元素全部为空"。
 
-### 完整例子
+### 7.4 完整例子
 
 ```cpp
 #include <iostream>
@@ -961,7 +961,7 @@ int main() {
 }
 ```
 
-### 空包的默认值
+### 7.5 空包的默认值
 
 当参数包为空时，unary fold 只对 `&&` 和 `||` 和 `,` 三个运算符有定义的默认值：
 
@@ -973,7 +973,7 @@ int main() {
 
 其他运算符对空包做 unary fold 会编译报错。如果需要处理空包，应使用 binary fold 并提供初始值，例如 `(0 + ... + pack)`。
 
-### 回到 CuTe 的代码
+### 7.6 回到 CuTe 的代码
 
 ```cpp
 static constexpr bool is_rest_empty_v = (cute::is_empty<Rest>::value && ...);
@@ -988,9 +988,9 @@ static constexpr bool is_rest_empty_v = (cute::is_empty<Rest>::value && ...);
 
 ---
 
-## NumPy 与 CuTe 对 A、B、C 矩阵内存布局的差异及处理
+## 8. NumPy 与 CuTe 对 A、B、C 矩阵内存布局的差异及处理
 
-### 核心差异
+### 8.1 核心差异
 
 | | NumPy (默认) | CuTe / BLAS |
 |---|---|---|
@@ -998,7 +998,7 @@ static constexpr bool is_rest_empty_v = (cute::is_empty<Rest>::value && ...);
 | **矩阵 (m,k) 的元素 [i,j] 偏移** | `i*k + j` | `i + j*m` |
 | **连续维度** | 最后一维（列）连续 | 第一维（行）连续 |
 
-### 关键等价关系
+### 8.2 关键等价关系
 
 **Row-major 的 (k, m) 矩阵 与 Column-major 的 (m, k) 矩阵的字节布局完全相同。**
 
@@ -1008,9 +1008,9 @@ static constexpr bool is_rest_empty_v = (cute::is_empty<Rest>::value && ...);
 
 两者描述的是同一个偏移公式 `i + j*m`，只是坐标命名不同。所以：将 numpy 数组的 shape 转置，`tofile()` 的原始字节流就直接匹配 CuTe 的 column-major 布局。
 
-### 各矩阵的具体处理
+### 8.3 各矩阵的具体处理
 
-#### transA='N'（A 不转置）
+#### 8.3.1 transA='N'（A 不转置）
 
 CuTe 中 A 是 (m, k) column-major，stride = (1, ldA=m)：
 ```
@@ -1025,7 +1025,7 @@ np_A[j, i] = buffer[j * m + i]      → 与 A_cute(i, j) 偏移相同
 `np_A.tofile("A.npy")` 直接输出的字节流就是 CuTe 需要的 column-major 布局。
 做 matmul 时用 `np_A.T` 得到逻辑上的 (m, k) 矩阵。
 
-#### transA='T'（A 转置）
+#### 8.3.2 transA='T'（A 转置）
 
 CuTe 中 A 的 stride = (ldA=k, 1)，即 (m, k) row-major：
 ```
@@ -1037,7 +1037,7 @@ NumPy 直接创建 shape **(m, k)** 的 row-major 数组：
 np_A[i, j] = buffer[i * k + j]      → 字节布局直接匹配
 ```
 
-#### transB='T'（B 转置）
+#### 8.3.3 transB='T'（B 转置）
 
 CuTe 中 B 是 (n, k) column-major，stride = (1, ldB=n)：
 ```
@@ -1049,12 +1049,12 @@ NumPy 创建 shape **(k, n)** row-major数组：
 np_B[j, i] = buffer[j * n + i]      → 匹配
 ```
 
-#### transB='N'（B 不转置）
+#### 8.3.4 transB='N'（B 不转置）
 
 CuTe 中 B 的 stride = (ldB=k, 1)，即 (n, k) row-major。
 NumPy 直接创建 shape **(n, k)** row-major数组，字节布局直接匹配。
 
-#### C 矩阵（始终 column-major）
+#### 8.3.5 C 矩阵（始终 column-major）
 
 C 始终是 (m, n) column-major，stride = (1, ldC=m)：
 ```
@@ -1068,7 +1068,7 @@ np_C[j, i] = buffer[j * m + i]      → 匹配
 
 计算 `C_logical = A_logical @ B_logical.T` 得到 (m, n)，再 `.T` 转为 (n, m) 后 `tofile()`。
 
-### 总结表
+### 8.4 总结表
 
 | 矩阵 | trans | CuTe 布局 | CuTe stride | NumPy shape | 转换方法 |
 |------|-------|----------|-------------|-------------|---------|
@@ -1080,9 +1080,9 @@ np_C[j, i] = buffer[j * m + i]      → 匹配
 
 ---
 
-## 为什么 Python 中 matmul 要用 `A_logical @ B_logical.T`？
+## 9. 为什么 Python 中 matmul 要用 `A_logical @ B_logical.T`？
 
-### 直接原因：CuTe kernel 的 B 矩阵形状是 (N, K)，不是 (K, N)
+### 9.1 直接原因：CuTe kernel 的 B 矩阵形状是 (N, K)，不是 (K, N)
 
 在 `gemm_device` kernel 中（`sgemm_1.cu:98-100`）：
 
@@ -1122,7 +1122,7 @@ C = A × Bᵀ
 
 其中 A 的形状是 (M, K)，B 的形状是 (N, K)，Bᵀ 的形状是 (K, N)。
 
-### 对比教科书 GEMM
+### 9.2 对比教科书 GEMM
 
 教科书写法：`C(m,n) = A(m,k) × B(k,n)`，B 的形状是 (K, N)。
 
@@ -1130,7 +1130,7 @@ CuTe 的写法：`C(m,n) = A(m,k) × B(n,k)ᵀ`，B 的形状是 (N, K)。
 
 两种写法数学结果相同，但 CuTe 选择将 B 存储为 (N, K) 的原因是：这样 A 和 B 的**结构对称**——都是"输出维度在前，缩并维度在后"。A 的 M 维和 B 的 N 维分别对应输出 C 的行和列，而 K 维是被求和消掉的缩并维度。
 
-### Python 中对应的代码
+### 9.3 Python 中对应的代码
 
 ```python
 A_logical  # shape (m, k)，与 CuTe 的 A(M,K) 对应
@@ -1144,11 +1144,11 @@ C_logical = A_logical @ B_logical.T   # (m,k) @ (k,n) → (m,n)
 
 ---
 
-## 每个线程计算 C 矩阵的多少个元素？形状和分布如何？
+## 10. 每个线程计算 C 矩阵的多少个元素？形状和分布如何？
 
 以命令行参数 `512 1024 2048 N T` 为例：M=512, N=1024, K=2048, transA='N', transB='T'，调用 `gemm_nt`。
 
-### 关键参数
+### 10.1 关键参数
 
 ```cpp
 // gemm_nt 中的配置 (sgemm_1_ref_np.cu:272-286)
@@ -1161,11 +1161,11 @@ auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));  // shape (16,16), stri
 // 256 threads per block
 ```
 
-### 结论：每个线程计算 8×8 = 64 个 C 矩阵元素，分布是跨步(strided)的，不是连续子矩阵
+### 10.2 结论：每个线程计算 8×8 = 64 个 C 矩阵元素，分布是跨步(strided)的，不是连续子矩阵
 
-### 推导过程
+### 10.3 推导过程
 
-#### 第 1 步：CTA 网格划分
+#### 10.3.1 第 1 步：CTA 网格划分
 
 C 矩阵全局大小 (M=512, N=1024)，被 CTA tile (128, 128) 划分：
 
@@ -1174,7 +1174,7 @@ CTA grid: ceil(512/128) × ceil(1024/128) = 4 × 8 = 32 个 CTA
 每个 CTA 负责 C 矩阵中一个 128×128 的子块
 ```
 
-#### 第 2 步：线程对 C 矩阵的分区 — `local_partition`
+#### 10.3.2 第 2 步：线程对 C 矩阵的分区 — `local_partition`
 
 ```cpp
 // sgemm_1_ref_np.cu:142
@@ -1193,7 +1193,7 @@ local_partition(gC, tC, threadIdx.x, Step<_1,_1>{})
   → outer_partition(gC, (16, 16), (tm, tn))
 ```
 
-#### 第 3 步：get_flat_coord 将 threadIdx.x 映射为 2D 坐标
+#### 10.3.3 第 3 步：get_flat_coord 将 threadIdx.x 映射为 2D 坐标
 
 ```cpp
 // tC = Layout<Shape<16,16>, Stride<1,16>>   (column-major)
@@ -1215,7 +1215,7 @@ threadIdx.x = 16 → (tm=0,  tn=1)
 threadIdx.x = 255→ (tm=15, tn=15)
 ```
 
-#### 第 4 步：outer_partition 执行 zipped_divide + 切片
+#### 10.3.4 第 4 步：outer_partition 执行 zipped_divide + 切片
 
 ```cpp
 outer_partition(gC, tiler=(16, 16), coord=(tm, tn))
@@ -1247,7 +1247,7 @@ tensor_tiled((tm, tn), (_, _))
 
 结果形状：**(8, 8)**，即每个线程计算 **64 个**元素。
 
-#### 第 5 步：元素在 C 矩阵中的具体位置
+#### 10.3.5 第 5 步：元素在 C 矩阵中的具体位置
 
 对于线程坐标 (tm, tn)，它计算的 C 矩阵元素在 128×128 CTA tile 中的位置为：
 
@@ -1258,7 +1258,7 @@ N 方向索引: tn, tn+16, tn+32, tn+48, tn+64, tn+80, tn+96, tn+112    (8 个�
 
 即 C_tile(tm + i*16,  tn + j*16)，其中 i ∈ [0,8), j ∈ [0,8)。
 
-### 可视化：threadIdx.x = 0 (tm=0, tn=0) 的元素分布
+### 10.4 可视化：threadIdx.x = 0 (tm=0, tn=0) 的元素分布
 
 在 128×128 的 CTA tile 中，用 `X` 标记该线程计算的元素（每 16 行 16 列取一个）：
 
@@ -1282,7 +1282,7 @@ M ↓
 
 8 行 × 8 列 = 64 个 `X`，均匀分散在整个 128×128 tile 中，步长为 16。
 
-### 这是"strided"（跨步/交错）分布，不是连续子矩阵
+### 10.5 这是"strided"（跨步/交错）分布，不是连续子矩阵
 
 如果是连续子矩阵，thread 0 应该计算左上角的 8×8 块（行 0-7，列 0-7）。但实际上它计算的是行 {0,16,32,...,112} × 列 {0,16,32,...,112}，元素之间间隔 16。
 
@@ -1290,7 +1290,7 @@ M ↓
 - **更好的内存合并访问**：相邻 threadIdx.x 的 tm 值连续（0,1,2,...,15），在 column-major 存储下，它们访问的 C 矩阵地址也连续，有利于合并写入全局内存
 - **负载均衡**：每个线程的工作量完全相同（64 个元素）
 
-### 全局统计
+### 10.6 全局统计
 
 ```
 C 矩阵总元素:      512 × 1024 = 524,288
@@ -1301,7 +1301,7 @@ CTA 数量:          4 × 8 = 32
 总计:              32 × 256 × 64 = 524,288  ✓
 ```
 
-### tCsA 和 tCsB 的分区（补充说明）
+### 10.7 tCsA 和 tCsB 的分区（补充说明）
 
 计算 tCrC 时，每个 K-tile 迭代中使用的 A 和 B 数据分区：
 
@@ -1329,9 +1329,9 @@ for k in [0, 8):
 
 ---
 
-## local_tile 4 参数版本和 dice 函数
+## 11. local_tile 4 参数版本和 dice 函数
 
-### 问题
+### 11.1 问题
 
 ```cpp
 // sgemm_1_ref_np.cu:105
@@ -1340,7 +1340,7 @@ Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,B
 
 这行代码中，`local_tile` 4 参数版本做了什么？它调用的 `dice` 是什么，在哪里实现，做了什么？
 
-### local_tile 4 参数版本的功能
+### 11.2 local_tile 4 参数版本的功能
 
 源码位于 `include/cute/tensor_impl.hpp:1057-1069`：
 
@@ -1362,7 +1362,7 @@ local_tile(Tensor    && tensor,
 
 这个设计解决了一个实际问题：GEMM 中 A(M,K)、B(N,K)、C(M,N) 三个矩阵各自只有 2 个维度，但 `cta_tiler = (BLK_M, BLK_N, BLK_K)` 和 `cta_coord = (blockIdx.x, blockIdx.y, _)` 是 3 维的。每个矩阵只需要其中 2 个维度的 tiler/coord，`dice` + `Step` 就是筛选机制。
 
-### dice 函数的实现位置和源码
+### 11.3 dice 函数的实现位置和源码
 
 `dice` 定义在 `include/cute/underscore.hpp:162-178`：
 
@@ -1403,7 +1403,7 @@ lift_dice(A const& a, B const& b)
 }
 ```
 
-### dice 的功能：按标记筛选 tuple 元素
+### 11.4 dice 的功能：按标记筛选 tuple 元素
 
 `dice(proj, tuple)` 逐元素对齐 `proj` 和 `tuple`：
 - `proj` 中是 `_1`（或任何非 Underscore 的 Int）→ **保留** `tuple` 中对应的元素
@@ -1415,7 +1415,7 @@ lift_dice(A const& a, B const& b)
 - `lift_dice`：保留时返回 `cute::tuple<B>{b}`（包装成单元素 tuple），丢弃时返回 `cute::tuple<>{}`（空 tuple）。这两种返回值通过 `filter_tuple` → `tuple_cat` 拼接成最终结果。
 - `dice` 入口：当 `A` 不是 tuple 时（即只有一个元素），保留时直接返回 `b` 本身（不包装），这样 `dice(_1, x)` 返回 `x` 而不是 `tuple<X>{x}`。
 
-### filter_tuple 的工作方式
+### 11.5 filter_tuple 的工作方式
 
 `filter_tuple(t0, t1, f)` 在 `include/cute/algorithm/tuple_algorithms.hpp:352-358`：
 
@@ -1429,7 +1429,7 @@ auto filter_tuple(T0 const& t0, T1 const& t1, F&& f)
 
 即：对 `t0` 和 `t1` 逐元素应用 `f`（得到空 tuple 或单元素 tuple），然后用 `tuple_cat` 把所有结果拼接起来。空 tuple 拼接时自然消失，单元素 tuple 贡献一个元素。
 
-### 具体实例：gB 的 dice 过程
+### 11.6 具体实例：gB 的 dice 过程
 
 ```cpp
 // 输入
@@ -1465,7 +1465,7 @@ tuple_cat(tuple<>{}, tuple<blockIdx.y>{}, tuple<_>{}) = (blockIdx.y, _)
 
 结果：**diced_coord = (blockIdx.y, _)**
 
-### dice 之后调用 3 参数版 local_tile
+### 11.7 dice 之后调用 3 参数版 local_tile
 
 ```cpp
 local_tile(mB, diced_tiler=(128, 8), diced_coord=(blockIdx.y, _))
@@ -1497,7 +1497,7 @@ auto inner_partition(Tensor&& tensor, Tiler const& tiler, Coord const& coord)
 }
 ```
 
-#### zipped_divide 阶段
+#### 11.7.1 zipped_divide 阶段
 
 mB 形状 (N=1024, K=2048)，tiler = (128, 8)：
 
@@ -1509,7 +1509,7 @@ zipped_divide 结果形状: ((128, 8), (8, 256))
                          ─ tile ─   ─ rest ─
 ```
 
-#### 切片阶段
+#### 11.7.2 切片阶段
 
 coord = (blockIdx.y, _) 是 tuple，走 `append<R1>(coord, _)` 分支：
 
@@ -1527,7 +1527,7 @@ tensor_tiled(repeat<2>(_), append<2>((blockIdx.y, _), _))
 
 其中 k=256 = K/BLK_K = 2048/8，对应 K 维度的迭代次数。
 
-### 三个矩阵的 dice 对比
+### 11.8 三个矩阵的 dice 对比
 
 | 矩阵 | 张量形状 | proj | dice 后 tiler | dice 后 coord | local_tile 结果 |
 |------|---------|------|-------------|-------------|----------------|
@@ -1537,7 +1537,7 @@ tensor_tiled(repeat<2>(_), append<2>((blockIdx.y, _), _))
 
 注意 C 的 coord 中没有 `_`（K 维被 dice 丢弃了），所以 rest 的两个维度都被固定，结果只有 tile 维度，无第 3 维。
 
-### dice 和 slice 的对偶关系
+### 11.9 dice 和 slice 的对偶关系
 
 `underscore.hpp` 中同时定义了 `slice` 和 `dice`，它们是互补操作：
 
@@ -1552,7 +1552,7 @@ tensor_tiled(repeat<2>(_), append<2>((blockIdx.y, _), _))
 
 ---
 
-## sgemm_1_ref_np.cu 中的三条同步语句
+## 12. sgemm_1_ref_np.cu 中的三条同步语句
 
 在 `examples/cute/tutorial/sgemm_1_ref_np.cu:213-215` 的 `gemm_device` 函数中，有三条同步语句：
 
@@ -1562,7 +1562,7 @@ cp_async_wait<0>();      // Sync on all (potential) cp.async instructions
 __syncthreads();         // Wait for all threads to write to smem
 ```
 
-### 各自作用
+### 12.1 各自作用
 
 1. **`cp_async_fence()`** (line 213)
    - 标记一组 cp.async 指令的结束边界
@@ -1579,7 +1579,7 @@ __syncthreads();         // Wait for all threads to write to smem
    - 确保 block 内所有线程都执行到此处
    - 保证所有线程写入 smem 的操作对其他线程可见
 
-### 为什么需要三层同步？
+### 12.2 为什么需要三层同步？
 
 虽然这个例子中使用的是普通 `copy()` 而非真正的 cp.async 指令（注释中说 "potential"），但代码保留了完整的同步模式以便将来替换为异步拷贝：
 
@@ -1588,7 +1588,7 @@ __syncthreads();         // Wait for all threads to write to smem
 - **wait** 确保数据到达：在使用数据前必须等待传输完成
 - **syncthreads** 确保线程同步：即使数据到达，也需要确保所有线程都完成各自的写入，避免 RAW hazard
 
-### 实现位置
+### 12.3 实现位置
 
 1. **`cp_async_fence()`** 和 **`cp_async_wait<N>()`**
    - 定义在：`include/cute/arch/copy_sm80.hpp:164-194`
@@ -1620,7 +1620,7 @@ __syncthreads();         // Wait for all threads to write to smem
    - 编译为 PTX 指令 `bar.sync 0;`（barrier synchronization）
    - 不在 CUTLASS 代码中定义，直接使用 CUDA 提供的版本
 
-### 同步顺序的必要性
+### 12.4 同步顺序的必要性
 
 在 mainloop 中（line 200-233），同步顺序为：
 
@@ -1642,7 +1642,7 @@ __syncthreads()            // 等待所有线程读取完成（line 232）
 
 最后的 `__syncthreads()` (line 232) 确保所有线程读取完 smem 后才能进入下一次迭代重新写入，避免 WAR (Write-After-Read) hazard。
 
-## 关于 `MMA_Atom<MMA>::make_fragment_A(A)` / `make_fragment_B(B)`（对应 `sgemm_1_ref_np.cu 512 1024 2048 N T`）
+## 13. 关于 `MMA_Atom<MMA>::make_fragment_A(A)` / `make_fragment_B(B)`（对应 `sgemm_1_ref_np.cu 512 1024 2048 N T`）
 
 在 `include/cute/algorithm/gemm.hpp` 的这个重载里（`D`/`C` 是 rmem，`A`/`B` 是 smem，见 468-471 行约束），
 `make_fragment_A(A)` 和 `make_fragment_B(B)` 的作用是：
@@ -1668,7 +1668,7 @@ __syncthreads()            // 等待所有线程读取完成（line 232）
 - `gemm.hpp` 493-494：从 A/B 拷贝到 rA/rB。
 - `mma_traits.hpp` 119-122：`MMA_Atom::call` 要求 A/B/C/D 都是 `is_rmem`。
 
-## 补充：`if constexpr (has_dereference<FrgTypeA>::value)` 在该场景下是 true 还是 false
+## 14. 补充：`if constexpr (has_dereference<FrgTypeA>::value)` 在该场景下是 true 还是 false
 
 结论：在你给的场景（`examples/cute/tutorial/sgemm_1_ref_np.cu`，参数 `512 1024 2048 N T`，调用 `gemm(tCsA, tCsB, tCrC)`）下，这个 `if constexpr` 是 **false**。
 
@@ -1683,7 +1683,7 @@ __syncthreads()            // 等待所有线程读取完成（line 232）
 
 因此在 `include/cute/atom/mma_atom.hpp` 的 `make_fragment_A` 中会走 `else` 分支（`make_fragment_like<FrgTypeA>(atensor)`）。
 
-## `include/cute/atom/mma_atom.hpp` 里 3 个 `MMA_Atom` 的关系与语法
+## 15. `include/cute/atom/mma_atom.hpp` 里 3 个 `MMA_Atom` 的关系与语法
 
 在 `include/cute/atom/mma_atom.hpp` 中这 3 个声明/定义是同一个类模板家族：
 
@@ -1716,7 +1716,7 @@ __syncthreads()            // 等待所有线程读取完成（line 232）
 - `include/cute/atom/mma_atom.hpp`（`MMA_Atom` 三段定义）
 - `include/cute/atom/mma_traits.hpp`（`MMA_Traits` 主模板和特化）
 
-## 在当前讨论条件下，第 3 个 `MMA_Atom` 里各 `using` 的具体类型
+## 16. 在当前讨论条件下，第 3 个 `MMA_Atom` 里各 `using` 的具体类型
 
 场景固定为：`examples/cute/tutorial/sgemm_1_ref_np.cu`，参数 `512 1024 2048 N T`，并调用 `gemm(tCsA, tCsB, tCrC)`。
 
@@ -1786,7 +1786,7 @@ __syncthreads()            // 等待所有线程读取完成（line 232）
   - `MMA_Traits<UniversalFMA<D,A,B,C>>` 给出 `ValType*`、`Shape_MNK`、`ThrID`、`ALayout/BLayout/CLayout`。
   - `detail::FrgTypeA_or_Default / FrgTypeB_or_Default / FrgTypeC_or_Default` 的默认回退规则。
 
-## `include/cute/atom/mma_traits.hpp` 这段 `FrgTypeC_or_Default` 用到的 C++ 语法特性
+## 17. `include/cute/atom/mma_traits.hpp` 这段 `FrgTypeC_or_Default` 用到的 C++ 语法特性
 
 代码：
 
@@ -1819,7 +1819,7 @@ struct FrgTypeC_or_Default<X,void_t<typename X::FrgTypeC>> { using type = typena
 
 语义上，这就是“有 `FrgTypeC` 就用它，否则默认用 `ValTypeC`”的编译期类型选择器。
 
-## 为什么 `include/cute/algorithm/gemm.hpp` 里 32-bit 分支要写成这种双层循环，为什么 `m += 2`
+## 18. 为什么 `include/cute/algorithm/gemm.hpp` 里 32-bit 分支要写成这种双层循环，为什么 `m += 2`
 
 场景固定为：`examples/cute/tutorial/sgemm_1_ref_np.cu`，参数 `512 1024 2048 N T`。
 
@@ -1903,7 +1903,7 @@ for (int m = 0; m < M; m += 2) {
 - 同一个文件里也给了另一套 `#else` 的 column-major kinked 版本，那一版会写成 `n += 2`。
 - 说明 `m += 2` 是这里选中的一种遍历策略，不是 GEMM 数学定义要求必须如此。
 
-## `include/cute/arch/util.hpp` 209 行 `explode` 用了什么 C++ 语法，以及它在做什么
+## 19. `include/cute/arch/util.hpp` 209 行 `explode` 用了什么 C++ 语法，以及它在做什么
 
 代码：
 
@@ -2013,7 +2013,7 @@ detail::explode(MMA_Op::fma,
 - 但 CUTLASS/CuTe 内部更方便先把这些寄存器放在 `rD/rA/rB/rC` 这种容器里；
 - `explode` 就负责在调用点把容器重新展开成平铺参数。
 
-## `include/cute/layout.hpp` 里的 `raked_product`
+## 20. `include/cute/layout.hpp` 里的 `raked_product`
 
 `include/cute/layout.hpp` 第 1744-1759 行把 `raked_product` 定义成：
 
@@ -2101,7 +2101,7 @@ blocked_product(block, tiler)
 - `blocked_product` 更像 `(block_coord, tile_coord)`；
 - `raked_product` 更像 `(tile_coord, block_coord)`。
 
-## `raked_product` 里 `zip(get<1>(result), get<0>(result))` 是怎么变的
+## 21. `raked_product` 里 `zip(get<1>(result), get<0>(result))` 是怎么变的
 
 这个问题要分三步看，定义分别在：
 
@@ -2116,7 +2116,7 @@ logical_product(block, tiler)
 = ((_32,_8),(_4,_1)):((_1,_32),(_256,_0))
 ```
 
-### 1. `get<0>(result)` 和 `get<1>(result)` 分别是多少
+### 21.1 `get<0>(result)` 和 `get<1>(result)` 分别是多少
 
 `include/cute/layout.hpp` 第 499-502 行是：
 
@@ -2149,7 +2149,7 @@ get<1>(result) = (_4,_1):(_256,_0)
 - `get<0>(result)` 取出 `logical_product` 的第 0 个 mode；
 - `get<1>(result)` 取出 `logical_product` 的第 1 个 mode。
 
-### 2. 对两个 layout 做 `zip()` 的语义是什么
+### 21.2 对两个 layout 做 `zip()` 的语义是什么
 
 `include/cute/layout.hpp` 第 1527-1531 行是：
 
@@ -2187,7 +2187,7 @@ zip(layoutA, layoutB)
 - 新的第 0 个 mode = `(layoutA 的第 0 个 mode, layoutB 的第 0 个 mode)`
 - 新的第 1 个 mode = `(layoutA 的第 1 个 mode, layoutB 的第 1 个 mode)`
 
-### 3. 代入本题的 `get<1>(result)` 和 `get<0>(result)`
+### 21.3 代入本题的 `get<1>(result)` 和 `get<0>(result)`
 
 现在把上面的两个子 layout 代进去：
 
@@ -2237,7 +2237,7 @@ zip(get<1>(result), get<0>(result))
 
 这就是 `raked_product(block, tiler)` 得到的结果。
 
-### 4. 为什么它看起来像“交换并转置”
+### 21.4 为什么它看起来像“交换并转置”
 
 如果直接看 `logical_product` 的结果：
 
@@ -2287,7 +2287,7 @@ raked_product   : ((_4,_32),(_1,_8)):((_256,_1),(_0,_32))
 
 两者只是 mode 内部的组合顺序不同，但这个顺序差异正是 “blocked” 和 “raked/interleaved” 的本质区别。
 
-## 为什么 GDB 在 `examples/cute/tutorial/sgemm_2_ref_np.cu` 266 行之后跳过 269-289 行
+## 22. 为什么 GDB 在 `examples/cute/tutorial/sgemm_2_ref_np.cu` 266 行之后跳过 269-289 行
 
 先说结论：
 
@@ -2295,7 +2295,7 @@ raked_product   : ((_4,_32),(_1,_8)):((_256,_1),(_0,_32))
 - 而是 `examples/cute/tutorial/sgemm_2_ref_np.cu` 第 269-289 行在这次编译产物里根本没有生成可执行指令；
 - GDB 只能沿着真实的 PC（程序计数器）走，所以它会从第 266 行直接跳到下一条“真的有代码”的源行。
 
-### 1. `.o` 和可执行文件是怎么连出来的
+### 22.1 `.o` 和可执行文件是怎么连出来的
 
 你给的 `nvcc -c` 命令会生成：
 
@@ -2330,7 +2330,7 @@ build-rtx-5060ti/examples/cute/tutorial/CMakeFiles/cute_tutorial_sgemm_2_ref_np.
 
 所以如果你已经有这个 `.o`，在 `build-rtx-5060ti/examples/cute/tutorial` 目录里直接执行上面的 `g++` 链接命令即可生成可执行文件。
 
-### 2. 为什么第 266 行能停住，而 269-289 行不能
+### 22.2 为什么第 266 行能停住，而 269-289 行不能
 
 看 `examples/cute/tutorial/sgemm_2_ref_np.cu` 第 264-289 行：
 
@@ -2372,7 +2372,7 @@ TiledCopy copyB = make_tiled_copy(...);
 - 编译器仍然可以不为“没有运行时副作用的语句”发射代码；
 - GDB 也不可能在没有机器指令的源行上单步停住。
 
-### 3. 这不是猜测，DWARF 和 GDB 都能直接证明
+### 22.3 这不是猜测，DWARF 和 GDB 都能直接证明
 
 对
 
@@ -2418,7 +2418,7 @@ Line 294 ... starts at address 0xb8fc and ends at 0xb927.
 
 所以 `#ifdef LIKE_DEBUG` 下的 `printf(...)` 真被编进去了。若没有这个宏，266 之后 GDB 会直接跳到更后面的下一条有代码的行。
 
-### 4. 为什么 `make_tiled_copy` 调用也被跳过
+### 22.4 为什么 `make_tiled_copy` 调用也被跳过
 
 `make_tiled_copy` 的定义在 `include/cute/atom/copy_atom.hpp` 第 495-516 行：
 
@@ -2452,7 +2452,7 @@ make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TA>{},
 - 不会生成一段“进入 `make_tiled_copy` 再返回”的运行时代码；
 - GDB 也就没有机会一步一步走进这个函数体。
 
-### 5. 如何让 GDB “严格执行每一行代码”
+### 22.5 如何让 GDB “严格执行每一行代码”
 
 严格说，做不到。
 
@@ -2464,7 +2464,7 @@ make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TA>{},
 
 你能做的是“让这些行真的产生运行时代码”。常用办法有 4 种。
 
-#### 方法 A：在每一行后面加一个不可内联的调试锚点
+#### 22.5.1 方法 A：在每一行后面加一个不可内联的调试锚点
 
 例如在 `examples/cute/tutorial/sgemm_2_ref_np.cu` 里临时加：
 
@@ -2493,7 +2493,7 @@ TiledCopy copyB = make_tiled_copy(...); debug_touch(copyB);
 
 这样每一行后面都会产生一个真实的 host 调用点，GDB 就能停。
 
-#### 方法 B：加真实副作用
+#### 22.5.2 方法 B：加真实副作用
 
 最直接的就是：
 
@@ -2503,7 +2503,7 @@ TiledCopy copyB = make_tiled_copy(...); debug_touch(copyB);
 
 只要这一行真的有副作用，编译器就必须给它生成代码。
 
-#### 方法 C：对 host 代码进一步减少内联
+#### 22.5.3 方法 C：对 host 代码进一步减少内联
 
 你现在已经有：
 
@@ -2524,7 +2524,7 @@ TiledCopy copyB = make_tiled_copy(...); debug_touch(copyB);
 - 这些选项只能减少“已有代码”的内联；
 - 它们不能把“本来没有代码的源码行”变成有代码。
 
-#### 方法 D：如果想调 device 代码，用 `cuda-gdb`
+#### 22.5.4 方法 D：如果想调 device 代码，用 `cuda-gdb`
 
 这里你问的第 266-289 行是 host 代码，普通 `gdb` 就能看 host 部分。
 
@@ -2536,7 +2536,7 @@ cuda-gdb build-rtx-5060ti/examples/cute/tutorial/cute_tutorial_sgemm_2_ref_np
 
 普通 `gdb` 不能替代 `cuda-gdb` 做设备侧单步。
 
-### 6. 实际上最靠谱的理解方式
+### 22.6 实际上最靠谱的理解方式
 
 对这段 CuTe 代码，更接近事实的理解是：
 
@@ -2552,9 +2552,9 @@ cuda-gdb build-rtx-5060ti/examples/cute/tutorial/cute_tutorial_sgemm_2_ref_np
 
 ---
 
-## `make_identity_tensor` 的功能是什么？ArithTuple 和 `_1@0` 符号的含义
+## 23. `make_identity_tensor` 的功能是什么？ArithTuple 和 `_1@0` 符号的含义
 
-### `make_identity_tensor` 的功能
+### 23.1 `make_identity_tensor` 的功能
 
 `make_identity_tensor` 定义在 `include/cute/tensor_impl.hpp:494-500`：
 
@@ -2586,7 +2586,7 @@ Tensor cA = make_identity_tensor(shape(mA));   // (512, 2048)
 
 **在 tutorial 中的用途：** `cA` 和 `cB` 用于预测 GEMM 数据分区后每个线程处理的元素对应的全局坐标。注释 `// (m,k) -> (m,k)` 的意思就是"输入坐标 (m,k)，输出也是 (m,k)"——identity tensor 把坐标原样返回，不做任何变换。
 
-### `ArithTuple` 的含义
+### 23.2 `ArithTuple` 的含义
 
 `ArithmeticTuple` 定义在 `include/cute/numeric/arithmetic_tuple.hpp:44-67`：
 
@@ -2613,7 +2613,7 @@ CUTE_HOST_DEVICE void print(ArithmeticTupleIterator<ArithTuple> const& iter)
 
 当用 `print(cA)` 打印整个 tensor 时，CuTe 会遍历所有元素。对于 identity coordinate tensor，它打印的是遍历器的状态，形式为 `ArithTuple(coordinates)`。`_0` 是 `Int<0>` 打印出来的字符串，代表值为 0 的编译期整数常量（下划线 `_` 只是 `Int<N>` 的打印前缀）。
 
-### `_1@0` 这种 stride 符号的含义
+### 23.3 `_1@0` 这种 stride 符号的含义
 
 打印输出的 `Layout:(512,2048):(_1@0,_1@1)` 中，stride 部分 `(_1@0, _1@1)` 的拆解：
 
@@ -2674,7 +2674,7 @@ using E = ScaledBasis<Int<1>, Ns...>;
 
 之所以用 `_1@0` 这种表示法而不是简单的 `(1, 1)`，是因为 CuTe 的 stride 系统需要追踪每个 stride 元素关联的**坐标模式**。在更复杂的 layout 操作（如 `logical_product`、`zip`、`raked_product`）中，stride 元素会被重新分组和组合，`@N` 标记能清晰表明每个 stride 分量最初来自哪个维度，这对于 layout 代数运算的正确性至关重要。
 
-### 输出解读
+### 23.4 输出解读
 
 ```
 global full cA:ArithTuple(_0,_0) o (512,2048):(_1@0,_1@1)
@@ -2689,9 +2689,9 @@ global full cA:ArithTuple(_0,_0) o (512,2048):(_1@0,_1@1)
 
 ---
 
-## `counting_iterator<int>(42)` 在 `make_tensor(counting_iterator<int>(42), make_shape(4,5))` 中的作用
+## 24. `counting_iterator<int>(42)` 在 `make_tensor(counting_iterator<int>(42), make_shape(4,5))` 中的作用
 
-### 1. `counting_iterator` 是什么
+### 24.1 `counting_iterator` 是什么
 
 `counting_iterator` 定义在 `include/cute/pointer_base.hpp:192-229`：
 
@@ -2724,7 +2724,7 @@ struct counting_iterator
 
 因此 `counting_iterator<int>(42)` 创建了一个行为上等同于**无限长虚拟数组 `[42, 43, 44, 45, ...]`** 的迭代器。
 
-### 2. `make_tensor(iterator, shape)` 如何工作
+### 24.2 `make_tensor(iterator, shape)` 如何工作
 
 这个重载定义在 `include/cute/tensor_impl.hpp:406-413`：
 
@@ -2753,7 +2753,7 @@ Layout: Shape(_4, _5) : Stride(_1, _4)
 Data:   counting_iterator(42)  → 虚拟数组 [42, 43, 44, 45, 46, 47, ...]
 ```
 
-### 3. 索引过程：坐标到值的映射
+### 24.3 索引过程：坐标到值的映射
 
 当用 `A(row, col)` 访问 Tensor 时，调用链为（`include/cute/tensor.hpp:183`）：
 
@@ -2778,7 +2778,7 @@ A(row, col) = counting_iterator[row + 4*col]
             = 42 + row + 4*col
 ```
 
-### 4. 日志输出与 `counting_iterator<int>(42)` 的关系
+### 24.4 日志输出与 `counting_iterator<int>(42)` 的关系
 
 运行日志（`run.tma_tensor.log`）：
 
@@ -2806,7 +2806,7 @@ A(0, 0) = 42 + 0 + 4×0 = 42
 
 是的，**第 1 个元素是 42 就是因为 `counting_iterator<int>(42)` 中的 `42`**。这个 `42` 是 counting_iterator 的起始值，作为虚拟数组的第 0 个元素。配合 stride `(_1, 4)` 的 column-major 映射，`(0,0)` 位置恰好取到虚拟数组的第 0 个元素，即 42。
 
-### 5. 整个矩阵值的生成规律
+### 24.5 整个矩阵值的生成规律
 
 ```
 A(row, col) = 42 + row + 4*col
@@ -2821,7 +2821,7 @@ A(row, col) = 42 + row + 4*col
 
 **直观理解：** column-major stride `(_1, 4)` 意味着同一列中相邻行的线性索引相差 1，而相邻列之间相差 4（等于行数）。counting_iterator 起始于 42，沿列向下走依次产生 42→43→44→45，跳到下一列索引 +4 后继续从 46 开始，以此类推。
 
-### 6. 这种编码方式的设计意图
+### 24.6 这种编码方式的设计意图
 
 这段示例代码（`examples/cute/tutorial/tma_tensor.cu:49`）演示的是 CuTe 的**隐式张量（Implicit Tensor）**概念——Tensor 不需要指向真实内存，通过 counting_iterator 创建"计算出来的值"，结合 layout 的坐标映射，就能产生有规律的矩阵数据。这是 CuTe 的"数据和布局分离"哲学的体现：同一个 layout 换一个不同的数据源，就能生成完全不同的内容。
 
@@ -2829,9 +2829,9 @@ A(row, col) = 42 + row + 4*col
 
 ---
 
-## `tma_tensor.cu` 编译错误分析与修复
+## 25. `tma_tensor.cu` 编译错误分析与修复
 
-### 错误现象
+### 25.1 错误现象
 
 编译日志（`make.log:20-29`）：
 
@@ -2850,7 +2850,7 @@ note: number of parameters of function template "cute::as_arithmetic_tuple(const
 ArithmeticTupleIterator citer_1 = make_inttuple_iter(42, Int<2>{}, Int<7>{});
 ```
 
-### 根因分析
+### 25.2 根因分析
 
 `make_inttuple_iter` 定义在 `include/cute/numeric/arithmetic_tuple.hpp:208-213`：
 
@@ -2888,7 +2888,7 @@ as_arithmetic_tuple(T const& t) {   // 只接受一个参数！
 
 **本质问题：** `make_inttuple_iter` 的实现存在 bug——它接受 variadic 参数却不包装成 tuple，直接展开传给只接受单参数的 `as_arithmetic_tuple`。
 
-### 修复方案
+### 25.3 修复方案
 
 修改 `examples/cute/tutorial/tma_tensor.cu:52`，用 `make_tuple()` 将多个参数包装成单个 tuple：
 
@@ -2904,7 +2904,7 @@ ArithmeticTupleIterator citer_1 = make_inttuple_iter(make_tuple(42, Int<2>{}, In
 
 **为什么 `make_tuple` 可以解决问题：** `as_arithmetic_tuple` 的通用实现（`include/cute/numeric/arithmetic_tuple.hpp:73-76`）自带递归展开逻辑——如果传入的类型 `T` 是 tuple（`is_tuple<T>::value == true`），它会用 `tapply` 递归对每个子元素调用 `as_arithmetic_tuple`，最后用 `make_arithmetic_tuple` 重新组合。所以传入 `make_tuple(42, Int<2>{}, Int<7>{})` 会被正确递归处理。
 
-### 调用链对比
+### 25.4 调用链对比
 
 | | 修改前（报错） | 修改后（正确） |
 |---|---|---|
@@ -2914,7 +2914,7 @@ ArithmeticTupleIterator citer_1 = make_inttuple_iter(make_tuple(42, Int<2>{}, In
 | 匹配重载 | 无 | `as_arithmetic_tuple(T const&)` where `T = tuple<int, C<2>, C<7>>` |
 | 递归处理 | — | `tapply` 逐个处理 `42` → `42`, `Int<2>{}` → `Int<2>{}`, `Int<7>{}` → `Int<7>{}`，然后 `make_arithmetic_tuple(42, Int<2>{}, Int<7>{})` |
 
-### 完整修复后的代码
+### 25.5 完整修复后的代码
 
 修改 `examples/cute/tutorial/tma_tensor.cu` 的第 52 行：
 
@@ -2922,9 +2922,9 @@ ArithmeticTupleIterator citer_1 = make_inttuple_iter(make_tuple(42, Int<2>{}, In
 ArithmeticTupleIterator citer_1 = make_inttuple_iter(make_tuple(42, Int<2>{}, Int<7>{}));
 ```
 
-## make_tiled_mma 与 MMA_Atom 等价的构造过程分析
+## 26. make_tiled_mma 与 MMA_Atom 等价的构造过程分析
 
-### 分析目标
+### 26.1 分析目标
 
 `examples/cute/tutorial/like_layout.cu` 中 `doc05_mma_atom` 函数，line 727-730：
 
@@ -2938,7 +2938,7 @@ TiledMMA mma2 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
 
 ---
 
-### 步骤 1: 重载解析 — Overload 2 包装原始 MMA_Op
+### 26.2 步骤 1: 重载解析 — Overload 2 包装原始 MMA_Op
 
 `include/cute/atom/mma_atom.hpp:543-554`
 
@@ -2974,7 +2974,7 @@ using ThrID     = SM70_QuadPair;     // 线程布局 (32 threads per atom)
 
 ---
 
-### 步骤 2: Overload 1 — 已有 3D 参数，append<3> 为 no-op
+### 26.3 步骤 2: Overload 1 — 已有 3D 参数，append<3> 为 no-op
 
 `include/cute/atom/mma_atom.hpp:526-541`
 
@@ -3025,7 +3025,7 @@ if constexpr (N == tuple_size<T>::value) {
 
 ---
 
-### 步骤 3: TiledMMA 构造
+### 26.4 步骤 3: TiledMMA 构造
 
 `include/cute/atom/mma_atom.hpp:228-231`
 
@@ -3095,7 +3095,7 @@ auto permutation_mnk() const {
 
 ---
 
-### 步骤 4: 等价性验证
+### 26.5 步骤 4: 等价性验证
 
 **为什么 mma2 等价于 mma？**
 
@@ -3125,7 +3125,7 @@ auto permutation_mnk() const {
 
 ---
 
-### 完整的调用/构造函数链
+### 26.6 完整的调用/构造函数链
 
 ```
 make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
@@ -3164,7 +3164,7 @@ make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
         └─► is-a MMA_Atom + AtomLayoutMNK = _1,_1,_1 → 无实际 tiling → 等价于 MMA_Atom
 ```
 
-### 对照不同的 tiling 示例
+### 26.7 对照不同的 tiling 示例
 
 `examples/cute/tutorial/like_layout.cu:735-740` 展示了不同 `thr_layout` 的效果：
 
@@ -3177,9 +3177,9 @@ auto mma3 = make_tiled_mma(SM70_8x8x4_F32F16F16F32_NT{},
 
 ---
 
-## 附录: 前文修正
+## 27. 附录: 前文修正
 
-### `like_layout.cu:728` 的 `thr_layout` 和 `permutations` 已是 3D，`append<3>` 为 no-op
+### 27.1 `like_layout.cu:728` 的 `thr_layout` 和 `permutations` 已是 3D，`append<3>` 为 no-op
 
 原分析将 `like_layout.cu:728` 的调用误当作传入了 2D 参数。纠正如下：
 
@@ -3223,9 +3223,9 @@ TiledMMA<MMA_Atom<SM70_8x8x4_F32F16F16F32_NT>,
 
 ---
 
-## `zipped_product` 编译错误: `logical_product` 的 Tuple/Layout 重载选择
+## 28. `zipped_product` 编译错误: `logical_product` 的 Tuple/Layout 重载选择
 
-### 错误现象
+### 28.1 错误现象
 
 `examples/cute/tutorial/like_layout.cu:746`, `doc05_mma_atom()`:
 
@@ -3246,7 +3246,7 @@ include/cute/layout.hpp:1666 — static assertion failed:
   → zipped_product(...) at like_layout.cu:746
 ```
 
-### 根因: `logical_product` 对 Tuple 和 Layout 走不同重载
+### 28.2 根因: `logical_product` 对 Tuple 和 Layout 走不同重载
 
 `logical_product` 有两个重载（`include/cute/layout.hpp:1649-1675`）:
 
@@ -3283,7 +3283,7 @@ logical_product(Layout<LShape,LStride> const& block,
 
 — **有 rank 检查**: tiler 的 mode 数不能超过 block 的 rank。
 
-### 为什么真实 TiledMMA 构造不报错，但 like_layout.cu:746 报错
+### 28.3 为什么真实 TiledMMA 构造不报错，但 like_layout.cu:746 报错
 
 真实 `TiledMMA` 构造函数 (`include/cute/atom/mma_atom.hpp:231`, `TiledMMA::TiledMMA()`):
 
@@ -3309,7 +3309,7 @@ thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}
 
 两者是不同的模板参数（`include/cute/atom/mma_atom.hpp:208-211`），功能也不同。
 
-### 修复方法
+### 28.4 修复方法
 
 将 `like_layout.cu:746` 的 tiler 从 tuple `Tile<_8,_8,_4>` 改为 Layout:
 
@@ -3329,7 +3329,7 @@ auto tiler = Layout<Shape<_1,_1,_1>, Stride<_0,_0,_0>>{};
 auto result = zipped_product(block, tiler);
 ```
 
-### `zipped_product` 结果含义
+### 28.5 `zipped_product` 结果含义
 
 `zipped_product(Layout<Shape<_4,_2>,...>, Layout<Shape<_1,_1,_1>>{})` 计算的是原子内的线程到 (V,M,N,K) 的 4D layout 映射。对于单原子（`Shape<_1,_1,_1>`），`zipped_product` 的结果等价于：
 
@@ -3344,9 +3344,9 @@ zipped_product(ThrID=Layout<Shape<_4,_2>, Stride<_1,_16>>,
 
 ---
 
-## `transform_layout` 逐 step 剖析: `like_layout.cu:547` 调用
+## 29. `transform_layout` 逐 step 剖析: `like_layout.cu:547` 调用
 
-### 调用起点
+### 29.1 调用起点
 
 `examples/cute/tutorial/like_layout.cu:547`, `doc04_mma_atom()`:
 
@@ -3368,7 +3368,7 @@ return transform_layout(block, tiler, [](auto const& l, auto const& t) { return 
 
 ---
 
-### Step 1: 进入 `transform_layout(t0, t1, f)` — 计算 R0, R1, R
+### 29.2 Step 1: 进入 `transform_layout(t0, t1, f)` — 计算 R0, R1, R
 
 `include/cute/layout.hpp:756-764`, `transform_layout()`:
 
@@ -3409,7 +3409,7 @@ detail::transform_layout(t0, t1, f, seq<0,1>{}, seq<>{}, seq<>{})
 
 ---
 
-### Step 2: `detail::transform_layout` — 展开为 `make_layout(...)`
+### 29.3 Step 2: `detail::transform_layout` — 展开为 `make_layout(...)`
 
 `include/cute/layout.hpp:738-744`, `detail::transform_layout()`:
 
@@ -3461,9 +3461,9 @@ return make_layout(results...); // 拼接为嵌套 layout
 
 ---
 
-### Step 3: 每对 mode 的 `logical_product` 结果
+### 29.4 Step 3: 每对 mode 的 `logical_product` 结果
 
-#### Mode 0: `logical_product(Layout<Shape<_2>, Stride<_5>>, Layout<Shape<_3>, Stride<_5>>)`
+#### 29.4.1 Mode 0: `logical_product(Layout<Shape<_2>, Stride<_5>>, Layout<Shape<_3>, Stride<_5>>)`
 
 `layout<0>(A)` 返回 `Layout<Shape<_2>, Stride<_5>>` — 一个**单 mode Layout**（rank=1）。`get<0>(tiler)` 是 `Layout<Shape<_3>, Stride<_5>>`。
 
@@ -3480,13 +3480,13 @@ logical_product(Layout<LShape,LStride> const& block, Layout<TShape,TStride> cons
 
 解释: 在 block (2 元素, stride=5) 的每个元素位置上, "嵌入" tiler (3 元素, stride=5), 形成嵌套 `(block_shape, (tiler_shape))`。
 
-#### Mode 1: `logical_product(Layout<Shape<_5>, Stride<_1>>, Layout<Shape<_4>, Stride<_6>>)`
+#### 29.4.2 Mode 1: `logical_product(Layout<Shape<_5>, Stride<_1>>, Layout<Shape<_4>, Stride<_6>>)`
 
 同理, mode-1: `Shape = (_5, (_4))`, `Stride = (_1, (_30))`
 
 ---
 
-### Step 4: 最终拼接结果
+### 29.5 Step 4: 最终拼接结果
 
 `make_layout` 将两个 mode 的 Layout 结果拼接为 2D 嵌套 layout:
 
@@ -3502,7 +3502,7 @@ result=((_2,(_3)),(_5,(_4))):((_5,(_10)),(_1,(_30)))
 
 ---
 
-### 参数不对称时 range 的作用
+### 29.6 参数不对称时 range 的作用
 
 若 `R0 ≠ R1`（如 `logical_product(Shape<_2,_3,_4>, Tile<_8,_9>{})` 中 R0=3, R1=2），则:
 
@@ -3528,9 +3528,9 @@ make_layout(
 
 ---
 
-## `make_range` 实现原理
+## 30. `make_range` 实现原理
 
-### 定义链
+### 30.1 定义链
 
 `include/cute/numeric/integer_sequence.hpp:118-119`:
 
@@ -3565,7 +3565,7 @@ struct range_impl<T, integer_sequence<T, N...>, Begin> {
 };
 ```
 
-### 核心思想: '平移法'
+### 30.2 核心思想: '平移法'
 
 `make_range<Min, Max>` 生成 `integer_sequence<int, Min, Min+1, ..., Max-1>`（半开区间 `[Min, Max)`）。
 
@@ -3578,9 +3578,9 @@ struct range_impl<T, integer_sequence<T, N...>, Begin> {
 结果:       int_seq<Begin, Begin+1, Begin+2, ..., Begin+Count-1> = int_seq<Begin, ..., End-1>
 ```
 
-### 逐步推导
+### 30.3 逐步推导
 
-#### Step 1: 计算长度 Count = End - Begin
+#### 30.3.1 Step 1: 计算长度 Count = End - Begin
 
 `make_integer_range<T, Begin, End>` 的第二个模板参数为:
 
@@ -3598,7 +3598,7 @@ make_integer_sequence<T, (End-Begin > 0) ? (End-Begin) : 0>
 
 三元 `(End-Begin > 0) ? ... : 0` 防止负数: C++ 标准中 `make_integer_sequence<T, N>` 要求 `N >= 0`。
 
-#### Step 2: `range_impl` 平移每个元素
+#### 30.3.2 Step 2: `range_impl` 平移每个元素
 
 `range_impl` 的**模板偏特化** (`include/cute/numeric/integer_sequence.hpp:48-51`) 匹配 `integer_sequence<T, 0, 1, ..., Count-1>`:
 
@@ -3616,7 +3616,7 @@ struct range_impl<T, integer_sequence<T, N...>, Begin> {
 = Begin, Begin+1, Begin+2, ..., End-1
 ```
 
-### 示例追踪
+### 30.4 示例追踪
 
 **`make_range<2, 5>`**:
 
@@ -3658,14 +3658,14 @@ make_range<0, 3>
 
 事实上 `make_seq<N>` = `make_integer_sequence<int, N>` 即 `make_range<0, N>` 的特例。
 
-### `make_range` 的序列运算意义
+### 30.5 `make_range` 的序列运算意义
 
 从数学角度就是**集合平移运算**: 给定集合 `S = {0, 1, 2}` 和偏移 `Begin = 2`，生成 `S + Begin = {2, 3, 4}`。
 
 这使得 C++ 元编程中能在编译期自然地表达**切片和拼接**，是 `transform_layout` 中 `make_range<R,R0>` 和 `make_range<R,R1>` 的基础 — 前者从 rank R 开始提取 t0 的剩余 mode，后者提取 t1 的剩余 mode。
-# hpc.group_gemm_pertensor_fp8 完整调用链分析
+## 31. hpc.group_gemm_pertensor_fp8 完整调用链分析
 
-## 1. CUDA 实现位置
+### 31.1 CUDA 实现位置
 
 CUDA kernel 实现在以下文件中：
 
@@ -3681,11 +3681,11 @@ CUDA kernel 实现在以下文件中：
 | `src/group_gemm/group_gemm.h:12-17` | `group_gemm_pertensor_fp8_async` 函数声明 |
 | `src/utils/tma.cuh:36-57` | TMA 描述符更新工具函数 `update_tma_gtensor` |
 
-## 2. 算子注册机制
+### 31.2 算子注册机制
 
 算子通过 **PyTorch TorchScript `TORCH_LIBRARY_FRAGMENT`** 机制注册，分两步：
 
-### 2.1 C++ 端注册 (TORCH_LIBRARY_FRAGMENT)
+#### 31.2.1 C++ 端注册 (TORCH_LIBRARY_FRAGMENT)
 
 `src/group_gemm/entry.cc:192-198`
 
@@ -3703,7 +3703,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 - `m.impl("group_gemm_pertensor_fp8", torch::kCUDA, ...)` 将 CUDA dispatch key 绑定到 `group_gemm_pertensor_fp8_entry` 函数
 - 这段代码被编译进 `_C.*.so` 共享库
 
-### 2.2 Python 端加载 .so
+#### 31.2.2 Python 端加载 .so
 
 `hpc/__init__.py:43-45`
 
@@ -3715,7 +3715,7 @@ torch.ops.load_library(so_files[0])
 
 `torch.ops.load_library()` 加载共享库，触发其中所有 `TORCH_LIBRARY_FRAGMENT` 静态初始化，将算子注册到 `torch.ops.hpc` 命名空间下。
 
-### 2.3 Python 端 fake kernel 注册 (torch.compile 支持)
+#### 31.2.3 Python 端 fake kernel 注册 (torch.compile 支持)
 
 `hpc/group_gemm.py:155-159`
 
@@ -3728,7 +3728,7 @@ def group_gemm_pertensor_fp8_fake(x, weight, seqlens, cu_seqlens, y_scale,
 
 这个 fake kernel 为 `torch.compile` 提供 shape/dtype 推断信息，在 tracing 阶段使用。
 
-### 2.4 Python 端函数导出
+#### 31.2.4 Python 端函数导出
 
 `hpc/__init__.py:30-49`
 
@@ -3747,7 +3747,7 @@ _export_functions(_discover_modules())
 
 `_discover_modules()` 扫描 `hpc/` 下所有 `.py` 文件（排除以 `_` 开头的），import 后提取所有 callable，注入到 `hpc` 包的全局命名空间。
 
-## 3. 完整调用链
+### 31.3 完整调用链
 
 ```
 Python: hpc.group_gemm_pertensor_fp8(x, weight, seqlens, cu_seqlens, y_scale, ...)
@@ -3846,26 +3846,26 @@ hpc::group_gemm::kernels::group_gemm_pertensor_fp8_kernel<Config, TmaA, TmaB, Tm
 GPU 硬件执行: SM90 FP8 MMA (E4M3), TMA 异步拷贝, warpgroup barrier 同步
 ```
 
-## 4. Tile 调度策略
+### 31.4 Tile 调度策略
 
 `src/group_gemm/kernels.cuh:22-61`
 
 两种调度模式根据问题规模自动选择（`src/group_gemm/group_gemm_pertensor_fp8.cu:69`）:
 
-### 水平循环 (IsLoopH = true): k <= 1024 || n <= 1024
+#### 31.4.1 水平循环 (IsLoopH = true): k <= 1024 || n <= 1024
 - `get_next_tile_horizon` (`src/group_gemm/kernels.cuh:22-40`)
 - 每个 block 在 N 维度上依次取 tile，跨 group 工作
 - 适合小规模问题
 
-### 垂直循环 (IsLoopH = false): 其他情况
+#### 31.4.2 垂直循环 (IsLoopH = false): 其他情况
 - `get_next_tile_vert` (`src/group_gemm/kernels.cuh:42-61`)
 - 每个 block 固定 M tile，在 N 维度上迭代
 - 通过 cu_tiles_ptr 二分查找对应的 group
 - 适合大规模问题
 
-## 6. TORCH_LIBRARY_FRAGMENT 宏详解
+### 31.5 TORCH_LIBRARY_FRAGMENT 宏详解
 
-### 6.1 宏的功能
+#### 31.5.1 宏的功能
 
 `TORCH_LIBRARY_FRAGMENT` 是 PyTorch 提供的自定义算子注册宏，用于在程序静态初始化阶段（`main()` 之前）向 PyTorch 的 dispatcher 注册自定义算子。
 
@@ -3883,7 +3883,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 }
 ```
 
-### 6.2 宏的实现位置
+#### 31.5.2 宏的实现位置
 
 PyTorch 头文件：
 
@@ -3895,7 +3895,7 @@ PyTorch 头文件：
 | `{conda_env}/lib/python3.12/site-packages/torch/include/torch/library.h` | 546-555 | `torch::Library::Kind` 枚举 (DEF/IMPL/FRAGMENT) |
 | `{conda_env}/lib/python3.12/site-packages/torch/include/c10/macros/Macros.h` | 100-118 | `C10_CONCATENATE`、`C10_UID`、`C10_STRINGIZE` 辅助宏 |
 
-### 6.3 宏的完整展开
+#### 31.5.3 宏的完整展开
 
 **第一步**：公开宏 (`torch/library.h:994-1002`)：
 
@@ -3972,7 +3972,7 @@ TorchLibraryInit 构造函数
          └─► m.impl(...) 绑定 CUDA 实现到 dispatcher
 ```
 
-### 6.4 `hpc` 和 `m` 参数的含义
+#### 31.5.4 `hpc` 和 `m` 参数的含义
 
 | 参数 | 含义 | 传入值 | 展开后 |
 |------|------|--------|--------|
@@ -3983,7 +3983,7 @@ TorchLibraryInit 构造函数
 - `hpc` → 对应宏的第一个参数（命名空间）
 - `group_gemm_pertensor_fp8` → 对应 `m.def()` 中的算子名
 
-### 6.5 为什么使用 `FRAGMENT` 而非 `TORCH_LIBRARY`
+#### 31.5.5 为什么使用 `FRAGMENT` 而非 `TORCH_LIBRARY`
 
 | 特性 | `TORCH_LIBRARY` | `TORCH_LIBRARY_FRAGMENT` |
 |------|-----------------|--------------------------|
@@ -4002,7 +4002,7 @@ TorchLibraryInit 构造函数
 | `src/rope/entry.cc` | rope 相关算子 |
 | `src/activation/entry.cc` | 激活函数相关算子 |
 
-### 6.6 `TorchLibraryInit` RAII 类
+#### 31.5.6 `TorchLibraryInit` RAII 类
 
 `torch/library.h:937-954`：
 
@@ -4028,9 +4028,9 @@ class TorchLibraryInit final {
 
 这是一个典型的 RAII 模式：`static const` 对象在进程启动时构造，构造函数中先创建 `Library`，再调用用户提供的回调函数完成注册。
 
-## 7. `Tensor?` 问号语法：可选参数
+### 31.6 `Tensor?` 问号语法：可选参数
 
-### 7.1 含义
+#### 31.6.1 含义
 
 在 TorchScript 算子签名中，`Tensor?` 表示该参数是**可选的 (Optional)**，调用时可以传入 `None` 或不传。
 
@@ -4044,7 +4044,7 @@ m.def(
 
 其中 `Tensor? output` 和 `Tensor? tma_desc` 是可选参数。
 
-### 7.2 C++ 端如何接收
+#### 31.6.2 C++ 端如何接收
 
 Schema 中的 `Tensor?` 在 C++ 实现侧映射为 `std::optional<torch::Tensor>`。
 
@@ -4063,7 +4063,7 @@ torch::Tensor group_gemm_pertensor_fp8_entry(
 )
 ```
 
-### 7.3 类型系统实现
+#### 31.6.3 类型系统实现
 
 `Tensor?` 在 PyTorch 内部表示为 `OptionalType(TensorType)`：
 
@@ -4080,7 +4080,7 @@ struct TORCH_API OptionalType : public UnionType {
 
 schema 字符串中的 `?` 后缀被 `parseSchema()` 函数 (`torch/csrc/jit/frontend/function_schema_parser.h:16-22`) 解析为 `OptionalType`。
 
-### 7.4 为什么设计成可选参数
+#### 31.6.4 为什么设计成可选参数
 
 `output` 和 `tma_desc` 设为可选参数是为了**内存复用**优化：
 
@@ -4108,7 +4108,7 @@ if (tma_desc.has_value()) {
 
 在 Python 调用侧 (`hpc/group_gemm.py:49-96`)，`output` 和 `tma_desc` 的默认值均为 `None`，对应 schema 中的 `Tensor?`：调用者不传这些参数时，它们等价于 `None`，在 C++ 端对应 `std::nullopt`。
 
-## 8. `torch::empty` 的 device 推断、`options.dtype()` 定义与副作用分析
+### 31.7 `torch::empty` 的 device 推断、`options.dtype()` 定义与副作用分析
 
 本节分析 `src/group_gemm/entry.cc:38-43` 这段代码：
 
@@ -4122,7 +4122,7 @@ if (output.has_value()) {
 }
 ```
 
-### 8.1 y 的 device 如何确定
+#### 31.7.1 y 的 device 如何确定
 
 y 的 device **继承自输入 tensor `x` 的 device**，通过 `x.options()` 获得：
 
@@ -4192,7 +4192,7 @@ x (CUDA tensor on device 0)
   → torch::empty(...)   → 在 device 0 上分配 bfloat16 tensor y
 ```
 
-### 8.2 `options` 本身是否被 `dtype()` 修改
+#### 31.7.2 `options` 本身是否被 `dtype()` 修改
 
 **不会。** `options` 的原始值保持不变。
 
@@ -4214,7 +4214,7 @@ tmas = torch::empty({num_group * 2, 128}, options); // 复用 options，分配 F
 
 这正是 `src/group_gemm/entry.cc:38-52` 中实际发生的模式 — `options`（FP8 dtype）在 line 43 被 `.dtype()` 临时改为 BF16 用于分配输出 tensor，随后 line 52 再次使用原始 `options`（FP8）分配 TMA descriptor tensor。
 
-### 8.3 `TensorOptions` setter 方法的三类重载对比
+#### 31.7.3 `TensorOptions` setter 方法的三类重载对比
 
 `{conda_env}/lib/python3.12/site-packages/torch/include/c10/core/TensorOptions.h:220-241`
 
@@ -4226,7 +4226,7 @@ tmas = torch::empty({num_group * 2, 128}, options); // 复用 options，分配 F
 
 在实际代码中，`options.dtype(torch::kBFloat16)` 匹配的是 ScalarType 重载（第 2 种），因此**不修改原对象**。
 
-### 8.4 `torch::empty` 的完整调用路径
+#### 31.7.4 `torch::empty` 的完整调用路径
 
 `{conda_env}/lib/python3.12/site-packages/torch/include/torch/csrc/autograd/generated/variable_factories.h:275-277`
 
@@ -4246,9 +4246,9 @@ inline at::Tensor empty(at::IntArrayRef size, at::TensorOptions options = {}, ..
 3. **包装为 Variable**：`autograd::make_variable(..., options.requires_grad())` — 根据原始 options 的 `requires_grad` 设置来包装
 4. 由于步骤 1 设置了 `requires_grad(std::nullopt)`，`at::empty()` 返回的是不追踪梯度的 tensor；步骤 3 再根据原始设置决定是否启用梯度追踪
 
-## 9. y_scale 与 torch._scaled_mm 的 scale_a/scale_b 的数学关系
+### 31.8 y_scale 与 torch._scaled_mm 的 scale_a/scale_b 的数学关系
 
-### 9.1 两种接口的差异
+#### 31.8.1 两种接口的差异
 
 在测试文件 `tests/test_group_gemm_pertensor_like.py:39-41`，naive 实现使用 `torch._scaled_mm`：
 
@@ -4260,7 +4260,7 @@ y_group = torch._scaled_mm(
 
 而在 `hpc/group_gemm.py:94`，自定义算子只接收一个 `y_scale` 参数，传入 `src/group_gemm/entry.cc:15-21` 的 `y_scale`（per-group tensor），最终在 CUDA kernel 中应用。
 
-### 9.2 torch._scaled_mm 的数学定义
+#### 31.8.2 torch._scaled_mm 的数学定义
 
 `torch._scaled_mm(A, B, scale_a, scale_b, out_dtype=torch.bfloat16)` 的计算逻辑等价于：
 
@@ -4280,7 +4280,7 @@ C = (A_fp8 * scale_a) @ B_fp8  → 累积后再乘以 scale_b → C * scale_b
 C = scale_a * scale_b * (A_fp8 @ B_fp8)
 ```
 
-### 9.3 自定义 CUDA kernel 的数学定义
+#### 31.8.3 自定义 CUDA kernel 的数学定义
 
 在 `src/group_gemm/kernels.cuh:347-374`，CUDA kernel 的计算为：
 
@@ -4301,7 +4301,7 @@ for (int i = 0; i < size(tCr); ++i) {
 C = y_scale * (A_fp8 @ B_fp8)
 ```
 
-### 9.4 等价关系推导
+#### 31.8.4 等价关系推导
 
 令两种实现的结果相等：
 
@@ -4315,7 +4315,7 @@ scale_a * scale_b * (A_fp8 @ B_fp8) = y_scale * (A_fp8 @ B_fp8)
 y_scale = scale_a * scale_b
 ```
 
-### 9.5 测试代码中的验证
+#### 31.8.5 测试代码中的验证
 
 在 `tests/test_group_gemm_pertensor_like.py:57-58`：
 
@@ -4329,13 +4329,13 @@ scale_hpc = torch.full((num_group,), 1.0, dtype=torch.float, device="cuda")
 
 满足 `y_scale = scale_a * scale_b = 1.0`，所以两种实现的计算结果等价。
 
-### 9.6 补充说明：per-tensor vs per-group
+#### 31.8.6 补充说明：per-tensor vs per-group
 
 `torch._scaled_mm` 的 `scale_a` / `scale_b` 可以是标量（所有 token 共享），也可以是 1D tensor（per-token scale）。
 
 `group_gemm_pertensor_fp8` 的 `y_scale` 是一个形状为 `[num_group]` 的 1D tensor（`tests/test_group_gemm_pertensor_like.py:58`），每个 group 可以有不同的 scale。尽管算子名称中包含 "pertensor"，但这里的 "tensor" 实际指的是对每个 group 内使用**单一 scale**（而非逐元素的 block-wise scale），与 `group_gemm_blockwise_fp8` 的 block-wise 量化形成对比。
 
-## 10. tmas 形状 `{num_group * 2, 128}` 的设计原因
+### 31.9 tmas 形状 `{num_group * 2, 128}` 的设计原因
 
 `src/group_gemm/entry.cc:52`：
 
@@ -4343,7 +4343,7 @@ scale_hpc = torch.full((num_group,), 1.0, dtype=torch.float, device="cuda")
 tmas = torch::empty({num_group * 2, 128}, options);
 ```
 
-### 10.1 总体布局
+#### 31.9.1 总体布局
 
 `tmas` 是一个存储 TMA 描述符的 tensor，按 **每 group 2 个描述符** 布局：
 
@@ -4352,7 +4352,7 @@ tmas = torch::empty({num_group * 2, 128}, options);
 | `igroup * 2 + 0` | X 的 TMA descriptor | 当前 group 的输入激活子 tensor 的加载描述符 |
 | `igroup * 2 + 1` | Y 的 TMA descriptor | 当前 group 的输出子 tensor 的存储描述符 |
 
-### 10.2 逐层代码证据
+#### 31.9.2 逐层代码证据
 
 **入口层** — `src/group_gemm/entry.cc:39`：
 
@@ -4386,7 +4386,7 @@ auto *td_y = td_xy + igroup * 2 + 1;  // Y descriptor for group igroup
 
 使用 `igroup * 2 + 1` 处的 descriptor 进行 Y 的 TMA 存储。
 
-### 10.3 为什么需要 per-group TMA 描述符
+#### 31.9.3 为什么需要 per-group TMA 描述符
 
 每个 group 的 X 子 tensor 和 Y 子 tensor **起始地址和形状都不同**：
 
@@ -4406,13 +4406,13 @@ vec_t<cute::TmaDescriptor, 2> td_xy{
 
 然后 `update_grouped_tma` kernel 对每个 group 拷贝模板，并调用 `update_tma_gtensor()` 替换描述符中的地址和形状字段（`src/utils/tma.cuh:37-57`），生成每 group 专属的 TMA descriptor。
 
-### 10.4 为什么每个 descriptor 128 字节
+#### 31.9.4 为什么每个 descriptor 128 字节
 
 每个 `cute::TmaDescriptor` 的大小是 **128 字节**。这是 NVIDIA Hopper (SM90) GPU 硬件定义的 TMA (Tensor Memory Access) 描述符固定大小。SM90 架构规格中，TMA descriptor 固定为 1024 bits = 128 bytes。
 
 因此 tensor 的第二维度 `128` 正好容纳一个 `cute::TmaDescriptor`，加上第一维 `num_group * 2` 个条目，总字节数 = `num_group * 2 * 128`，即 `tmas.nbytes()`。
 
-### 10.5 复用场景（跳过 TMA 更新）
+#### 31.9.5 复用场景（跳过 TMA 更新）
 
 当调用者传入预缓存的 `tma_desc` 时（`src/group_gemm/entry.cc:48-50`）：
 
@@ -4425,9 +4425,9 @@ if (tma_desc.has_value()) {
 
 `update_tma = false` 使得 `launch_group_gemm_fp8`（`src/group_gemm/group_gemm_pertensor_fp8.cu:42`）跳过 `update_grouped_tma` kernel launch，直接使用上一次写入的 per-group TMA descriptor。这在同一个 x/w 形状被反复调用时可以省去 TMA 更新开销。
 
-## 11. 为什么 W 不需要 per-group TMA descriptor
+### 31.10 为什么 W 不需要 per-group TMA descriptor
 
-### 11.1 三种 tensor 的数据布局差异
+#### 31.10.1 三种 tensor 的数据布局差异
 
 三种 tensor 在全局内存中的布局由 `src/group_gemm/group_gemm_pertensor_fp8.cu:27-32` 定义：
 
@@ -4453,7 +4453,7 @@ auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)),
 | **W** | 3D `(n, k, num_group)`，group 是第 3 维 | 通过坐标索引，W 是一个整体连续的大 tensor | **否** |
 | **Y** | 2D `(n, m)`，所有 groups 拼接在 M 维上 | 不同 group 的 sub-tensor 起始地址和 M 长度不同 | 是 |
 
-### 11.2 W 如何通过单一 TMA 描述符访问不同 group
+#### 31.10.2 W 如何通过单一 TMA 描述符访问不同 group
 
 W 的 TMA 描述符 `tma_w` 在 `launch_group_gemm_fp8` 中创建（`src/group_gemm/group_gemm_pertensor_fp8.cu:34-37`），作为**模板参数**和**kernel 参数**传递，不存储在 `td_xy` 表中：
 
@@ -4492,7 +4492,7 @@ tBg = (TMA, TMA_N, TMA_K, num_group)     // kernels.cuh:202
 
 **`igroup` 是 tBg 的第 4 个坐标索引**，不是 descriptor 索引。TMA 硬件根据（固定）descriptor 中的基地址 + 坐标 `(*, *, *, igroup)` 自动计算目标地址。由于 W 是 3D contiguous tensor（stride: `(k, 1, n*k)`），`igroup` 维度的步长为 `n*k`，硬件自动加上 `igroup * n * k * sizeof(element)` 的偏移。
 
-### 11.3 为什么 X 和 Y 不能用同样的坐标方式
+#### 31.10.3 为什么 X 和 Y 不能用同样的坐标方式
 
 X 和 Y 的 group 划分方式与 W 根本不同：
 
@@ -4513,7 +4513,7 @@ TMA descriptor **必须在创建时指定完整的边界形状（bounding box sh
 
 Y 同理：output tensor 按 `cu_seqlens` 拼接，各 group 的子区域非均匀，需要独立 descriptor。
 
-### 11.4 总结对比
+#### 31.10.4 总结对比
 
 ```
                     ┌─────────┬──────────────┬─────────────────────┐
@@ -4532,9 +4532,9 @@ Y 同理：output tensor 按 `cu_seqlens` 拼接，各 group 的子区域非均�
 └───────────────────┴─────────│──────────────│─────────────────────┘
 ```
 
-## 12. 编译器探测类型技巧：为什么 `TD<Config::SLayoutXAtom>` 失败及修复
+### 31.11 编译器探测类型技巧：为什么 `TD<Config::SLayoutXAtom>` 失败及修复
 
-### 12.1 代码意图
+#### 31.11.1 代码意图
 
 `src/group_gemm/group_gemm_pertensor_fp8.cu:15-19` 定义了两个仅声明、无实现的模板类：
 
@@ -4550,7 +4550,7 @@ class ITD;        // 接受整数参数的 incomplete class
 - `TD<Config> td1;` (`line 46`) — 让编译器在报错 "incomplete type is not allowed" 时，在错误信息中打印出 `Config` 的完整模板实例化类型
 - `TD<Config::SLayoutXAtom> config_slayout_atom_1;` (`line 48`) — 期望同样的方式打印出 `SLayoutXAtom` 的类型
 
-### 12.2 `TD<Config>` 为什么成功
+#### 31.11.2 `TD<Config>` 为什么成功
 
 `temp/success.log:1-4`：
 
@@ -4570,7 +4570,7 @@ using Config = GroupGEMMFp8Config<Tin, Tout, kTileM, kTileN, kTileK, kStage,
 
 `Config` 是通过 `using` 声明的**类型别名**。在模板函数体内，`using Config = ...` 明确告诉编译器 "这是一个类型"（`using` 只能用于类型别名）。因此 `TD<Config>` 直接作为类型模板参数传递，无需额外关键字。
 
-### 12.3 `TD<Config::SLayoutXAtom>` 为什么失败
+#### 31.11.3 `TD<Config::SLayoutXAtom>` 为什么失败
 
 `temp/debug.log:3-5`：
 
@@ -4601,7 +4601,7 @@ using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
 
 但编译器在模板定义阶段无法确定这一点（它不进行模板定义处的完整实例化查找），所以必须由程序员通过 `typename` 告知。
 
-### 12.4 修复方法
+#### 31.11.4 修复方法
 
 将 `TD<Config::SLayoutXAtom>` 改为：
 
@@ -4611,7 +4611,7 @@ TD<typename Config::SLayoutXAtom> config_slayout_atom_1;
 
 `typename` 关键字告诉编译器：在依赖上下文 `Config::` 中，`SLayoutXAtom` **是一个类型**。
 
-### 12.5 通用模板：如何探测依赖上下文中的嵌套类型
+#### 31.11.5 通用模板：如何探测依赖上下文中的嵌套类型
 
 对于模板函数/类内部的依赖嵌套类型，一律需要 `typename`：
 
@@ -4623,7 +4623,7 @@ TD<typename Config::SLayoutXAtom> config_slayout_atom_1;
 | `TD<typename Config::SLayoutX>` | 合法 | 同理，嵌套依赖类型 |
 | `TD<typename Config::TiledMma>` | 合法 | 同理 |
 
-### 12.6 完整修复代码
+#### 31.11.6 完整修复代码
 
 在 `src/group_gemm/group_gemm_pertensor_fp8.cu:48`，修改为：
 
@@ -4642,9 +4642,9 @@ TD<typename Config::SLayoutXAtom> config_slayout_atom_1;
 ITD<Config::kTileM> itd_tile_m;  // OK: kTileM 是 constexpr int，默认就是值
 ```
 
-## 13. SLayoutXAtom 类型推导链
+### 31.12 SLayoutXAtom 类型推导链
 
-### 13.1 编译器报错输出
+#### 31.12.1 编译器报错输出
 
 `temp/debug.log.2:18-20`，kTileM=64 实例化时：
 
@@ -4665,7 +4665,7 @@ TD<cute::ComposedLayout<
 ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag_bits<8>, Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>>
 ```
 
-### 13.2 推导步骤总览
+#### 31.12.2 推导步骤总览
 
 整个推导链经过 5 个关键步骤：
 
@@ -4679,7 +4679,7 @@ SLayoutXAtom
                     └── Layout shape/stride: upcast 重缩放
 ```
 
-### 13.3 完整推导（逐步骤）
+#### 31.12.3 完整推导（逐步骤）
 
 **步骤 1 — `slayout_selector` 选择 Swizzle 原子**
 
@@ -4816,7 +4816,7 @@ return composition(layout.layout_a(), smem_ptr_flag_bits<B*N>{}, upcast<N>(layou
 
 `composition(A, O, B)` → `ComposedLayout<A, O, B>`。
 
-### 13.4 最终结果
+#### 31.12.4 最终结果
 
 ```
 Config::SLayoutXAtom  (kSwizzleX=128, Tin=float_e4m3_t)
@@ -4828,7 +4828,7 @@ Config::SLayoutXAtom  (kSwizzleX=128, Tin=float_e4m3_t)
     >
 ```
 
-### 13.5 物理含义
+#### 31.12.5 物理含义
 
 `SLayoutXAtom` 是 SM90 GMMA shared memory 中 **128-byte swizzle K-major** 布局的原子描述。具体地：
 
@@ -4838,11 +4838,11 @@ Config::SLayoutXAtom  (kSwizzleX=128, Tin=float_e4m3_t)
 
 - **`Layout<Shape<8,128>, Stride<128,1>>`**：在 `float_e4m3_t` 元素单位下的 shared memory tile 形状为 8 行 × 128 列，row-major 连续存储（row-stride=128, col-stride=1）。对应 8×128 个 `float_e4m3_t` = 1024 bytes = 1KB tile。这正是 `kTileK=128` 列的 X 数据在共享内存中的物理排布。
 
-### 13.6 `std::conditional_t` 的来源
+#### 31.12.6 `std::conditional_t` 的来源
 
 编译器输出中的 `std::conditional_t<true, Swizzle<3,4,3>, const Swizzle<3,4,3>&>` 不是类型推导的结果，而是 `ComposedLayout` 基类 `cute::tuple` 的 EBO (Empty Base Optimization) 存储细节。当 Swizzle 是空类型时，`tuple` 通过 `conditional_t` 选择值存储或引用存储。最终逻辑类型就是 `Swizzle<3,4,3>`，此包装不影响类型的语义。
 
-### 13.7 `upcast` 的分支选择过程
+#### 31.12.7 `upcast` 的分支选择过程
 
 `3rd/cutlass/include/cute/layout.hpp:1806-1825`：
 
@@ -4874,7 +4874,7 @@ auto upcast(Layout<Shape,Stride> const& layout) {
 }
 ```
 
-#### 第一层调用：Branch 1 (is_tuple) — 拆分元组
+##### 31.12.7.1 第一层调用：Branch 1 (is_tuple) — 拆分元组
 
 入口参数：`Shape<Int<8>, Int<1024>>` 和 `Stride<Int<1024>, Int<1>>`。
 
@@ -4893,7 +4893,7 @@ return make_layout(upcast<8>(Int<8>{}, Int<1024>{}),   // 第 0 维
 
 于是进入**两层递归**。
 
-#### 第二层调用：Pair 0 — `upcast<8>(Int<8>, Int<1024>)`
+##### 31.12.7.2 第二层调用：Pair 0 — `upcast<8>(Int<8>, Int<1024>)`
 
 - **Branch 1**：`is_tuple<Int<8>>` — `Int<8>` 不是 tuple → **跳过**
 - **Branch 2**：`is_constant<0, Int<1024>>` — `is_constant<0, Int<1024>>` 检查 `1024 == 0`（`integral_constant.hpp:108`）→ **false，跳过**
@@ -4918,7 +4918,7 @@ new_stride = signum(1024) * ceil_div(abs(Int<1024>{}), Int<8>{})
 
 结果：`make_layout(Int<8>, Int<128>)` → `Layout<Int<8>, Int<128>>`。
 
-#### 第二层调用：Pair 1 — `upcast<8>(Int<1024>, Int<1>)`
+##### 31.12.7.3 第二层调用：Pair 1 — `upcast<8>(Int<1024>, Int<1>)`
 
 - **Branch 1**：`is_tuple<Int<1024>>` → **跳过**
 - **Branch 2**：`is_constant<0, Int<1>>` — `1 == 0` → **false，跳过**
@@ -4940,7 +4940,7 @@ new_stride = signum(1) * ceil_div(abs(Int<1>{}), Int<8>{})
 
 结果：`make_layout(Int<128>, Int<1>)` → `Layout<Int<128>, Int<1>>`。
 
-#### 合并回去
+##### 31.12.7.4 合并回去
 
 `transform_layout` 将两个结果合并回 tuple：
 
@@ -4955,7 +4955,7 @@ make_layout(upcast<8>(Int<8>{}, Int<1024>{}),   // → Layout<Int<8>, Int<128>>
 Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>
 ```
 
-#### 分支选择决策树
+##### 31.12.7.5 分支选择决策树
 
 ```
 upcast<8>(Layout<Shape<Int<8>, Int<1024>>, Stride<Int<1024>, Int<1>>>)
@@ -4983,7 +4983,7 @@ upcast<8>(Layout<Shape<Int<8>, Int<1024>>, Stride<Int<1024>, Int<1>>>)
   └─► 最终: Layout<Shape<Int<8>,Int<128>>, Stride<Int<128>,Int<1>>>
 ```
 
-#### 四个分支各自的触发条件
+##### 31.12.7.6 四个分支各自的触发条件
 
 | 分支 | 条件 | 何时触发 | 本例是否触发 |
 |------|------|----------|:--:|
@@ -4994,9 +4994,9 @@ upcast<8>(Layout<Shape<Int<8>, Int<1024>>, Stride<Int<1024>, Int<1>>>)
 
 `Int<N>` 同时满足 "is_static"（空类型，无运行时成员）又不是 "is_constant<0>"（除非 N=0），因此**所有的 `Int<1024>` / `Int<1>` stride 都会落入 Branch 3** 的 `ceil_div` 逻辑。Branch 4 只在 stride 是运行时变量（如 `int` 类型）时才会命中，本例不涉及。
 
-## 14. SLayoutX / SLayoutW 类型化简
+### 31.13 SLayoutX / SLayoutW 类型化简
 
-### 14.1 类型定义回顾
+#### 31.13.1 类型定义回顾
 
 `src/group_gemm/config.h:77-84`：
 
@@ -5012,7 +5012,7 @@ using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{},
 
 `SLayoutXAtom` / `SLayoutWAtom` 均为 `ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag_bits<8>, Layout<Shape<_8,_128>, Stride<_128,_1>>>`（第 13 章已推导）。`tile_to_shape` 将原子布局平铺到指定的 tile 尺寸上。
 
-### 14.2 化简规则
+#### 31.13.2 化简规则
 
 编译器报错中有两类噪声需要去掉：
 
@@ -5024,7 +5024,7 @@ std::conditional_t<true, Swizzle<3,4,3>, const Swizzle<3,4,3>&>  →  Swizzle<3,
 
 **规则 2**：`cute::C<N>` 是 `cute::Int<N>`（即 `cute::integral_constant<int, N>`），在 CuTe 中通常记作 `_N`。本次用 `Int<N>` 表示。
 
-### 14.3 SLayoutX (kTileM=64, kTileK=128, kStage=8)
+#### 31.13.3 SLayoutX (kTileM=64, kTileK=128, kStage=8)
 
 `temp/debug.log.2:33-36`，化简前：
 
@@ -5079,7 +5079,7 @@ ComposedLayout<
 >
 ```
 
-### 14.4 SLayoutW (kTileN=128, kTileK=128, kStage=8)
+#### 31.13.4 SLayoutW (kTileN=128, kTileK=128, kStage=8)
 
 `temp/debug.log.2:38-41`。注意 `SLayoutW` 定义中用的 tile size 是 `(kTileN, kTileK, kStage)` 即 `(128, 128, 8)`，与 `kTileM` 无关，因此对所有 kTileM 取值类型相同。
 
@@ -5105,7 +5105,7 @@ ComposedLayout<
 >
 ```
 
-### 14.5 SLayoutX 的 kTileM 敏感性
+#### 31.13.5 SLayoutX 的 kTileM 敏感性
 
 对比 4 个 kTileM 值下的 SLayoutX（`temp/debug.log.2:3/13/23/33`），变化的仅最后一列：
 
@@ -5118,7 +5118,7 @@ ComposedLayout<
 
 规律：Mode-2 的 Shape 第二分量 = `kTileM / 8`，Stride 第二分量 = `kTileN * kTileM = 128 * kTileM`。
 
-### 14.6 与 SLayoutXAtom 的区别对比
+#### 31.13.6 与 SLayoutXAtom 的区别对比
 
 `SLayoutXAtom` 是**原子布局**（2D），仅描述单个 swizzle tile 在 shared memory 中形态：
 
@@ -5133,9 +5133,9 @@ Layout<Shape<Int<8>, Int<128>>, Stride<Int<128>, Int<1>>>
 
 ---
 
-## 15. SLayoutY 与 CopyBoxY 类型化简
+### 31.14 SLayoutY 与 CopyBoxY 类型化简
 
-### 15.1 定义回顾
+#### 31.14.1 定义回顾
 
 `config.h:79,85-88`：
 
@@ -5153,7 +5153,7 @@ using CopyBoxY     = decltype(tile_to_shape(SLayoutYAtom{},
 - `Tout=bfloat16_t` → `smem_ptr_flag_bits<16>`（16 bit），区别于 float_e4m3_t 的 `smem_ptr_flag_bits<8>`
 - Y 不需要多 stage 双缓冲 → SLayoutY/CopyBoxY 是 **2D**（N × M），不像 SLayoutX/SLayoutW 是 3D（Stage × K × M/N）
 
-### 15.2 SLayoutYAtom 类型
+#### 31.14.2 SLayoutYAtom 类型
 
 ```
 ComposedLayout<
@@ -5168,7 +5168,7 @@ ComposedLayout<
 
 32×8 原子，MN-major 排布（N 方向 32 元素连续，M 方向 stride=32）。
 
-### 15.3 SLayoutY 化简类型
+#### 31.14.3 SLayoutY 化简类型
 
 `SLayoutY = tile_to_shape(SLayoutYAtom{}, Shape<Int<128>, Int<kTileM>>)`
 
@@ -5207,7 +5207,7 @@ ComposedLayout<
 
 规律：Mode-1 Shape 第二分量 = `kTileM / 8`。
 
-### 15.4 CopyBoxY 化简类型
+#### 31.14.4 CopyBoxY 化简类型
 
 `CopyBoxY = tile_to_shape(SLayoutYAtom{}, Shape<Int<64>, Int<kTileM>>)`
 
@@ -5242,7 +5242,7 @@ ComposedLayout<
 | 48     | `tuple<Int<8>, Int<6>>`  | `tuple<Int<32>, Int<512>>`  |
 | 64     | `tuple<Int<8>, Int<8>>`  | `tuple<Int<32>, Int<512>>`  |
 
-### 15.5 与 SLayoutX/SLayoutW 的关键差异对比
+#### 31.14.5 与 SLayoutX/SLayoutW 的关键差异对比
 
 | 属性 | SLayoutX / SLayoutW | SLayoutY / CopyBoxY |
 |------|---------------------|---------------------|
@@ -5254,9 +5254,9 @@ ComposedLayout<
 | 用途 | TMA load（X从global→smem，W从global→smem） | TMA store（Y从smem→global） |
 - Mode-2 Stride 第二分量：`Int<16384>` vs `Int<8192>`（= `128*kTileN` vs `128*kTileM`）
 
-## 16. SM80_16x8x16_F16F16F16F16_TN 和 `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16`
+### 31.15 SM80_16x8x16_F16F16F16F16_TN 和 `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16`
 
-### 16.1 CUTLASS/CUTE 这个 struct 封装了什么
+#### 31.15.1 CUTLASS/CUTE 这个 struct 封装了什么
 
 `cute-gemm/3rd/cutlass/include/cute/arch/mma_sm80.hpp` 中的
 `SM80_16x8x16_F16F16F16F16_TN` 是对 Ampere SM80 warp-level MMA 指令的很薄封装：
@@ -5296,7 +5296,7 @@ D = A * B + C
 
 `row.col` 表示这条 PTX 指令视角下 A fragment 按 row-major 解释，B fragment 按 column-major 解释。CUTE 上层 tensor 的真实全局内存 layout 可以不同，关键是 `MMA_Traits` 和 copy/partition 负责把每个 lane 的寄存器 fragment 放到这条指令要求的位置。
 
-### 16.2 输入输出操作数是否都必须在寄存器
+#### 31.15.2 输入输出操作数是否都必须在寄存器
 
 是的，对 `mma.sync.aligned...` 这条 PTX 指令本身来说，`a`、`b`、`c`、`d` 全部都是寄存器 fragment，不是 global/shared memory 地址。
 
@@ -5312,7 +5312,7 @@ NVIDIA PTX ISA 对 `mma` 的描述也是这种模型：矩阵 A、B、C、D 的 
 参考：NVIDIA PTX ISA, `mma` instruction:
 <https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma>
 
-### 16.3 后缀是 `f16.f16.f16.f16`，为什么 CUTLASS 用 `uint32_t` 寄存器
+#### 31.15.3 后缀是 `f16.f16.f16.f16`，为什么 CUTLASS 用 `uint32_t` 寄存器
 
 `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` 末尾四个类型按 PTX 语法分别表示：
 
@@ -5364,7 +5364,7 @@ mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
 参考：NVIDIA PTX ISA, `mma` examples:
 <https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma>
 
-### 16.4 需要几个线程协同参与
+#### 31.15.4 需要几个线程协同参与
 
 需要一个完整 warp，也就是 32 个线程协同参与。
 
@@ -5372,7 +5372,7 @@ mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
 
 如果 warp 中有线程没有执行同一条 `mma.sync.aligned`，或者有线程已经退出，行为未定义。
 
-### 16.5 每个线程提供多少 A/B/C/D 数据
+#### 31.15.5 每个线程提供多少 A/B/C/D 数据
 
 对 `SM80_16x8x16_F16F16F16F16_TN`，每个线程提供：
 
@@ -5392,7 +5392,7 @@ mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
 | C | `32 * 4 = 128` | `16 x 8` |
 | D | `32 * 4 = 128` | `16 x 8` |
 
-### 16.6 每个 lane 的 fragment 坐标
+#### 31.15.6 每个 lane 的 fragment 坐标
 
 令：
 
@@ -5401,7 +5401,7 @@ groupID           = laneid >> 2;  // 0..7
 threadID_in_group = laneid & 3;   // 0..3
 ```
 
-#### A fragment，8 个 fp16 元素
+##### 31.15.6.1 A fragment，8 个 fp16 元素
 
 对展开后的 A 元素 `ai, i = 0..7`：
 
@@ -5415,7 +5415,7 @@ col = threadID_in_group * 2 + (i & 1) + 8  if i >= 4
 
 这 8 个 half 被 packed 到 CUTLASS 的 4 个 `uint32_t` A registers 中。
 
-#### B fragment，4 个 fp16 元素
+##### 31.15.6.2 B fragment，4 个 fp16 元素
 
 对展开后的 B 元素 `bi, i = 0..3`：
 
@@ -5428,7 +5428,7 @@ col = groupID
 
 这 4 个 half 被 packed 到 CUTLASS 的 2 个 `uint32_t` B registers 中。
 
-#### C/D fragment，4 个 fp16 元素
+##### 31.15.6.3 C/D fragment，4 个 fp16 元素
 
 对展开后的 C 或 D 元素 `ci/di, i = 0..3`：
 
@@ -5449,7 +5449,7 @@ using ThrID = Layout<_32>;
 
 即一个 MMA atom 的 thread-id 空间就是 32 个 lane；而 A/B/C layout 描述的正是这些 lane 内 value fragment 到 `M/N/K` 坐标的映射。
 
-## 17. `mma.sync.m16n8k16` 做大矩阵乘法时如何处理 M/N/K 不能整除
+### 31.16 `mma.sync.m16n8k16` 做大矩阵乘法时如何处理 M/N/K 不能整除
 
 `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` 这条指令本身**不处理任意形状**。它每次只接受一个 warp 内已经排好的寄存器 fragment，并固定计算一个 `16 x 8 x 16` 的 MMA atom：
 
@@ -5459,7 +5459,7 @@ D[16 x 8] = A[16 x 16] * B[16 x 8] + C[16 x 8]
 
 所以不能把问题理解成“最后多出来 1 行时，mma 指令只算 1 行”。真实做法是：CUTLASS 外层仍然发射固定形状的 threadblock/warp/MMA tile，但在 global memory load 和 epilogue store 阶段加 predicate，把越界元素屏蔽掉。越界的 A/B 乘数按 0 参与计算，越界的 C/D 输出不读或不写。
 
-### 17.1 CUTLASS 的三层粒度
+#### 31.16.1 CUTLASS 的三层粒度
 
 以 SM80 默认 half tensorop GEMM 为例，`DefaultGemmConfiguration<arch::OpClassTensorOp, arch::Sm80, ...>` 里常见配置是：
 
@@ -5480,7 +5480,7 @@ using InstructionShape = GemmShape<16, 8, 16>;
 
 因此 `InstructionShape`、`WarpShape`、`ThreadblockShape` 是内核内部 tile 形状；用户的 `problem_size = {M,N,K}` 可以不被它们整除。
 
-### 17.2 M/N 尾块：多出来的输出 tile 只写合法元素
+#### 31.16.2 M/N 尾块：多出来的输出 tile 只写合法元素
 
 CUTLASS kernel 按 threadblock tile 对 M/N 维度做 grid：
 
@@ -5559,7 +5559,7 @@ bool guard = row_guard && mask_.predicates[column];
 
 所以最后一个 M/N tile 中的越界 C/D 元素不会访问内存。
 
-### 17.3 K 尾块：多算的 K 项用 A/B predicate 变成 0
+#### 31.16.3 K 尾块：多算的 K 项用 A/B predicate 变成 0
 
 K 维度不能整除 `k=16` 或 threadblock K tile 时，做法类似，但重点在 A/B load。
 
@@ -5595,7 +5595,7 @@ cutlass::arch::cp_async<kSrcBytes, kCacheOpA>(
 
 当 `iterator_A.valid()` / `iterator_B.valid()` 为 false 时，越界 A/B 元素不会被当作有效乘数。使用 zfill 路径时，shared memory 里的对应位置填 0；普通 predicated copy 路径也依赖 mainloop 对无效访问的屏蔽和清零策略。这样最后一次 `mma.sync` 虽然仍然按 `k=16` 形状执行，但越界 K lane 对应的 A/B 数据是 0，因此数学效果等价于只累加合法的 K 项。
 
-### 17.4 对 `M = 16*128 + 1` 的直观解释
+#### 31.16.4 对 `M = 16*128 + 1` 的直观解释
 
 假设 `N`、`K` 暂时都是整 tile，只有 `M=2049`：
 
@@ -5615,7 +5615,7 @@ C/D: [2049 x N]
 
 所以最终全局内存里只会得到真实的第 2048 行输出，不会写坏 D 后面的内存。
 
-### 17.5 CUTLASS 通用 GEMM 的关键思想
+#### 31.16.5 CUTLASS 通用 GEMM 的关键思想
 
 可以把 CUTLASS 的边界处理总结成三句话：
 
@@ -5625,7 +5625,7 @@ C/D: [2049 x N]
 
 这种方式的优点是主计算路径仍然使用高吞吐的固定形状 tensor core 指令，只有边界 block 多做少量无效计算；代价是边界处会有 predicate 判断和 padding/zero-fill 开销，但通常只发生在矩阵边缘，整体影响很小。
 
-### 17.6 “任意形状”不等于“任意 alignment”
+#### 31.16.6 “任意形状”不等于“任意 alignment”
 
 还要区分两个概念：
 
@@ -5644,7 +5644,7 @@ static int const kAlignmentC = Epilogue::OutputTileIterator::kElementsPerAccess;
 
 通用库的做法通常是：能满足 alignment 时走最快的 tensorop kernel；不满足时选择 alignment 更小的 kernel、SIMT kernel，或由调用方 padding 输入矩阵。
 
-## 18. `make_tiled_mma` 的 `permutations = make_layout(Shape<_1,_2,_1>{})` 是否有实际作用
+### 31.17 `make_tiled_mma` 的 `permutations = make_layout(Shape<_1,_2,_1>{})` 是否有实际作用
 
 问题代码在 `/data/like/package/cute-gemm/gemm-simple-like.cu` 第 88-90 行：
 
@@ -5664,7 +5664,7 @@ using MMA = decltype(make_tiled_mma(mma_atom{},
 
 结论先说清楚：**在这份代码的这个具体取值下，第三个参数 `(1,2,1)` 基本没有实际效果，不会把 TiledMMA 能处理的矩阵乘法形状从 `32 x 16 x 16` 继续扩大，也不会改变打印出来的 A/B/C thread-value layout。**
 
-### 18.1 第二个参数已经把 atom 扩展到 `32 x 16 x 16`
+#### 31.17.1 第二个参数已经把 atom 扩展到 `32 x 16 x 16`
 
 `mma_op = SM80_16x8x16_F16F16F16F16_TN` 的 atom shape 是：
 
@@ -5721,7 +5721,7 @@ ThrK = 1   // K 方向 1 个 atom
 dim3 block(size(MMA{}));  // 打印为 block.x = 128
 ```
 
-### 18.2 第三个参数在源码中的位置
+#### 31.17.2 第三个参数在源码中的位置
 
 `cute/atom/mma_atom.hpp` 中 `make_tiled_mma` 的实现是：
 
@@ -5757,7 +5757,7 @@ auto t_tensor = logical_divide(btensor, t_tile);
 
 所以它的设计目的不是“增加 MMA atom 的数量”，而是**在把 tensor 切成 atom tile 之前，先对 M/N/K 维做一个逻辑分块/排列**，从而影响 thread/value 到矩阵坐标的映射。
 
-### 18.3 但当前 `(1,2,1)` 不改变可处理 shape
+#### 31.17.3 但当前 `(1,2,1)` 不改变可处理 shape
 
 `TiledMMA::tile_size_mnk<I>()` 的源码是：
 
@@ -5813,7 +5813,7 @@ layoutB_TV: 相同
 
 因此在这份 `gemm-simple-like.cu` 中，第三参数可以理解为“形式上指定了一个 N 方向大小为 2 的 permutation tile，但它被已有的 N 方向 `2` 个 atom repeat 覆盖掉了，实际映射没有变化”。
 
-### 18.4 `permutations` 什么时候会有实际作用
+#### 31.17.4 `permutations` 什么时候会有实际作用
 
 `permutations` 有用的场景是：你想指定一个比 `atom_shape * thr_repeat` 更大的逻辑排列周期，或者想让 atom 按某种 swizzle/permutation 顺序覆盖 M/N/K 坐标。
 
@@ -5833,7 +5833,7 @@ make_layout(Shape<_1,_2,_1>{})
 
 只是一个很简单的 layout，而且 `N` 方向的 `perm_size = 2` 远小于当前 `core_size_N = 16`。所以它不会影响 `partition_A/B/C` 得到的实际 thread-value layout。
 
-### 18.5 回答问题中的两个判断
+#### 31.17.5 回答问题中的两个判断
 
 **判断 1：`(1,2,1)` 作为 permutations 参数是否有实际作用？**
 
@@ -5880,7 +5880,7 @@ make_layout(Shape<_1,_2,_1>{})
 ```
 
 可以删掉而不改变这个 `TiledMMA` 的实际 tile shape 和当前打印出的 A/B/C 映射。
-## cutlass_test_unit_cute_core 中 swizzle_layout_like.cpp 的 printf 为什么打印不出来
+## 32. cutlass_test_unit_cute_core 中 swizzle_layout_like.cpp 的 printf 为什么打印不出来
 
 结论：不是 cmake 没有重新编译，也不是 gtest 把 stdout 吃掉了；根因是 `test_swizzle_2d` 这个 namespace-scope 函数模板在两个 `.cpp` 文件中同名、同签名、同模板实参实例化，但函数体不同，造成 ODR 违规/weak COMDAT 符号碰撞。最终链接出的 `cutlass_test_unit_cute_core` 里，`CuTe_core.SwizzleLayout_like` 调用到的是另一个没有 debug `printf` 的 `test_swizzle_2d` 实例，所以 `swizzle_layout_like.cpp` 里 helper 内部的 `printf("<<<<<<<\n")` 没有执行。
 
@@ -5928,7 +5928,7 @@ nm -C build-bjh100/test/unit/cute/core/cutlass_test_unit_cute_core | rg "test_sw
 
 不要依赖链接顺序解决这个问题。当前链接顺序碰巧让 `swizzle_layout.cpp` 的无打印版本赢了；换编译器、链接器、优化选项或目标文件顺序后行为可能变化，但本质上两个不同函数体共享同一个外部链接模板名字已经是不可靠的。
 
-## cutlass_test_unit_cute_core 编译错误：print_tensor 未声明
+## 33. cutlass_test_unit_cute_core 编译错误：print_tensor 未声明
 
 `make.log` 里的直接错误是：
 
@@ -5987,7 +5987,7 @@ test_like_swizzle_2d(SwLayout const& sw_layout)
 2. 如果需要完整打印 tensor，打开 `#include <cute/util/print_tensor.hpp>`，并使用 `cute::print_tensor(sw_tensor);`。
 3. 如果只是做单元测试，不需要额外输出，删除或注释 `print_tensor(sw_tensor)`，减少测试日志噪声。
 
-## cutlass_test_unit_cute_core 编译错误：print_tensor.hpp 依赖 pointer_flagged.hpp
+## 34. cutlass_test_unit_cute_core 编译错误：print_tensor.hpp 依赖 pointer_flagged.hpp
 
 当前 `make.log` 的错误已经不是 `print_tensor` 未声明，而是包含了 `<cute/util/print_tensor.hpp>` 之后，`print_tensor.hpp` 自己内部用到的类型/函数没有提前声明：
 
@@ -6032,7 +6032,7 @@ cute::print_tensor(sw_tensor);
 2. 在 `test/unit/cute/core/swizzle_layout_like.cpp:38 file-scope include` 附近加入 `#include <cute/pointer_flagged.hpp>`，位置放在 `<cute/util/print_tensor.hpp>` 前。
 3. 如果不需要 `print_tensor` 的 pretty-print 输出，最干净的测试修法仍然是删除或注释 `test/unit/cute/core/swizzle_layout_like.cpp:52 test_like_swizzle_2d`，这样也不需要新增 `print_tensor.hpp` 和 `pointer_flagged.hpp` 依赖。
 
-## SwizzleLayout_like 第一个例子中 print_tensor 如何调用到 Swizzle::apply
+## 35. SwizzleLayout_like 第一个例子中 print_tensor 如何调用到 Swizzle::apply
 
 本节只看 `TEST(CuTe_core_like, SwizzleLayout_like)` 的第一个例子：
 
@@ -6142,11 +6142,11 @@ m=7: 8*7 + (n xor 7) = 63 62 61 60 59 58 57 56
 
 因此它不是无规律，而是 `Swizzle<3,0,3>` 把 row-major index 的 bit[5:3] 复制到低 3 bit 上做 XOR。直观说：第 `m` 行内部，列号按 `n xor m` 重新排列；不跨行搬移，因为高 3 bit `m` 保持不变。
 
-## SwizzleLayout_like 剩余两个例子的 print_tensor 结果解释
+## 36. SwizzleLayout_like 剩余两个例子的 print_tensor 结果解释
 
 前面第一个例子已经说明了共同调用路径：`print_tensor` 最终会通过 composed layout 计算 `layout_a()(offset() + layout_b()(coord))`。这个关键入口在 `include/cute/layout_composed.hpp:118 ComposedLayout::operator()`；真正的 swizzle 位运算在 `include/cute/swizzle.hpp:78 Swizzle::apply`。因此下面只需要分别算清楚两个例子的 `layout_b(m,n)` 和 `Swizzle::apply(offset)`。
 
-### 第二个例子：Swizzle<3,0,-3>
+### 36.1 第二个例子：Swizzle<3,0,-3>
 
 代码位置：
 
@@ -6224,7 +6224,7 @@ m=7: 8*(7 xor n) + n = 56 49 42 35 28 21 14  7
    56   49   42   35   28   21   14    7
 ```
 
-### 第三个例子：Swizzle<2,1,3> + 嵌套 shape/stride
+### 36.2 第三个例子：Swizzle<2,1,3> + 嵌套 shape/stride
 
 代码位置：
 
@@ -6337,7 +6337,7 @@ m=7, (m0,m1,m2)=(1,1,1): 46 42 47 43 60 56 61 57
 
 因此第三个例子看起来更乱，是因为乱序来自两层：第一层是嵌套 stride 本身已经把 `m,n` 的 bit 分散到了 offset 的 bit5、bit1、bit3、bit2、bit0、bit4；第二层是 `Swizzle<2,1,3>` 又把 bit4/bit5 右移后 XOR 到 bit1/bit2。`print_tensor` 输出的每个数字就是这两层映射叠加后的最终线性 index。
 
-## SM80_CP_ASYNC_CACHEGLOBAL 中的 cp.async.cg.shared.global.L2::128B
+## 37. SM80_CP_ASYNC_CACHEGLOBAL 中的 cp.async.cg.shared.global.L2::128B
 
 `SM80_CP_ASYNC_CACHEGLOBAL` 位于 cute-gemm 仓库的 CUTLASS 子目录：
 
@@ -6420,7 +6420,7 @@ cp.async.wait_group / cp.async.wait_all
 
 总结：`cp.async.cg.shared.global.L2::128B` 是 Ampere/SM80 以后用于 global-to-shared 软件流水的核心指令形态。`cg` 控制缓存策略，`shared.global` 控制搬运方向，`L2::128B` 是 L2 预取提示，第三个操作数才是本条指令真正拷贝到 shared 的字节数。CUTLASS/CuTe 把它包装成 `SM80_CP_ASYNC_CACHEGLOBAL`，用于 GEMM 主循环中把下一批 global tile 异步搬进 shared memory，从而和当前 tile 的 MMA 计算重叠。
 
-## SwizzleLayout_like 第 4 个例子：Swizzle<3,3,3> + 8x32 row-major
+## 38. SwizzleLayout_like 第 4 个例子：Swizzle<3,3,3> + 8x32 row-major
 
 第 4 个例子的代码位置：
 
@@ -6549,7 +6549,7 @@ result = bit[8:6] 保持 3，bit[5:3] 改成 4，bit[2:0] 保持 0
 
 所以第 4 个例子的精确规律是按线性 offset 的 bit 段来 XOR：`Swizzle<3,3,3>` 取 bit[8:6] 作为 YYY，右移 3 位后 XOR 到 bit[5:3] 的 ZZZ。对于 `(_8,_32):(_32,_1)`，这等价于每 64 个元素为一大段，段号 `floor(offset/64)` 控制本段内 8 元素小块的重排；组内 8 个连续元素不变。
 
-## gemm-multi-stage-like.cu 中 SmemLayoutA 类型如何由 tile_to_shape 得到
+## 39. gemm-multi-stage-like.cu 中 SmemLayoutA 类型如何由 tile_to_shape 得到
 
 问题代码在 cute-gemm 仓库的 `gemm-multi-stage-like.cu`：
 
@@ -6703,7 +6703,7 @@ Sw<3,3,3> o _0 o (_128,_32,_3):(_32,_1,_4096)
 
 总结：`SmemLayoutA` 的类型不是手写出来的，而是两步推导出来的。第一步，`SmemLayoutAtom` 用 `composition(Swizzle<3,3,3>, Layout<_8,_32>)` 得到一个带 swizzle 的 8x32 atom；第二步，`tile_to_shape` 对这个 `ComposedLayout` 的内部 `Layout<_8,_32>` 做平铺，把它扩展到目标 shape `(128,32,3)`，得到普通 layout `(_128,_32,_3):(_32,_1,_4096)`，再把原来的 `Swizzle<3,3,3> o _0` 套回去。
 
-## Copy_Traits 的 SrcLayout 为什么变成 Copy_Atom 的 ValLayoutSrc
+## 40. Copy_Traits 的 SrcLayout 为什么变成 Copy_Atom 的 ValLayoutSrc
 
 日志中的现象是：
 
@@ -6832,7 +6832,7 @@ Copy_Atom
 
 一句话总结：`Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>>::SrcLayout` 描述的是 cp.async 这条指令一次搬 128 bit 的 bit 级布局，所以是 `(_1,_128):(_0,_1)`；`Copy_Atom<g2s_copy_traits, T>` 需要知道以用户元素类型 `T` 来看一次 copy 有多少个 value，于是用 `recast_layout<uint1_t, ValType>` 把 128 个 1-bit 单位重解释成 8 个 16-bit value，得到 `ValLayoutSrc = (_1,_8):(_0,_1)`。
 
-## trait_ratio 调用 nratio 后，nratio 是如何表达除法的？
+## 41. trait_ratio 调用 nratio 后，nratio 是如何表达除法的？
 
 以前面 `recast_layout<uint1_t, ValType>(BitLayoutSrc{})` 为上下文，调用入口在 `3rd/cutlass/include/cute/layout.hpp:1653 recast_layout`。它在 `3rd/cutlass/include/cute/layout.hpp:1655 recast_layout` 计算：
 
@@ -6925,7 +6925,7 @@ else if constexpr (scale::den == 1) {
 
 一句话总结：`trait_ratio` 先把 `sizeof_bits<ValType>` 和 `sizeof_bits<uint1_t>` 的 `value` 转成 `C<16>` 和 `C<1>`，然后调用的是 `nratio(C<a>, C<b>)` 这个重载，返回 `R<16,1>`；`nratio` 所谓的“除法”是类型级比例 `R<分子,分母>`，真正被后续代码使用的是 `R::num` 和 `R::den`，本例最终触发 `recast_layout` 的 `upcast<16>`。
 
-## G2SCopyA 的 Tiler_MN 和 TiledLayout_TV 是如何算出来的？
+## 42. G2SCopyA 的 Tiler_MN 和 TiledLayout_TV 是如何算出来的？
 
 `G2SCopyA` 的类型定义在 `gemm-multi-stage-like.cu:271 GemmConfig::G2SCopyA` 到 `gemm-multi-stage-like.cu:275 GemmConfig::G2SCopyA`：
 
@@ -6972,7 +6972,7 @@ TiledLayout_TV: ((_4,_32),_8):((_256,_1),_32)
 
 就是 `tiler` 和 `layout_tv` 的类型打印。
 
-### 第一步：计算 layout_mn
+### 42.1 第一步：计算 layout_mn
 
 `raked_product` 的定义在 `3rd/cutlass/include/cute/layout.hpp:1532 raked_product` 到 `3rd/cutlass/include/cute/layout.hpp:1539 raked_product`：
 
@@ -7065,7 +7065,7 @@ mn : (_32,(_8,_4)):(_4,(_128,_1))
 
 这里 K 维的层级 shape `(_8,_4)` 分别对应 `v_k` 和 `t_k`：`v_k` 的 stride 是 128，`t_k` 的 stride 是 1。后续 `right_inverse` 会按 stride 从 1 开始反推，所以它先看到 stride 为 1 的 `t_k` 子维，再看到 stride 为 4 的 `m` 子维，最后看到 stride 为 128 的 `v_k` 子维。
 
-### 第二步：计算 TiledLayout_TV
+### 42.2 第二步：计算 TiledLayout_TV
 
 `TiledLayout_TV` 来自 `3rd/cutlass/include/cute/atom/copy_atom.hpp:486 make_tiled_copy`：
 
@@ -7230,7 +7230,7 @@ auto tAsA_copy = g2s_thr_copy_a.partition_D(sA);
 
 一句话总结：`Tiler_MN: (_32,_32)` 来自 `raked_product((_32,_4):(_4,_1), (_1,_8):(_0,_1))` 后的 tile shape，即 `32 x (4*8)`；`TiledLayout_TV: ((_4,_32),_8):((_256,_1),_32)` 是这个 `layout_mn` 的 `right_inverse`，它表达的是 `tid = 4*m + k_group`、`vid = k_inner`，最终每个线程搬同一行上的 8 个连续 half，128 个线程一次覆盖 A 的 `32 x 32` 子 tile。
 
-## parallel_contain_target.cc 多线程 two-sum 实现讲解
+## 43. parallel_contain_target.cc 多线程 two-sum 实现讲解
 
 代码位置是 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc`。
 
@@ -7247,7 +7247,7 @@ parallel_contain_target.cc
   main                           // 测试用例，行 94-119
 ```
 
-### 单线程版本
+### 43.1 单线程版本
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:13 single_thread_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:25 single_thread_contain_target` 是单线程基准实现。
 
@@ -7280,7 +7280,7 @@ step 1:
 
 这个版本的作用主要是作为正确性参考。后面的多线程结果必须和它一致。
 
-### 多线程版本的核心思路
+### 43.2 多线程版本的核心思路
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:27 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:80 parallel_contain_target` 是多线程实现。
 
@@ -7322,7 +7322,7 @@ step 1:
               true or false
 ```
 
-### 为什么先构建 counts 表？
+### 43.3 为什么先构建 counts 表？
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:33 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:37 parallel_contain_target` 构建了：
 
@@ -7354,7 +7354,7 @@ counts 是否包含 y
 
 因为 `counts` 构建完成后不再修改，所以多个线程可以并发读取它。代码里所有 worker 线程只调用 `counts.find(y)` 和读取 `it->second`，没有写入 `counts`。
 
-### 如何分配线程？
+### 43.4 如何分配线程？
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:39 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:43 parallel_contain_target` 使用：
 
@@ -7417,7 +7417,7 @@ const size_t begin = tid * chunk;
 const size_t end = std::min(n, begin + chunk);
 ```
 
-### 每个线程做什么？
+### 43.5 每个线程做什么？
 
 worker 线程的逻辑在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:58 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:72 parallel_contain_target`。
 
@@ -7490,7 +7490,7 @@ case B: arr = [3, 3], target = 6
   => true
 ```
 
-### found 原子变量的作用
+### 43.6 found 原子变量的作用
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:45 parallel_contain_target` 定义了：
 
@@ -7534,7 +7534,7 @@ stop early                      stop early
 
 这里使用 `memory_order_relaxed` 是足够的，因为 `found` 只表达“是否已经找到答案”这个布尔状态，不依赖它同步其它内存数据。`counts` 和 `arr` 在线程启动前已经构建好，worker 线程只读它们。
 
-### 等待线程结束
+### 43.7 等待线程结束
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:75 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:77 parallel_contain_target`：
 
@@ -7561,7 +7561,7 @@ main thread
 return found
 ```
 
-### 正确性验证
+### 43.8 正确性验证
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:82 run_case` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:92 run_case` 同时调用单线程和多线程版本：
 
@@ -7607,7 +7607,7 @@ All tests passed.
 
 一句话总结：这个多线程版本先用单线程构建一个只读 `counts` 哈希表，然后把数组索引区间切成多个 chunk 给多个 CPU 线程并行扫描；每个线程只读 `arr/counts`，用 `atomic<bool> found` 协调提前退出，最后用单线程基准和 `assert` 验证多线程结果正确。
 
-## parallel_contain_target.cc 新版：hash 分桶 + 每桶独立建表 + 并行查询
+## 44. parallel_contain_target.cc 新版：hash 分桶 + 每桶独立建表 + 并行查询
 
 新版代码位置仍然是 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc`。相比前一个版本，新版把“构建全局 counts 哈希表”也并行化了。核心函数是 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:62 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:166 parallel_contain_target`。
 
@@ -7664,7 +7664,7 @@ arr size = N, thread_count = T, bucket_count = T
           atomic found
 ```
 
-### 辅助函数
+### 44.1 辅助函数
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:15 worker_count_for` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:25 worker_count_for` 用来决定线程数：
 
@@ -7707,7 +7707,7 @@ target - x 超出 int 范围
 => 不继续查 y
 ```
 
-### Phase 1：并行分桶
+### 44.2 Phase 1：并行分桶
 
 Phase 1 的数据结构在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:74 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:75 parallel_contain_target`：
 
@@ -7772,7 +7772,7 @@ thread 2:
 
 Phase 1 完成后，主线程在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:98 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:101 parallel_contain_target` 对所有 worker 做 `join`，确保分桶全部结束。
 
-### Phase 2：每桶独立建表
+### 44.3 Phase 2：每桶独立建表
 
 Phase 2 的目标数据结构在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:103 parallel_contain_target`：
 
@@ -7850,7 +7850,7 @@ bucket worker 2 只写 bucket_counts[2]
 
 Phase 2 完成后，主线程在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:123 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:126 parallel_contain_target` 再次 `join` 所有 worker。之后 `bucket_counts` 就变成只读数据。
 
-### Phase 3：并行查询
+### 44.4 Phase 3：并行查询
 
 Phase 3 在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:128 parallel_contain_target` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:165 parallel_contain_target`。
 
@@ -7916,7 +7916,7 @@ bucket_counts[bucket_index(y, bucket_count)]
 
 而不是 `bucket_counts[bucket_index(x, bucket_count)]`。
 
-### x == y 的特殊处理
+### 44.5 x == y 的特殊处理
 
 如果 `x + y == target` 且 `x != y`，只要 `y` 存在就可以返回 true。
 
@@ -7959,7 +7959,7 @@ bucket_counts[hash(3)%T][3] = 2
 => true
 ```
 
-### found 的提前退出
+### 44.6 found 的提前退出
 
 Phase 3 的 worker 循环条件在 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:139 parallel_contain_target`：
 
@@ -7992,7 +7992,7 @@ stop                             stop
 
 这里 `memory_order_relaxed` 足够，因为 `found` 只用来传递“是否已找到”这个布尔状态，不用来保护其它数据。`bucket_counts` 在 Phase 2 完成并 `join` 后才进入 Phase 3，Phase 3 中它只读。
 
-### 为什么这个版本更接近 O(N / num_thread)？
+### 44.7 为什么这个版本更接近 O(N / num_thread)？
 
 旧版本的问题是：`counts` 哈希表由主线程单线程构建，所以这一步是 `O(N)` wall-clock。
 
@@ -8043,7 +8043,7 @@ hash 均匀时的平均 wall-clock: O(N / num_thread)
 hash 极端倾斜时最坏情况:     O(N)
 ```
 
-### 测试覆盖
+### 44.8 测试覆盖
 
 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:168 run_case` 到 `/softhome/like/asset/code/cute-reed/like-useful/parallel_contain_target.cc:178 run_case` 同时调用单线程和新版多线程实现：
 
@@ -8073,7 +8073,7 @@ large false
 
 一句话总结：新版实现把全局哈希表构建拆成“本地分桶 + 每桶独立建表”，避免多个线程同时写一个 `unordered_map`；查询阶段再按 `hash(target - x)` 定位到唯一 bucket，只读查表，并用 `atomic<bool> found` 做提前退出。在 hash 均匀时，三个阶段的 wall-clock 都接近 `O(N / num_thread)`。
 
-## bench_ddr_bandwidth.cc：测量 DDR 内存带宽并尽量剔除 cache 影响
+## 45. bench_ddr_bandwidth.cc：测量 DDR 内存带宽并尽量剔除 cache 影响
 
 实现文件是 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc`。这个程序的目标不是测 L1/L2/L3 cache 带宽，而是让被计时的访问尽量来自 DDR 内存。
 
@@ -8104,7 +8104,7 @@ bench_ddr_bandwidth.cc
   main                  // 参数解析、运行测试、打印结果，行 278-347
 ```
 
-### 使用方法
+### 45.1 使用方法
 
 编译命令：
 
@@ -8150,7 +8150,7 @@ read+nt_write      bytes=   536870912 best_s=0.005534 bandwidth=90.36 GiB/s
 sink=0
 ```
 
-### 为什么要让 buffer 大于 LLC？
+### 45.2 为什么要让 buffer 大于 LLC？
 
 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:107 detect_llc_bytes` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:115 detect_llc_bytes` 从 Linux sysfs 读取：
 
@@ -8203,7 +8203,7 @@ ASCII 图：
   测出来更接近 DDR streaming bandwidth
 ```
 
-### 为什么要 clflush？
+### 45.3 为什么要 clflush？
 
 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:152 flush_cache_lines` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:164 flush_cache_lines` 对 buffer 每 64B 调用一次：
 
@@ -8238,7 +8238,7 @@ before timed pass:
 
 需要注意：`clflush` 不是关闭 cache，而是把指定 cache line 从 cache hierarchy 中驱逐。计时过程中 CPU 读入的数据仍然会进入 cache，但因为访问是大数组单次流式扫描，后面不会反复命中同一批 cache line。
 
-### 为什么写带宽用 non-temporal store？
+### 45.4 为什么写带宽用 non-temporal store？
 
 普通写入可能触发 write-allocate：
 
@@ -8296,7 +8296,7 @@ non-temporal store:
   尽量减少 cache 污染和 write-allocate 影响
 ```
 
-### 三个测试项的含义
+### 45.5 三个测试项的含义
 
 读带宽测试在 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:185 best_read_seconds` 到 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:209 best_read_seconds`。
 
@@ -8346,7 +8346,7 @@ bytes = 2 * buffer_size
 read+nt_write
 ```
 
-### 为什么需要 g_sink？
+### 45.6 为什么需要 g_sink？
 
 `/softhome/like/asset/code/cute-reed/like-useful/bench_ddr_bandwidth.cc:30 g_sink` 定义为：
 
@@ -8358,7 +8358,7 @@ volatile uint64_t g_sink = 0;
 
 目的：防止编译器发现读出来的数据没有被使用，然后把整个读循环优化掉。
 
-### 是否需要修改内核参数？
+### 45.7 是否需要修改内核参数？
 
 不必须修改内核参数。这个程序可以直接在普通用户态运行，核心依赖是：
 
@@ -8402,7 +8402,7 @@ echo 3 > /proc/sys/vm/drop_caches
 
 而且这类命令需要 root，还会影响整机其它进程，不建议作为本测试的必要步骤。
 
-### 工作原理总结
+### 45.8 工作原理总结
 
 可以把程序理解成下面这条流水线：
 
@@ -8427,7 +8427,7 @@ bandwidth = transferred_bytes / elapsed_seconds
 
 一句话总结：这个 benchmark 不能从硬件上关闭 cache，但通过“大于 LLC 的工作集 + 计时前 clflush + 流式单次访问 + non-temporal store”，让被计时的内存流量主要来自 DDR；不需要修改内核参数，想要更稳定结果时再用 CPU/NUMA 绑定和固定频率等运行环境设置。
 
-## TiledMMA_ins.get_layoutA_TV() 为什么打印成这个 layout？
+## 46. TiledMMA_ins.get_layoutA_TV() 为什么打印成这个 layout？
 
 问题中的打印来自 `gemm-multi-stage-like.cu:473 main` 到 `gemm-multi-stage-like.cu:474 main`：
 
@@ -8466,7 +8466,7 @@ TiledLayout_TV: ((_4,_8,_2,_2),((_2,_2,_2),(_1,_1))):((_64,_1,_16,_0),((_32,_8,_
 
 其 `TiledLayout_TV` 就是 `mma.get_layoutA_TV()` 的返回值。
 
-### 1. TiledMMA 的构造参数
+### 46.1 TiledMMA 的构造参数
 
 `gemm-multi-stage-like.cu:247 GemmConfig` 到 `gemm-multi-stage-like.cu:265 GemmConfig` 定义：
 
@@ -8524,7 +8524,7 @@ kMmaPN = 2 * 2 *  8 = 32
 kMmaPK = 1 * 1 * 16 = 16
 ```
 
-### 2. make_tiled_mma 如何得到 ThrLayoutVMNK
+### 46.2 make_tiled_mma 如何得到 ThrLayoutVMNK
 
 `make_tiled_mma` 在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:582 make_tiled_mma` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:591 make_tiled_mma`：
 
@@ -8594,7 +8594,7 @@ thread_idx = ThrV + 32 * ThrM + 64 * ThrN + 0 * ThrK
 
 因为 `ThrK` size 是 1，所以 stride 0 在这里只是一个 size-1 占位维。
 
-### 3. tile_size_mnk 得到 A tile 是 32x16
+### 46.3 tile_size_mnk 得到 A tile 是 32x16
 
 `tile_size_mnk` 在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:381 tile_size_mnk` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:393 tile_size_mnk`：
 
@@ -8631,7 +8631,7 @@ ref_A = make_layout((_32,_16))
 auto ref_A = make_layout(make_shape(tile_size_mnk<0>(), tile_size_mnk<2>()));
 ```
 
-### 4. thrfrg_A(ref_A) 的调用链和中间结果
+### 46.4 thrfrg_A(ref_A) 的调用链和中间结果
 
 `get_layoutA_TV()` 在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:455 get_layoutA_TV` 调用：
 
@@ -8732,7 +8732,7 @@ RestK = _1
 
 注意这里还没有把 `ThrN` 放进去，因为 A 只依赖 M/K，不依赖 N。
 
-### 5. get_layoutA_TV 为什么还要 compose(atile, _)
+### 46.5 get_layoutA_TV 为什么还要 compose(atile, _)
 
 `get_layoutA_TV()` 并不是直接返回 `thrfrg_A(ref_A)`。它在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:457 get_layoutA_TV` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:461 get_layoutA_TV` 构造了 `atile`：
 
@@ -8786,7 +8786,7 @@ thrfrg_A(ref_A).compose(atile, _)
 
 可以看到 `(_2,_2):(_1,_0)` 被放进了线程 mode 中，这就是后面最终第一个 mode 出现 `(_4,_8,_2,_2)` 的原因。
 
-### 6. right_inverse(thr_layout_vmnk_) 为什么是 _128:_1
+### 46.6 right_inverse(thr_layout_vmnk_) 为什么是 _128:_1
 
 `get_layoutA_TV()` 接着在 `3rd/cutlass/include/cute/atom/mma_atom.hpp:463 get_layoutA_TV` 到 `3rd/cutlass/include/cute/atom/mma_atom.hpp:467 get_layoutA_TV` 做：
 
@@ -8818,7 +8818,7 @@ thrfrg_A(ref_A).compose(atile,_).compose(thridx_2_thrid,_)
 
 这和日志完全一致。
 
-### 7. 最终 layout 每个 mode 的含义
+### 46.7 最终 layout 每个 mode 的含义
 
 最终打印：
 
@@ -8865,7 +8865,7 @@ offset =
 
 因为 `RestM = RestK = 1`，所以最后两个 stride 0 是 size-1 维的占位，确实不产生不同坐标。
 
-### 8. 第一个 mode 中 stride=_0 有什么用？
+### 46.8 第一个 mode 中 stride=_0 有什么用？
 
 第一个 mode 是：
 
@@ -8942,7 +8942,7 @@ offset 不变
 
 这表示 N 方向的两个线程组在 A copy/layout 上访问同一组 A 坐标。
 
-### 9. stride=_0 是否意味着对应 shape=_2 没意义？
+### 46.9 stride=_0 是否意味着对应 shape=_2 没意义？
 
 不是。
 
@@ -8980,3 +8980,1516 @@ shape = 2:
 其中 `(_1,_1)` 的 stride 是 `(_0,_0)`，这是因为当前 `RestM=RestK=1`，它们只是保留 layout 层级结构的 size-1 占位。
 
 一句话总结：`get_layoutA_TV()` 的结果来自 `ref_A(_32,_16)` 经 `thrfrg_A` 切成 atom/thread/value 层级，再用 `atile` 把 A 的 `(ThrM,ThrK)` 线程维扩展成完整 `(ThrM,ThrN,ThrK)`，最后用 `right_inverse(thr_layout_vmnk_)` 把完整 `thr_idx` 接进来；第一个 mode 中最后一个 `shape=_2,stride=_0` 是 `ThrN` 维，表示 N 方向两个线程组对 A 坐标是广播复用，不表示这个维度没有意义。
+
+## 47. CUTLASS wgmma_tma_sm90.cu：TMA、WGMMA 与 warp specialization
+
+以下源码定位均相对于 CUTLASS code base 根目录 /share/users/like/package/cutlass，格式为“相对路径:行号，函数名”。分析文件是 examples/cute/tutorial/hopper/wgmma_tma_sm90.cu。
+
+### 47.1 示例的整体任务
+
+这个 Hopper SM90 教程把 global-memory A/B tile 通过 TMA 异步搬到三阶段 shared memory，再让 WGMMA 从 shared-memory descriptor 直接读取并累加到 C fragment：
+
+    global A/B
+        | TMA asynchronous load
+        v
+    shared A/B pipeline
+        | WGMMA reads shared descriptors
+        v
+    WGMMA accumulator
+        | axpby
+        v
+    global C
+
+CTA tile、pipeline stage 和 WGMMA/TMA 类型由 host 端 gemm_nt()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:262-344, gemm_nt()）或 gemm_tn()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:346-426, gemm_tn()）配置，设备端统一进入 gemm_device()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:65-260, gemm_device()）。
+
+### 47.2 shared storage 与 kernel 参数
+
+SharedStorage（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:52-63, SharedStorage）包含：
+
+| 成员 | 作用 |
+|---|---|
+| A | 按 SmemLayoutA 存放 A 的多 stage shared tile |
+| B | 按 SmemLayoutB 存放 B 的多 stage shared tile |
+| tma_barrier | 每个 pipe 一个 ClusterTransactionBarrier，追踪 TMA transaction |
+| mma_barrier | 每个 pipe 一个 ClusterBarrier，追踪 WGMMA 消费 |
+
+gemm_device() 的模板参数携带问题 shape、CTA tiler、A/B 元素类型、TMA descriptor、C stride、TiledMMA、alpha 和 beta（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:65-77, gemm_device()）。__launch_bounds__(size(TiledMma{})) 使 block 线程数由 TiledMMA 的线程布局决定。
+
+kernel 开头的静态检查（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:79-91, gemm_device()）验证 shape 是 (M,N,K)、CTA tile 是 (BLK_M,BLK_N,BLK_K)、A/B shared layout 与 CTA tile 的 M/N/K 尺寸一致，以及 C stride 与 M/N shape 相容。
+
+### 47.3 global tile 与 shared tensor
+
+gemm_device() 在 examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:93-114 中：
+
+1. tma_a.get_tma_tensor 和 tma_b.get_tma_tensor 建立 TMA 视图 mA/mB；C 用 make_gmem_ptr 建立普通 tensor mC。
+2. local_tile 按 blockIdx 取得当前 CTA 的 gA/gB/gC。
+3. 动态 shared memory 被解释成 SharedStorage，建立 sA: (BLK_M, BLK_K, PIPE) 和 sB: (BLK_N, BLK_K, PIPE)。
+
+第三个 mode 是环形 pipeline stage，后续 producer/consumer barrier 允许同一 stage 在不同 K tile 间复用。
+
+### 47.4 TMA partition 与 transaction
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:116-136, gemm_device() 对 A/B 调用 tma_partition：
+
+    auto [tAgA, tAsA] = tma_partition(
+        tma_a, Int<0>{}, Layout<_1>{},
+        group_modes<0,2>(sA), group_modes<0,2>(gA));
+
+group_modes<0,2> 把 (X,Y,Z) 变成 ((X,Y),Z)，让 TMA 负责 tile 的 mode 0，外层保留 K tile 和 pipe。Int<0>{} 与 Layout<_1>{} 表示本示例没有 TMA multicast。返回的 tAgA/tBgB 是 global tile view，tAsA/tBsB 是 shared pipe view。
+
+源码第 135--136 行（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:134-136, gemm_device()）计算 A+B 一次 TMA transaction 的字节数。这个值会传给 arrive_and_expect_tx，使 producer barrier 同时等待线程 arrive 和预期 transaction 完成。
+
+### 47.5 barrier 初始化与 prologue
+
+#### 47.5.1 producer/consumer barrier
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:142-165, gemm_device() 初始化 K_PIPE_MAX、K tile 计数和两个指针状态：
+
+    int warp_idx = cutlass::canonical_warp_idx_sync();
+    int lane_predicate = cute::elect_one_sync();
+    uint64_t* producer_mbar = smem.tma_barrier;
+    uint64_t* consumer_mbar = smem.mma_barrier;
+
+每个 pipe 的 producer barrier 初始化 arrival count 为 1，consumer barrier 初始化 arrival count 为 128（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:155-162, gemm_device()）。这反映了本示例的策略：一个 elected lane 发起 TMA，而 128 个线程完成 WGMMA 消费后各自 arrive。cluster_sync()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:164-165, gemm_device()）保证 barrier 初始化在所有 CTA 间完成。
+
+#### 47.5.2 初始 TMA loads
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:167-180, gemm_device() 对所有 pipe 做 prologue。只有 warp 0 的 elected lane 执行 arrive_and_expect_tx 和两条 TMA copy；所有线程统一减少 k_tile_count、增加 k_tile。
+
+TMA copy atom 不是 128 个线程逐元素搬运；TMA engine 根据 descriptor 完成整块异步传输。
+
+### 47.6 WGMMA descriptor 与 accumulator
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:182-203, gemm_device() 调用 mma.get_thread_slice(threadIdx.x)，建立 A/B/C 的 per-thread views：
+
+    Tensor tCsA = thr_mma.partition_A(sA);
+    Tensor tCsB = thr_mma.partition_B(sB);
+    Tensor tCgC = thr_mma.partition_C(gC);
+    Tensor tCrC = thr_mma.make_fragment_C(tCgC);
+    Tensor tCrA = thr_mma.make_fragment_A(tCsA);
+    Tensor tCrB = thr_mma.make_fragment_B(tCsB);
+
+这里 tCrA/tCrB 是从 shared layout 生成的 WGMMA descriptor 视图，不是 SM80 风格的显式 S2R 寄存器 fragment。源码注释也明确说 WGMMA 直接从 shared memory 读取 descriptor（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:185-189, gemm_device()）；tCrC 才是需要清零并持续累加的 C fragment。
+
+### 47.7 三阶段主循环
+
+源码把主循环称为显式 producer-consumer synchronization（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:205-218, gemm_device()）：
+
+    auto write_state = cutlass::PipelineState<K_PIPE_MAX>();
+    auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();
+
+两个 PipelineState 都包含环形 pipe index 和 phase：write_state 追踪下一次 TMA 写入，read_state 追踪下一次 WGMMA 读取；phase 在环回时翻转，避免同一 barrier slot 的不同轮次混淆。
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:220-253, gemm_device() 的一轮顺序是：
+
+1. ProducerBarType::wait 等待当前 read_pipe 的 TMA 完成（223--225）。
+2. warpgroup_arrive、gemm、warpgroup_commit_batch 发起一批 WGMMA（227--230）。
+3. warpgroup_wait<0> 等待当前 K tile 的 WGMMA 完成（232--233）。
+4. 每个线程对 consumer_mbar[read_pipe] arrive，然后递增 read_state（235--237）。
+5. 如果还有 K tile，elected lane 选择 write_state.index()，等待旧内容被 consumer 消费，重新设置 transaction bytes，并发起 A/B TMA（239--250）。
+6. 统一递减 k_tile_count、递增 k_tile（251--252）。
+
+while 条件 k_tile_count > -K_PIPE_MAX 用同一循环完成尾部 drain：当 k_tile_count <= 0 时，第 239--249 行的条件禁止新的 TMA，但已经在 pipe 中的 tile 仍会被读完。
+
+### 47.8 epilogue 与 host 配置
+
+主循环之后，examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:255-260, gemm_device() 调用 axpby(alpha, tCrC, beta, tCgC)，完成 C 的 alpha * accumulator + beta * old_C 写回。
+
+gemm_nt()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:262-344, gemm_nt()）使用 (128,128,64) CTA tile、3 个 pipeline stage、MN-major 的 SM90_64x64x16_F16F16F16_SS（285--306）；gemm_tn()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:346-426, gemm_tn()）使用对应的 K-major layout 和 WGMMA（369--390）。两者都创建 TMA atom，并通过 cutlass::launch_kernel_on_cluster 启动同一个 gemm_device（gemm_nt()：312--343；gemm_tn()：396--425）。
+
+gemm()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:428-446, gemm()）只把 N,T dispatch 到 gemm_nt()，把 T,N dispatch 到 gemm_tn()；其他转置组合直接 assert。
+
+main()（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:448-561, main()）检查 Hopper compute capability 9（460--463），读取默认 m=512,n=256,k=1024,transA=N,transB=T（467--485），初始化 half A/B/C（487--506），先运行一次再做 100 次计时（531--555）。
+
+### 47.9 是否使用 warp specialization
+
+结论：这个教程没有采用通常意义上的 warp specialization。它采用的是“elected lane 提交 TMA + 全 block/warpgroup 执行 WGMMA + 显式 producer-consumer barrier”的统一控制流。
+
+#### 47.9.1 为什么看起来像 warp specialization
+
+在 examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:149-177, gemm_device()，只有 (warp_idx == 0) && lane_predicate 的线程初始化 barrier 并发起 TMA。这是单 lane 的提交优化，避免全 block 重复提交同一 TMA；它不等于 producer warp。
+
+真正的 warp specialization 通常会让不同 warp 长期执行不同角色：
+
+    warp 0: producer，专门 TMA
+    warp 1--3: consumer，专门 WGMMA
+
+本示例不是这种结构，因为 warp 0 也会进入同一个 WGMMA 主循环。
+
+#### 47.9.2 所有线程仍参与 WGMMA
+
+mma.get_thread_slice(threadIdx.x) 对每个线程建立 MMA 视图（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:192-203, gemm_device()）；主循环的 warpgroup_arrive -> gemm -> warpgroup_commit_batch -> warpgroup_wait 没有按 warp id 排除某些 warp（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:223-233, gemm_device()）。因此 warpgroup_* 是 WGMMA 的协作/完成机制，不是 producer warp 和 consumer warp 的角色切换。
+
+#### 47.9.3 barrier 的 producer/consumer 是事件角色
+
+ProducerBarType 表示 TMA transaction 完成，ConsumerBarType 表示 128 个线程完成对该 pipe 的 WGMMA 消费（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:149-162, gemm_device()）。它们是 pipeline 状态机的事件，不是固定分配给两组 warp 的永久角色：每轮所有线程都 wait producer、执行 WGMMA、arrive consumer；只有实际提交 TMA 的 elected lane 被条件分支选出（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:223-249, gemm_device()）。
+
+#### 47.9.4 源码注释的直接证据
+
+在 examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:208-212, gemm_device()，教程先说明 SM90 mainloop 依靠 TMA/MMA 的显式 producer-consumer synchronization，随后把更高级的 warp-specialization strategies 说成 CUTLASS 其他 mainloop 中的可选实现。这与实际控制流一致：本文件演示的是基础 TMA + WGMMA pipeline，不是 warp-specialized mainloop。
+
+### 47.10 最终判断
+
+    使用：
+      TMA asynchronous load
+      WGMMA warpgroup asynchronous MMA
+      三阶段 PipelineState
+      producer/consumer cluster barriers
+      warp 0 中 elected lane 的单线程 TMA 提交
+
+    没有使用：
+      专用 producer warp / consumer warp 的固定分工
+      按 warp 角色分裂的长期不同控制流
+
+所以，warp_idx、elect_one_sync()、warpgroup_*() 和 producer/consumer barrier 不能单独证明使用了 warp specialization；关键判断是不同 warp 是否被分配成长期不同的 producer/consumer 控制流，本示例不满足这一条件。
+
+## 48. CUTE_ARCH_MMA_SM90A_ENABLED 如何打开
+
+### 48.1 结论：让 device 编译目标成为 SM90A
+
+CUTE_ARCH_MMA_SM90A_ENABLED 不是需要在 CUTLASS 源码中手工写一个 #define 的开关。正确做法是让 nvcc 的 device 编译目标带有 SM90A 的架构特性，也就是使用 90a，而不是只有 90。
+
+对于 CUTLASS 根目录，推荐使用仓库自己的 CMake 变量：
+
+    cmake -S /share/users/like/package/cutlass -B build -DCUTLASS_NVCC_ARCHS="90a"
+    cmake --build build --target cute_tutorial_wgmma_tma_sm90 -j
+
+CUTLASS 的 README 明确要求 Hopper GH100 使用 90a；README.md:258-279（Target Architecture 文档段，无函数）还说明，使用没有 a 后缀的 SM90 编译包含 SM90a 特性的 kernel，可能在运行时失败。CUTLASS 顶层 CMake 在 CMakeLists.txt:176-185（顶层架构配置段，无函数）把 90a 列为 CUDA 12.0 以上支持的架构，在 CMakeLists.txt:232-238（顶层架构配置段，无函数）把 CUTLASS_NVCC_ARCHS 保存为实际构建架构。
+
+如果不用 CUTLASS 的 CMake，而是直接调用 nvcc，可以使用：
+
+    nvcc -std=c++17 -arch=sm_90a source.cu -o app
+
+或者显式写成只生成 SM90A 代码的形式：
+
+    nvcc -std=c++17 -gencode arch=compute_90a,code=sm_90a source.cu -o app
+
+-arch=sm_90a 是 nvcc 的简写；在 CUDA 12.8 的实际编译过程中它可能同时产生通用的 compute_90 中间代码和 SM90A 代码，因此在通用中间代码那一遍看不到该宏是正常的。最终 sm_90a device pass 会看到该宏。若要只检查 SM90A pass，使用显式的 -gencode 形式更清楚。
+
+### 48.2 CUTLASS/CUTE 中宏是如何派生的
+
+在 CUTE 的 GMMA 头文件中，宏由 CUDA 编译器提供的三个条件派生，而不是由 CUTLASS CMake 直接传入：
+
+    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+
+这个条件出现在 include/cute/arch/mma_sm90_gmma.hpp:37-40（头文件配置段，无函数）和 include/cute/arch/mma_sm90_gmma_ext.hpp:38-41（头文件配置段，无函数）。稀疏 GMMA 变体也采用同样的条件，见 include/cute/arch/mma_sm90_gmma_sparse_ext.hpp:38-41（头文件配置段，无函数）。
+
+三个条件的含义是：
+
+1. __CUDA_ARCH__ 只在 CUDA device 编译阶段存在；SM90/SM90A 的数值为 900。
+2. __CUDA_ARCH_FEAT_SM90_ALL 由 nvcc 根据目标架构的 feature set 提供。它不是 CUTLASS 源码中定义的普通用户宏；CUTLASS 只检查它。
+3. 90a 目标提供 SM90 的 architecture-accelerated features，因此满足 SM90A 的条件；只使用 90 时，不能把 SM90A 特性当作已启用。
+
+CUTE 还有一条从 CUTLASS 架构配置转发的路径。include/cute/arch/config.hpp:33-43（头文件配置段，无函数）先包含 cutlass/arch/config.h，再把 CUTLASS_ARCH_MMA_SM90A_ENABLED 转成 CUTE_ARCH_MMA_SM90A_ENABLED。CUTLASS_ARCH_MMA_SM90A_ENABLED 的来源在 include/cutlass/arch/config.h:42-52（头文件配置段，无函数）：CUDA 12 以上先声明 SM90 API 可用，随后只有在 __CUDA_ARCH__ == 900 且 __CUDA_ARCH_FEAT_SM90_ALL 存在时才声明 SM90A device 特性已启用。
+
+因此，给 nvcc 添加 -DCUTE_ARCH_MMA_SM90A_ENABLED 不是推荐的打开方法。这样只是绕过头文件的架构判断，不能让不支持 SM90A 的目标突然支持 wgmma 指令，还可能令 host pass 或错误的 device pass 走进不适用的 inline PTX。应当设置 90a 架构，让 nvcc 自己产生这些内建条件。
+
+### 48.3 宏控制的实际代码路径
+
+宏打开时，GMMA 的 fma 会发出 WGMMA inline PTX；宏没有打开时，代码进入 CUTE_INVALID_CONTROL_PATH。例如 include/cute/arch/mma_sm90_gmma_ext.hpp:54-88（cute::SM90::GMMA::MMA_64x24x16_F16F16F16_SS::fma）在条件分支的真路径发出 wgmma.mma_async.sync.aligned.m64n24k16.f16.f16.f16，假路径报告没有 CUTE_ARCH_MMA_SM90A_ENABLED。
+
+WGMMA 的 warpgroup 同步原语也受同一个宏控制：include/cute/arch/mma_sm90_gmma.hpp:47-57（cute::warpgroup_arrive）、include/cute/arch/mma_sm90_gmma.hpp:59-71（cute::warpgroup_wait）和 include/cute/arch/mma_sm90_gmma.hpp:73-84（cute::warpgroup_commit_batch）。因此，编译器目标架构必须正确；仅仅让某个头文件看到一个手工 -D 并不能替代硬件和 PTX 目标选择。
+
+### 48.4 这个 CUTLASS CMake 工程实际怎样传递 90a
+
+CMakeLists.txt:667-695（cutlass_apply_cuda_gencode_flags）读取 CUTLASS_NVCC_ARCHS_ENABLED，把每个架构转换为 CUDA_ARCHITECTURES target property。CUDA.cmake:326-357（cutlass_add_executable）创建可执行目标并调用这个架构设置函数；因此 examples/cute/tutorial/hopper/CMakeLists.txt:35-38（cutlass_example_add_executable）中的 cute_tutorial_wgmma_tma_sm90 最终会按 CUTLASS_NVCC_ARCHS=90a 编译。
+
+这也是为什么在本仓库中应优先使用 -DCUTLASS_NVCC_ARCHS="90a"，而不是只设置通用项目中的 CMAKE_CUDA_ARCHITECTURES。后者是否生效取决于外部工程；CUTLASS 自己的目标属性会由 CUTLASS_NVCC_ARCHS_ENABLED 重新设置。
+
+### 48.5 与 CUTLASS_ARCH_MMA_SM90_SUPPORTED 的区别
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:448-465（main）先检查运行设备的 major 是否为 9，然后用 CUTLASS_ARCH_MMA_SM90_SUPPORTED 包住示例主体；examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:556-560（main）在该宏没有定义时打印 waived 信息。CUTLASS_ARCH_MMA_SM90_SUPPORTED 在 include/cutlass/arch/config.h:42-45（头文件配置段，无函数）主要表示 CUDA 工具链版本支持 SM90 API，并不等价于 CUTE_ARCH_MMA_SM90A_ENABLED 已经打开。
+
+换句话说：
+
+    CUTLASS_ARCH_MMA_SM90_SUPPORTED  = 工具链/API 层面的 SM90 支持
+    CUTE_ARCH_MMA_SM90A_ENABLED      = 当前 device pass 具备 SM90A feature，可发出 GMMA/WGMMA
+
+要让 wgmma 的 inline PTX 真正走真分支，关键是第二个条件，而它由 90a device 编译目标提供。
+
+### 48.6 验证是否真的按 SM90A 编译
+
+1. 重新配置或清理旧的 CMake build 目录，避免缓存中的 CUTLASS_NVCC_ARCHS 仍是 90。
+2. 使用下面的命令检查实际编译命令：
+
+       cmake --build build --target cute_tutorial_wgmma_tma_sm90 --verbose
+
+   目标命令中应能看到 90a，或者等价的 compute_90a / sm_90a gencode。
+3. 诊断 CUTE 宏时必须在 device pass 中检查，并且先包含对应的 CUTE GMMA 头文件；不要用 host-only 预处理结果判断。一个直接的编译诊断可以采用显式的 -gencode arch=compute_90a,code=sm_90a。
+4. 运行示例还需要实际的 Hopper GPU。源码 main 只检查 props.major == 9（examples/cute/tutorial/hopper/wgmma_tma_sm90.cu:448-463，main）；这不能把没有 SM90A 指令支持的旧目标转换成 SM90A，架构选择仍必须在编译阶段完成。
+
+最终答案：在 CUTLASS 中通过 -DCUTLASS_NVCC_ARCHS="90a"（或直接 nvcc -arch=sm_90a / 显式 SM90A gencode）打开 CUTE_ARCH_MMA_SM90A_ENABLED；不要手工定义 CUTE_ARCH_MMA_SM90A_ENABLED，也不要把 CUTLASS_ARCH_MMA_SM90_SUPPORTED 当作 SM90A 已启用的证明。
+
+## 49. `Layout_MN_SW128_Atom` 与 `tile_to_shape`
+
+### 49.1 先说结论
+
+`GMMA::Layout_MN_SW128_Atom<T>` 是一个供 Hopper GMMA/WGMMA 使用的、以 `T` 为元素单位的 shared-memory 布局原子。它同时表达两件事：
+
+1. 未 swizzle 前，第一维（A 的 M 维或 B 的 N 维）连续，即 MN-major。
+2. shared-memory 地址采用 WGMMA 的 128-byte swizzle，将每个 128B 范围内的 8 个 16B 小块按相邻“行”的地址位做 XOR 置换。这改变的是物理 shared-memory 地址，不改变逻辑矩阵坐标，主要用于形成 Hopper GMMA 接受的 canonical shared-memory layout，并改善 shared-memory bank 访问冲突。
+
+这里的 Atom 是“可重复铺放的最小布局块”，不是整个 CTA tile。`tile_to_shape` 负责重复这个 Atom，生成与目标 shape 完全兼容的完整布局。在本例中，它将 FP16 Atom 的 `(64,8)` 扩展成 A/B 每个 pipeline stage 的 `(128,64)`，再沿第三维放置 3 个 stage。
+
+调用点在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:267-307`（`gemm_nt`）。`sA` 和 `sB` 分别由下面两行产生：
+
+```cpp
+auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
+auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
+```
+
+该例中 `bM=128`、`bN=128`、`bK=64`、`bP=3`，并且 `TA`、`TB` 都是 16-bit `cute::half_t`。所以 `sA` 和 `sB` 的目标 shape 都是 `(128,64,3)`。同一函数在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:297-307`（`gemm_nt`）还把 WGMMA 的 A/B major mode 都设为 `GMMA::Major::MN`，并用 `sA(_,_,0)`、`sB(_,_,0)` 创建匹配这些 swizzled shared-memory layouts 的 TMA load atom。
+
+### 49.2 `Layout_MN_SW128_Atom<T>` 的类型是怎样组成的
+
+原始定义位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:68-94`（`cute::SM90::GMMA` 命名空间中的类型别名定义）：
+
+```cpp
+using Layout_MN_SW128_Atom_Bits =
+  ComposedLayout<
+    Swizzle<3,4,3>,
+    smem_ptr_flag,
+    Layout<Shape<_1024,_8>,Stride<_1,_1024>>>;
+
+template <class Type>
+using Layout_MN_SW128_Atom =
+  decltype(upcast<sizeof_bits<Type>::value>(Layout_MN_SW128_Atom_Bits{}));
+```
+
+其中各部分的作用如下。
+
+`Layout<Shape<_1024,_8>,Stride<_1,_1024>>` 是以 bit 为单位定义的基础二维布局。第一维 stride 为 1，因此第一维连续；这就是名字中 `MN` 的来源。对于 A，这个连续维是 M；对于 B，这个连续维是 N。第二维有 8 个位置，每个位置相隔 1024 bit，也就是 128 byte。
+
+`Swizzle<3,4,3>` 是地址置换函数。`include/cute/swizzle.hpp:42-96`（`cute::Swizzle` 和 `cute::Swizzle::apply`）给出了三个模板参数的定义和 XOR 实现；其核心是：
+
+```cpp
+return offset ^ shiftr(offset & yyy_msk{}, msk_sft{});
+```
+
+`ComposedLayout` 把基础 layout、offset 和外层变换组合为 `LayoutA o Offset o LayoutB`。逻辑坐标的组合映射见 `include/cute/layout_composed.hpp:52-119`（`cute::ComposedLayout::operator()`）。这里的 `smem_ptr_flag` 说明 swizzle 应附着到 shared-memory pointer；`include/cute/pointer_flagged.hpp:55-67`（`cute::make_tensor`）据此构造 swizzled smem pointer。实际解引用时，`include/cute/pointer_swizzle.hpp:68-105`（`cute::swizzle_ptr::apply_swizzle`、`operator*` 和 `operator[]`）将 swizzle 应用于真实 pointer address，因此这是 position-dependent swizzle，而不只是对从零开始的相对下标做排列。
+
+最后，`Layout_MN_SW128_Atom<Type>` 用元素位宽对 bit layout 做 `upcast`。普通 layout 的换算规则在 `include/cute/layout.hpp:1800-1834`（`cute::upcast`）：stride-1 mode 的 size 除以元素位数，其他 stride 除以元素位数；带 `smem_ptr_flag` 的专用重载在 `include/cute/pointer_flagged.hpp:69-76`（`cute::upcast`）同时记录 pointer 的元素位宽。
+
+对于本例的 `cute::half_t`，`sizeof_bits<TA>::value == 16`，所以基础 layout 从 bit 单位的
+
+```text
+(1024,8):(1,1024)
+```
+
+变为 half 元素单位的
+
+```text
+(64,8):(1,64)
+```
+
+完整 Atom 可打印为：
+
+```text
+Sw<3,4,3> o smem_ptr[16b](unset) o (64,8):(1,64)
+```
+
+也就是说，一个 FP16 Atom 有 `64 * 8 = 512` 个 half，共 `1024B`。未做 swizzle 时，其线性元素偏移是 `m_inner + 64 * k_inner`；swizzle 在形成实际 shared-memory 地址时再置换地址位。
+
+### 49.3 这个布局在 `gemm_nt` 中的实际功能
+
+它不是 global-memory A/B 的布局。global-memory tensor 的 layout 来自 `dA=(1,ldA)` 和 `dB=(1,ldB)`，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:275-284`（`gemm_nt`）。`Layout_MN_SW128_Atom` 描述的是 A/B tile 被 TMA 搬到 shared memory 以后如何摆放。
+
+这一个 shared-memory layout 同时连接了生产者和消费者：
+
+1. TMA 生产者通过 `make_tma_atom` 检查 `sA(_,_,0)`、`sB(_,_,0)` 并创建相应的 swizzled load，调用见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:300-307`（`gemm_nt`）。`include/cute/atom/copy_traits_sm90_tma_swizzle.hpp:45-55`（`cute::detail::get_tma_swizzle_bits`）明确把 `Swizzle<3,4,3>` 映射为 `TMA::SmemSwizzleBits::B128`；`include/cute/arch/copy_sm90_desc.hpp:239-260`（`cute::TMA::to_CUtensorMapSwizzle`）又把它转成 CUDA Driver API 的 `CU_TENSOR_MAP_SWIZZLE_128B`。
+2. WGMMA 消费者从同一布局生成 GMMA descriptor。`include/cute/atom/mma_traits_sm90_gmma.hpp:128-150`（`cute::SM90::GMMA::layout_type`）把 `Swizzle` 的 `B=3` 识别为 `LayoutType::B128`；`include/cute/atom/mma_traits_sm90_gmma.hpp:196-259`（`cute::SM90::GMMA::make_gmma_desc`）验证 Major-MN canonical layout，并把 layout type、leading byte offset 和 stride byte offset写入 descriptor。
+
+因此，`Layout_MN_SW128_Atom` 的关键功能是让 TMA 写入 shared memory 的地址置换，与 WGMMA descriptor 解释 shared memory 的方式完全一致。它不是一次数据转置运算，也不会改变 A/B 的逻辑 shape；它改变的是逻辑坐标到 shared-memory 物理地址的映射。
+
+### 49.4 `tile_to_shape` 的实现在哪里、做了什么
+
+一般 `Layout` 的主实现位于 `include/cute/layout.hpp:1762-1799`（`cute::tile_to_shape(Layout, TrgShape, ModeOrder)`）。它的算法可以按代码分成五步：
+
+1. 用 `append<R>(block)` 将 block 的 rank 补到目标 rank。
+2. 取 block 和 target 每个 mode 的总 size。
+3. 检查每个 block mode 能整除对应 target mode。
+4. 计算每个 mode 需要重复多少次：`product_shape = ceil_div(target_shape, block_shape)`。
+5. 用 `make_ordered_layout` 建立重复次数的紧凑 layout，再调用 `blocked_product`，把完整 block 作为单位铺到目标 shape。
+
+`make_ordered_layout` 的实现位于 `include/cute/layout.hpp:415-428`（`cute::make_ordered_layout`），`blocked_product` 位于 `include/cute/layout.hpp:1726-1742`（`cute::blocked_product`）。默认 mode order 是 `GenColMajor`，它是 `LayoutLeft` 的别名，即优先重复第 0 维，然后第 1 维，最后第 2 维；别名定义见 `include/cute/stride.hpp:272-281`（布局 major tag 定义段，无函数）。
+
+不过，本例传入的不是普通 `Layout`，而是带 `Swizzle` 和 `smem_ptr_flag` 的 `ComposedLayout`，所以首先匹配 `include/cute/layout_composed.hpp:544-553`（`cute::tile_to_shape(ComposedLayout, Shape, ModeOrder)`）。这个重载保留外层 swizzle 和 offset，仅对定义逻辑 domain 的 `layout_b()` 递归调用上述普通 `tile_to_shape`：
+
+```cpp
+return composition(layout.layout_a(),
+                   layout.offset(),
+                   tile_to_shape(layout.layout_b(), trg_shape, ord_shape));
+```
+
+对本例 FP16 Atom，具体计算是：
+
+```text
+block_shape   = (64, 8, 1)
+target_shape  = (128, 64, 3)
+product_shape = (2, 8, 3)
+```
+
+最终 `sA`/`sB` 可打印为：
+
+```text
+Sw<3,4,3> o smem_ptr[16b](unset) o
+((64,2),(8,8),(1,3)):((1,512),(64,1024),(0,8192))
+```
+
+这个嵌套 shape 逐 mode 展平后就是 `(128,64,3)`：
+
+- 第 0 维 `(64,2)`：Atom 内部 64 个 half，重复 2 次，得到 128。
+- 第 1 维 `(8,8)`：Atom 内部 8 个位置，重复 8 次，得到 64。
+- 第 2 维 `(1,3)`：原 Atom 没有 pipeline mode，补成 size 1 后重复 3 次。
+
+对应的未 swizzle 线性元素偏移可以写成：
+
+```text
+offset = m_inner
+       + 512  * m_repeat
+       + 64   * k_inner
+       + 1024 * k_repeat
+       + 8192 * pipe
+```
+
+外层的 `Swizzle<3,4,3>` 随后作用于实际 shared-memory byte address。每个 stage 有 `128 * 64 = 8192` 个 half，第三维 stride 正好是 8192 个元素，所以三个 pipeline stage 互不重叠。
+
+### 49.5 名字中的 `128` 为什么是 128
+
+`SW128` 的 `128` 指 128-byte swizzle 模式，不是 128 bit、128 个元素、CTA 的 `bM=128`，也不是整个 Atom 的大小。即使 CTA tile 的 M/N 改成其他可整除尺寸，这个名字仍然表示同一种 128B shared-memory swizzle。
+
+从 `Swizzle<3,4,3>` 可以直接推出 128B。根据 `include/cute/swizzle.hpp:54-79`（`cute::Swizzle`、`cute::Swizzle::apply`）：
+
+```text
+BBits = 3
+MBase = 4
+SShift = 3
+yyy_mask = 0x380   // byte-address bits [9:7]
+zzz_mask = 0x070   // byte-address bits [6:4]
+
+swizzled_addr = addr ^ ((addr & 0x380) >> 3)
+```
+
+低 4 个 byte-address bits `[3:0]` 保持不变，因此每个 16B 小块内部的字节顺序不变。bits `[6:4]` 选择一个 128B 范围内的 8 个 16B 小块之一，因为 `8 * 16B = 128B`；它们与更高的 bits `[9:7]` 做 XOR，从而让相邻 128B 行使用不同的 16B-block 排列。bits 10 及以上不参与该 XOR，所以这一排列按 1024B 周期重复。
+
+代码中的枚举转换也直接证明了这个命名：
+
+- `include/cute/atom/copy_traits_sm90_tma_swizzle.hpp:45-55`（`cute::detail::get_tma_swizzle_bits`）将 `B==3, M==4` 返回为 TMA `B128`。
+- `include/cute/arch/copy_sm90_desc.hpp:239-260`（`cute::TMA::to_CUtensorMapSwizzle`）将该值转换为 `CU_TENSOR_MAP_SWIZZLE_128B`。
+- `include/cute/atom/mma_traits_sm90_gmma.hpp:128-150`（`cute::SM90::GMMA::layout_type`）将同一个 `B==3` 转换为 GMMA descriptor 的 `LayoutType::B128`。
+
+所以，`128` 的准确含义是：TMA 和 WGMMA 共同约定的 128-byte shared-memory swizzle layout。`tile_to_shape` 只负责把这种布局原子铺满 `(128,64,3)`；它不会把 `SW128` 里的 128 解释成目标 shape 的某一维。
+
+## 50. `TiledMMA` 日志中的 `PermutationMNK: (_,_,_)`
+
+### 50.1 `_` 不是“没有数据”，而是默认的编译期占位符
+
+日志 `temp/run.wgmma_tma_sm90_like.log:10-20` 中的输出是：
+
+```text
+TiledMMA
+  ThrLayoutVMNK:  (_128,_1,_1,_1):(_1,_0,_0,_0)
+  PermutationMNK: (_,_,_)
+MMA_Atom
+  ThrID:      _128:_1
+  Shape_MNK:  (_64,_64,_16)
+  LayoutA_TV: (_128,(_64,_16)):(_0,(_1,_64))
+  LayoutB_TV: (_128,(_64,_16)):(_0,(_1,_64))
+  LayoutC_TV: ((_4,_8,_4),(_2,_2,_8)):((_128,_1,_16),(_64,_8,_512))
+```
+
+`TiledMMA` 的第三个模板参数默认就是 `Tile<Underscore,Underscore,Underscore>`，定义见 `include/cute/atom/mma_atom.hpp:205-223`（`cute::TiledMMA` 模板声明）。因此，当前调用没有传递 MNK permutation 时，类型中保留三个 `cute::Underscore`。
+
+当前源码中的调用是 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:297-298`（`gemm_nt`）：
+
+```cpp
+TiledMMA tiled_mma = make_tiled_mma(
+  SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN,GMMA::Major::MN>{});
+```
+
+这里调用的是 `make_tiled_mma(MMA_Op const&, ...)` 重载，见 `include/cute/atom/mma_atom.hpp:543-553`（`cute::make_tiled_mma`）。该重载将 `MMA_Op` 包成 `MMA_Atom<MMA_Op>`，并使用两个默认参数：
+
+```cpp
+MMAThrLayout = Layout<Shape<_1,_1,_1>>
+Permutations = Tile<Underscore,Underscore,Underscore>
+```
+
+再看 `include/cute/atom/mma_atom.hpp:526-541`（`cute::make_tiled_mma(MMA_Atom, ...)`）：`append<3>(permutations, _)` 将 permutation 补成 rank 3，最终仍是 `Tile<_,_,_>`；`append<3>(thr_layout, Layout<_1,_0>{})` 则得到默认的三维 MNK thread tiling。
+
+日志之所以显示三个 `_`，是因为 `include/cute/atom/mma_atom.hpp:669-678`（`cute::print(TiledMMA const&)`）直接打印 `TiledMMA` 的第三个类型参数 `TiledPerm{}`。对 `Underscore` 的打印自然就是 `_`，并不代表某个运行时数组为空。
+
+### 50.2 默认 `_` 在计算时如何变成实际 tile size
+
+真正使用 permutation 的地方是 `include/cute/atom/mma_atom.hpp:378-395`（`cute::TiledMMA::permutation_mnk` 和 `cute::TiledMMA::tile_size_mnk`）：
+
+```cpp
+auto perm = get<I>(PermutationMNK{});
+return conditional_return(
+  is_underscore<decltype(perm)>{},
+  size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk()),
+  perm);
+```
+
+意思是：
+
+- 若用户显式提供 permutation，使用用户提供的值。
+- 若值是 `_`，就使用 `AtomShape_MNK` 在该维的大小，再乘以该 MNK 维上的 thread tiling 大小。
+
+本例日志中的 `ThrLayoutVMNK` 是 `(_128,_1,_1,_1):(_1,_0,_0,_0)`。因此 M/N/K 三个 thread-tiling size 都是 1，而 Atom shape 是 `(64,64,16)`，于是：
+
+```text
+permutation_mnk<0>() = 64 * 1 = 64
+permutation_mnk<1>() = 64 * 1 = 64
+permutation_mnk<2>() = 16 * 1 = 16
+tile_size_mnk<0..2>() = (64,64,16)
+```
+
+`tile_shape(mma)` 的实现见 `include/cute/atom/mma_atom.hpp:617-631`（`cute::tile_size`、`cute::tile_shape`），所以对当前对象打印 `tile_shape(tiled_mma)` 会得到 `(_64,_64,_16)`。这正是“没有显式 permutation”时的默认 Atom tile，不是零大小。
+
+### 50.3 当前 `MMA_Atom` 真正能执行多大的硬件 MMA
+
+名字 `SM90_64x64x16_F16F16F16_SS` 中的 `64x64x16` 是硬件 WGMMA 指令的 M/N/K shape：
+
+```text
+C[64,64] += A[64,16] * B[64,16]^T
+```
+
+对应 traits 位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:648-674`（`MMA_Traits<SM90_64x64x16_F16F16F16_SS<...>>`）：
+
+- `Shape_MNK = Shape<_64,_64,_16>`：一个 MMA atom 的逻辑 M/N/K。
+- `ThrID = Layout<_128>`：一个 atom 由 128 个线程参与。
+- `ALayout = ABLayout<64,16>`、`BLayout = ABLayout<64,16>`：A/B 的 operand layout。
+- `CLayout = CLayout_64x64`：C 的 64x64 输出 layout。
+
+实际 inline PTX 也明确写出同一个 shape，见 `include/cute/arch/mma_sm90_gmma.hpp:409-455`（`cute::SM90::GMMA::MMA_64x64x16_F16F16F16_SS::fma`）：
+
+```text
+wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16
+```
+
+所以一次硬件 MMA 的数据规模是：
+
+```text
+A: 64 * 16 = 1,024 个 FP16 输入
+B: 64 * 16 = 1,024 个 FP16 输入
+C: 64 * 64 = 4,096 个 FP16 累加/输出元素
+乘加对数: 64 * 64 * 16 = 65,536
+```
+
+日志中的 `LayoutC_TV` 第一部分总大小是 `4*8*4=128`，第二部分总大小是 `2*2*8=32`。这表示 128 个线程共同覆盖 4,096 个 C 元素，平均每线程持有 32 个 FP16 C 累加值；WGMMA 的 C register 定义也对应 16 个 `uint32_t`，即 32 个 FP16，见 `include/cute/arch/mma_sm90_gmma.hpp:416-422`（`MMA_64x64x16_F16F16F16_SS` 的 register type 定义）。
+
+### 50.4 为什么 CTA tile 是 `(128,128,64)`，而日志 Atom 仍是 `(64,64,16)`
+
+不要把 `MMA_Atom` 的指令 shape 和 `gemm_nt` 的 CTA tile 混为一谈：
+
+- `MMA_Atom`/`TiledMMA::tile_shape`：一次 atom 指令，`(64,64,16)`。
+- `cta_tiler`：一个 CTA 从 global/shared memory pipeline 角度处理的 tile，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:286-291`（`gemm_nt`），是 `(128,128,64)`。
+
+两者的关系是：
+
+```text
+128 / 64 = 2 个 M atom
+128 / 64 = 2 个 N atom
+ 64 / 16 = 4 个 K atom
+
+一个 CTA 的一个 K tile = 2 * 2 * 4 = 16 次 64x64x16 WGMMA
+```
+
+`TiledMMA` 的 partition 代码会把大 tensor 划分成 Atom 部分和 Rest 部分。C/A/B 的实现分别位于 `include/cute/atom/mma_atom.hpp:238-274`（`cute::TiledMMA::thrfrg_C`）、`include/cute/atom/mma_atom.hpp:277-314`（`cute::TiledMMA::thrfrg_A`）和 `include/cute/atom/mma_atom.hpp:316-352`（`cute::TiledMMA::thrfrg_B`）。这些函数先按 Atom shape 做 `zipped_divide`，再把剩余 tile 作为 `RestM/RestN/RestK` 保留下来。
+
+对于当前 `(128,128,64)` CTA tile，按 thread 0 的静态 shape 计算可看到：
+
+```text
+partition_shape_C = ((2,2,8),2,2)
+partition_shape_A = ((64,16),2,4)
+partition_shape_B = ((64,16),2,4)
+```
+
+这里的 `2,2,4` 正好是 M/N/K 方向相对于 Atom `(64,64,16)` 的重复次数；C 的 `2,2` 是剩余的 M/N atom tile，A/B 的 `2,4` 是剩余的 M/K 或 N/K atom tile。
+
+在 kernel 中，`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:210-230`（`gemm_device`）先取得 thread partition，然后在每个已完成的 shared-memory K tile 上执行：
+
+```cpp
+gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);
+```
+
+这里的 `gemm` 最终落到 `include/cute/algorithm/gemm.hpp:462-497`（shared-memory `(V,M,K) x (V,N,K) => (V,M,N)` 的 `cute::gemm`）：它遍历 Rest K，并对每个 K slice 调用 rank-2 的 `(V,M) x (V,N) => (V,M,N)` GEMM；后者位于 `include/cute/algorithm/gemm.hpp:263-386`（`cute::gemm` 的 rank-2 dispatch）。因此，一个 CTA 的 128x128x64 tile 是由多个 64x64x16 atom 调用组合出来的，而不是让单条 WGMMA 指令直接处理 128x128x64。
+
+### 50.5 对本例完整 GEMM 的数量关系
+
+以日志和运行参数 `M=512, N=1024, K=2048` 为例：
+
+```text
+CTA M tile: ceil(512  / 128) = 4
+CTA N tile: ceil(1024 / 128) = 8
+K tile:     ceil(2048 / 64)  = 32
+```
+
+每个 CTA 的每个 K tile 有 16 条 `64x64x16` atom MMA，因此理论上的 atom 调用数量为：
+
+```text
+4 * 8 * 32 * 16 = 16,384 次 WGMMA atom 调用
+```
+
+这只是把完整问题分解到当前 CTA/Atom 配置后的数量；实际执行仍由 TMA pipeline、barrier 和 WGMMA asynchronous commit/wait 组织。结论可以概括为：`PermutationMNK: (_,_,_)` 表示默认 identity/inferred tiling，当前 `TiledMMA` 的单个硬件 MMA 规模是 `(64,64,16)`，而 `(128,128,64)` CTA tile 通过 16 个这样的 Atom MMA 完成。
+
+## 51. `dimGrid` 的计算和 `dimCluster.x = 2`
+
+### 51.1 相关代码和坐标含义
+
+`gemm_nt` 在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:286-322`（`gemm_nt`）中定义了 CTA tile 和 launch dimensions：
+
+```cpp
+auto bM = Int<128>{};
+auto bN = Int<128>{};
+auto bK = Int<64>{};
+auto cta_tiler = make_shape(bM, bN, bK);
+
+dim3 dimBlock(size(tiled_mma));
+dim3 dimCluster(2, 1, 1);
+dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
+             round_up(size(ceil_div(n, bN)), dimCluster.y));
+```
+
+kernel 中的 CTA 坐标是 `make_coord(blockIdx.x, blockIdx.y, _)`，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:98-108`（`gemm_device`）。因此：
+
+- `blockIdx.x` 对应 M 方向，`gA` 和 `gC` 使用 M tile。
+- `blockIdx.y` 对应 N 方向，`gB` 和 `gC` 使用 N tile。
+- K 不是 grid 维度；一个 CTA 在 kernel 内通过 `k_tile` 循环处理 K tile，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:143-148`、`:168-180`（`gemm_device`）。
+
+所以 `dimGrid.x` 是 M 方向 CTA 数，`dimGrid.y` 是 N 方向 CTA 数；它们不是元素数，也不是 cluster 数。
+
+### 51.2 `ceil_div(m, bM)`：计算 CTA 数
+
+CuTe 的 `cute::ceil_div` 实现在 `include/cute/int_tuple.hpp:319-345`（`cute::ceil_div`）。标量分支使用：
+
+```cpp
+(a + b - 1) / b
+```
+
+因此：
+
+```text
+ceil_div(m, 128) = (m + 127) / 128
+ceil_div(n, 128) = (n + 127) / 128
+```
+
+对于运行参数 `m=512,n=1024`：
+
+```text
+M 方向 CTA 数 = ceil_div(512, 128)  = 4
+N 方向 CTA 数 = ceil_div(1024, 128) = 8
+```
+
+向上取整是为了保留边界 tile，不能因为矩阵尺寸不是 tile 的整数倍而丢掉最后一个 CTA。
+
+这里的 `size(...)` 来自 `include/cute/int_tuple.hpp:263-276`（`cute::size`）。它对 shape/tuple 求元素乘积；当前 `ceil_div` 返回标量，因此 `size(ceil_div(...))` 数值上就是这个标量本身。这样写是为了统一支持 CuTe 的标量、静态 shape 和嵌套 shape。
+
+### 51.3 `round_up`：使 CTA grid 能被 cluster 整除
+
+CuTe 的 `round_up` 实现在 `include/cute/int_tuple.hpp:350-369`（`cute::round_up`），标量分支是：
+
+```cpp
+((a + b - 1) / b) * b
+```
+
+所以本行等价于：
+
+```text
+dimGrid.x = round_up(ceil_div(m, 128), 2)
+dimGrid.y = round_up(ceil_div(n, 128), 1)
+```
+
+对于当前参数：
+
+```text
+dimGrid.x = round_up(4, 2) = 4
+dimGrid.y = round_up(8, 1) = 8
+dimGrid   = (4, 8, 1)
+```
+
+运行日志 `temp/run.wgmma_tma_sm90_like.log:23` 也打印了 `dimGrid.x=4, dimGrid.y=8`。
+
+如果某个方向的 CTA 数不是 cluster 尺寸的整数倍，例如 M 方向需要 5 个 CTA 且 `cluster.x=2`，则 `round_up(5,2)=6`。CUTLASS 的 host 侧检查 `include/cutlass/cluster_launch.hpp:101-112`（`cutlass::ClusterLauncher::check_cluster_dims`）明确要求：
+
+```text
+grid.x % cluster.x == 0
+grid.y % cluster.y == 0
+grid.z % cluster.z == 0
+```
+
+不满足时，`launch_kernel_on_cluster` 会返回无效配置，而不是启动不完整的 cluster。
+
+### 51.4 `dimCluster(2,1,1)` 的含义
+
+`dimCluster` 表示每个 cluster 中包含多少个 CTA，不是 CTA tile size：
+
+```text
+一个 cluster = 2 个 x 方向 CTA、1 个 y 方向 CTA、1 个 z 方向 CTA
+```
+
+当前启动参数的关系是：
+
+```text
+CTA 网格     = (4,8,1)，总共 32 个 CTA
+Cluster 形状 = (2,1,1)，每个 cluster 有 2 个 CTA
+Cluster 网格 = (4/2, 8/1, 1/1) = (2,8,1)
+Cluster 总数 = 16
+```
+
+`ClusterLaunchParams` 的字段定义见 `include/cutlass/cluster_launch.hpp:318-334`（`cutlass::ClusterLaunchParams`）。`include/cutlass/cluster_launch.hpp:215-249`（`cutlass::ClusterLauncher::launch`）把 grid、cluster、block 和 shared-memory 参数传给 CUDA cluster launch；cluster dimension attribute 的设置见 `include/cutlass/cluster_launch.hpp:166-180`（`cutlass::ClusterLauncher::make_cluster_launch_config`）。
+
+### 51.5 为什么选择 `dimCluster.x = 2`
+
+这里要区分“数学上必须”和“本示例的 launch 选择”。
+
+#### 51.5.1 不是因为 `bM=128` 必须配两个 CTA
+
+`bM=128` 只表示一个 CTA 负责 128 行，并不要求两个 CTA 组成 cluster。对当前 `m=512`，M 方向已有 4 个 CTA，设置 `cluster.x=1` 也能得到同样的 `(128,128,64)` CTA tile。`cluster.x=2` 主要改变 CTA 的组织方式和 launch contract。
+
+#### 51.5.2 用于演示 Hopper cluster launch 和 cluster barrier
+
+当前 kernel 使用 Hopper cluster 原语：
+
+- `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:150-166`（`gemm_device`）使用 `ClusterTransactionBarrier`、`ClusterBarrier` 并调用 `cluster_sync()`。
+- `include/cute/arch/cluster_sm90.hpp:48-83`（`cute::cluster_arrive`、`cute::cluster_wait`、`cute::cluster_sync`）实现了 `barrier.cluster` 同步。
+
+因此，`dimCluster.x=2` 让该教程按“两 CTA 一个 cluster”启动，便于展示 cluster launch、cluster barrier 和 cluster 级同步。它不是从 `ceil_div` 的结果中推导出来的数值，而是传给 CUDA 的显式 cluster 配置。
+
+#### 51.5.3 当前代码没有启用 TMA multicast
+
+沿 x 方向组成两个 CTA，确实是未来做 TMA multicast 的一种自然组织：两个 M 相邻 CTA 负责不同 A tile，但可能共享同一个 B tile。不过这份代码没有实际启用 multicast：
+
+- `gemm_device` 的注释明确说明 `Int<0>, Layout<_1>` 表示 TMA 不 multicast，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:120-126`（`gemm_device`）。
+- `tma_partition` 也使用 `Int<0>{}, Layout<_1>{}`，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:129-133`（`gemm_device`）。
+- host 侧创建的是普通 `SM90_TMA_LOAD`，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:300-307`（`gemm_nt`），而不是 multicast TMA atom。
+
+因此，当前 `cluster.x=2` 不会自动让两个 CTA 共用一次 A/B TMA load，也不能据此断言已经获得 multicast 带宽收益。严格从代码看，它是一个两 CTA cluster 的教学/launch 选择，并为 cluster barrier 或后续 multicast 扩展保留了结构。
+
+### 51.6 本例的完整计算结果
+
+对运行参数 `M=512,N=1024,K=2048`：
+
+```text
+bM,bN,bK       = (128,128,64)
+ceil_div(M,bM) = 4
+ceil_div(N,bN) = 8
+dimCluster     = (2,1,1)
+dimGrid        = (4,8,1)
+CTA 总数       = 32
+Cluster 网格   = (2,8,1)
+Cluster 总数   = 16
+```
+
+所以这行代码的本质是：先按 `(128,128)` CTA tile 将 M/N 问题尺寸向上取整，再把 CTA 数量向上补齐到 `(2,1)` cluster 形状的整数倍；`dimCluster.x=2` 表示 M 方向每两个 CTA 组成一个 cluster，而不是表示 M tile 大小为 2。
+
+## 52. 如何解释 `tmaA` / `tmaB` 的打印结果
+
+### 52.1 日志内容
+
+`temp/run.wgmma_tma_sm90_like.log:22-43` 中先打印了 global-memory tensor：
+
+```text
+Tensor mA:
+ptr[16b](0x...) o (512,2048):(_1,512)
+
+Tensor mB:
+ptr[16b](0x...) o (1024,2048):(_1,1024)
+```
+
+随后打印两个 TMA Copy Atom：
+
+```text
+Copy_Atom tmaA:
+Copy_Atom
+  ThrID:        _1:_0
+  ValLayoutSrc: (_1,_512):(_0,_1)
+  ValLayoutDst: (_1,_512):(_0,_1)
+  ValLayoutRef: (_1,_512):(_0,_1)
+  ValueType:    16b
+
+Copy_Atom tmaB:
+Copy_Atom
+  ThrID:        _1:_0
+  ValLayoutSrc: (_1,_512):(_0,_1)
+  ValLayoutDst: (_1,_512):(_0,_1)
+  ValLayoutRef: (_1,_512):(_0,_1)
+  ValueType:    16b
+```
+
+host 侧构造代码位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:281-307`（`gemm_nt`）：
+
+```cpp
+Tensor mA = make_tensor(A, make_shape(M,K), dA);
+Tensor mB = make_tensor(B, make_shape(N,K), dB);
+
+Copy_Atom tmaA = make_tma_atom(
+    SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));
+Copy_Atom tmaB = make_tma_atom(
+    SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN,bK));
+```
+
+### 52.2 首先要区分：日志打印的是类型结构，不是完整 descriptor 值
+
+`Copy_Atom` 的打印函数位于 `include/cute/atom/copy_atom.hpp:618-630`（`cute::print(Copy_Atom const&)`）。它只打印五个类型属性：
+
+```cpp
+typename Atom::ThrID
+typename Atom::ValLayoutSrc
+typename Atom::ValLayoutDst
+typename Atom::ValLayoutRef
+sizeof_bits<typename Atom::ValType>::value
+```
+
+注意该函数的 `Copy_Atom const&` 参数甚至没有变量名；函数体没有读取传入的 `tmaA` 或 `tmaB` 对象。因此日志没有打印以下实际值：
+
+- A/B 的 global-memory 基地址。
+- 完整 global tensor shape。
+- global byte strides。
+- TMA box shape 和 element strides。
+- shared-memory swizzle mode。
+- `TmaDescriptor` 的 128-byte opaque descriptor 内容。
+- 生成 TMA 坐标所需的 `aux_params_`。
+
+这些值确实保存在 TMA traits 中。`include/cute/atom/copy_traits_sm90_tma.hpp:99-121`（`Copy_Traits<SM90_TMA_LOAD,...>`）定义了成员 `tma_desc_` 和 `aux_params_`，但普通 `print(Copy_Atom)` 不输出它们。
+
+所以，tmaA/tmaB 打印相同不等于 tmaA/tmaB 的运行时值相同。它只表示二者有相同的 Copy Atom 类型结构。
+
+### 52.3 各打印字段的含义
+
+#### 52.3.1 `ThrID: _1:_0`
+
+`SM90_TMA_LOAD` 的 traits 把 `ThrID` 定义为 `Layout<_1>`，见 `include/cute/atom/copy_traits_sm90_tma.hpp:99-110`（`Copy_Traits<SM90_TMA_LOAD,...>`）。打印成 `_1:_0` 表示：
+
+- logical copy-thread mode 的 size 是 1。
+- 唯一 logical thread 映射到 thread id 0。
+
+它不是说整个 CUDA block 只有一个线程。本例 `dimBlock.x=128`；只是一次 TMA 指令只需要一个 elected thread/lane 发起。kernel 中确实仅在 `warp_idx==0 && lane_predicate` 时提交 TMA，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:168-177`（`gemm_device`）。
+
+#### 52.3.2 `ValLayoutSrc: (_1,_512):(_0,_1)`
+
+这是 `(logical-thread, logical-value)` 到 source value index 的映射：
+
+- 第一维 `_1:_0`：一个 logical TMA thread。
+- 第二维 `_512:_1`：该 Copy Atom 的一个 reference vector 有 512 个连续 value。
+
+这里的“连续”是 Copy Atom 的逻辑 value layout；global-memory 的真实多维坐标和 stride 由 TMA descriptor/coordinate tensor 解释。
+
+#### 52.3.3 `ValLayoutDst: (_1,_512):(_0,_1)`
+
+它表示同一 Copy Atom 在 destination 侧也覆盖 512 个 logical value。它不意味着 shared memory 是普通线性布局。`sA`/`sB` 的 `Swizzle<3,4,3>` 被编码进 TMA descriptor，TMA hardware 会按 128B swizzle 写入 shared memory；`ValLayoutDst` 只是 Copy Atom 的抽象 `(thread,value)` layout。
+
+#### 52.3.4 `ValLayoutRef: (_1,_512):(_0,_1)`
+
+`RefLayout` 是用于协调 source/destination partition 的 reference mapping。对 `SM90_TMA_LOAD`，源码直接定义 `RefLayout = SrcLayout`，见 `include/cute/atom/copy_traits_sm90_tma.hpp:104-110`（`Copy_Traits<SM90_TMA_LOAD,...>`），所以日志中的 Src 和 Ref 必然相同。
+
+#### 52.3.5 `ValueType: 16b`
+
+当前 `TA`、`TB` 都是 `cute::half_t`，每个 value 为 16 bit。`Copy_Atom` 在 `include/cute/atom/copy_atom.hpp:51-67`（`cute::Copy_Atom<Copy_Traits,...>`）把 `CopyInternalType` 保存为 `ValType`，再把 bit layout recast 成 value layout。
+
+`make_tma_copy_atom` 返回 Atom 时使用 `typename GEngine::value_type` 作为 Copy Atom 的 value type，见 `include/cute/atom/copy_traits_sm90_tma.hpp:1163-1178`（`cute::detail::make_tma_copy_atom`）。mA/mB 的 value type 都是 half，所以两者都打印 `16b`。
+
+### 52.4 为什么恰好是 512 个 half
+
+这个 512 不是完整 CTA tile 的元素数。完整 A/B shared-memory stage 都是：
+
+```text
+128 * 64 = 8192 个 half = 16384 byte
+```
+
+512 是 `make_tma_atom` 针对当前 global layout、shared layout 和 CTA tile 找到的“单个 Copy Atom reference vector”大小。
+
+构造入口位于 `include/cute/atom/copy_traits_sm90_tma.hpp:1373-1393`（`cute::make_tma_atom`）：
+
+1. `make_identity_layout(shape(gtensor)).compose(cta_tiler)` 生成 `cta_v_tile`，描述 CTA tile 中每个 value 对应哪个 global tensor mode。
+2. 未显式指定 `TmaInternalType` 时，使用 global tensor 的 value type，即 half。
+3. 调用 `detail::make_tma_copy_atom`。
+
+`detail::make_tma_copy_atom` 位于 `include/cute/atom/copy_traits_sm90_tma.hpp:1131-1178`：
+
+1. 从 `sA/sB` 分离 swizzle 和非 swizzle layout。
+2. 调用 `construct_tma_gbasis`，找出 shared-memory vector 与 global-memory modes 之间可由一个 TMA descriptor box 表达的 basis。
+3. 创建 TMA descriptor 和 coordinate auxiliary parameters。
+4. 计算 `num_bits_per_tma = size(tma_gbasis) * sizeof_bits<TmaInternalType>`。
+5. 用这个 bit 数生成 `Copy_Traits` 和 `Copy_Atom`。
+
+`construct_tma_gbasis` 的实现位于 `include/cute/atom/copy_traits_sm90_tma.hpp:728-849`（`cute::detail::construct_tma_gbasis`）。它先求非 swizzled SMEM layout 的 right inverse，再和 `cta_v_map` 组合，保留兼容的 contiguous basis modes，并把 TMA rank 限制在最多 5 维。
+
+对本例 tmaA，相关布局可展开为：
+
+```text
+mA layout:
+  (512,2048):(1,512)
+
+sA(_,_,0) 的非 swizzle 部分:
+  ((64,2),(8,8)):((1,512),(64,1024))
+
+cta_v_map:
+  (128,64):(1@M,1@K)
+
+SMEM inverse 与 global mode 组合后:
+  (64,8,2,8):(1@M,1@K,64@M,8@K)
+
+构造出的 tma_gbasis:
+  (64,8):(1@M,1@K)
+```
+
+所以：
+
+```text
+size(tma_gbasis) = 64 * 8 = 512
+num_bits_per_tma = 512 * 16 = 8192 bit
+num_values        = 8192 / 16 = 512 half
+num_bytes         = 512 * 2 = 1024 byte
+```
+
+`SM90_TMA_LOAD` 的 bit-level traits 是 `Layout<Shape<_1,NumBitsPerTMA>>`，见 `include/cute/atom/copy_traits_sm90_tma.hpp:101-110`（`Copy_Traits<SM90_TMA_LOAD,...>`）。`Copy_Atom` 再通过 `recast_layout<uint1_t,half_t>` 把 `(1,8192 bit)` 转成 `(1,512 half)`，相关 recast 定义见 `include/cute/atom/copy_atom.hpp:57-67`（`cute::Copy_Atom<Copy_Traits,...>`）。这就是日志 `_512` 的直接来源。
+
+### 52.5 一个 `copy(...)` 如何覆盖完整的 128x64 tile
+
+虽然一个 Copy Atom reference vector 是 512 half，但一个 CTA stage 有 8192 half。因此 `tma_partition` 会把完整 tile 分解成：
+
+```text
+TMA value mode = 512 half
+TMA_Iter       = 8192 / 512 = 16
+```
+
+该逻辑位于 `include/cute/atom/copy_traits_sm90_tma.hpp:1395-1435`（`cute::tma_partition`）：
+
+- 第 1411-1414 行求完整 shared-memory tile 的 vector layout。
+- 第 1416-1418 行用 `Copy_Atom::NumValSrc` 分离单指令部分。
+- 第 1424-1425 行把结果组织成 `((TMA,TMA_Iter),Rest...)`。
+
+对当前布局，这个 mode 可写成：
+
+```text
+TMA      = (64,8)，共 512 half
+TMA_Iter = (2,8)，共 16 次
+总元素   = 512 * 16 = 8192 half
+```
+
+kernel 中虽然只写了一次：
+
+```cpp
+copy(tma_a.with(barrier), tAgA(_,k_tile), tAsA(_,pipe));
+```
+
+`include/cute/algorithm/copy.hpp:184-235`（`cute::copy(Copy_Atom,src,dst)`）负责按 tensor rank dispatch，并在存在普通 Rest modes 时展开循环；对于 `tma_partition` 保留下来的嵌套 `(TMA,TMA_Iter)` 第 0 mode，`include/cute/atom/copy_atom.hpp:89-113`（`cute::Copy_Atom::call`）在当前 tensor size 大于 `NumValSrc` 时继续递归剥离嵌套 mode，最终对每个 512-value slice 调用底层 TMA operation。两层 dispatch 合起来，使这一个 C++ `copy` 调用提交覆盖整个 128x64 stage 所需的 16 个 TMA box 操作，而不是只搬 512 个 half。
+
+每个 A/B stage 的 transaction bytes 是：
+
+```text
+A: 128 * 64 * 2 = 16384 byte
+B: 128 * 64 * 2 = 16384 byte
+合计                  = 32768 byte
+```
+
+kernel 使用完整 partition tensor 的 `sizeof` 计算这个总量，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:135-137`（`gemm_device`），并把它传给 producer transaction barrier。
+
+### 52.6 tmaA 与 mA、sA、bM、bK 的关系
+
+#### 52.6.1 mA 决定 descriptor 的 global-memory 一侧
+
+当前 mA 是：
+
+```text
+shape  = (M,K) = (512,2048)
+stride = (1,512) 个 half
+base   = A 的 device pointer
+```
+
+`make_tma_copy_desc` 在 `include/cute/atom/copy_traits_sm90_tma.hpp:917-1058`（`cute::detail::make_tma_copy_desc`）中从 gtensor 提取 base address、global shape 和 global strides，将 strides 转换成 byte，然后调用 `cuTensorMapEncodeTiled`。因此 tmaA descriptor 中包含 A 的地址、`(512,2048)` 范围和 K stride `512*2=1024B` 等信息。
+
+这些动态值影响 tmaA 的实际行为，但不影响日志中显示的 Copy Atom 类型，所以普通 `print(tmaA)` 看不到它们。
+
+#### 52.6.2 sA 决定 descriptor 的 shared-memory box、顺序和 swizzle
+
+传入的是 `sA(_,_,0)`，即固定 pipeline stage 0，只保留一个 `(128,64)` stage。`make_tma_copy_atom` 从它提取：
+
+- 非 swizzle layout，用于寻找 compatible TMA basis 和 box shape。
+- `Swizzle<3,4,3>`，编码为 TMA 128B shared-memory swizzle。
+
+descriptor 创建代码在 `include/cute/atom/copy_traits_sm90_tma.hpp:985-1058`（`cute::detail::make_tma_copy_desc`）：第 989-1000 行生成 `smem_box_shape`，第 1042-1058 行把 swizzle、box shape、element stride 和 global tensor 信息一起传给 `cuTensorMapEncodeTiled`。
+
+第三个 pipeline mode `bP=3` 不进入 tmaA descriptor，因为 host 构造时已经用 `sA(_,_,0)` 固定了该 mode。运行时 `tAsA(_,pipe)` 决定同一 descriptor 的 TMA 数据写入哪个 pipeline stage。
+
+#### 52.6.3 `(bM,bK)` 决定 CTA 从 mA 选择的逻辑 tile
+
+`make_shape(bM,bK)=(128,64)` 被 compose 到 mA 的 identity layout，形成 `cta_v_tile`。它告诉构造器：每个 CTA 的 A TMA 区域来自 `(M,K)` tensor 的 128x64 tile。
+
+`construct_tma_gbasis` 在 `include/cute/atom/copy_traits_sm90_tma.hpp:742-745`（`cute::detail::construct_tma_gbasis`）检查 shared layout 与 CTA value map 的总 size 相同。本例二者都是 8192 half。
+
+### 52.7 tmaB 为什么打印相同，但实际 descriptor 不同
+
+tmaB 的构造过程完全相同，只是输入换成：
+
+```text
+mB shape  = (N,K) = (1024,2048)
+mB stride = (1,1024) 个 half
+CTA tile  = (bN,bK) = (128,64)
+sB stage  = 与 sA 相同的 FP16 SW128 layout
+```
+
+由于当前：
+
+```text
+TA == TB == half
+bM == bN == 128
+sA(_,_,0) 与 sB(_,_,0) 的类型/shape/stride 相同
+```
+
+两者都得到 `(64,8)` 的 tma_gbasis、512 half 的 reference vector 和同一个 Copy Atom 类型，所以打印完全相同。
+
+但 tmaB descriptor 中保存的是 B 的 base address、global shape `(1024,2048)` 和 K stride `1024*2=2048B`；tmaA 保存的是 A 的地址、shape `(512,2048)` 和 K stride `512*2=1024B`。因此两个对象发出的 TMA global coordinates 和读取地址不同。
+
+### 52.8 运行时 tmaA/tmaB 还需要 barrier 才可执行
+
+host 创建出来的 `SM90_TMA_LOAD` traits 是“non-executable”形式，只包含 descriptor 和 coordinate auxiliary parameters。`include/cute/atom/copy_traits_sm90_tma.hpp:99-132`（`Copy_Traits<SM90_TMA_LOAD,...>::with`）说明必须通过 `.with(tma_mbar)` 加入 transaction barrier，才能得到可执行的 `SM90_TMA_LOAD_OP`。
+
+kernel 正是在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:168-177` 和 `:240-249`（`gemm_device`）中调用：
+
+```cpp
+tma_a.with(producer_mbar[pipe])
+tma_b.with(producer_mbar[pipe])
+```
+
+然后真正提交异步 global-to-shared TMA copy。
+
+最终可以把关系概括为：
+
+```text
+mA/mB
+  -> 决定 global base、完整 shape、global byte strides、TMA coordinate mapping
+
+sA/sB 的单个 stage
+  -> 决定 shared-memory layout、TMA box 分解和 128B swizzle
+
+(bM,bK)/(bN,bK)
+  -> 决定每个 CTA 选择的 logical global tile，当前均为 128x64
+
+三者共同
+  -> 生成 TmaDescriptor、AuxParams 和 Copy_Atom 类型
+
+print(Copy_Atom)
+  -> 只显示一个 logical thread、每 Atom 512 个 half、16-bit value type
+  -> 不显示 descriptor 中 tmaA/tmaB 各自不同的实际值
+
+## 53. `tma_demo_kernel` 第 124 行 `asm volatile` 的功能
+
+### 53.1 整体作用
+
+在 `tma_demo/tma_demo.cu:124-133`（函数 `tma_demo_kernel`）中，这段 CUDA 内联 PTX 实现了一个基于 `mbarrier` 的忙等待（spin-wait）：每个线程反复检查 TMA load 是否已经完成，只有 barrier 报告指定 phase 完成后才继续执行后面的 shared-memory 计算。
+
+TMA load 由 thread 0 在 `tma_demo/tma_demo.cu:117-119`（函数 `tma_demo_kernel`）发起，但数据写入的是整个 CTA 使用的 shared-memory tile。因此，其他线程不能仅依靠发起线程返回就开始读取 tile，必须等待 TMA 引擎通过 mbarrier 发布完成信号。
+
+### 53.2 汇编块逐句解释
+
+```cpp
+asm volatile(
+    "{\n"
+    ".reg .pred P;\n"
+    "WAIT_LOOP:\n"
+    "  mbarrier.try_wait.parity.shared.b64 P, [%0], %1;\n"
+    "  @!P bra WAIT_LOOP;\n"
+    "}\n"
+    :
+    : "r"((uint32_t)__cvta_generic_to_shared(&mbarrier)), "r"(phase)
+    : "memory");
+```
+
+- `{ ... }` 创建 PTX 局部作用域，避免其中的寄存器名和标签与周围汇编冲突。
+- `.reg .pred P` 声明一个 predicate 寄存器。`mbarrier.try_wait.parity.shared.b64` 在 `tma_demo/tma_demo.cu:128`（函数 `tma_demo_kernel`）中把 barrier 测试结果写入 `P`；测试通过表示指定 phase 的 barrier transaction 已完成。
+- `WAIT_LOOP` 是轮询标签。
+- `@!P bra WAIT_LOOP` 在 `tma_demo/tma_demo.cu:129`（函数 `tma_demo_kernel`）使用谓词执行跳转：`P` 为假时回到标签继续检查，`P` 为真时跳出循环，执行第 135 行之后的计算。
+- `%0` 对应输入约束中的 `"r"((uint32_t)__cvta_generic_to_shared(&mbarrier))`，即 mbarrier 的 shared-memory 地址；`__cvta_generic_to_shared` 把通用指针转换成 PTX shared 地址空间指针值。
+- `%1` 对应 `"r"(phase)`。本例 `phase` 在 `tma_demo/tma_demo.cu:123`（函数 `tma_demo_kernel`）初始化为 `0`，用于等待当前 barrier phase。循环流水线中若重复使用同一个 barrier，通常需要在每轮切换 phase。
+
+### 53.3 `asm volatile` 和 `"memory"` 的含义
+
+`asm volatile` 表示这段内联汇编具有不可忽略的副作用，编译器不能把它当作无效代码删除。末尾的 `"memory"` clobber 告诉 CUDA 编译器该汇编可能读写任意内存，从而限制普通内存访问跨越该汇编块被重新排序。
+
+这两者主要约束编译器，不等价于 CUDA 的线程同步或硬件 memory fence。真正让线程等待的是 `mbarrier.try_wait.parity`；本例中 TMA 对 barrier 的关联由 `tma_demo/tma_demo.cu:56-67`（函数 `tma_load_2d`）的 `cp.async.bulk.tensor...mbarrier::complete_tx::bytes` 完成，而 barrier 的初始化和预期传输字节数设置在 `tma_demo/tma_demo.cu:97-108`（函数 `tma_demo_kernel`）。
+
+因此，执行顺序可以概括为：
+
+```text
+mbarrier.init + mbarrier.arrive.expect_tx
+    -> thread 0 发起 cp.async.bulk.tensor TMA load
+    -> TMA 写入 shared memory，并在传输完成时更新 mbarrier
+    -> 所有线程在第 124 行轮询，直到 phase 完成
+    -> 线程读取完整的 smem_tile 并继续计算
+
+## 54. `tma_demo_kernel` 第 132 行 `phase` 参数的作用
+
+### 54.1 `phase` 是输入还是输出
+
+在 `tma_demo/tma_demo.cu:123-132`（函数 `tma_demo_kernel`）中，`phase` 是函数内部声明的局部变量，不是 kernel 的函数参数。它在第 123 行被初始化为 `uint32_t phase = 0`，随后在第 132 行通过 `"r"(phase)` 作为 inline PTX 的输入操作数传入。
+
+CUDA extended asm 的冒号部分是：
+
+```cpp
+asm volatile(template
+    : output_operands
+    : input_operands
+    : clobbers);
+```
+
+第 131 行的输出操作数区域为空，第 132 行的两个 `"r"` 位于输入操作数区域：
+
+```cpp
+: "r"((uint32_t)__cvta_generic_to_shared(&mbarrier)), "r"(phase)
+```
+
+因此，`phase` 是输入参数，不是输出参数。`"r"` 约束要求编译器把它放入一个 32-bit 通用寄存器，PTX 模板中的 `%1` 就引用这个寄存器。汇编执行结束后，C++ 变量 `phase` 仍然是 `0`；代码中没有 `=r` 或 `+r` 这类输出/读写约束来回写它。
+
+### 54.2 `phase` 传给哪条指令
+
+在 `tma_demo/tma_demo.cu:128`（函数 `tma_demo_kernel`）中，`%1` 被用作：
+
+```ptx
+mbarrier.try_wait.parity.shared.b64 P, [%0], %1;
+```
+
+这里：
+
+- `%0` 是 mbarrier 的 shared-memory 地址，对应第 132 行的第一个输入操作数。
+- `%1` 是 `phase` 的值，对应第 132 行的第二个输入操作数。
+- `P` 是 PTX 内部的 predicate 输出。它表示 barrier 对指定 phase 的测试是否通过，但这个结果没有写回任何 C++ 变量。
+
+`phase` 表示要等待的 mbarrier phase bit（奇偶相位）。本例传入 `0`，表示等待初始化后的这一轮 barrier transaction 完成；TMA 传输完成并使 barrier 进入下一 phase 后，`P` 才会变为真，随后 `@!P bra WAIT_LOOP` 在 `tma_demo/tma_demo.cu:129`（函数 `tma_demo_kernel`）停止循环。
+
+### 54.3 为什么后续流水线通常要修改 `phase`
+
+本示例只发起一次 TMA load，所以 `phase` 固定为 `0` 即可。若在同一个 kernel 中循环复用同一个 mbarrier，每次 transaction 完成后需要把等待相位切换到下一位，通常写成 `phase ^= 1`，再把新的 phase 作为下一次 `mbarrier.try_wait.parity` 的输入。这个切换发生在 C++ 代码中，不是由第 132 行的 inline PTX 自动完成的。
+
+需要区分两种状态：`phase` 这个 C++ 标量只是等待条件的输入副本；真正被 TMA 和 mbarrier 硬件更新的是 `tma_demo/tma_demo.cu:91`（函数 `tma_demo_kernel`）声明的 shared-memory `mbarrier` 对象。第 132 行只读取 mbarrier 地址和 phase 值，并通过 PTX predicate `P` 返回测试结果。
+
+## 55. `.parity` 形式的 `phase` 合法取值
+
+### 55.1 结论：传给本条指令的值必须是 0 或 1
+
+在 `tma_demo/tma_demo.cu:128-132`（函数 `tma_demo_kernel`）中，使用的是：
+
+```ptx
+mbarrier.try_wait.parity.shared.b64 P, [%0], %1;
+```
+
+这里的 `%1` 是 `phase`，但 `.parity` 变体要求它表示 phase 的奇偶性（`phaseParity`），不是任意的完整 phase 编号：
+
+- 偶数 phase（0、2、4、...）对应 `phaseParity = 0`；
+- 奇数 phase（1、3、5、...）对应 `phaseParity = 1`。
+
+因此，对这条 `.parity` 指令而言，规范允许的输入只有 `0` 和 `1`。虽然 C++ 的 `uint32_t phase` 和 `"r"(phase)` 在类型和寄存器层面可以承载任意 32-bit 整数，编译器通常也无法在运行时替你检查该值，但把 `2`、`3` 或其他值直接传给 `phaseParity` 不符合 PTX 指令约定，不能依赖其行为。
+
+### 55.2 完整 phase 序列与 parity 的区别
+
+mbarrier 内部可以依次经历 phase `0, 1, 2, 3, ...`；`.parity` 指令只保留其中的最低位。因此如果 C++ 代码用一个完整计数器记录第 `k` 轮等待，传入指令前应使用：
+
+```cpp
+uint32_t phase_parity = full_phase & 1u;
+```
+
+在本示例中没有多轮循环，所以 `tma_demo/tma_demo.cu:123`（函数 `tma_demo_kernel`）直接写 `uint32_t phase = 0`。如果复用同一个 mbarrier，等待一轮完成后通常执行 `phase ^= 1`，再把 `0/1` 中的下一个值传给 `mbarrier.try_wait.parity`；这就是之前文档所说的 phase 切换。
+
+### 55.3 为什么不能把任意整数当作 phase 传入
+
+`.parity` 版本的指令只需要区分“当前 phase”与“上一 phase”的奇偶性，硬件并不通过这个操作数识别完整的 phase 计数。若需要使用 `mbarrier.arrive` 返回的完整状态 token，应改用不带 `.parity` 的 `mbarrier.test_wait`/`mbarrier.try_wait` 形式，而不是把完整计数器直接塞进 `phaseParity`。
+
+PTX 规范在 `mbarrier.test_wait/mbarrier.try_wait` 中明确说明 `phaseParity` 的有效值为 `0` 和 `1`，可参见 [NVIDIA PTX ISA 文档](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)。
+
+## 56. `tAgA`、`tAsA`、`tBgB`、`tBsB` 的打印结果
+
+### 56.1 这四个 Tensor 是怎样得到的
+
+`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:100-115`（函数 `gemm_device`）先构造：
+
+```text
+gA: (BLK_M, BLK_K, k)       global TMA coordinate Tensor
+gB: (BLK_N, BLK_K, k)       global TMA coordinate Tensor
+sA: (BLK_M, BLK_K, PIPE)    shared-memory Tensor
+sB: (BLK_N, BLK_K, PIPE)    shared-memory Tensor
+```
+
+随后 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:152-167`（函数 `gemm_device`）执行：
+
+```cpp
+auto [tAgA, tAsA] = tma_partition(
+    tma_a, Int<0>{}, Layout<_1>{},
+    group_modes<0,2>(sA), group_modes<0,2>(gA));
+```
+
+`group_modes<0,2>` 把前两个 mode 组合起来，因此：
+
+```text
+sA: (M,K,PIPE) -> ((M,K),PIPE)
+gA: (M,K,k)    -> ((M,K),k)
+```
+
+该操作的实现位于 `include/cute/tensor_impl.hpp:691-712`（函数 `cute::group_modes`）。组合后的 mode 0 是一次 CTA stage 的完整 TMA tile；剩下的 mode 分别是 shared-memory pipeline stage 和 global K tile。
+
+`Int<0>{}, Layout<_1>{}` 表示这里只有一个 logical multicast participant，multicast offset 为 0，并不会再把 tile 分给其他 CTA。源码注释位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:143-150`（函数 `gemm_device`），offset 的计算位于 `include/cute/atom/copy_traits_sm90_tma.hpp:1426-1433`（函数 `cute::tma_partition`）。
+
+### 56.2 先理解打印格式中的 `o`
+
+`include/cute/tensor_impl.hpp:1117-1121`（函数 `cute::print(Tensor)`）依次打印：
+
+```text
+tensor.data() o tensor.layout()
+```
+
+所以日志左侧是 Tensor 的 data engine 或起始位置，右侧才是 shape/stride layout。可以把 `o` 理解成“data engine 与 layout 的组合”：layout 先把逻辑坐标变成 offset，data engine 再把这个 offset 解释成 global TMA 坐标或 shared-memory 地址。
+
+### 56.3 为什么 `tAgA` 是这个结果
+
+日志为：
+
+```text
+ArithTuple(128,_0) o
+(((_64,_8),(_2,_8)),32):
+(((_1@0,_1@1),(_64@0,_8@1)),_64@1)
+```
+
+#### 56.3.1 `ArithTuple(128,_0)` 是起始 global 坐标
+
+`tma_a.get_tma_tensor` 返回的是 TMA coordinate Tensor，而不是持有普通 global pointer 的 Tensor；其实现见 `include/cute/atom/copy_traits_sm90_tma.hpp:147-154`（函数 `Copy_Traits<SM90_TMA_LOAD>::get_tma_tensor`）。
+
+当前日志中的 CTA 坐标是 `(blockIdx.x,blockIdx.y)=(1,0)`。`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:104-108`（函数 `gemm_device`）用 `local_tile` 选择 A tile，因此 A 的 M 起点是：
+
+```text
+blockIdx.x * bM = 1 * 128 = 128
+```
+
+K 起点暂时为 0，所以 data engine 打印为 `ArithTuple(128,0)`。
+
+#### 56.3.2 `(64,8)` 是一个 TMA Atom 覆盖的 value mode
+
+`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:318-339`（函数 `gemm_nt`）设置 `bM=128`、`bK=64`，并用 `Layout_MN_SW128_Atom<half>` 构造 TMA Atom。当前 Atom 一次处理：
+
+```text
+64 * 8 = 512 half
+```
+
+因此第一个子 mode 是：
+
+```text
+shape  = (_64,_8)
+stride = (_1@0,_1@1)
+```
+
+`_1@0` 和 `_1@1` 不是 byte stride。它们是 `ScaledBasis`：`@0` 表示 TMA 坐标向量的第 0 维，这里是 M；`@1` 表示第 1 维，这里是 K。其打印逻辑位于 `include/cute/numeric/arithmetic_tuple.hpp:463-475`（函数 `cute::print(ArithmeticTupleIterator)` 和 `cute::print(ScaledBasis)`）。
+
+所以 Atom 内的 `(m0,k0)` 对 global 坐标的贡献是：
+
+```text
+M += m0       0 <= m0 < 64
+K += k0       0 <= k0 < 8
+```
+
+#### 56.3.3 `(2,8)` 是覆盖整个 128x64 CTA tile 所需的 TMA iteration mode
+
+完整 tile 是 `128x64`，一个 Atom 是 `64x8`，所以还要重复：
+
+```text
+M 方向: 128 / 64 = 2
+K 方向:  64 /  8 = 8
+总次数: 2 * 8 = 16
+```
+
+因此第二个子 mode 是：
+
+```text
+shape  = (_2,_8)
+stride = (_64@0,_8@1)
+```
+
+其中 `_64@0` 表示每向下一个 M iteration，TMA 的 M 坐标增加 64；`_8@1` 表示每向下一个 K iteration，K 坐标增加 8。
+
+#### 56.3.4 最外层 `32:_64@1` 是 global K tile mode
+
+运行参数中 `K=2048`，而每个 CTA K tile 为 `bK=64`，所以：
+
+```text
+K tile count = 2048 / 64 = 32
+```
+
+每换一个 `k_tile`，global K 坐标增加 64，因此打印为 shape `32`、stride `_64@1`。`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:175-180`（函数 `gemm_device`）也直接使用 `size<1>(tAgA)` 作为 K tile count。
+
+把这些 mode 合起来，`tAgA` 的完整坐标公式是：
+
+```text
+tAgA(((m0,k0),(mi,ki)), k_tile)
+
+M = 128 + m0 + 64*mi
+K =        k0 +  8*ki + 64*k_tile
+
+m0: 0..63, k0: 0..7
+mi: 0..1,  ki: 0..7
+k_tile: 0..31
+```
+
+这正好解释：
+
+```text
+shape  = (((64,8),(2,8)),32)
+stride = (((1@0,1@1),(64@0,8@1)),64@1)
+```
+
+### 56.4 为什么 `tAsA` 是这个结果
+
+日志为：
+
+```text
+Sw<3,4,3>_smem_ptr[16b](0x...) o
+((_512,_16),(_1,_3)):((_1,_512),(_0,_8192))
+```
+
+#### 56.4.1 左侧表示 16-bit、128B-swizzled shared-memory pointer
+
+`Sw<3,4,3>_smem_ptr[16b]` 表示 data engine 是带 `Swizzle<3,4,3>` 的 shared-memory pointer，元素类型为 16 bit。右侧 stride 的单位是 half 元素，不是 byte；这些线性 offset 还要经过 swizzle 才得到实际 shared-memory bank/address 映射。
+
+`tma_partition` 会先去掉 swizzle，求底层 layout 的 right inverse，以 shared-memory 的连续访问次序遍历 tile；相关实现位于 `include/cute/atom/copy_traits_sm90_tma.hpp:1411-1415`（函数 `cute::tma_partition`）。`get_nonswizzle_portion` 的作用是返回 composed layout 的底层 layout，见 `include/cute/swizzle_layout.hpp:149-165`（函数 `cute::get_nonswizzle_portion`）。
+
+#### 56.4.2 `_512:_1` 是一个 TMA Atom 的 512 个 half
+
+原始 `sA` layout 在一个 stage 内可以拆成：
+
+```text
+Atom value: (64,8):(1,64)
+```
+
+它在 shared offset 上是连续的：
+
+```text
+v = m0 + 64*k0,  0 <= v < 512
+```
+
+因此 shared-memory 一侧可以 coalesce 成 shape `_512`、stride `_1`。global 一侧不能做相同合并，因为 `1@0` 与 `1@1` 属于不同的 TMA coordinate basis，所以 `tAgA` 仍保留 `(64,8)`。
+
+#### 56.4.3 `_16:_512` 是 16 个 TMA iteration
+
+剩余的 `(2,8)` iteration 在原始 shared layout 中是：
+
+```text
+shape  = (2,8)
+stride = (512,1024)
+```
+
+由于 `1024 = 2 * 512`，它同样可 coalesce：
+
+```text
+i = mi + 2*ki,  0 <= i < 16
+offset contribution = 512*i
+```
+
+所以打印为 shape `_16`、stride `_512`。一个 pipeline stage 的第 0 mode 总大小为：
+
+```text
+512 * 16 = 8192 half = 16384 bytes
+```
+
+`include/cute/atom/copy_traits_sm90_tma.hpp:1416-1425`（函数 `cute::tma_partition`）正是先用 `Copy_Atom::NumValSrc` 分离单指令部分，再 compose 和 coalesce 成 `((TMA,TMA_Iter),Rest...)`。
+
+#### 56.4.4 `(_1,_3):(_0,_8192)` 是 3-stage pipeline
+
+`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:323-327`（函数 `gemm_nt`）设置 `bP=3`。原始 `sA` 中 pipeline mode 已经是 `(_1,_3):(_0,_8192)`：
+
+
+- `_1:_0` 是 tile_to_shape 保留下来的退化 mode，extent 为 1，所以 stride 0 不会导致别名问题；
+- `_3:_8192` 表示 3 个 pipeline stage；
+- 相邻 stage 相差 8192 个 half，即 16384 bytes。
+
+因此，如果用 `(v,i),(p0,pipe)` 表示 `tAsA` 坐标，则送入 swizzled pointer 的线性 offset 是：
+
+```text
+offset = v + 512*i + 0*p0 + 8192*pipe
+
+v: 0..511, i: 0..15, p0: 0, pipe: 0..2
+```
+
+### 56.5 `tBgB` 和 `tBsB` 为什么几乎相同
+
+日志中的 B partition 为：
+
+```text
+tBgB:
+ArithTuple(0,_0) o
+(((_64,_8),(_2,_8)),32):
+(((_1@0,_1@1),(_64@0,_8@1)),_64@1)
+
+tBsB:
+Sw<3,4,3>_smem_ptr[16b](另一个地址) o
+((_512,_16),(_1,_3)):((_1,_512),(_0,_8192))
+```
+
+A 和 B 的 partition layout 相同，是因为本例 `bM=bN=128`、`bK=64`，并且 `sA`、`sB` 都使用相同的 `Layout_MN_SW128_Atom<half>`；定义见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:318-339`（函数 `gemm_nt`）。
+
+不同之处有两个：
+
+1. `tAgA` 的起点是 `(128,0)`，而 `tBgB` 是 `(0,0)`。当前打印 CTA 为 `(blockIdx.x,blockIdx.y)=(1,0)`；A 由 `blockIdx.x` 选择 M tile，B 由 `blockIdx.y` 选择 N tile，所以 B 的 N 起点仍为 0。
+2. `tAsA` 和 `tBsB` 的 shared-memory base pointer 不同。`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:110-115`（函数 `gemm_device`）分别从 `smem.A.begin()` 和 `smem.B.begin()` 创建 Tensor；layout 相同并不表示它们指向同一块 shared memory。
+
+因此 `tBgB` 的公式只是把 A 的 M 轴换成 B 的 N 轴：
+
+```text
+N = 0 + n0 + 64*ni
+K =     k0 +  8*ki + 64*k_tile
+```
+
+### 56.6 四个 Tensor 在实际 copy 中怎样配对
+
+`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:200-209`（函数 `gemm_device`）执行：
+
+```cpp
+copy(tma_a.with(producer_mbar[pipe]),
+     tAgA(_,k_tile), tAsA(_,pipe));
+```
+
+这里：
+
+- `tAgA(_,k_tile)` 从 32 个 global K tiles 中选择第 `k_tile` 个 128x64 A tile；
+- `tAsA(_,pipe)` 从 3 个 shared-memory stages 中选择第 `pipe` 个 8192-half destination；
+- 嵌套 mode 中的 `512x16` 使一次 C++ `copy` 覆盖全部 8192 个 half。
+
+B 的 copy 完全对称。`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:158-160`（函数 `gemm_device`）计算 transaction bytes：
+
+```text
+A: 8192 half * 2 bytes = 16384 bytes
+B: 8192 half * 2 bytes = 16384 bytes
+合计                       32768 bytes
+```
+
+这与日志中的 `tma_transaction_bytes:32768` 一致。
+```
+```
+
+---
+
+## `wgmma_tma_sm90_like.cu` barrier init 参数 1 和 128 的含义
+
+文件：`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu`
+
+```cpp
+// 行 188-194
+using ProducerBarType = cutlass::arch::ClusterTransactionBarrier;  // TMA
+using ConsumerBarType = cutlass::arch::ClusterBarrier;             // MMA
+CUTE_UNROLL
+for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+    if ((warp_idx == 0) && lane_predicate) {
+        ProducerBarType::init(&producer_mbar[pipe],   1);   // 行 193
+        ConsumerBarType::init(&consumer_mbar[pipe], 128);   // 行 194
+    }
+}
+```
+
+### `init(arrive_count)` 的含义
+
+`ClusterBarrier::init` 的实现（`include/cutlass/arch/barrier.h:391-406`）：
+
+```cpp
+CUTLASS_HOST_DEVICE
+static void init(ValueType const* smem_ptr, uint32_t arrive_count) {
+    CUTLASS_ASSERT(arrive_count != 0 && "Arrive count must be non-zero");
+    uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+    asm volatile(
+        "{\n\t"
+        "mbarrier.init.shared::cta.b64 [%1], %0; \n"
+        "}"
+        :
+        : "r"(arrive_count), "r"(smem_addr)
+        : "memory");
+}
+```
+
+底层是 `mbarrier.init` PTX 指令。`arrive_count` 参数指定的是：**barrier phase 翻转之前，必须收到多少次 arrive 操作**。barrier 初始 phase 为 0；每收到 `arrive_count` 次 arrive 就翻转一次 phase。只有 phase 翻转到位的线程/硬件信号才表示"该 pipe 已准备好"。
+
+---
+
+### ProducerBarType: 为什么是 `1`？
+
+**`ClusterTransactionBarrier`** 是 transaction-based barrier，与 TMA 硬件配合使用。
+
+**谁在 arrive？** — TMA 硬件自动 arrive，不是线程 arrive。
+
+主循环中（`gemm_device` 行 273-282）：
+
+```cpp
+if ((warp_idx == 0) && lane_predicate && (k_tile_count > 0))
+{
+    int pipe = write_state.index();
+    ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+    ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+    copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+    copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+    ++write_state;
+}
+```
+
+关键机制：
+
+1. **`arrive_and_expect_tx`**（行 279）设置该 barrier 期望接收的总字节数 = `tma_transaction_bytes`（即 A tile + B tile 的总大小，`gemm_device` 行 159-160）
+
+2. **`tma_a.with(producer_mbar[pipe])` 和 `tma_b.with(producer_mbar[pipe])`**（行 280-281）：两个 TMA 加载都绑定到**同一个** barrier。TMA 硬件异步搬运数据，每搬完一批就在该 barrier 上累加已搬运字节数。
+
+3. **当总搬运字节数达到 `tma_transaction_bytes` 时**，TMA 硬件对该 barrier 执行恰好 **1 次 arrive**，barrier phase 翻转。
+
+所以 `init(producer_mbar, 1)` 的含义是：**该 barrier 期望 1 次硬件 arrive（即 1 次 TMA transaction 完成），对应 1 个 K-tile（A+B）的异步搬运全部结束。**
+
+为什么不是 2？虽然有两个 `copy(tma_a...)` 和 `copy(tma_b...)`，但它们绑定的是同一个 barrier，硬件按累计字节数判定完成，整体算作 1 次 transaction completion → 1 次 arrive。
+
+---
+
+### ConsumerBarType: 为什么是 `128`？
+
+**`ClusterBarrier`** 是 thread-based arrive barrier，由线程显式调用 `arrive()`。
+
+**谁在 arrive？** — 所有 128 个线程。
+
+主循环中（`gemm_device` 行 260-269）：
+
+```cpp
+// MMAs to cover 1 K_TILE
+warpgroup_arrive();
+gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);
+warpgroup_commit_batch();
+warpgroup_wait<0>();
+
+// Notify that consumption is done
+ConsumerBarType::arrive(&consumer_mbar[read_pipe]);   // 行 269
+++read_state;
+```
+
+**行 269 没有任何 `if (warp_idx == 0)` 保护**，所有 128 个线程都执行到此并调用 `ConsumerBarType::arrive()`。
+
+核心原因：
+- `SM90_64x64x16_F16F16F16_SS` MMA 指令使用 1 个 warp group = **4 warps = 128 threads**
+- `warpgroup_arrive()` / `warpgroup_commit_batch()` / `warpgroup_wait<0>()` 是 warp-group 级别的同步，要求所有 128 线程参与
+- MMA 完成后，所有 128 个线程都需要通知 consumer barrier "我完成了对该 pipe 数据的消费"
+- 因此 barrier 需要收集 128 次 arrive 才翻转 phase
+
+所以 `init(consumer_mbar, 128)` 的含义是：**该 barrier 期望 128 次线程 arrive（即整个 warp group 的所有线程都完成 MMA）后才翻转 phase。**
+
+---
+
+### 双向同步流程总结
+
+把 producer barrier 和 consumer barrier 配合起来看：
+
+```
+                          ProducerBar(TMA)              ConsumerBar(MMA)
+                          ├─ init(arrive_count=1)       ├─ init(arrive_count=128)
+                          │                             │
+ TMA 加载 pipe[k] ────────┤                             │
+ TMA 硬件搬运完毕 ────────┤ arrive(1次,硬件自动) ──────→│ phase 翻转
+                          │                             │
+                          │                             ├─ warpgroups wait producer bar
+                          │                             ├─ 128线程发 GMMA
+                          │                             ├─ 128线程 arrive consumer bar
+                          │                             ├─ phase 翻转
+                          │                             │
+ consumer bar phase 翻转 ──┤ wait consumer bar ←────────┤
+                          │                             │
+ TMA 可复用 pipe[k] ──────┤                             │
+```
+
+**`1` 对应的是硬件（TMA）的无差别单次 arrive；`128` 对应的是软件（线程）的集体 arrive。** 两者共同构成了生产者-消费者流水线中 pipe 的"数据已就绪"和"数据已消费完毕"两个信号。
+
