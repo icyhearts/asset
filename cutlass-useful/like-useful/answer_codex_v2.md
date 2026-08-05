@@ -1292,3 +1292,316 @@ Producer 复用 stage:
 ```
 
 如果以后修改成 warp-specialized kernel、改变 consumer 线程集合或让多个 producer 参与 arrive，这两个值也必须随实际协议修改；它们并不是所有 Hopper TMA kernel 都固定使用的常数。
+
+## 24. `cluster_sync()` 中 `barrier.cluster.arrive` 与 `barrier.cluster.wait`
+
+### 24.1 `cluster_sync()` 的实际展开
+
+在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:201-202`（函数 `gemm_device`）中：
+
+```cpp
+// Ensure barrier init is complete on all CTAs
+cluster_sync();
+```
+
+`cluster_sync()` 的实现位于 `include/cute/arch/cluster_sm90.hpp:75-83`（函数 `cute::cluster_sync`）：
+
+```cpp
+CUTE_DEVICE void cluster_sync()
+{
+  cluster_arrive();
+  cluster_wait();
+}
+```
+
+其中两个包装函数分别在 `include/cute/arch/cluster_sm90.hpp:57-73`（函数 `cute::cluster_arrive` 和 `cute::cluster_wait`）展开为：
+
+```cpp
+asm volatile("barrier.cluster.arrive.aligned;\n" : : );
+asm volatile("barrier.cluster.wait.aligned;\n" : : );
+```
+
+因此它是一个“分离式 cluster barrier”：先 arrive，后 wait，而不是一条既登记又等待的单独指令。
+
+### 24.2 `barrier.cluster.arrive.aligned` 的功能
+
+```ptx
+barrier.cluster.arrive.aligned;
+```
+
+`barrier.cluster.arrive` 的作用是登记当前 warp 已经到达 cluster barrier。它不会等待其他 warp 或其他 CTA 到达，执行线程可以继续运行后面的代码。`.aligned` 表示同一个 warp 的非退出线程必须执行相同的这条 barrier 指令；不能让同一个 warp 中只有部分线程执行它。
+
+在本例中，`arrive` 的默认语义是 release：在 arrive 之前发出的普通内存访问可以通过后续匹配的 cluster wait 与其他参与者建立可见性关系。它本身不提供“所有 CTA 已经到达”的等待效果，也不代表 barrier phase 已经完成。
+
+可以把它理解为：
+
+```text
+每个 warp: 记录“我到达了”
+当前线程: 不等待其他 warp/CTA
+barrier 状态: 累积本 phase 的 arrivals
+```
+
+### 24.3 `barrier.cluster.wait.aligned` 的功能
+
+```ptx
+barrier.cluster.wait.aligned;
+```
+
+`barrier.cluster.wait` 会阻塞执行线程，直到 cluster 中所有非退出参与者都已经执行对应的 `barrier.cluster.arrive`。当条件满足时，barrier phase 完成并重新初始化，下一轮可以复用同一个隐式 cluster barrier。
+
+`.aligned` 同样要求 warp 内线程收敛地执行同一条指令。wait 默认带 acquire 语义；wait 返回后，其他线程在 arrive 之前完成的普通内存访问对当前线程可见。也就是说，`arrive` 负责“发布到达和之前的写入”，`wait` 负责“等待全部到达并获取这些写入”。
+
+在当前代码中，两个 CTA 通过 `dimCluster(2,1,1)` 组成 cluster，launch 参数见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:345-354`（函数 `gemm_nt`）。因此这里同步的是 cluster 内的两个 CTA，而不是只同步单个 CTA；`__syncthreads()` 不能替代它。
+
+### 24.4 为什么初始化 barrier 后必须同时使用两条指令
+
+`gemm_device` 中的 producer/consumer mbarrier 初始化只由每个 CTA 的一个 elected lane 执行，代码见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:182-200`（函数 `gemm_device`）：
+
+```cpp
+if ((warp_idx == 0) && lane_predicate) {
+  ProducerBarType::init(...);
+  ConsumerBarType::init(...);
+}
+```
+
+`cluster_sync()` 的目的就是让每个 CTA 的 barrier 初始化完成并对 cluster 内其他 CTA 可见，然后才在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:204-212`（函数 `gemm_device`）开始调用 `arrive_and_expect_tx` 和发起 TMA load。
+
+### 24.5 只保留 `arrive` 会怎样
+
+如果替换成：
+
+```cpp
+asm volatile("barrier.cluster.arrive.aligned;\n" : : );
+```
+
+而删除 `wait`，当前线程和 CTA 会在登记 arrival 后直接继续执行。结果是：
+
+1. 不再等待 cluster 内其他 CTA 的 elected lane 完成 `mbarrier.init`；某个 CTA 可能已经开始 `arrive_and_expect_tx` 或 TMA load，而另一个 CTA 还在初始化自己的 barrier，形成初始化访问竞态。
+2. 当前 cluster barrier phase 没有完成，因为完成条件要求参与者后续执行匹配的 wait；该 barrier 也不会按正常流程重置以供下一轮使用。
+3. 这条路径没有建立 arrive-wait 的 acquire 侧同步，因此不能把它当作 cluster 级内存可见性屏障。
+
+本例可能表现为 TMA/barrier 状态错误、数据竞态或后续同步挂起；即使某次运行碰巧没有报错，也不能认为初始化已经被正确同步。
+
+### 24.6 只保留 `wait` 会怎样
+
+如果替换成：
+
+```cpp
+asm volatile("barrier.cluster.wait.aligned;\n" : : );
+```
+
+则没有当前 phase 的 `barrier.cluster.arrive`。在本 kernel 第一次执行 `cluster_sync()` 时，cluster barrier 没有任何匹配的到达记录，所有执行 wait 的线程都会等待，通常表现为 kernel 在第 202 行永久卡住。
+
+只有在某个更早的、同一 barrier phase 的代码已经执行过匹配 arrive 时，单独 wait 才可能继续；本例并不存在这样的前置 arrive，所以不能省略 arrive。
+
+### 24.7 两条指令的配合关系
+
+```text
+所有 warp 执行 barrier.cluster.arrive.aligned
+    -> 每个 warp 登记 arrival，释放 arrive 之前的内存访问
+所有 warp 执行 barrier.cluster.wait.aligned
+    -> 等待 cluster 内全部 arrival
+    -> acquire arrive 之前的可见写入
+    -> barrier phase 完成并可复用
+```
+
+因此，`cluster_sync()` 不是简单的函数拆分，而是一个完整的 release/acquire cluster synchronization 协议：`arrive` 不能替代 `wait`，`wait` 也不能在没有匹配 `arrive` 的情况下独立工作。
+
+PTX 规范对这两个指令的描述见 [NVIDIA PTX ISA barrier.cluster 文档](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-barrier-cluster)。
+
+## 25. NVIDIA PTX 中 release/acquire 语义的详细例子
+
+### 25.1 release/acquire 先看成一条“发布-获取”链
+
+对一段跨线程共享的数据，可以先用下面的抽象顺序理解：
+
+```text
+线程 A 写数据
+    -> release 操作：发布此前的写入
+    -> acquire 操作：等待并获取发布结果
+线程 B 读数据
+```
+
+如果 release 操作和 acquire 操作通过同一个同步对象建立了同步关系，那么线程 A 在 release 之前的写入，才能保证在线程 B 的 acquire 之后可见。release 不会发布它之后才发生的写入；acquire 也不会替线程 B 执行一个普通的读取。
+
+在本例中，
+- `barrier.cluster.arrive.aligned` 没有显式写 `.release`，但默认使用 release 语义；
+- `barrier.cluster.wait.aligned` 没有显式写 `.acquire`，但默认使用 acquire 语义。
+
+因此下面两种写法在默认内存序上等价：
+
+```ptx
+barrier.cluster.arrive.aligned;
+barrier.cluster.wait.aligned;
+
+barrier.cluster.arrive.release.aligned;
+barrier.cluster.wait.acquire.aligned;
+```
+
+相关封装分别位于 `include/cute/arch/cluster_sm90.hpp:57-83`（函数 `cute::cluster_arrive`、`cute::cluster_wait`、`cute::cluster_sync`）。
+
+### 25.2 例子一：两个 CTA 交换 shared-memory 数据
+
+假设 cluster 中有 CTA 0 和 CTA 1，各自写一个 shared-memory slot，写完后希望两个 CTA 都读取对方的 slot：
+
+```ptx
+// CTA 0: 写 slot0；CTA 1: 写 slot1
+st.shared::cluster.u32 [payload_slot], value;
+
+// 两个 CTA 的所有参与 warp 都执行
+barrier.cluster.arrive.release.aligned;
+barrier.cluster.wait.acquire.aligned;
+
+// wait 返回后再读取对方写入的 slot
+ld.shared::cluster.u32 result, [other_payload_slot];
+```
+
+执行顺序可以画成：
+
+```text
+CTA 0: st payload0 -> arrive.release -----\\
+                                          +-> wait.acquire -> ld payload1
+CTA 1: st payload1 -> arrive.release -----/
+```
+
+这里的关键不是 arrive 指令本身“把数据复制给了 CTA 1”，而是：
+
+1. `st.shared::cluster` 把数据写入 cluster 可寻址的 shared memory；
+2. `arrive.release` 把该线程在 arrive 之前的写入发布到 barrier 同步关系中；
+3. `wait.acquire` 等待整个 cluster 的 arrivals，并在返回后建立读取侧的可见性；
+4. `ld.shared::cluster` 放在 wait 之后，因此读取对方 slot 时才满足这条同步链。
+
+本例不能把 `ld` 放在 wait 之前；acquire 只约束 acquire 之后的内存访问，不能追溯地修复已经发生的早读。
+
+### 25.3 例子二：release 只负责它之前的写入
+
+考虑下面的程序顺序：
+
+```ptx
+st.shared::cluster.u32 [data], 42;
+barrier.cluster.arrive.release.aligned;
+st.shared::cluster.u32 [data2], 99;
+```
+
+与之匹配的另一线程执行：
+
+```ptx
+barrier.cluster.wait.acquire.aligned;
+ld.shared::cluster.u32 r0, [data];
+ld.shared::cluster.u32 r1, [data2];
+```
+
+release 只保证第一条 `st`（位于 arrive 之前）参与 release/acquire 同步。第二条 `st data2` 位于 arrive 之后，不会因为前面的 release 自动被发布；它需要自己的同步协议，或者必须移动到 release 之前。
+
+所以 release/acquire 不是“对整个线程未来所有内存操作加锁”，而是一个有程序顺序边界的内存序关系：
+
+```text
+release 之前的访问  --被发布-->  acquire 之后的访问
+release 之后的访问  --不自动包含在本次发布中--
+```
+
+### 25.4 例子三：`.relaxed` 仍然同步到达，但不发布普通内存写入
+
+PTX 还提供：
+
+```ptx
+barrier.cluster.arrive.relaxed.aligned;
+```
+
+`.relaxed` 版本仍然登记 arrival，`wait` 仍然可以等待这个 barrier；但 arrive 不再为 arrive 之前的普通内存访问提供 release 排序。下面的代码不能仅凭 barrier 保证 `data` 在另一 CTA 的 wait 后可见：
+
+```ptx
+st.shared::cluster.u32 [data], 42;
+barrier.cluster.arrive.relaxed.aligned;
+barrier.cluster.wait.acquire.aligned;
+```
+
+如果确实要使用 relaxed arrive，需要显式的 cluster fence 在 arrive 之前建立内存顺序。PTX 文档给出的模式是：
+
+```ptx
+st.shared::cluster.u32 [data], 42;
+fence.cluster.acq_rel;
+barrier.cluster.arrive.relaxed.aligned;
+barrier.cluster.wait.acquire.aligned;
+```
+
+这说明“barrier 到达同步”和“内存访问顺序”是两个可分别控制的维度：`.relaxed` 只去掉 arrive 的内存序保证，不会把 barrier 变成普通计算指令。
+
+### 25.5 例子四：global 原子操作中的 `.release` / `.acquire`
+
+release/acquire 不只出现在 `barrier.cluster`。CUTLASS 的 CuTeDSL 协作启动代码中，`examples/python/CuTeDSL/ampere/cooperative_launch.py:300-350`（函数 `_read_barrier`）使用：
+
+```ptx
+ld.global.acquire.gpu.b32 value, [barrier_ptr];
+```
+
+这个 load 的含义是：当它读取到同步协议要求的 barrier 状态后，后续 global/shared 内存访问不能被放到 acquire 之前，并可以观察 release 侧已经发布的 GPU-scope 写入。这里的 `.gpu` 是作用域，表示 GPU 范围；`.acquire` 是内存序，两者不是同一个概念。
+
+同一个文件的 `examples/python/CuTeDSL/ampere/cooperative_launch.py:352-407`（函数 `_increment_barrier`）使用：
+
+```ptx
+atom.add.release.gpu.u32 old, [barrier_ptr], increment;
+```
+
+它是一个 GPU-scope 的 release 原子加：原子性负责“多个线程的加法不会互相破坏”，release 负责“该原子操作之前的写入可以通过匹配的 acquire 读取被观察到”。因此：
+
+```text
+.gpu      = 同步作用域
+.release  = 发布方向
+.add      = 原子读改写操作
+```
+
+当前 `barrier.cluster` 的语法把作用域隐含在 `cluster` 中，而 `ld.global.acquire.gpu` / `atom.add.release.gpu` 把作用域显式写在指令后缀中。
+
+### 25.6 例子五：`volatile` 不是 release/acquire
+
+当前 wrapper 写成：
+
+```cpp
+asm volatile("barrier.cluster.arrive.aligned;\n" : : );
+```
+
+这里有两个不同层次：
+
+- `volatile` 是 inline asm 对编译器的副作用声明，防止汇编被当作无用代码删除；
+- `barrier.cluster.arrive.aligned` 的 release/acquire 语义来自 PTX 指令本身及其默认 `.release` 修饰，而不是来自 C++ 的 `volatile`。
+
+把同一条指令写成普通的非 volatile asm，不能把它变成 relaxed；反过来，写了 `asm volatile` 也不能给一条没有 release/acquire 语义的普通指令凭空增加内存序。
+
+### 25.7 例子六：当前 TMA pipeline 中的两套同步协议
+
+当前 kernel 需要区分 cluster barrier 和 TMA transaction barrier：
+
+```text
+cluster_sync():
+  barrier.cluster.arrive.release.aligned
+  barrier.cluster.wait.acquire.aligned
+  -> 保证每个 CTA 已完成 mbarrier.init，且初始化写入可见
+
+TMA producer barrier:
+  mbarrier.arrive.expect_tx
+  cp.async.bulk.tensor...mbarrier::complete_tx::bytes
+  mbarrier.try_wait.parity
+  -> 等待异步 TMA transaction 的字节数完成
+```
+
+`cluster_sync()` 的调用位置和用途见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:201-213`（函数 `gemm_device`）。TMA producer barrier 的登记和 copy 见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:204-213`（函数 `gemm_device`），真正等待 TMA phase 的代码见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:253-259`（函数 `gemm_device`）。
+
+因此，不能把下面两件事混为一谈：
+
+1. `barrier.cluster.wait.acquire` 保证 cluster barrier 之前的普通内存访问具有获取侧可见性；
+2. `mbarrier.try_wait.parity` 保证与该 mbarrier 关联的异步 TMA transaction 已完成并可被使用。
+
+前者是 cluster 范围的 release/acquire 内存同步，后者是 TMA/mbarrier 的异步完成协议；在本 kernel 中两者分别负责 barrier 初始化和 shared-memory tile 数据就绪。
+
+### 25.8 一句话记忆规则
+
+```text
+release: 我在这里之前写的内容，可以被匹配的 acquire 之后读取
+acquire: 我在这里之后读取时，可以依赖匹配 release 之前的写入
+relaxed: 仍可参与同步协议，但不自动提供上述内存顺序
+scope: 决定同步可传播到 CTA、cluster、GPU 还是 system
+volatile: 约束编译器保留 asm，不定义 GPU 内存序
+```
+
+PTX 对 `barrier.cluster` 的默认 release/acquire 规则、`.relaxed` 差异和 `fence.cluster` 用法，见 [NVIDIA PTX ISA barrier.cluster 文档](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-barrier-cluster)。

@@ -493,3 +493,24 @@ examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex.md  里面
 }
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu calles:
+  cluster_sync();
+可以拆分成
+
+  asm volatile("barrier.cluster.arrive.aligned;\n" : : );
+  asm volatile("barrier.cluster.wait.aligned;\n" : : );
+这两条指令，分别有什么功能?
+少了其中一个，会有什么后果?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+  asm volatile("barrier.cluster.arrive.aligned;\n" : : );
+  asm volatile("barrier.cluster.wait.aligned;\n" : : );
+  分别有 release/acquire主义，使用一些更多的详细的例子，解释 nvidia ptx 里面的 release/qcquire语义。
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+
+

@@ -3150,3 +3150,147 @@ simo 代码位于  /share/users/like/package/simo_conda_sglang
 onnxruntime 代码位于 /softhome/like/package/onnxruntime/
 当前项目如何编译 Debug版本?比如 simo/onnx/ort_plugin/simo_qdq_ops.cc  要debug版本。
 }
+{
+##
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/ simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /share/users/like/package/onnxruntime onnx 代码位于 /share/users/like/package/onnx/
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+onnxruntime  DynamicQuantizeLSTM 算子的实现 位于 onnxruntime code base ./onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc, 这个实现是cpu 实现。
+现在你帮我实现一个 CUDAExecutionProvider  的 SimoQuantizeLSTM,  domain 和 simo/onnx/ort_plugin/simo_qdq_ops.cc算子保持同一个domain.
+# 限制条件, 只有 input 2(W), input 3(R) 都是常量才进行量化。否则 跳过 LSTM 量化。 不支持 peehole.  属性layout : int (default is 0),只支持 default 0,否则跳过
+# 模型量化阶段, 在 simo/onnx/api.py quantize 函数里面， 把浮点 lstm 模型的 input 2(W),  input 3(R) 调用 simo 的 量化算子进行量化。
+## input 2 W, The weight tensor for the gates. Concatenation of `W[iofc]` and `WB[iofc]` (if bidirectional) along dimension 0. The tensor has shape `[num_directions, 4*hidden_size, input_size]`. 这个权重在 onnx 中是 W[iofc] 的 Concatenation, 在量化权重的时候，要先把 input 2 拆开.
+### 对于单向 lstm 拆成 W[iofc] 4个矩阵， 4个矩阵 分别调用 simo 量化 kernel，得到4个 权重 uint8 tensor和 4个 uint8 scale tensor , 
+量化后，4个 权重 uint8 tensor 拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 W 输入,
+4个 uint8 scale tensor  拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 W_scale 输入,
+
+### 对于双向 lstm 拆成 W[iofc] 4个矩阵 + WB[iofc] 4个，总共8个矩阵， 分别调用 simo 量化 kernel，得到8个 权重 uint8 carrier和8个 uint8 scale, 
+量化后，8个 权重 uint8 tensor 拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 W 输入,
+8个 uint8 scale tensor  拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 W_scale 输入,
+## input 3 R,  The recurrence weight tensor. Concatenation of `R[iofc]` and `RB[iofc]` (if bidirectional) along dimension 0. This tensor has shape `[num_directions, 4*hidden_size, hidden_size]`. 
+### 对于单向 lstm,  input 3是 R[iofc] 4个矩阵的 Concatenation,  要把 input 3 拆成 R[iofc] 4个矩阵，分别调用 simo 量化 kernel，得到4个 权重 uint8 carrier和 4个 uint8 scale carrier 
+量化后，4个 权重 uint8 tensor 拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 R 输入,
+4个 uint8 scale tensor  拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 R_scale 输入,
+
+### 对于双向 lstm, input 3 是 `R[iofc]` and `RB[iofc]` 的 Concatenation,  把 input 3拆成  8 个矩阵: R[iofc]/RB[iofc]，分别调用 simo 量化 kernel，得到8个 权重 uint8 carrier和 8个 uint8 scale,
+
+量化后，8个 权重 uint8 tensor 拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 R 输入,
+8个 uint8 scale tensor  拼接成 一个 initializer 作为 SimoQuantizeLSTM 的 R_scale 输入,
+## simo 量化 没有 zero_point
+
+## input 2(W) 和 input 3(R) 的角色都是权重， 共享同一个 量化 spec,比如
+{
+  "targets": ["LSTM"],
+  "input": {"dtype": "mxint8", "axis": 1},
+  "weight": {"dtype": "mxint8", "axis": 1, "block_size": 32},
+}
+input 2(W) 和 input 3(R) 都用 mxint8 量化
+
+## simo/onnx/api.py quantize 函数 如何对权重进行量化，可以参考 simo 现有的对 conv/gemm 权重的量化算子调用。
+
+# 实现 SimoQuantizeLSTM Compute 函数，在模型运行阶段，动态量化 input 1(X), 反量化 input 2(W), input 3(R), matmul 仍旧以浮点运行进行。
+# sigmoid, tanh, elementwise, matmul等浮点算子, 直接调用 torch cuda 算子
+## 逐时间步计算  /share/users/like/package/onnx/docs/Operators.md 中 LSTM 的计算过程。
+### 对于 Xt 和 W[iofc] 的matmul
+   把拼接好的W[iofc]和W_scale[iofc]拆开，   把 W[iofc] 和 W_scale[iofc] 使用 simo c++ 调用 triton 反量化算子的方式，进行反量化到浮点类型 DQ W[iofc],  W[iofc] 是独立的矩阵.
+   把 Xt 先 使用 simo c++ 调用 triton 量化算子，再使用  simo c++ 调用 triton 反量化算子, 得到 QDQ Xt
+   QDQ Xt 和 浮点类型 DQ W[iofc] 进行 matmul
+### 对于 Ht-1 和 R[iofc] 的 matmul
+   把拼接好的R[iofc]和R_scale[iofc]拆开，   把 R[iofc] 和 R_scale[iofc] 使用 simo c++ 调用 triton 反量化算子的方式，进行反量化到浮点类型 DQ R[iofc], R[iofc] 是独立的矩阵.
+   对于 time 0
+     如果输入有 initial_h ， 先 使用 simo c++ 调用 triton 量化算子，再使用  simo c++ 调用 triton 反量化算子, 得到 QDQ initial_h 
+     如果输入没有有 initial_h， initial_h 初始化为 0
+     QDQ initial_h/初始化0 和 浮点类型 DQ R[iofc] 进行 matmul
+   对于 time >=1
+     先 使用 simo c++ 调用 triton 量化算子，再使用  simo c++ 调用 triton 反量化算子, 得到 QDQ Ht-1 
+     QDQ Ht-1 和 浮点类型 DQ R[iofc] 进行 matmul
+### 对于 ft (.) Ct-1, 
+   对于 time 0,
+     如果输入有 initial_c  ， 先 使用 simo c++ 调用 triton 量化算子，再使用  simo c++ 调用 triton 反量化算子, 得到 QDQ initial_c  
+     如果输入没有有 initial_c ,initial_c  初始化为 0
+     QDQ initial_c/初始化0 和 ft (.)  进行 elementwise 乘法
+   对于 time >=1,
+     使用 simo c++ 调用 triton 量化算子，再使用  simo c++ 调用 triton 反量化算子, 得到 QDQ Ct-1
+     QDQ Ct-1和 ft (.)  进行 elementwise 乘法
+## bias 不量化，直接使用浮点计算 bias。
+
+##  如何在 c++ 中调用 triton dequantize 算子，从而对 lstm 的 input 1(X) 动态量化，参考 simo/onnx/ort_plugin/simo_qdq_ops.cc c++ 调用 triton 算子的方法。
+# 要支持单向/双向 lstm
+# 要有完善的单元测试,  双向 lstm和 单向 lstm 都要测试到，在 simo/onnx/tests/test_dynamic_qdq_runtime_debug.py 中追加 LSTM 的量化测试。 写完代码，用指定 conda环境, 先  pip uninstall simo ,再 pip install -e ".[dev]" --no-build-isolation, 再运行 你的单元测试。
+# 单元测试中，要把 onnxruntime 浮点 cuda 版本lstm 结果和 SimoQuantizeLSTM 的结果做余弦相似度对比, relative l2 norm error对比。
+# 写代码前先把执行计划写入 like-useful/PLAN_SIMO_QUATIZED_LSTM.md
+
+}
+{
+# 注册机制是否可以使用 Lite Custom Op? 优先使用Lite Custom Op,如果不可行，再使用CustomOpBase
+# Ht, Ct的量化 Quantizespec ，直接使用input的 quantize spec
+
+}
+{
+把答案追加到 like-useful/answer_codex_v2.md
+ldd simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+        linux-vdso.so.1 (0x00007ffcc37fd000)
+        libcuda.so.1 => /lib/x86_64-linux-gnu/libcuda.so.1 (0x00007f85f0b84000)
+        libtorch.so => not found
+        libtorch_cpu.so => not found
+        libtorch_cuda.so => not found
+        libc10.so => not found
+        libc10_cuda.so => not found
+        libstdc++.so.6 => /lib/x86_64-linux-gnu/libstdc++.so.6 (0x00007f85f08e0000)
+        libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f85f07f9000)
+        libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007f85f07cb000)
+        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f85f05a2000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007f85f7027000)
+        libdl.so.2 => /lib/x86_64-linux-gnu/libdl.so.2 (0x00007f85f059b000)
+        libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0 (0x00007f85f0596000)
+        librt.so.1 => /lib/x86_64-linux-gnu/librt.so.1 (0x00007f85f0591000)
+会发现 not found 库，但是  pytest simo/onnx/tests/test_dynamic_qdq_runtime_debug.py 却能通过，这是什么原理?
+它是如何在找不到 libtorch_cuda.so 情况下通过测试的 ？
+把答案追加到 like-useful/answer_claude_v2.md
+}
+{
+我已经把当前代码 同步到 /share/users/like/package//simo_conda_sglang_pip/
+我在 conda 环境 /share_data/users/like/miniconda3/envs/simo_sglang_pip/中，使用/share/users/like/package//simo_conda_sglang_pip/代码安装 simo，使用的是正式的 wheel安装 ：
+```
+pip install  . --no-build-isolation
+```
+在这样一个以wheel安装的环境中, 然后在工作目录 /share/users/like/package/jdjv/silero_vad_clean 中使用 /share_data/users/like/miniconda3/envs/simo_sglang_pip/环境  执行下面的命令:
+
+# lstm
+CONFIG_DIR=/share/users/like/package/jdjv/quant_schema/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.`hostname`.SimoQuantizeLSTM.`nowstr.sh` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.`hostname`.SimoQuantizeLSTM.`nowstr.sh` 2>&1
+日志 temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.gpu007.rd.sio-software.com.SimoQuantizeLSTM.2026_08_04___18_31_08
+不同量化类型的输出: logs/simo_sglang_pip.gpu007.rd.sio-software.com.SimoQuantizeLSTM.2026_08_04___18_31_08/
+
+# no lstm
+CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_no_lstm/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.`hostname`.no-lstm.`nowstr.sh` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.`hostname`.no-lstm.`nowstr.sh` 2>&1
+日志 temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.gpu007.rd.sio-software.com.no-lstm.2026_08_04___19_38_18
+ 不同量化类型的输出:logs/simo_sglang_pip.gpu007.rd.sio-software.com.no-lstm.2026_08_04___19_38_18/
+
+1.  两次测试都完整地生成模型精度数据了吗？有没有 core dump？有没有抛异常?
+2. 两次测试，Linear+Conv的配置，和Linear+Conv+LSTM的配置， 增加  LSTM量化后，不同量化数据类型的模型精度有什么变化 ？
+把答案追加到 like-useful/answer_codex_v2.md
+
+}
+{ #CUSTOM_OP_LIBRARY=/share_data/users/like/miniconda3/envs/simo_sglang_pip/lib/python3.12/site-packages/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+
+我已经把当前代码 同步到 /share/users/like/package//simo_conda_sglang_pip/
+我在 conda 环境 /share_data/users/like/miniconda3/envs/simo_sglang_pip/中，使用/share/users/like/package//simo_conda_sglang_pip/代码安装 simo，使用的是正式的 wheel安装 ：
+```
+pip install  . --no-build-isolation
+```
+在这样一个以wheel安装的环境中, 然后在工作目录 /share/users/like/package/jdjv/silero_vad_clean 中使用 /share_data/users/like/miniconda3/envs/simo_sglang_pip/环境  执行下面的命令:
+
+# lstm
+CUSTOM_OP_LIBRARY=/share_data/users/like/miniconda3/envs/simo_sglang_pip/lib/python3.12/site-packages/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so CONFIG_DIR=/share/users/like/package/jdjv/quant_schema/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.SimoQuantizeLSTM.`nowstr.sh`.`hostname` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.SimoQuantizeLSTM.`nowstr.sh`.`hostname` 2>&1 &
+日志 temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.SimoQuantizeLSTM.2026_08_05___10_44_13.gpu007.rd.sio-software.com
+不同量化类型的输出: logs/simo_sglang_pip.SimoQuantizeLSTM.2026_08_05___10_44_13.gpu007.rd.sio-software.com/
+
+# no lstm
+日志 
+ 不同量化类型的输出:
+
+1.  两次测试都完整地生成模型精度数据了吗？有没有 core dump？有没有抛异常?
+2. 两次测试，Linear+Conv的配置，和Linear+Conv+LSTM的配置， 增加  LSTM量化后，不同量化数据类型的模型精度有什么变化 ？
+把答案追加到 like-useful/answer_codex_v2.md
+
+}

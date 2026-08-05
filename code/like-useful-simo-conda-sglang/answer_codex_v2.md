@@ -13011,3 +13011,225 @@ KernelRegistry 选中 OpKernel factory
 | 修改 ORT 内置或 contrib CPU/CUDA Execution Provider | `OpKernel`，`Status Compute(OpKernelContext*) const` | schema + `ONNX_OPERATOR_*_KERNEL*` 宏 + ORT 内部构建/registry |
 
 所以，对当前代码最实用的建议是：继续把 `simo_qdq_ops.cc` 的 Lite 方式作为新实现的默认范式；CPU 的 `DequantizeCpuDirectKernel` 不是“错误写法”，但它承担了 Lite 已经封装的参数解析、类型声明和错误通道工作。只要目标运行时支持当前随插件发布的 Lite Custom Op header/API，CPU QDQ 可以逐步统一到 Lite 风格，行为上仍可通过首个 `OrtKernelContext&` 访问低层 API。不要为了让 `DynamicQuantizeLSTM` 的签名看起来一致而将 `simo` QDQ 改成 `OpKernel` 宏注册：那会把独立插件变成必须重编 ONNX Runtime 的内部 fork，破坏外部插件的版本隔离和部署方式。
+
+## 87. 为什么 `ldd` 显示 Torch 库 `not found`，CUDA pytest 却能通过
+
+结论先说：pytest 运行时并没有在“缺少 `libtorch_cuda.so`”的情况下执行。`libtorch_cuda.so` 等文件真实存在于当前 Python 环境的 `torch/lib` 中，并且在 ORT 加载 custom-op 之前已经由 `import torch` 装入同一个进程。`ldd` 则在一个没有启动 Python、没有导入 Torch的新加载器环境中检查依赖，因此两者看到的动态链接器状态不同。
+
+当前五个依赖实际位于：
+
+```text
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torch/lib/libtorch.so
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torch/lib/libc10.so
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/torch/lib/libc10_cuda.so
+```
+
+### 87.1 当前 `RUNPATH` 为什么没有帮助 `ldd`
+
+插件的 ELF 动态段包含：
+
+```text
+NEEDED  libtorch.so
+NEEDED  libtorch_cpu.so
+NEEDED  libtorch_cuda.so
+NEEDED  libc10.so
+NEEDED  libc10_cuda.so
+RUNPATH $ORIGIN/../../../torch/lib
+```
+
+`$ORIGIN` 是被加载的 `.so` 所在目录。当前使用的是 editable install，插件仍位于源码树：
+
+```text
+/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/
+```
+
+所以该 RUNPATH 在当前文件位置实际展开为：
+
+```text
+/share/users/like/package/simo_conda_sglang/torch/lib
+```
+
+这个目录不存在，`ldd` 又没有从当前 shell 的 `LD_LIBRARY_PATH` 得到环境内的 `site-packages/torch/lib`，因此报告 `not found`。
+
+这个相对 RUNPATH 是为普通 wheel 安装布局设计的。wheel 安装后插件通常位于：
+
+```text
+.../site-packages/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+此时 `$ORIGIN/../../../torch/lib` 正好归一化为 `.../site-packages/torch/lib`。editable install 将 Python 包映射到源码目录，打破了这个相对位置，因此代码还需要运行时预加载作为补充。
+
+### 87.2 pytest 中的实际加载顺序
+
+`simo/onnx/tests/test_dynamic_qdq_runtime_debug.py` 在模块初始化阶段就会 `import torch`。此外，`simo/onnx/runtime.py` 的 `register_custom_ops()` 在调用 ORT 注册函数前也显式执行一次 `import torch`：
+
+```python
+def register_custom_ops(sess_options, library_path=None):
+  import torch
+
+  path = get_custom_ops_library_path() if library_path is None else Path(library_path)
+  sess_options.register_custom_ops_library(str(path))
+  return sess_options
+```
+
+因此实际顺序是：
+
+```text
+pytest Python 进程
+  -> import torch
+     -> 动态链接器从 site-packages/torch/lib 装入
+        libtorch.so、libtorch_cpu.so、libtorch_cuda.so、libc10.so、libc10_cuda.so
+  -> register_custom_ops(...)
+  -> ONNX Runtime dlopen(libSimoOnnxCustomOps_sm90.so)
+  -> 动态链接器处理插件的 DT_NEEDED
+  -> 发现相同 SONAME 的 Torch/C10 对象已经在当前加载器 namespace 中
+  -> 复用已加载对象并解析符号
+  -> custom-op 注册及 CUDA 测试成功
+```
+
+换言之，加载插件时不再需要通过其 RUNPATH 打开一份新的 `libtorch_cuda.so`；动态链接器直接复用当前进程已经加载的对象。`ldd` 只展示“从一个新进程按当前搜索路径开始加载会发生什么”，不会模拟 Python 先执行 `import torch` 后的进程状态。
+
+在当前环境中的实测结果是：
+
+```text
+不 import torch，直接 ctypes.CDLL(plugin):
+  FAIL: libtorch.so: cannot open shared object file
+
+先 import torch，再 ctypes.CDLL(plugin):
+  OK
+```
+
+而 `import torch` 后读取 `/proc/self/maps`，可以看到上述五个库都已从 `site-packages/torch/lib` 映射进进程。这直接解释了 pytest 为什么可以通过。
+
+### 87.3 如何让 `ldd` 也显示正确路径
+
+可以只为诊断命令补上 Torch library 目录：
+
+```bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang/bin/python
+TORCH_LIB="$($PY -c 'from pathlib import Path; import torch; print(Path(torch.__file__).resolve().parent / "lib")')"
+LD_LIBRARY_PATH="$TORCH_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  ldd simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+此时五个依赖都会解析到 `simo_sglang/lib/python3.12/site-packages/torch/lib`。
+
+需要注意的是，若调用方绕过 `simo.onnx.runtime.register_custom_ops()`，直接执行 `SessionOptions.register_custom_ops_library(...)`，并且此前没有导入 Torch，那么当前 editable 布局确实可能加载失败。可靠的使用方式是走 `register_custom_ops()`；或者由部署环境把 Torch library 目录加入 `LD_LIBRARY_PATH`。普通 wheel 安装则应由现有相对 RUNPATH 直接覆盖这一问题。
+
+## 88. Silero VAD 两批量化测试的完整性与精度对比
+
+### 88.1 直接结论
+
+两次测试都完整生成了预期的 10 组量化模型和精度数据。根据主日志、每个 shard 的日志及汇总 JSON，没有发现 core dump、进程崩溃或 Python/ONNX Runtime 异常：
+
+| 测试 | 配置完成数 | 量化模型 | `summary.json` | shard 结果 | 错误数 |
+|---|---:|---:|---:|---:|---:|
+| +LSTM 配置 | 10/10 | 10/10 | 10/10 | 240/240 `done` | 0 |
+| no-LSTM 配置 | 10/10 | 10/10 | 10/10 | 240/240 `done` | 0 |
+
+每批输出都同时具有 10 个 `onnx_quant_config.json`、10 个 `run_metadata.json`、10 个 `shard_summary.json`、240 个 shard NPZ 和 240 个 shard 日志。
+
+每个配置都处理了相同的 20 个 AISHELL-4 文件、12.7253 小时音频和 1,431,607 个 chunk。每个配置启动 24 个 shard，因为数据集只有 20 个文件，所以 shard 20 到 23 正常地处理 0 个文件；它们仍写出 NPZ，状态为 `done`、`errors=0`、`returncode=0`。这不是缺失数据。
+
+更严格的只读校验结果如下：
+
+- 20 个 `quantized_model.onnx` 全部通过 `onnx.load` 和 `onnx.checker.check_model`。
+- 480 个 shard NPZ 全部通过 ZIP 完整性检查，没有损坏或零字节文件。
+- 20 个 summary 都包含数值型 `roc_auc` 和 `accuracy`、非空 `finished_at_utc`、24 个 `status=done` shard；`overall.errors`、所有 shard 的 `errors` 之和均为 0。
+- 两份主日志均运行到第 518 行并写出最后一个 `mxint8` summary：[LSTM 主日志](/share/users/like/package/jdjv/silero_vad_clean/temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.gpu007.rd.sio-software.com.SimoQuantizeLSTM.2026_08_04___18_31_08:518)、[no-LSTM 主日志](/share/users/like/package/jdjv/silero_vad_clean/temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.gpu007.rd.sio-software.com.no-lstm.2026_08_04___19_38_18:518)。
+- 扫描两份主日志和 480 个 shard 日志，没有命中 `core dumped`、`segfault`、`Traceback`、`Exception`、`RuntimeError`、`ONNXRuntimeError`、`FATAL`、非零 `returncode`，工作目录下也没有 core 文件。
+
+shard 日志中存在 ONNX Runtime 的 `transformer_memcpy` 性能 warning，例如[这个空 shard 日志](/share/users/like/package/jdjv/silero_vad_clean/logs/simo_sglang_pip.gpu007.rd.sio-software.com.SimoQuantizeLSTM.2026_08_04___18_31_08/onnx_quant_w_mxint8_a_mxint8_aishell4_24shards/shards/shard_020.log:4)。它提示图中加入了 Memcpy 节点，不是异常，也没有令 shard 失败。
+
+因此，对问题 1 的回答是：**两次测试都完整结束；没有发现 core dump；没有抛出导致任务失败的异常；精度数据完整。**
+
+### 88.2 对比口径
+
+下面的差值统一定义为：
+
+```text
+delta = 启用 LSTM 量化后的指标 - no-LSTM 指标
+```
+
+`pp` 表示百分点，例如 `-1.605 pp` 表示指标从 0.927574 变为 0.911524，而不是相对下降 1.605%。两次运行使用相同模型、数据、1,431,607 个 chunk 和固定阈值 0.11。对这 10 对配置做规范化 JSON 比较后，移除新增的 LSTM module config，其他配置完全相同，因此可以把成对差异归因于启用 LSTM replacement 路径。
+
+这里的“LSTM 量化影响”是端到端影响：标准 ONNX LSTM 被 `com.simo::SimoQuantizeLSTM` 替换，同时加入权重 DQ 和逐时间步状态/输入 QDQ。因此差值既包含量化误差，也可能包含 custom-op/ATen 与标准 ORT LSTM 的数值路径差异，不能用这两组 aggregate summary 把二者拆开。summary 也没有逐 utterance 配对指标或置信区间，所以表格是这批固定数据的确定性实测差值，不是统计显著性结论。
+
+需要修正“Linear + Conv”这个表述：量化配置确实包含 Linear target，但这个 Silero VAD 简化后的实际命中统计中没有 Linear。九组常规配置是 `12 Conv` 对比 `12 Conv + 2 LSTM`；也就是对这个模型而言，实际比较是 **Conv 与 Conv + LSTM**。LSTM 主日志对九组配置均记录 `inserted_by_op={"Conv": 12, "LSTM": 2}`，no-LSTM 日志记录 `{"Conv": 12}`。
+
+### 88.3 完整精度变化
+
+| 量化配置 | no-LSTM ROC-AUC | +LSTM ROC-AUC | delta AUC | no-LSTM Acc@0.11 | +LSTM Acc@0.11 | delta Acc |
+|---|---:|---:|---:|---:|---:|---:|
+| `w_mxfp4_e2m1_a_mxfp4_e2m1_scale_int_sipu` | 0.927574 | 0.911524 | -1.605 pp | 0.633507 | 0.784626 | +15.112 pp |
+| `w_mxfp6_e2m3_a_mxfp6_e2m3_scale_int_sipu` | 0.941489 | 0.922599 | -1.889 pp | 0.766768 | 0.851374 | +8.461 pp |
+| `w_mxfp6_e3m2_a_mxfp6_e3m2_scale_int_sipu` | 0.936454 | 0.933828 | -0.263 pp | 0.729514 | 0.819539 | +9.002 pp |
+| `w_int8_per_channel_a_int8_per_channel` | 0.946673 | 0.538793 | -40.788 pp | 0.828686 | 0.690298 | -13.839 pp |
+| `w_int8_per_channel_a_int8_per_tensor` | 0.947514 | 0.558937 | -38.858 pp | 0.853845 | 0.746381 | -10.746 pp |
+| `w_int8_per_tensor_a_int8_per_tensor` | 0.945295 | 0.547201 | -39.809 pp | 0.831788 | 0.698989 | -13.280 pp |
+| `w_fp8_2d_block_a_fp8_1d_block` | 0.947480 | 0.913916 | -3.356 pp | 0.835417 | 0.562707 | -27.271 pp |
+| `w_mxfp8_e4m3_a_mxfp8_e4m3_scale_int_sipu` | 0.941704 | 0.941186 | -0.052 pp | 0.765563 | 0.818387 | +5.282 pp |
+| `w_mxfp8_e5m2_a_mxfp8_e5m2_scale_int_sipu` | 0.938949 | 0.935727 | -0.322 pp | 0.767449 | 0.839683 | +7.223 pp |
+| `w_mxint8_a_mxint8` | 0.946729 | 0.933877 | -1.285 pp | 0.828048 | 0.884793 | +5.675 pp |
+
+原始 float baseline 是 ROC-AUC `0.947480`、Acc@0.11 `0.835417`，见 [float summary](/share/users/like/package/jdjv/silero_vad_clean/logs/onnx_float_baseline_aishell4_24shards/summary.json)。
+
+结果可以概括为：
+
+- **ROC-AUC 在 10 种配置中全部下降。** 因为 ROC-AUC 不依赖固定阈值，这说明加入 LSTM 量化后，没有一种配置改善整体样本排序质量。
+- **MXFP8 E4M3 最稳。** 它的增量 AUC 损失只有 `0.000518`，即 `0.052 pp`；启用 LSTM 后的绝对 AUC `0.941186` 也是 10 组中最高。
+- MXFP6 E3M2 和 MXFP8 E5M2 的增量 AUC 损失也较小，分别为 `0.263 pp` 和 `0.322 pp`。MXINT8 损失 `1.285 pp`，MXFP4/MXFP6 E2M3 损失约 `1.6` 到 `1.9 pp`。
+- **三种普通 INT8 LSTM 配置发生严重退化。** AUC 从约 `0.945` 到 `0.948` 降到 `0.539` 到 `0.559`，损失 `38.858` 到 `40.788 pp`，已经接近随机排序水平；固定阈值 accuracy 也下降 `10.746` 到 `13.839 pp`。这三组不应作为可接受的部署候选。
+- `w_fp8_2d_block_a_fp8_1d_block` 也明显退化：AUC 损失 `3.356 pp`，Acc@0.11 损失 `27.271 pp`。这一组尤其有诊断价值，因为当前 Conv per-block FP8 不受支持：LSTM 运行只插入 2 个 LSTM、跳过 12 个 Conv，而 no-LSTM 运行插入 0 个节点、跳过 12 个 Conv，证据见 [LSTM 日志第 338 行](/share/users/like/package/jdjv/silero_vad_clean/temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.gpu007.rd.sio-software.com.SimoQuantizeLSTM.2026_08_04___18_31_08:338) 和 [no-LSTM 日志第 338 行](/share/users/like/package/jdjv/silero_vad_clean/temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.gpu007.rd.sio-software.com.no-lstm.2026_08_04___19_38_18:338)。因此该行基本隔离了 FP8 block LSTM 本身的影响；它的数据完整，但不是“Conv + LSTM”结果。
+- MX 系列的 Acc@0.11 反而上升 `5.282` 到 `15.112 pp`，但这与 AUC 全部下降并不矛盾。`Acc@0.11` 使用固定阈值，LSTM 量化改变输出分数的尺度或校准后，单点 accuracy 可能上升，而全阈值范围内的排序能力仍下降。不能据此认定 MXFP4 比 no-LSTM 更好；部署前应重新扫描阈值，并优先结合 ROC-AUC 判断。
+
+如果优先考虑阈值无关的质量，当前结果中首选是 MXFP8 E4M3，其次是 MXFP8 E5M2 或 MXFP6 E3M2。若只看当前固定阈值 0.11，MXINT8 的 `0.884793` 最高，但它的 AUC 比 no-LSTM 低 `1.285 pp`，这更像校准变化，而不是无条件的模型质量提升。
+
+### 88.4 关于“正式 wheel 安装测试”的重要限定
+
+这些结果确认评估进程使用了 wheel 环境。每个 shard 的命令行都是：
+
+```text
+/share_data/users/like/miniconda3/envs/simo_sglang_pip/bin/python ...
+```
+
+但是，这两次命令**没有加载 wheel 内打包的 custom-op 动态库**。`test_quant_onnx.sh` 的默认值令日志中的每个评估命令都显式传入：
+
+```text
+--custom-op-library /share_data/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+wheel 实际安装的动态库位于：
+
+```text
+/share_data/users/like/miniconda3/envs/simo_sglang_pip/lib/python3.12/site-packages/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+当前核对时，这两个 `.so` 的 SHA-256 也不同：
+
+```text
+外部显式加载的 .so:
+84162622636f2043f95d609aa072451d717880b205d2ef16b781cf5a22fef936
+
+wheel site-packages 中的 .so:
+57a5214dbe881005440c35a7f29abf0374793f17973b1340ab55a5341c767b78
+```
+
+所以严谨的表述是：**wheel 安装的 Python `simo` 代码与显式指定的外部 custom-op `.so` 组合，完整通过了这两批精度测试。** 现有日志不能证明 wheel 自带的 `.so` 被加载或其 RUNPATH 已在这次业务测试中得到验证。
+
+要做纯 wheel 闭环复测，应显式改用环境内插件路径，例如：
+
+```bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang_pip/bin/python
+CUSTOM_OP_LIBRARY="$($PY -c 'from simo.onnx.runtime import get_custom_ops_library_path; print(get_custom_ops_library_path())')" \
+PY="$PY" \
+CONFIG_DIR=/share/users/like/package/jdjv/quant_schema/ \
+MODEL=onnx_float_baseline/silero_vad.onnx \
+OUTPUT_ROOT=logs/simo_sglang_pip.wheel-only.SimoQuantizeLSTM \
+SIMPLIFY=true \
+bash test_quant_onnx.sh
+```
+
+另外，shard 日志中的 provider 列表是 `['CUDAExecutionProvider', 'CPUExecutionProvider']`，所以这也是允许其他节点 CPU fallback 的精度测试，不是严格的全图 CUDA placement 测试；这不影响上面的精度对比和完整性结论。
