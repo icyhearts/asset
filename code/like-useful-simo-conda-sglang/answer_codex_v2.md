@@ -13233,3 +13233,255 @@ bash test_quant_onnx.sh
 ```
 
 另外，shard 日志中的 provider 列表是 `['CUDAExecutionProvider', 'CPUExecutionProvider']`，所以这也是允许其他节点 CPU fallback 的精度测试，不是严格的全图 CUDA placement 测试；这不影响上面的精度对比和完整性结论。
+
+## 89. DynamicQuantizeLSTM 与 SimoQuantizeLSTM 的真实 Silero LSTM 隔离对比
+
+### 89.1 已实现的脚本
+
+新增脚本 [compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:1)。它完成以下操作：
+
+1. 用 ONNX Runtime basic graph optimization 对原始 Silero VAD 模型做 constant folding。
+2. 递归遍历 `If` 子图中的全部 LSTM。折叠后共找到 4 个 LSTM，但 W/R hash 表明它们实际对应 2 套唯一权重，分别在采样率分支中重复。
+3. 对每个 LSTM 复制真实的 W、R、B 和节点属性，生成只含一个标准 LSTM 节点的 standalone float ONNX。没有使用 toy model 或随机权重。
+4. 将每个 standalone float 模型转换为 `QInt8 + per_channel=True` 的 `com.microsoft::DynamicQuantizeLSTM` 模型，以及使用指定配置转换为 `com.simo::SimoQuantizeLSTM` 模型。
+5. 强制 float baseline 和 SIMO 使用 CUDA EP，DynamicQuantizeLSTM 使用 CPU EP。CUDA 会话启用 `session.disable_cpu_ep_fallback=1`。
+6. 对 `Y`、`Y_h`、`Y_c` 分别及合并后计算 cosine similarity、relative L2、MAE 和 max absolute error。
+7. 除独立同输入样本外，还执行 Silero 风格的闭环 rollout，把每个实现自己的 `Y_h/Y_c` 回灌到下一步。
+8. 从两种量化模型反解 W/R，以检查 carrier、scale、转置和 gate layout。
+9. 内置一个使用同一 ATen/Triton CUDA 路径的精确 SIMO reference，以及唯一变量为“不对 C 做 QDQ”的消融。正式测试中 reference 与 custom op 的 12 组 rollout 最大绝对差全部为 `0.0`。
+
+关键实现位置包括递归抽取 [第 190 行](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:190)、standalone 模型构造 [第 292 行](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:292)、两种量化 [第 358 行](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:358)、C-QDQ 消融 [第 559 行](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:559) 和权重反解检查 [第 852 行](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:852)。
+
+正式测试命令为：
+
+```bash
+/share_data/users/like/miniconda3/envs/simo_sglang/bin/python \
+  like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py \
+  --output-dir temp/compare-silero-vad-lstm \
+  --custom-op-library simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so \
+  --overwrite
+```
+
+默认参数使用 16 组同输入样本、`sequence_length=1`、`batch_size=1`，并对 `X std=0.01/0.1/0.5` 分别执行 256 步闭环回灌。详细逐输出和逐步数据保存在 [comparison.json](/share/users/like/package/simo_conda_sglang/temp/compare-silero-vad-lstm/comparison.json)。输出目录还保存了 folded 模型及 4 组 float/Dynamic/SIMO standalone 模型。
+
+### 89.2 业务精度对比
+
+三次评测使用相同的 20 个文件、12.7253 小时音频和 1,431,607 个 chunk，`errors` 均为 0：
+
+| 模型 | ROC-AUC | 相对 float 的 AUC 差值 | Accuracy@0.11 | 相对 float 的 Acc 差值 |
+|---|---:|---:|---:|---:|
+| float baseline | 0.947480001 | 0 | 0.835417122 | 0 |
+| ORT DynamicQuantizeLSTM | 0.947420025 | -0.0060 pp | 0.835807592 | +0.0390 pp |
+| SIMO only-LSTM INT8 per-channel | 0.539159014 | -40.8321 pp | 0.666529990 | -16.8887 pp |
+
+因此，ORT DynamicQuantizeLSTM 的端到端精度基本等同 float baseline，而当前 SimoQuantizeLSTM 已接近随机排序。这里不是 Conv 或 Linear 干扰，因为 SIMO 配置只包含 LSTM target。
+
+### 89.3 Standalone 单步和权重结果
+
+float CPU 与 float CUDA 控制组的 combined relative L2 约为 `2e-7`，排除了 CPU/CUDA LSTM 后端差异作为原因。
+
+真实 W/R 反量化误差如下。4 个节点只有两套唯一 W/R，因此按权重集合列出：
+
+| 权重集合 | 张量 | ORT DQ vs float relative L2 | SIMO DQ vs float relative L2 |
+|---|---|---:|---:|
+| A | W | 0.766885% | 0.772502% |
+| A | R | 0.808861% | 0.815239% |
+| B | W | 0.759128% | 0.763012% |
+| B | R | 0.780751% | 0.786390% |
+
+两者差距仅约 `0.004` 到 `0.006` 个百分点。SIMO 的 `iofc` gate 拆分、axis=0 行 scale、W/R 恢复、转置 MatMul 和 Wb+Rb 合并均未发现错误。
+
+16 组独立同输入样本的 combined relative L2 范围如下：
+
+| 初始状态 | ORT Dynamic | SIMO | 两者 cosine 范围 |
+|---|---:|---:|---:|
+| 全零 H/C | 1.10% 至 1.29% | 1.14% 至 1.24% | 均大于 0.99991 |
+| 随机 H/C | 1.04% 至 1.17% | 1.14% 至 1.25% | 均大于 0.99992 |
+
+单次调用中两者非常接近，不能解释 40.8 pp 的 AUC 差距。这也是普通短序列 smoke test 没有发现问题的原因。
+
+### 89.4 256 步 state-feedback 结果
+
+下表给出 4 个 LSTM 随机轨迹的 combined 指标范围。`SIMO no C-QDQ` 与当前 custom op 使用完全相同的 W/R/X/H QDQ 和 ATen 数学，只让 C 保持 float：
+
+| X std | ORT relative L2 | 当前 SIMO relative L2 | 当前 SIMO cosine | SIMO no C-QDQ relative L2 |
+|---:|---:|---:|---:|---:|
+| 0.01 | 0.52% 至 1.55% | 27.31% 至 73.45% | 0.9484 至 0.9723 | 0.62% 至 1.51% |
+| 0.1 | 0.50% 至 1.77% | 6.70% 至 65.43% | 0.9566 至 0.9979 | 0.50% 至 1.65% |
+| 0.5 | 1.41% 至 1.92% | 3.69% 至 4.89% | 0.9989 至 0.9994 | 1.68% 至 1.85% |
+
+最敏感的 `X std=0.01` 中，第 256 步当前 SIMO 的 combined relative L2 已达到 `30.28%` 至 `90.88%`；ORT 仅为 `0.58%` 至 `1.76%`。取消 C-QDQ 后为 `0.67%` 至 `1.67%`。
+
+这个消融具有因果意义，不只是相关性：完整 Torch/Triton reference 和当前 custom op 在每一步逐位一致；唯一移除 C-QDQ 后误差恢复到 ORT 的量级。
+
+### 89.5 根因与 bug 定性
+
+ONNX 标准方程直接使用浮点 `Ct-1`：`Ct = ft * Ct-1 + it * ct`，见 [Operators.md](/share/users/like/package/onnx/docs/Operators.md:17375)。ORT DynamicQuantizeLSTM 只在量化 GEMM 中动态量化 A，也就是 X 或 H，见 [rnn_helpers.cc](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cpu/rnn/rnn_helpers.cc:271)；其 cell update 直接使用 float C，见 [uni_directional_lstm.cc](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cpu/rnn/uni_directional_lstm.cc:538)。
+
+当前 SIMO 则对 X、H 和 C 全部调用相同的 `QuantizeDequantizeState`，见 [simo_lstm_ops.cc](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:732)，随后在第 752 行用 `c_qdq` 更新 C。Silero 的评测每 512 samples 调用一次模型，并把返回 state 作为下一个 chunk 的输入，见 [evaluate_silero_vad_public_v5.py](/share/users/like/package/jdjv/silero_vad_clean/scripts/evaluate_silero_vad_public_v5.py:142)。所以长期记忆 C 在整段音频中被重复 QDQ 数百到数千次。
+
+普通 INT8 full-range 又会放大这个问题：
+
+- 当前配置是 activation `axis=0`。对运行时 `[batch, K]`，axis 0 表示每个 batch row 一个 scale。Silero `batch=1` 时，整个 128 维 C 共享一个 scale，并不是每个 hidden channel 一个 scale。
+- signed INT8 默认范围是 `[-128,127]`，而 scale divisor 使用 `(127 - (-128))/2 = 127.5`，见 [utils.py](/share/users/like/package/simo_conda_sglang/simo/quantization/utils.py:28)。
+- 对控制 scale 的负绝对极值，QDQ 会得到 `-128 / 127.5 = -1.0039216` 倍原值；正极值则最多恢复为 `127 / 127.5 = 0.9960784` 倍。负 C outlier 每次 QDQ 都可能被约 0.392% 地放大。
+- 同一行里一个很大的 C outlier 会决定整行 scale，使较小的 cell 分量被粗粒度舍入，甚至归零。该误差再经过 forget gate 和下一 chunk 的 state feedback 持续改变 recurrent trajectory。
+
+因此结论要分两层：
+
+1. **没有证据表明 W/R 的 INT8 per-channel carrier、gate 顺序或 MatMul 布局有实现 bug。** 真实权重 DQ 误差与 ORT 几乎相同，单步结果也相近。
+2. **SimoQuantizeLSTM 的 recurrence 存在设计级语义 bug。** 如果目标是对标 ONNX LSTM 或 ORT DynamicQuantizeLSTM，C 不应使用 activation QDQ。原实现计划明确要求 QDQ C，所以代码忠实实现了计划；问题在计划的量化语义，而不是 C++ 漏写或错写。它正是本次 INT8 AUC 崩溃的首要原因。
+
+ORT 和 SIMO 也并非“完全相同的 INT8 per-channel”：`per_channel=True` 在 ORT 这里只控制 W/R；ORT 的 X/H 使用每次 GEMM 一个 asymmetric UINT8 动态参数。SIMO 对 X/H/C 使用 symmetric signed INT8、axis=0 每行参数。最关键的差异仍然是 ORT 完全不量化 C。
+
+### 89.6 建议修复与测试
+
+首选修复是保持 X/H/W/R 的现有 QDQ，但让 `initial_c` 和后续 C 始终保持计算 dtype：
+
+```cpp
+c = forget_gate * c + input_gate * cell_gate;
+```
+
+不建议仅改成 narrow range 就认为问题解决。`[-127,127]` 可以消除负极值的固定放大，但共享 scale 造成的 C 分量损失仍会长期积累。如果产品确实要求量化 C，应提供独立于 input 的 C spec，至少使用 symmetric narrow range，并选择不会让单个 outlier 控制整条 state 的粒度。
+
+现有测试的盲区也很明确：[runtime baseline test](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_dynamic_qdq_runtime_debug.py:1329) 只使用 `sequence_length=4` 和很小的初始状态；逐步 reference 在第 1466 行主动把 C-QDQ 写成期望语义，因此只能证明实现符合原计划。普通 INT8 layout 测试在第 1496 行之后只检查 shape 和 finite。建议新增真实或代表性 W/R、`sequence_length=1`、至少 512 至 2000 次 Y_h/Y_c 回灌的 regression，并分别覆盖 full-range/narrow-range 和 C-QDQ 开关。
+
+## 90. SimoQuantizeLSTM 与 DynamicQuantizeLSTM 量化边界对齐结果
+
+### 90.1 实现变更
+
+本次先将实施计划写入 [PLAN_SIMO_ALIGN_LSTM.md](/share/users/like/package/simo_conda_sglang/like-useful/PLAN_SIMO_ALIGN_LSTM.md:1)，之后才修改代码。
+
+CUDA custom op 的 recurrence 已按计划对齐。W/R 的离线 DQ 和每个时间步 X/H 的 input-spec QDQ 保持不变，包括非零 `initial_h` 的首步 QDQ；删除了 `initial_c` 和后续 C 的 QDQ。cell update 现在直接使用计算 dtype 中的 C，见 [simo_lstm_ops.cc](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:750)：
+
+```cpp
+c = forget_gate * c + input_gate * cell_gate;
+```
+
+`com.simo::SimoQuantizeLSTM` v2 的八输入、三输出、属性、carrier 格式、gate IOFC 顺序和模型转换接口均未改变。继续跳过 peephole P、`sequence_lens`、clip、`input_forget`、custom activation 和 `layout=1`。
+
+CUDA 单元测试的逐步参考已改为 float C，见 [test_dynamic_qdq_runtime_debug.py](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_dynamic_qdq_runtime_debug.py:1454)。新增的高动态范围 `initial_c` 回归在同一个 MX block 中混合 `8.0`、`-6.0` 和小值，见[第 1520 行](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_dynamic_qdq_runtime_debug.py:1520)。它同时验证三个输出的 shape、dtype、finite、custom-op/float-C reference 一致性，以及新语义与 legacy C-QDQ reference 确实不同。
+
+Silero 对比脚本也只保留一个 `simo_torch_reference`，见 [compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:560)。`simo_torch_full`、`simo_without_c_qdq` 和 `quantize_cell_state` 已删除；float、Dynamic、SIMO operator 和 SIMO Torch reference 各自独立回灌自身 `Y_h/Y_c`。逐步误差、最终步误差、权重反量化诊断以及 operator/reference `1e-6` 门槛均保留。
+
+### 90.2 构建与测试
+
+使用 `/share_data/users/like/miniconda3/envs/simo_sglang/bin/python` 依次执行了：
+
+```bash
+python -m pip uninstall -y simo
+python -m pip install -e ".[dev]" --no-build-isolation
+```
+
+editable wheel 和 sm90 custom-op 动态库均重新构建成功。新库为 `6,359,296` bytes，SHA-256 是 `3eec3783dcc4bc3fa6ed9d20202171bb8f5b26d329c16c0e87ca872eba3dbb60`。目标 Python 环境可以注册并加载它；补入该环境的 Torch library 目录后，`ldd` 的 Torch、CUDA 和 C10 依赖全部解析，无 `not found`。
+
+测试结果如下：
+
+| 测试 | 结果 | 覆盖 |
+|---|---:|---|
+| LSTM 静态转换/ABI pytest | 43 passed | 固定八输入三输出、属性、optional placeholder、unsupported subset、各 carrier layout |
+| CUDA runtime LSTM pytest | 16 passed | forward、reverse、bidirectional、非零 H/C、8 种量化 layout、FP32/FP16/BF16 |
+| 生成模型 ONNX checker | 13/13 passed | folded 模型及 4 组 float/Dynamic/SIMO standalone 模型 |
+
+普通逐步 reference 的 custom-op 最大绝对误差为 `1.862645149e-08`。高动态范围 C 回归中，custom op 对 float-C reference 的最大绝对误差为 `5.960464478e-08`，明显低于 `1e-6`；float-C 与 legacy C-QDQ reference 的差异为 `0.0147636961`。用旧动态库执行该新回归会以同样的 `0.0147636961` 误差失败，因此该测试能够实际捕获旧语义，不是无效断言。
+
+`py_compile`、Ruff check、Ruff format check 和 `git diff --check` 均通过。生成的 [comparison.json](/share/users/like/package/simo_conda_sglang/temp/compare-silero-vad-lstm/comparison.json) 也通过结构完整性检查：4 个 LSTM、每个 16 组独立样本、12 组闭环轨迹、每条 256 个逐步误差值，且 12 组 operator/reference 最大绝对误差全部为 `0.0`。
+
+### 90.3 真实 Silero LSTM 新结果
+
+重新执行了：
+
+```bash
+python like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py --overwrite
+```
+
+输入仍是相同的 Silero VAD constant-folded 模型和 `w_int8_per_channel_a_int8_per_channel` 配置。模型中 4 个真实 LSTM 全部处理成功。每个节点执行 16 组 zero-state 和 16 组 random-state 独立样本，并在 `X std=0.01/0.1/0.5` 下分别执行 256 步闭环 rollout。
+
+W/R 反量化误差没有变化，这符合本次只调整 C 边界的预期：
+
+| 张量 | ORT Dynamic relative L2 | SIMO relative L2 |
+|---|---:|---:|
+| W | 0.759128% 至 0.766885% | 0.763012% 至 0.772502% |
+| R | 0.780751% 至 0.808861% | 0.786390% 至 0.815239% |
+
+独立同输入结果仍处于约 1% relative L2：
+
+| 初始状态 | ORT Dynamic relative L2 | SIMO relative L2 | 更接近 float 的节点数 |
+|---|---:|---:|---:|
+| zero H/C | 1.0998% 至 1.2864% | 1.1422% 至 1.2405% | Dynamic 3，SIMO 1 |
+| random H/C | 1.0373% 至 1.1731% | 1.0872% 至 1.1843% | Dynamic 4，SIMO 0 |
+
+256 步完整轨迹的 combined 指标如下：
+
+| X std | ORT relative L2 | SIMO relative L2 | ORT cosine | SIMO cosine | 更接近 float 的节点数 |
+|---:|---:|---:|---:|---:|---:|
+| 0.01 | 0.5205% 至 1.5507% | 0.6187% 至 1.5150% | 0.999885046 至 0.999986512 | 0.999887957 至 0.999986701 | Dynamic 2，SIMO 2 |
+| 0.1 | 0.4967% 至 1.7682% | 0.4950% 至 1.6493% | 0.999847111 至 0.999990279 | 0.999865022 至 0.999988226 | Dynamic 1，SIMO 3 |
+| 0.5 | 1.4065% 至 1.9176% | 1.6779% 至 1.8497% | 0.999816515 至 0.999901138 | 0.999831249 至 0.999859368 | Dynamic 3，SIMO 1 |
+
+最终第 256 步的 combined 误差如下：
+
+| X std | ORT relative L2 | SIMO relative L2 | ORT max abs | SIMO max abs | 更接近 float 的节点数 |
+|---:|---:|---:|---:|---:|---:|
+| 0.01 | 0.5782% 至 1.7582% | 0.6654% 至 1.6682% | 0.09331 至 0.42336 | 0.10649 至 0.34843 | Dynamic 3，SIMO 1 |
+| 0.1 | 0.5176% 至 1.8001% | 0.4550% 至 1.8968% | 0.05097 至 0.32197 | 0.09531 至 0.22156 | Dynamic 1，SIMO 3 |
+| 0.5 | 0.9584% 至 1.8865% | 1.7961% 至 1.9477% | 0.02981 至 0.04175 | 0.03417 至 0.14092 | Dynamic 4，SIMO 0 |
+
+按完整 256 步轨迹的 combined relative L2 计，12 组中 Dynamic 和 SIMO 各胜 6 组；只看第 256 步，Dynamic 胜 8 组，SIMO 胜 4 组。SIMO 不再系统性偏离 float，但也不能据此声称它在所有输入尺度上都优于 ORT。
+
+### 90.4 与旧结果的变化及原因
+
+旧 custom op 与新 custom op 的长期闭环变化如下：
+
+| X std | 旧 SIMO relative L2 | 新 SIMO relative L2 | 旧 SIMO cosine | 新 SIMO cosine |
+|---:|---:|---:|---:|---:|
+| 0.01 | 27.31% 至 73.45% | 0.6187% 至 1.5150% | 0.9484 至 0.9723 | 0.999887957 至 0.999986701 |
+| 0.1 | 6.70% 至 65.43% | 0.4950% 至 1.6493% | 0.9566 至 0.9979 | 0.999865022 至 0.999988226 |
+| 0.5 | 3.69% 至 4.89% | 1.6779% 至 1.8497% | 0.9989 至 0.9994 | 0.999831249 至 0.999859368 |
+
+最敏感的 `X std=0.01` 中，旧 SIMO 第 256 步 relative L2 为 `30.28%` 至 `90.88%`，新结果降为 `0.6654%` 至 `1.6682%`。新结果与第 89 节中旧脚本的 `SIMO no C-QDQ` 消融范围 `0.62%` 至 `1.51%`、`0.50%` 至 `1.65%`、`1.68%` 至 `1.85%` 一致，说明实现变化准确兑现了消融结论。
+
+变化原因是 C 不再在每次调用和每个时间步重复经过 shared-scale QDQ。旧实现中，大 C outlier 控制整行 scale，小 cell 分量被粗粒度舍入；signed full-range 的正负端点不对称还可能让负极值每次略微放大。这些误差经 forget gate 和 state feedback 反复累积，最终改变 recurrent trajectory。现在 `C_t = f_t * C_{t-1} + i_t * c_t` 全程保持浮点，上述长期误差源被移除。
+
+W/R 和 X/H 的量化路径没有改变，因此权重误差和单次调用误差基本保持原量级。SIMO 与 ORT 仍不会逐位一致：ORT DynamicQuantizeLSTM 使用动态 asymmetric UINT8 GEMM，SIMO 继续使用配置指定的 signed QDQ 类型、粒度、scale 和 carrier 舍入。当前结果证明的是量化边界已经对齐，且 custom op 与新的 SIMO reference 严格一致；它不等价于两套量化参数或整数 GEMM 完全相同。
+
+## 91. Silero `test_quant_onnx.sh` 两次批量评测核查
+
+### 91.1 完整性、core dump 和异常
+
+核查了以下两次运行的完整日志和输出目录：
+
+```text
+no-LSTM:
+  temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.2026_08_05___18_01_55.gpu007.rd.sio-software.com
+  logs/simo_sglang_pip.no-listm.2026_08_05___18_01_55.gpu007.rd.sio-software.com/
+
+Linear+Conv+LSTM:
+  temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.SimoQuantizeLSTM.2026_08_05___17_58_10.gpu007.rd.sio-software.com
+  logs/simo_sglang_pip.SimoQuantizeLSTM.2026_08_05___17_58_10.gpu007.rd.sio-software.com/
+```
+
+两次运行均完整完成了 10/10 个量化配置。每个配置都写出了 `quantized_model.onnx`、`onnx_quant_config.json`、`run_metadata.json`、`shard_summary.json` 和 `summary.json`；每个配置的 24/24 shard 状态都是 `done`，总计 20 个音频文件、12.7253 小时、1,431,607 个 chunk，`overall.errors=0`。日志中各有 10 个 `QUANT_CONFIG`、10 个 `Aggregated results` 和 10 个 `Wrote .../summary.json` 标记，最后一个配置也正常写出 summary。20 个文件分到 24 个 shard 后，末尾 4 个空 shard 的 `files=0` 是预期行为，不是失败。
+
+`test_quant_onnx.sh` 使用 `set -euo pipefail`；两份日志都走完了全部 10 个配置。按日志和这两个输出目录范围扫描，没有发现 `core dumped`、`SIGSEGV`、`SIGABRT`、segmentation fault、Traceback、Python Exception、CUDA error、OOM、Killed 或 fatal error，也没有发现 core dump 文件。因此本次没有观察到 core dump 或抛异常；这里的结论基于保存下来的日志和产物，后台命令本身没有单独保存 shell `$?`。
+
+### 91.2 Linear+Conv 与 Linear+Conv+LSTM 的精度变化
+
+两组数据都来自同一 `aishell4` 评测集（20 files、1,431,607 chunks），表中 `+LSTM` 表示 `Linear+Conv+LSTM` 结果，`Delta` 是 `+LSTM - Linear+Conv`。精度指标为每个 `summary.json` 的 ROC-AUC 和 `Acc@0.11`；Delta 用百分点（pp）表示。
+
+| 量化类型 | Linear+Conv AUC | +LSTM AUC | Delta AUC | Linear+Conv Acc | +LSTM Acc | Delta Acc |
+|---|---:|---:|---:|---:|---:|---:|
+| mxfp4 e2m1/e2m1 | 0.927574 | 0.928150 | +0.0576 pp | 0.633507 | 0.697537 | +6.4030 pp |
+| mxfp6 e2m3/e2m3 | 0.941489 | 0.942556 | +0.1066 pp | 0.766768 | 0.767618 | +0.0851 pp |
+| mxfp6 e3m2/e3m2 | 0.936454 | 0.935604 | -0.0850 pp | 0.729514 | 0.710235 | -1.9280 pp |
+| INT8 per-channel/per-channel | 0.946673 | 0.946292 | -0.0381 pp | 0.828686 | 0.826533 | -0.2153 pp |
+| INT8 per-channel/per-tensor | 0.947514 | 0.947143 | -0.0371 pp | 0.853845 | 0.852163 | -0.1681 pp |
+| INT8 per-tensor/per-tensor | 0.945295 | 0.946201 | +0.0906 pp | 0.831788 | 0.833285 | +0.1498 pp |
+| FP8 2D-block/1D-block | 0.947480 | 0.946511 | -0.0969 pp | 0.835417 | 0.832369 | -0.3048 pp |
+| mxfp8 e4m3/e4m3 | 0.941704 | 0.942590 | +0.0886 pp | 0.765563 | 0.764228 | -0.1335 pp |
+| mxfp8 e5m2/e5m2 | 0.938949 | 0.938598 | -0.0351 pp | 0.767449 | 0.748806 | -1.8643 pp |
+| mxint8/mxint8 | 0.946729 | 0.946462 | -0.0268 pp | 0.828048 | 0.825332 | -0.2716 pp |
+
+总体上，增加 LSTM 量化后的变化不是单向的：10 种类型中 AUC 提升 4 种、下降 6 种；`Acc@0.11` 提升 3 种、下降 7 种。最大变化是 mxfp4 e2m1 的 Accuracy 上升 6.4030 pp；明显下降的是 mxfp6 e3m2（-1.9280 pp）和 mxfp8 e5m2（-1.8643 pp）。其余类型的 Accuracy 变化绝对值不超过 0.3048 pp，AUC 变化绝对值不超过 0.1066 pp。
+
+量化配置和插入日志也确认了对比边界：no-LSTM 配置包含 `Conv2d/Conv3d + Linear`，+LSTM 配置在此基础上增加 `LSTM`；除 FP8 2D-block 的 Conv 因 `conv_fp8_per_block` 在两组都跳过外，其余配置均报告 `Conv: 12`，+LSTM 组额外报告 `LSTM: 2`。因此表格反映的是在相同 Linear/Conv 配置上增加两个真实 LSTM 节点量化后的端到端精度变化，而不是数据集或 shard 数量变化。

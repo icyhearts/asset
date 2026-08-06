@@ -1605,3 +1605,173 @@ volatile: 约束编译器保留 asm，不定义 GPU 内存序
 ```
 
 PTX 对 `barrier.cluster` 的默认 release/acquire 规则、`.relaxed` 差异和 `fence.cluster` 用法，见 [NVIDIA PTX ISA barrier.cluster 文档](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-barrier-cluster)。
+
+## 26. `size(tAsA)`、`size<0>(tAsA)` 和 `K_PIPE_MAX` 为什么打印错误
+
+### 26.1 日志中的 0 不是 Tensor 的真实 size
+
+打印代码位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:176-182`（函数 `gemm_device`）：
+
+```cpp
+auto K_PIPE_MAX = size<1>(tAsA);
+int k_tile_count = size<1>(tAgA);
+
+printf(" size(tAsA):%d, size<0>(tAsA):%d, K_PIPE_MAX:%d\n",
+       size(tAsA), size<0>(tAsA), K_PIPE_MAX);
+printf("size(tAgA):%d, size<0>(tAgA):%d, k_tile_count:%d\n",
+       size(tAgA), size<0>(tAgA), k_tile_count);
+```
+
+日志显示：
+
+```text
+size(tAsA):32768, size<0>(tAsA):0, K_PIPE_MAX:0
+size(tAgA):262144, size<0>(tAgA):0, k_tile_count:32
+pipe=0, K_PIPE_MAX:0
+pipe=1, K_PIPE_MAX:0
+pipe=2, K_PIPE_MAX:0
+```
+
+其中 `size<0>(tAsA)=0`、`K_PIPE_MAX=0`、`size<0>(tAgA)=0` 都是假象。根因是把 CuTe 的静态整数类型 `cute::C<N>` 直接传给了 C 风格可变参数 `printf("%d", ...)`，导致 format 与实际参数类型不匹配。该调用属于未定义行为，打印值不能用于判断 Tensor shape。
+
+### 26.2 根据 Tensor layout 计算正确结果
+
+`tAgA` 和 `tAsA` 在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:153-168`（函数 `gemm_device`）由 `tma_partition` 生成。日志中的 layouts 是：
+
+```text
+tAsA = ((_512,_16),(_1,_3)):((_1,_512),(_0,_8192))
+tAgA = (((_64,_8),(_2,_8)),32):
+        (((_1@0,_1@1),(_64@0,_8@1)),_64@1)
+```
+
+#### 26.2.1 `tAsA` 的正确 size
+
+`tAsA` 的 top-level mode 0 是 `(_512,_16)`：
+
+```text
+size<0>(tAsA) = 512 * 16 = 8192
+```
+
+top-level mode 1 是 `(_1,_3)`：
+
+```text
+size<1>(tAsA) = 1 * 3 = 3
+K_PIPE_MAX    = 3
+```
+
+整个 Tensor 的元素数是：
+
+```text
+size(tAsA) = 8192 * 3 = 24576
+```
+
+所以正确结果不是 `32768,0,0`，而是：
+
+```text
+size(tAsA)=24576, size<0>(tAsA)=8192, K_PIPE_MAX=3
+```
+
+#### 26.2.2 `tAgA` 的正确 size
+
+`tAgA` 的 top-level mode 0 是 `((_64,_8),(_2,_8))`：
+
+```text
+size<0>(tAgA) = 64 * 8 * 2 * 8 = 8192
+```
+
+top-level mode 1 是运行时 K tile count `32`：
+
+```text
+size<1>(tAgA) = 32
+k_tile_count  = 32
+size(tAgA)    = 8192 * 32 = 262144
+```
+
+因此第二行中 `size(tAgA)=262144` 和 `k_tile_count=32` 恰好打印正确，只有静态的 `size<0>(tAgA)` 被错误打印为 0。
+
+### 26.3 `cute::size` 为什么有时返回普通 `int`，有时返回 `C<N>`
+
+`include/cute/tensor_impl.hpp:548-555`（函数 `cute::size(Tensor)`）把请求转发给 Tensor layout；`include/cute/layout.hpp:603-610`（函数 `cute::size(Layout)`）再对选中的 shape 调用 `size`。最终，`include/cute/int_tuple.hpp:221-276`（函数 `cute::Product::operator()` 和 `cute::size(IntTuple)`）计算各 shape leaf 的乘积。
+
+CuTe 会保留 shape 的静态/动态属性：
+
+| 表达式 | 正确值 | 返回类型特征 | 直接传 `%d` |
+|---|---:|---|---|
+| `size(tAsA)` | 24576 | 全静态，`C<24576>` | 错误 |
+| `size<0>(tAsA)` | 8192 | 全静态，`C<8192>` | 错误 |
+| `size<1>(tAsA)` | 3 | 全静态，`C<3>` | 错误 |
+| `size(tAgA)` | 262144 | 包含动态 K tile mode，运行时整数 | 正确 |
+| `size<0>(tAgA)` | 8192 | mode 0 全静态，`C<8192>` | 错误 |
+| `size<1>(tAgA)` | 32 | 动态 K tile mode，运行时整数 | 正确 |
+
+日志中静态值带下划线，例如 `_512`、`_16`、`_3`；动态值没有下划线，例如最外层的 `32`。这也能直接看出哪些 size 计算会保留为 `C<N>`。
+
+### 26.4 为什么 `C<N>` 有整数转换，`printf` 仍然打印错
+
+`include/cute/numeric/integral_constant.hpp:40-47`（函数 `cute::C<v>::operator value_type`）确实为 `C<N>` 提供了 constexpr 整数转换：
+
+```cpp
+template <auto v>
+struct C {
+  static constexpr auto value = v;
+  constexpr operator value_type() const noexcept { return value; }
+};
+```
+
+这个转换在普通、类型受检查的 C++ 表达式中会生效，例如：
+
+```cpp
+int n = size<0>(tAsA);
+if (pipe < K_PIPE_MAX) { ... }
+```
+
+但是 `printf` 的 `...` 是 C 风格可变参数。`%d` 只是告诉 `printf` 从参数区读取一个 `int`，不会让调用点对 class 类型执行类型安全的用户定义转换。直接传入空的静态常量 class `C<N>` 后，device varargs ABI 中没有与 `%d` 匹配的普通 `int`，于是 `printf` 从错误的寄存器或参数槽读取数据。
+
+这解释了：
+
+- `size<0>(tAsA)`、`K_PIPE_MAX`、`size<0>(tAgA)` 恰好显示为 0；
+- 全静态的 `size(tAsA)` 显示为 32768；
+- 这些错误值可能随编译器、优化等级或周围代码变化。
+
+日志中的 `32768` 与之前计算的 `tma_transaction_bytes` 相同只是当前 ABI/寄存器状态下的偶然结果，不能解释为 `tAsA` 的真实元素数。
+
+### 26.5 为什么循环仍然执行了 3 次
+
+`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:176-201`（函数 `gemm_device`）中，`K_PIPE_MAX` 的类型是 `C<3>`。在普通 C++ 比较中，它会通过 `C<3>::operator int()` 转换成 3：
+
+```cpp
+for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+  ...
+}
+```
+
+所以循环实际执行 `pipe=0,1,2`。日志已经打印出这三次循环，这反过来证明 `K_PIPE_MAX` 的逻辑值是 3；每一行中的 `K_PIPE_MAX:0` 仍然只是同一个 `%d` 类型不匹配问题。
+
+同理，`cutlass::PipelineState<K_PIPE_MAX>` 使用的是编译期值 3，不会因为调试打印显示 0 而变成零 stage pipeline。
+
+### 26.6 正确的打印方法
+
+最直接的修正是在进入 varargs 前显式转换为 `int`：
+
+```cpp
+printf("size(tAsA):%d, size<0>(tAsA):%d, K_PIPE_MAX:%d\n",
+       int(size(tAsA)), int(size<0>(tAsA)), int(K_PIPE_MAX));
+printf("size(tAgA):%d, size<0>(tAgA):%d, k_tile_count:%d\n",
+       int(size(tAgA)), int(size<0>(tAgA)), int(k_tile_count));
+```
+
+预计输出为：
+
+```text
+size(tAsA):24576, size<0>(tAsA):8192, K_PIPE_MAX:3
+size(tAgA):262144, size<0>(tAgA):8192, k_tile_count:32
+```
+
+如果希望同时观察一个值是否为 CuTe 静态常量，可以使用 CuTe 自己的打印函数。`include/cute/numeric/integral_constant.hpp:478-486`（函数 `cute::print(C<Value>)`）会把静态值打印成带下划线的形式：
+
+```cpp
+print(size<0>(tAsA));  // _8192
+print(K_PIPE_MAX);     // _3
+```
+
+结论是：Tensor shape 和 pipeline 配置本身都是正确的；错误只发生在调试输出这一层。

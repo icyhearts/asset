@@ -514,3 +514,19 @@ examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu calles:
 }
 
 
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+对
+```
+  if (this_thread_print) {
+    printf(" size(tAsA):%d, size<0>(tAsA):%d, K_PIPE_MAX:%d\n", size(tAsA), size<0>(tAsA), K_PIPE_MAX);
+    printf("size(tAgA):%d, size<0>(tAgA):%d, k_tile_count:%d\n", size(tAgA), size<0>(tAgA), k_tile_count);
+  }
+```
+的打印结果进行解释.
+
+为什么 size<0>(tAsA)=0? 为什么 K_PIPE_MAX=0?
+为什么size<0>(tAgA)=0?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}

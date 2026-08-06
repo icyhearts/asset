@@ -380,3 +380,4 @@ readelf -S "$SIMO_ONNX_CUSTOM_OPS_LIBRARY" | grep -E '\.debug_(info|line)' \
 ```
 
 结论是：当前项目对 `simo_qdq_ops.cc` 的 Debug 构建对象是完整的 `libSimoOnnxCustomOps_sm90.so`，不是 `simo._C`。临时调试使用 `build_sm90_runtime()` + `CXX` wrapper 最直接；整个 editable 开发环境使用 `DEBUG=1` 时，也必须保留该 wrapper，才能覆盖 `build_runtime.py` 内部硬编码的 `-O3`。
+

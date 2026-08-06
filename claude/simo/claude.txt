@@ -3284,13 +3284,122 @@ pip install  . --no-build-isolation
 CUSTOM_OP_LIBRARY=/share_data/users/like/miniconda3/envs/simo_sglang_pip/lib/python3.12/site-packages/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so CONFIG_DIR=/share/users/like/package/jdjv/quant_schema/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.SimoQuantizeLSTM.`nowstr.sh`.`hostname` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.SimoQuantizeLSTM.`nowstr.sh`.`hostname` 2>&1 &
 日志 temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.lstm.SimoQuantizeLSTM.2026_08_05___10_44_13.gpu007.rd.sio-software.com
 不同量化类型的输出: logs/simo_sglang_pip.SimoQuantizeLSTM.2026_08_05___10_44_13.gpu007.rd.sio-software.com/
-
 # no lstm
-日志 
- 不同量化类型的输出:
-
+CUSTOM_OP_LIBRARY=/share_data/users/like/miniconda3/envs/simo_sglang_pip/lib/python3.12/site-packages/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_no_lstm/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.no-listm.`nowstr.sh`.`hostname` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.`nowstr.sh`.`hostname` 2>&1 &
+日志 temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.2026_08_05___14_14_42.gpu007.rd.sio-software.com
+ 不同量化类型的输出: logs/simo_sglang_pip.no-listm.2026_08_05___14_14_42.gpu007.rd.sio-software.com/
 1.  两次测试都完整地生成模型精度数据了吗？有没有 core dump？有没有抛异常?
 2. 两次测试，Linear+Conv的配置，和Linear+Conv+LSTM的配置， 增加  LSTM量化后，不同量化数据类型的模型精度有什么变化 ？
 把答案追加到 like-useful/answer_codex_v2.md
 
+}
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/ simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /share/users/like/package/onnxruntime onnx 代码位于 /share/users/like/package/onnx/
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+你现在把 like-useful/const_fold_lstm.py like-useful/test-onnx-dynamic-quant-lstm.py 融合成一个脚本: like-useful/test-const-fold-quantize-lstm.py
+功能如下:
+先把  onnx 文件进行 const fold, 再调用 quantize_dynamic 进行量化，把量化后的 onnx 保存成新的onnx 文件
+期望对 /share/users/like/package/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx 进行const fold + quantize_dynamic.
+# quantize_dynamic 支持 op_types_to_quantize 参数，我只需要量化 LSTM
+# 要支持子图量化, /share/users/like/package/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx 里面， LSTM 位于子图
+# per_channel =True/False都要尝试, weight_type 要尝试合法的 quantize_dynamic 支持的类型，以笛卡尔积形式尝试，保存的文件名确定方式: 用户在命令行指定一个保存目录，程序内部确定 onnx 的 basename, basename 要体现出 per_channel True/False + weight_type 的组合.
+# 写完后用  conoda 环境测试写的脚本.
+}
+{ # // deprecated, 我想用editable
+我已经把当前代码 同步到 /share/users/like/package//simo_conda_sglang_pip/
+我在 conda 环境 /share_data/users/like/miniconda3/envs/simo_sglang_pip/中，使用/share/users/like/package//simo_conda_sglang_pip/代码安装 simo，使用的是正式的 wheel安装 ：
+```
+pip install  . --no-build-isolation
+```
+在这样一个以wheel安装的环境中, 然后在工作目录 /share/users/like/package/jdjv/silero_vad_clean 中使用 /share_data/users/like/miniconda3/envs/simo_sglang_pip/环境  执行下面的命令:
+# onnxruntime 自己 quantize_dynamic 测试:
+MODEL=/share/users/like/package/simo_conda_sglang/temp/test-const-fold-quantize-lstm/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx OUTPUT_DIR=logs/test_silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.`nowstr.sh`.`hostname` bash test_float.sh > temp/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.log.`nowstr.sh`.`hostname` 2>&1
+输出目录: logs/test_silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.2026_08_05___14_19_23.gpu007.rd.sio-software.com/
+日志: temp/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.log.2026_08_05___14_19_23.gpu007.rd.sio-software.com
+
+# simo only lstm quantize 测试
+QUANT_CONFIG=w8a8_int8/w_int8_per_channel_a_int8_per_channel.json CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_only_lstm/ CUSTOM_OP_LIBRARY=/share_data/users/like/miniconda3/envs/simo_sglang_pip/lib/python3.12/site-packages/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`  OUTPUT_DIR=logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`  SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`.log 2>&1 &
+输出目录 ：logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.2026_08_05___15_29_47.gpu007.rd.sio-software.com/
+日志: temp/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.2026_08_05___15_29_47.gpu007.rd.sio-software.com.log
+
+}
+
+{  
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/ simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /share/users/like/package/onnxruntime. onnx 代码位于 /share/users/like/package/onnx/.
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+onnxruntime  DynamicQuantizeLSTM 算子的实现 位于 onnxruntime code base ./onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc, 这个实现是cpu 实现。
+/share/users/like/package/simo_conda_sglang/temp/test-const-fold-quantize-lstm/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx 模型来自 like-useful/test-const-fold-quantize-lstm.py 的先const fold 再量化 lstm的产物。
+在工作目录 /share/users/like/package/jdjv/silero_vad_clean/ 中使用 /share_data/users/like/miniconda3/envs/simo_sglang/ 环境  执行下面的命令:
+# onnxruntime 自己 quantize_dynamic 测试:
+MODEL=/share/users/like/package/simo_conda_sglang/temp/test-const-fold-quantize-lstm/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx OUTPUT_DIR=logs/test_silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.`nowstr.sh`.`hostname` bash test_float.sh > temp/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.log.`nowstr.sh`.`hostname` 2>&1
+输出目录: logs/test_silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.2026_08_05___15_46_39.gpu007.rd.sio-software.com/
+日志: temp/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx.log.2026_08_05___15_46_39.gpu007.rd.sio-software.com
+这个测试虽然名字叫 test_float.sh 实际上使用的是 /share/users/like/package/simo_conda_sglang/temp/test-const-fold-quantize-lstm/silero_vad.const_folded.dynamic_lstm.per_channel_true.weight_qint8.onnx 模型，所以反应的模型精度是 onnxruntime DynamicQuantizeLSTM 对模型精度的影响。
+
+# simo only lstm quantize 测试
+QUANT_CONFIG=w8a8_int8/w_int8_per_channel_a_int8_per_channel.json CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_only_lstm/ CUSTOM_OP_LIBRARY=/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so  MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`  OUTPUT_DIR=logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`  SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`.log 2>&1 &
+输出目录 logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.2026_08_05___15_50_14.gpu007.rd.sio-software.com/
+日志: temp/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.2026_08_05___15_50_14.gpu007.rd.sio-software.com.log
+这个测试的模型精度是 只有 SimoQuantizeLSTM  情况下对 模型精度的影响。/share/users/like/package/jdjv/quant_schema_only_lstm/ 里面的配置文件，只有LSTM的targets.
+请完成以下任务:
+# 帮我写一个 python 代码 like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py 把 /share/users/like/package/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx const fold之后，对于所有的 LSTM算子，循环执行以下操作:
+ ## 把 LSTM 的权重 复制到新的 float lstm onnx 模型中, float onnx模型只有 lstm算子，排除其他算子的干扰，这样的模型来自真实模型，而不是toy model, 权重也是真实的权重，而不是随机数权重。
+ 构造一些随机输入,先用 CUDAExecutionProvider 执行一遍 float 模型推理, 得到 float baseline 输出。
+ ## 把float lstm onnx 用 onnxruntime quantize_dynamic 量化成  per_channel=true, dtype=qint8 的 DynamicQuantizeLSTM 模型， 用同样一批输入,用 CPUExecutionProvider 执行一遍推理，得到 DynamicQuantizeLSTM 输出，和float baseline 输出对比 cosine similarity, relative l2 norm error
+ ## 把float lstm onnx 用 simo/onnx/api.py quantize函数 量化成  SimoQuantizeLSTM 模型, 配置文件使用 /share/users/like/package/jdjv/quant_schema_only_lstm/w8a8_int8/w_int8_per_channel_a_int8_per_channel.json ，用同样一批输入, 用 CUDAExecutionProvider 执行一遍推理，得到 SimoQuantizeLSTM 输出，和float baseline 输出对比 cosine similarity, relative l2 norm error
+ ## 写完代码，用 /share_data/users/like/miniconda3/envs/simo_sglang 运行代码进行测试, 并观察， SimoQuantizeLSTM 和 DynamicQuantizeLSTM，哪个输出更加接近 float baseline, 分析结果追加到 like-useful/answer_codex_v2.md
+# 帮我分析原因，同样是仅量化 LSTM, 同样是 int8 per channel 量化，为什么 SimoQuantizeLSTM 比 onnxruntime DynamicQuantizeLSTM 模型精度差很多?  是不是 SimoQuantizeLSTM 对于 int8 per channel 的 实现有bug? 把答案追加到 like-useful/answer_codex_v2.md
+}
+
+{ # 帮我把 SimoQuantizeLSTM 和 DynamicQuantizeLSTM 的语义对齐
+
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/ simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /share/users/like/package/onnxruntime onnx 代码位于 /share/users/like/package/onnx/
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+onnxruntime  DynamicQuantizeLSTM 算子的实现 位于 onnxruntime code base ./onnxruntime/contrib_ops/cpu/quantization/dynamic_quantize_lstm.cc, 这个实现是cpu 实现。
+
+# 对于 it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi),  和DynamicQuantizeLSTM 一致，如果DynamicQuantizeLSTM没有量化，SimoQuantizeLSTM也不量化, 如果DynamicQuantizeLSTM有量化，SimoQuantizeLSTM  按 simo QDQ 量化
+# 对于ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf), 和DynamicQuantizeLSTM 一致，如果DynamicQuantizeLSTM没有量化，SimoQuantizeLSTM也不量化, 如果DynamicQuantizeLSTM有量化，SimoQuantizeLSTM  按 simo QDQ 量化
+# 对于 ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc), 和DynamicQuantizeLSTM 一致，如果DynamicQuantizeLSTM没有量化，SimoQuantizeLSTM也不量化, 如果DynamicQuantizeLSTM有量化，SimoQuantizeLSTM  按 simo QDQ 量化
+# 对于 Ct = ft (.) Ct-1 + it (.) ct, 和DynamicQuantizeLSTM 一致，如果DynamicQuantizeLSTM没有量化，SimoQuantizeLSTM也不量化, 如果DynamicQuantizeLSTM有量化，SimoQuantizeLSTM  按 simo QDQ 量化
+# 对于 ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo), 和DynamicQuantizeLSTM 一致，如果DynamicQuantizeLSTM没有量化，SimoQuantizeLSTM也不量化, 如果DynamicQuantizeLSTM有量化，SimoQuantizeLSTM  按 simo QDQ 量化
+# 对于 Ht = ot (.) h(Ct),  和DynamicQuantizeLSTM 一致，如果DynamicQuantizeLSTM没有量化，SimoQuantizeLSTM也不量化, 如果DynamicQuantizeLSTM有量化，SimoQuantizeLSTM  按 simo QDQ 量化
+# *** 总之，在是否量化一个LSTM 内部matmul/tanh/sigmoid/elementwise等操作的决策上，如果 DynamicQuantizeLSTM 没有量化， SimoQuantizeLSTM 也不量化，如果DynamicQuantizeLSTM 有量化， SimoQuantizeLSTM 按 QDQ 方式量化。
+# 写完代码，用指定 conda环境, 先  pip uninstall simo ,再 pip install -e ".[dev]" --no-build-isolation, 
+# 安装完后 ,再次运行 like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py 再重新跑一遍, 要执行 Silero 风格的闭环 rollout，把每个实现自己的 `Y_h/Y_c` 回灌到下一步。 分析新的结果, 把答案追加到 like-useful/answer_codex_v2.md
+# 写代码前先把执行计划写入 like-useful/PLAN_SIMO_ALIGN_LSTM.md
+
+}
+{
+把 /share/users/like/package/jdjv/quant_schema/ copy 成 /share/users/like/package/jdjv/quant_schema_only_lstm，把 /share/users/like/package/jdjv/quant_schema_only_lstm 里面所有的Conv/Linear的targets去掉，仅保留 LSTM 的量化配置  
+}
+{
+编译通过后， 在工作目录 /share/users/like/package/jdjv/silero_vad_clean/ 中使用 /share_data/users/like/miniconda3/envs/simo_sglang/ 环境  执行下面的命令:
+QUANT_CONFIG=w8a8_int8/w_int8_per_channel_a_int8_per_channel.json CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_only_lstm/ CUSTOM_OP_LIBRARY=/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so  MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`  OUTPUT_DIR=logs/simo_sglang_pip.w_int8_per_channel_a_int8_per_channel.only-lstm.`nowstr.sh`.`hostname`  SIMPLIFY=true bash test_quant_onnx.sh
+再次分析 silero_vad 的真实的模型精度情况
+}
+
+{ 
+keep LSTM cell state in floating point 修改之后， 我在工作目录 /share/users/like/package/jdjv/silero_vad_clean 中使用 /share_data/users/like/miniconda3/envs/simo_sglang/ 环境  执行下面的命令:
+
+# 没有 lstm 量化:
+CUSTOM_OP_LIBRARY=/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_no_lstm/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.no-listm.`nowstr.sh`.`hostname` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.`nowstr.sh`.`hostname` 2>&1 &
+日志: temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.2026_08_05___18_01_55.gpu007.rd.sio-software.com 
+不同量化类型的输出: logs/simo_sglang_pip.no-listm.2026_08_05___18_01_55.gpu007.rd.sio-software.com/
+# 有 lstm量化:
+CUSTOM_OP_LIBRARY=/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so CONFIG_DIR=/share/users/like/package/jdjv/quant_schema/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.SimoQuantizeLSTM.`nowstr.sh`.`hostname` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.SimoQuantizeLSTM.`nowstr.sh`.`hostname` 2>&1 &
+日志:  temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.SimoQuantizeLSTM.2026_08_05___17_58_10.gpu007.rd.sio-software.com 
+不同量化类型的输出:  logs/simo_sglang_pip.SimoQuantizeLSTM.2026_08_05___17_58_10.gpu007.rd.sio-software.com/
+1.  两次测试都完整地生成模型精度数据了吗？有没有 core dump？有没有抛异常?
+2. 两次测试，Linear+Conv的配置，和Linear+Conv+LSTM的配置， 增加  LSTM量化后，不同量化数据类型的模型精度有什么变化 ？
+把答案追加到 like-useful/answer_codex_v2.md
+
+}
+{
+/softhome/like/asset/code/cpp_guard/kgp.cpp 编译结果位于 /softhome/like/asset/code/cpp_guard/build/kgp
+/softhome/like/asset/code/cpp_guard/build/kgp 在运行过程中会 kill 其他进程，这个kill 动作，有可能被查出是谁干的吗?
+把答案追加到 like-useful/answer_codex_v3.md
+写一个脚本 like-useful/check_kill.sh, 检查当前系统是否具备 事后排查 kill 信号的配置或者条件
 }
