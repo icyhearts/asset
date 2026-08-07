@@ -530,3 +530,129 @@ examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run
 为什么size<0>(tAgA)=0?
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
 }
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 215 行:
+```
+      ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+      copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+      copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+```
+# 为什么 先调用arrive_and_expect_tx，后调用 copy? 如果顺序反了，有什么后果 ？
+# copy 有很多重载，这里调用的是哪个实现 ？
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+# tAgA 打印出来为什么是 ArithTuple(128,_0) o (((_64,_8),(_2,_8)),32):(((_1@0,_1@1),(_64@0,_8@1)),_64@1)?
+它的 stride 是带@符号的.
+普通的 tensor, operator() 的含义是，输入是逻辑偏移，先用 tensor layout 得到物理偏移, 再用物理偏移 + tensor base pointer, 取出 物理偏移 + tensor base pointer 处的元素。
+tAgA 这种 tensor, operator() 的含义又是什么? 注释显示， operator() 的输出结果是 cute::ArithmeticTuple<int, unsigned int>
+用例子说明.
+#
+```
+    for (int i = 0; i < 16; i++) {
+      auto elem = tAgA(i);
+      printf("auto elem = tAgA(%d);:\n", i);
+      print(elem); printf("\n");
+    }
+```
+打印的结果又该如何解释 ？
+# copy 函数 又是如何使用 tAgA产生的 cute::ArithmeticTuple<int, unsigned int>? 为什么 TMA copy 的源数据，不是 tensor value, 而是一堆 cute::ArithmeticTuple<int, unsigned int>?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+补充说明,运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+}
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 会调用 cuTensorMapEncodeTiled 吗?
+它是如何生成 tma descriptor 的？
+把 生成 tma descriptor 和 初始化 tma descriptor 的函数栈整理出来, 只考虑 A 矩阵， B 矩阵调用栈应该是类似的，不需要整理.
+
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+
+include/cute/atom/copy_traits_sm90_tma.hpp 1046行调用:
+```
+    CUresult result = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+```
+
+include/cutlass/cuda_host_adapter.hpp 定义:
+```
+#define CUTLASS_CUDA_DRIVER_WRAPPER_CALL(func) cutlass::call_##func
+```
+CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled) 是如何展开的?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+{
+对 include/cute/arch/util.hpp 310 行， explode_tuple  进行讲解
+以 `include/cute/atom/copy_traits_sm90_tma.hpp:64-90 调用 explode_tuple 为例讲解.
+三个 int_sequence 类型参数，只有类型，没有参数名，这是合法 c++ 语法吗?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+
+
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+tCrA的定义是：
+```
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
+```
+# tCrA 和普通的 Tensor of value有什么区别?
+      copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+TMA 把数据从 global memory copy 到 shared memory,即 tAgA -> tAsA.
+# tCsA 是通过 Tensor tCsA = thr_mma.partition_A(sA); 得到的, tCsA 和 tAsA 会有什么关系？ tCrA 又和 tCsA 有什么关系?
+# 整理数据从 tAgA -> tAsA -> tCsA -> tCrA -> gemm计算过程中，数据流动过程?
+# tAgA, tAsA, tCsA, tCrA的数据，CTA 内部所有线程看到的数据是一样的吗?
+代码打印了 tCrA 的前4个元素:
+```
+      for (int idx = 0; idx < 4; idx++) {
+      auto elem = tCrA(idx);
+      // elem.foo(); // error: union "cute::GmmaDescriptor" has no member "foo"
+      printf("idx:%d, elem=\n", idx);
+      print(elem); printf("\n");
+      }
+```
+# 为什么打印出来的结果是日志中的样子?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+{
+llama.cpp代码位于 /share/users/like/package/llama.cpp
+llama.cpp 在使用 cuda后端的时候，gemm或者matmul计算，使用的是cutlass, cublas, 还是llama.cpp 自己实现的 gemm/matmul cuda kernel? 用一个例子说明 
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+tCrA的定义是：
+```
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
+```
+# tCrA 是从 tCsA 得到的 tensor of descriptor , descriptor 本身也是要占用存储空间的，tCrA 是和 tCsA 一样在 shared memory 吗? 它是占用的什么物理上的存储空间?一个 thread的 tCrA 占用多少bytes? 一个 CTA 的 tCrA 占用多少 bytes?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+tCrA的定义是：
+```
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
+```
+# tCsA 打印结果显示，
+Tensor tCsA = thr_mma.partition_A(sA);                               // (MMA,MMA_M,MMA_K,PIPE):
+Sw<3,4,3>_smem_ptr[16b](0x7fdc01000400) o ((_64,(_8,_2)),_2,_4,(_1,_3)):((_1,(_64,_1024)),_512,_2048,(_0,_8192))
+tCsA 基地址是 0x7fdc01000400,至少需要48 bit存储， GmmaDescriptor 只用 14 bit 存储起始地址，这样不会出错吗？ 原始地址 0x7fdc01000400 的高位被丢弃， 只剩下 低14bit, tensorcore mma 指令是如何找到完整的 shared memory 地址的?
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}

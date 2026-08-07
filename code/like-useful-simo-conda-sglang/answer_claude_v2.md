@@ -2143,3 +2143,133 @@ Ort::Status Compute(const Ort::Custom::Tensor<uint8_t>& in,
 ### 36.8 一句话总结
 
 > **方式 C（`ONNX_OPERATOR_TYPED_KERNEL_EX`）不是"自定义算子"而是"内置算子"的实现方式，只能用于编译进 ONNX Runtime 源码树的代码。方式 A（`CreateLiteCustomOp`）和方式 B（`CustomOpBase`）都是外部自定义算子的 API，底层都是 `OrtCustomOp` C 结构体，但方式 A 是 ORT 官方推荐的现代方式——它通过模板元编程自动从 C++ 函数签名推断 schema，消除了方式 B 需要手写的大量样板代码。**
+
+## 37. onnxruntime CUDA LSTM 的底层实现，以及 SimoQuantizeLSTM 摆脱 torch 依赖的可行性分析
+
+### 37.1 问题一：onnxruntime CUDAExecutionProvider 的浮点 LSTM 是调用 cudnn，还是有自己的 CUDA kernel？
+
+**结论：直接调用 cuDNN，没有自己的 LSTM CUDA kernel。**
+
+证据链如下：
+
+1. **注册的是 cuDNN 基类 kernel**
+   `onnxruntime/core/providers/cuda/rnn/lstm.cc:51-61` 用 `REGISTER_KERNEL_VERSIONED_TYPED(float)` / `REGISTER_KERNEL_TYPED(float)` 注册了 `float`/`double`/`MLFloat16` 三种浮点类型的 LSTM，但 kernel 类就是 `LSTM<T>`。
+
+2. **LSTM kernel 是 `CudnnRnnBase` 的子类**
+   `onnxruntime/core/providers/cuda/rnn/lstm.h:12-15` 定义 `class LSTM final : public CudnnRnnBase<T>`，构造函数里 `SetRNNMode(CUDNN_LSTM)`。它只处理 ONNX 的 `W[iofc]`/`R[iofc]` 布局到 cuDNN linLayerID 的映射（`lstm.h:24-27`），并把权重交给 `CacheCudnnRnnWeights`（`lstm.h:31`）。
+
+3. **真正的计算在 cuDNN 调用里**
+   `onnxruntime/core/providers/cuda/rnn/cudnn_rnn_base.cc:184` 的 `CudnnRnnBase<T>::ComputeInternal()` 做了所有事：
+   - `cudnn_rnn_base.cc:351` 调用 `cudnnRNNForward(GetCudnnHandle(ctx), rnn_desc, CUDNN_FWD_MODE_INFERENCE, ...)` —— **这是推理时的核心计算**；
+   - `cudnn_rnn_base.cc:306-316` 通过 `CudnnRNN::Set()` 构造 cuDNN RNN descriptor（`cudnn_rnn_base.h:52-67` 的 `cudnnSetRNNDescriptor_v8`）；
+   - `cudnn_rnn_base.cc:322-327` 的 `ReorganizeWeights()` 把 ONNX 权重按 cuDNN 的 linLayerID 重排并拷入 cuDNN 权重 buffer（`cudnn_rnn_base.cc:34-46` 的 `cudnnGetRNNWeightParams` + `cudaMemcpyAsync`）。
+
+4. **ONNX 算子文档本身也说明 LSTM 通常由 CuDNN 这类自定义实现支持**
+   `onnx/docs/Operators.md:17334-17335` 明确写 "This operator is usually supported via some custom implementation such as CuDNN."
+
+5. **ORT 里唯一的非 cuDNN LSTM 是 CPU 版本和 DynamicQuantizeLSTM**
+   CUDA provider 目录下只有 `rnn/` 里这一个 LSTM 实现（`grep LSTM` 在 cuda provider 下除了 `lstm.cc/h`、`cudnn_rnn_base.*` 外只有 `cuda_execution_provider.cc` 的调度注册）。ORT 没有为 CUDA LSTM 写逐时间步的 CUDA kernel，而是把整个序列（含 `sequence_lens` 打包逻辑，见 `cudnn_rnn_base.cc:223-253`）一次交给 cuDNN。
+
+> 附带说明：cuDNN LSTM 只注册了 float/double/float16（`lstm.cc:51-61`），**没有 bfloat16**。而 SIMO 的 SimoQuantizeLSTM 显式支持 bf16（见下文 37.2），这也是 SIMO 不能直接"换成 ORT 官方 LSTM kernel"的原因之一。
+
+---
+
+### 37.2 问题二：当前 SimoQuantizeLSTM 用了哪些 torch 算子？ORT 的 cuda 算子能否覆盖？
+
+#### 37.2.1 SimoQuantizeLSTM 对 torch 的依赖点
+
+文件 `simo/onnx/ort_plugin/simo_lstm_ops.cc`（978 行）：
+
+**A. 头文件 / 编译期依赖（torch 强耦合的根源）**
+- `simo_lstm_ops.cc:5-9` include `<ATen/ATen.h>`、`<ATen/ops/from_blob.h>`、`<c10/core/InferenceMode.h>`、`<c10/cuda/CUDAGuard.h>`、`<c10/cuda/CUDAStream.h>`；
+- 模板参数携带 torch 类型：`simo_lstm_ops.cc:42` `at::kFloat`、`:50` `at::kHalf`、`:58` `at::kBFloat16`；
+- 构建时显式链接 torch：`simo/onnx/ort_plugin/build_runtime.py:89-111` 传了 `-ltorch` `-ltorch_cpu` `-ltorch_cuda` `-lc10` `-lc10_cuda`，include 里还加了 `torch_include_paths()`（`build_runtime.py:87`）。
+
+**B. 张量包装（避免拷贝、直接引用 ORT buffer）**
+- `simo_lstm_ops.cc:276-283` `WrapOrtTensor()`：`at::from_blob(tensor.Data(), shape, options)` 把 ORT 输入 buffer 包成 torch tensor（零拷贝）；
+- `simo_lstm_ops.cc:285-293` `WrapOrtOutput()`：先 `tensor.Allocate(shape)` 分配 ORT 输出，再 `at::from_blob` 包起来；
+- 因此后面所有计算都能用 torch 算子直接写进 ORT 分配的输出 buffer。
+
+**C. 权重反量化 DequantizeGate（`simo_lstm_ops.cc:467-515`）**
+- `at::empty`（`:485`）分配 fp32/fp16/bf16 输出；
+- `result.reshape(...)`（`:499`）、`result.slice(...)`（`:502`）、`result.permute(...)`（`:506`）、`result.contiguous()`（`:508`）做布局恢复；
+- 注意核心反量化计算本身走的是 SIMO 自己的 Triton QDQ kernel（`:486-496` 的 `LaunchQdqKernelForRuntime`），**不是 torch**。
+
+**D. 输入/隐状态量化-反量化 QuantizeDequantizeState（`simo_lstm_ops.cc:517-614`）**
+- `input.contiguous()` / `input.transpose(...)`（`:529,:535,:542,:548`）；
+- `at::zeros` + `copy_` 做 MX 格式的 block 对齐 padding（`:560-563`）；
+- `at::empty` 分配 quantized/scale/dequantized buffer（`:578-580`）；
+- 核心 Q/DQ 仍走 `LaunchQdqKernelForRuntime`（`:582-603`）。
+
+**E. 主循环 ComputeImpl（`simo_lstm_ops.cc:616-758`）—— 真正吃 torch 的部分**
+- `simo_lstm_ops.cc:670-673` 把 ORT 的 CUDA stream 转成 torch 外部 stream 并上 `CUDAStreamGuard` + `InferenceMode`；
+- 每个 gate 的矩阵乘：`simo_lstm_ops.cc:739-740` `at::matmul(x_qdq, w_gates[d][g].transpose(0,1)) + at::matmul(h_qdq, r_gates[d][g].transpose(0,1))`；
+- 加 bias：`simo_lstm_ops.cc:742` `gates[gate] + gate_bias[gate]`；
+- 激活：`:746-749` `at::sigmoid` ×3、`at::tanh` ×2；
+- 门融合：`:750` `c = forget_gate * c + input_gate * cell_gate`，`:751` `h = output_gate * at::tanh(c)`；
+- 写回 ORT 输出：`:752` `y.select(...).copy_(h)`，`:754-755` `y_h/y_c.select(...).copy_(...)`。
+
+> 一句话归纳：**matmul/sigmoid/tanh/elementwise(+,-,*)/copy_/transpose/contiguous/slice/select/reshape 全部依赖 torch；只有 QDQ 的量化/反量化计算用的是 SIMO 自己的 Triton kernel。**
+
+#### 37.2.2 onnxruntime 的 cuda 算子能否满足这些需求？
+
+理论上可以，而且 ORT 的 CUDA 算子覆盖得非常全：
+
+| SimoQuantizeLSTM 用的 torch 算子 | ORT CUDA 对应算子 | ORT 实现 | fp32/fp16/bf16 支持 |
+|---|---|---|---|
+| `at::matmul` | `MatMul` | 走 cuBLAS：`onnxruntime/core/providers/cuda/math/matmul.cc:94` `ComputeInternal`，`matmul.cc:174`/`:345` `cublasGemmHelper`；有 tunable 变体（含 bf16）：`onnxruntime/core/providers/cuda/tunable/math/matmul.cc:105-108` | float/double/fp16/bf16（`matmul.cc:44-47`） |
+| `at::sigmoid` / `at::tanh` | `Sigmoid` / `Tanh` | 手写 elementwise CUDA kernel：`activations.cc:80-81,84-85` 注册；`activations.cc:34-47` `UNARY_ACTIVATION_COMPUTE` 派发到 `activations_impl.cu` 的 `Impl_Sigmoid`/`Impl_Tanh` | float/double/fp16/**bf16**（`activations.cc:80-81` 用了 `UNARY_ACTIVATION_OP_HFD_WITH_BF16`） |
+| `+` / `-` / `*`（`c = f*c + i*g` 等） | `Add` / `Sub` / `Mul` | 手写 elementwise CUDA kernel：`binary_elementwise_ops.cc:276-289` 注册；`binary_elementwise_ops.cc:127-145` `BINARY_ELEMENTWISE_COMPUTE` 派发；broadcast 逻辑在 `binary_elementwise_ops.h:141-178`（`Add`/`Sub`/`Mul` class） | float/double/fp16/bf16（`binary_elementwise_ops.cc:281-289` `_WITH_BF16`/`BWUZCSILHFD`） |
+| `transpose` / `slice` / `select` / `reshape` | ONNX `Transpose`/`Slice` 等 | 这些属于"内存布局变换"，在 ORT 中要么是 `Transpose` 的 CUDA kernel（`cuda` 下有 transpose 实现），要么是纯 meta 操作 | — |
+
+**关键结论**：
+- 功能层面，ORT 的 `MatMul`/`Sigmoid`/`Tanh`/`Add`/`Sub`/`Mul` CUDA 算子**能覆盖** SimoQuantizeLSTM 在 fp32/fp16/bf16 下对 matmul/激活/elementwise 的需求；
+- 但"能覆盖"**不等于"能直接调用"**。见 37.3 的工程约束，那才是真正决定能不能摆脱 torch 的地方。
+
+---
+
+### 37.3 问题三：能不能真正摆脱 torch？两种实现哪个更符合工程规范？
+
+#### 37.3.1 现实约束：SimoQuantizeLSTM 是"外部自定义算子"，不是 ORT 内置 kernel
+
+这是整个讨论的**决定性前提**：
+
+1. **外部自定义算子无法访问 ORT 内部 kernel 类**
+   ORT 的 CUDA `MatMul<T>`/`Sigmoid<T>`/`Add<T>` 等 kernel 类都继承 `onnxruntime::CudaKernel`（`cuda_rnn_base.h:81`、`binary_elementwise_ops.h:129`），它们只能在 `onnxruntime/core/providers/cuda/` 源码树内使用（方式 C 的内置注册）。SIMO 的插件是**在 ORT 仓库外编译的独立 `.so`**（见 `setup.py:106-110` `build_sm90_runtime`、`build_runtime.py:91-114` 的裸 g++ 链接），它拿到的是 `OrtKernelContext`（`simo_lstm_ops.cc:388`）而不是 `OpKernelContext`，**根本 new 不出 `MatMul<float>` 这种类，也没有 `ctx->GetCublasHandle()`**。
+
+2. **ORT 提供的 C API 只有"在当前 stream 上 launch"的能力**
+   自定义算子能拿到的全部 GPU 资源是 `Ort::GetApi().KernelContext_GetGPUComputeStream(&context, &stream)`（`onnxruntime_c_api.h:4662`，实际用法在 `simo_lstm_ops.cc:246-274` `CudaStreamAndDevice()`）。没有 cublas handle、没有 cudnn handle、没有 ORT allocator。
+
+3. **因此"调用 onnxruntime 的 matmul/tanh/sigmoid/elementwise cuda 算子"现实上只有两条路：**
+   - **路线 X：在 SimoQuantizeLSTM 内部实例化 ORT 内置 kernel** —— 做不到，类不可见、依赖不可用；
+   - **路线 Y：自己调用 cuBLAS/cuDNN/CUDA runtime 重新实现 matmul/tanh/sigmoid/elementwise** —— 技术上可行（cuBLAS 的 `cublasGemmEx`、cuDNN 的激活、或仿照 `activations_impl.cu` 手写 elementwise kernel），但这本质上是"**重新实现 ORT 的 kernel**"，而不是"调用 ORT 的算子"。
+
+#### 37.3.2 "调用 ORT 算子" vs "调用 torch 算子" 的工程对比
+
+| 维度 | 调用 torch 算子（现状） | 调用 ORT 算子（理想） | 自己调 cuBLAS/cuDNN（路线 Y） |
+|---|---|---|---|
+| 可行性 | ✅ 已实现 | ❌ 外部插件无法实例化 ORT 内置 kernel | ✅ 可行，但要重写 kernel |
+| 依赖 | 强依赖 libtorch（`build_runtime.py:89-111` 链接 5 个 torch 库） | 摆脱 torch，但和 ORT 内部深度耦合 | 摆脱 torch，只依赖 CUDA/cuBLAS/cuDNN |
+| 数值一致性 | matmul 是 cuBLAS，和 ORT 一致；激活/elementwise 是 torch 自己的实现 | 和 ORT 逐 bit 一致 | 取决于实现精度（如 sigmoid 的精度处理 `activations_impl.cu:55-61`） |
+| 维护性 | 插件和 torch 版本绑定 | 插件和 ORT 版本绑定 | 与 ORT 内部实现解耦，但要自己维护 kernel |
+| 工程规范 | 依赖一个"比自己大一个数量级"的框架，只为一层 LSTM | 违反 ORT 的扩展边界 | 自定义算子推荐做法 |
+
+#### 37.3.3 结论：哪种更符合工程规范？
+
+**核心判断：SimoQuantizeLSTM 是"external custom op"，这个身份决定了"调用 onnxruntime 内置 cuda 算子"这条路在架构上是不成立的。** ORT 的扩展边界就是 C API + stream；凡是需要 ORT 内部句柄（cublas/cudnn/allocator/OpKernelContext）的调用，都不属于外部插件的合法能力范围。强行"调用 ORT 算子"等于把 ORT 内部实现当私有 API 用，这比依赖 torch 更不工程规范。
+
+在"现状（torch）"与"路线 Y（自写 cuBLAS/cuDNN）"之间，工程规范角度的排序是：
+
+1. **如果目标只是让 SimoQuantizeLSTM 工作、快速迭代**：**保持现状调用 torch**。理由：
+   - QDQ 计算本来就是 SIMO 自己的 Triton kernel，只有 matmul/激活/elementwise 是 torch；
+   - `at::matmul` 底层也是 cuBLAS（与 ORT 的 matmul 走同一条 `cublasGemmEx` 路径），数值上已经和 ORT 对齐；
+   - torch 的 `sigmoid`/`tanh`/elementwise 是成熟、经过大规模验证的实现，正确性有保障；
+   - 构建脚本已经固定依赖 torch（`setup.py:8,10-15`、`build_runtime.py:87-111`），移除它需要同时改 build 流程。
+
+2. **如果目标是从依赖角度"去 torch 化"（比如运行环境没有 libtorch、或希望插件更轻量）**：更工程规范的做法是**路线 Y**——用 cuBLAS（`cublasGemmEx`）做 matmul、手写或调用 cuDNN 做 sigmoid/tanh/elementwise，并沿用现有的 `KernelContext_GetGPUComputeStream`（`simo_lstm_ops.cc:246-274`）在 ORT 的 stream 上 launch。这才是 external custom op 的"正统"依赖边界（只依赖 CUDA runtime / cuBLAS / cuDNN，不依赖任何推理框架）。代价是要自己维护这几个 kernel 的 fp32/fp16/bf16 三套实现（可参考 ORT `activations_impl.cu:55-61` 的 half 精度处理）。
+
+3. **"调用 ORT 内部算子"**：**不建议**。它既没有摆脱 torch 的部署优势，又破坏了 ORT 的插件边界，还会把插件和 ORT 具体版本绑定死。
+
+#### 37.3.4 一句话总结
+
+> **onnxruntime 的 CUDA LSTM 是直接调用 `cudnnRNNForward`（`cudnn_rnn_base.cc:351`），没有自己的 LSTM CUDA kernel。SimoQuantizeLSTM 当前在 matmul/sigmoid/tanh/elementwise 上使用 torch（`simo_lstm_ops.cc:739-751`），且构建时硬链接 libtorch（`build_runtime.py:89-111`）。"调用 ORT 的 cuda 算子"对外部自定义算子而言架构上不可行——ORT 只对外暴露 stream（`onnxruntime_c_api.h:4662`），内置 kernel 的 cublas/cudnn 句柄对外不可见。真正可行的去 torch 化路线是自写 cuBLAS/cuDNN 实现（路线 Y），但那要自己维护三套 dtype 的 kernel；如果以工程规范和迭代效率为第一目标，继续调用 torch 反而更稳妥，因为 `at::matmul` 底层同样是 cuBLAS，数值上与 ORT 一致，且 QDQ 核心计算本来就是 SIMO 自己的 Triton kernel。**

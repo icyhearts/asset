@@ -13485,3 +13485,442 @@ Linear+Conv+LSTM:
 总体上，增加 LSTM 量化后的变化不是单向的：10 种类型中 AUC 提升 4 种、下降 6 种；`Acc@0.11` 提升 3 种、下降 7 种。最大变化是 mxfp4 e2m1 的 Accuracy 上升 6.4030 pp；明显下降的是 mxfp6 e3m2（-1.9280 pp）和 mxfp8 e5m2（-1.8643 pp）。其余类型的 Accuracy 变化绝对值不超过 0.3048 pp，AUC 变化绝对值不超过 0.1066 pp。
 
 量化配置和插入日志也确认了对比边界：no-LSTM 配置包含 `Conv2d/Conv3d + Linear`，+LSTM 配置在此基础上增加 `LSTM`；除 FP8 2D-block 的 Conv 因 `conv_fp8_per_block` 在两组都跳过外，其余配置均报告 `Conv: 12`，+LSTM 组额外报告 `LSTM: 2`。因此表格反映的是在相同 Linear/Conv 配置上增加两个真实 LSTM 节点量化后的端到端精度变化，而不是数据集或 shard 数量变化。
+
+## 92. ORT CUDA LSTM 后端与 SimoQuantizeLSTM 去 Torch 评估
+
+本节基于本机实际源码和环境：SIMO commit `1b11286`、ONNX Runtime commit `8f0278c77b`（`branch-v1.27.0-like.debug`，环境中的 ORT 为 `1.27.0`）、ONNX commit `2bb504651`。结论分三点：
+
+1. CUDAExecutionProvider 的标准浮点 LSTM 主计算直接调用 cuDNN fused RNN API；ORT 只自带权重整理、reverse、双向输出重排和 zero-length mask 等辅助逻辑，并没有另一套完整的 CUDA LSTM gate recurrence kernel。
+2. 当前 ORT CUDA 原生 `MatMul`、`Sigmoid`、`Tanh`、`Add`、`Mul` 对 FP32/FP16/BF16 的覆盖足够表达 SimoQuantizeLSTM 当前支持的 recurrence，因此 custom-op 动态库可以摆脱 Torch 运行时依赖。但这需要同时替换 ATen 的张量分配、view/layout、copy、stream guard 和构建链接，不能只替换第 739-751 行的数学算子。
+3. 若只比较“调用 Torch 算子”和“调用 ORT 算子”，通过 ORT 公开的 `Ort::Op::Create/Invoke` 调用当前 CUDA EP 的原生算子更符合工程规范。不要直接 include/link ORT 内部 `cuda::MatMul`、`Impl_Sigmoid` 等私有实现。性能最优的生产方案则应进一步减少 standalone-op 调度和 kernel launch：合并四个 gate 的 GEMM，并用一个自有 fused CUDA kernel 完成 bias、activation 和 C/H update。
+
+### 92.1 CUDAExecutionProvider 的浮点 LSTM 实际走 cuDNN
+
+ONNX 规范在 [Operators.md:17332](/share/users/like/package/onnx/docs/Operators.md:17332) 的 LSTM 算子说明中已经写明该算子通常由 CuDNN 等定制实现支持；[Operators.md:17375](/share/users/like/package/onnx/docs/Operators.md:17375) 给出 gate、`C_t` 和 `H_t` 方程。
+
+ORT CUDA 路径的关键代码如下：
+
+| 文件+行号 | 函数/类型 | 代码事实 |
+|---|---|---|
+| [lstm.h:12](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/lstm.h:12) | `onnxruntime::cuda::LSTM<T>::LSTM` | `LSTM<T>` 继承 `CudnnRnnBase<T>`，第 15 行调用 `SetRNNMode(CUDNN_LSTM)`；第 24-31 行只负责 ONNX IOFC gate 到 cuDNN lin-layer ID 的映射和权重缓存。 |
+| [lstm.cc:10](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/lstm.cc:10) | `REGISTER_KERNEL_VERSIONED_TYPED*` / `REGISTER_KERNEL_TYPED` | CUDA EP 为 opset 7-13、14-21、22 注册 `float`、`double`、`MLFloat16` LSTM；当前没有 `BFloat16` LSTM 注册。 |
+| [cudnn_rnn_base.h:39](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/cudnn_rnn_base.h:39) | `CudnnRNN::Set` | 第 43 行创建 cuDNN RNN descriptor，第 52-67 行调用 `cudnnSetRNNDescriptor_v8`，算法为 `CUDNN_RNN_ALGO_STANDARD`。 |
+| [cudnn_rnn_base.cc:184](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/cudnn_rnn_base.cc:184) | `CudnnRnnBase<T>::ComputeInternal` | 第 306-316 行创建 cuDNN descriptor；第 346-368 行查询 workspace 后直接调用 `cudnnRNNForward(..., CUDNN_FWD_MODE_INFERENCE, ..., cx_data, y_c_data)`。这一步完成 LSTM 主 recurrence。 |
+| [cudnn_rnn_base.cc:13](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/cudnn_rnn_base.cc:13) | `CudnnRnnBase<T>::SetWeightBias` | 通过 `cudnnGetRNNWeightParams` 获取 cuDNN packed-weight 内部位置并拷贝 ONNX W/R/B。 |
+| [cudnn_rnn_base.cc:88](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/cudnn_rnn_base.cc:88) | `CudnnRnnBase<T>::ReorganizeWeights` | 将 ONNX W/R/B 整理成 cuDNN 所需 packed buffer；它是准备逻辑，不是另一套 LSTM 计算。 |
+| [rnn_impl.cu:11](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/rnn_impl.cu:11) | `_ReverseBySequenceKernel` / `ReverseBySequence` | ORT 自有 CUDA kernel 只负责 reverse direction 的序列翻转。 |
+| [rnn_impl.cu:52](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/rnn_impl.cu:52) | `_BidirectionalDataKernel` / `ReorderBidirectionalDataInSequence` | 将 cuDNN 双向输出布局重排成 ONNX 布局。 |
+| [rnn_impl.cu:97](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/rnn_impl.cu:97) | `_MaskZeroSequences` / `MaskZeroSequences` | 对 cuDNN 不支持的 zero-length batch 项做结果清零。 |
+| [cuda_execution_provider.cc:3206](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/cuda_execution_provider.cc:3206) | `RNNNeedFallbackToCPU` | 有 `activation_alpha/beta`、`clip`、非默认 activation、`input_forget=1` 或 peephole P 时返回 fallback；第 3453-3457 行的 capability 逻辑只在该检查通过时强制把 LSTM 放入 CUDA EP。 |
+
+所以准确表述不是“ORT 完全没有 CUDA kernel”，而是“LSTM 的 gate/recurrent 主计算由 cuDNN 完成，ORT 自有 CUDA kernel 只做输入输出适配和边界情况”。这也解释了 CUDA LSTM 的支持子集：`CudnnRnnBase<T>::CudnnRnnBase` 在 [cudnn_rnn_base.h:85](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/cudnn_rnn_base.h:85) 只支持 `layout=0`；`LSTM<T>::LSTM` 在 [lstm.h:17](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/lstm.h:17) 拒绝 `input_forget=1`；`CudnnRnnBase<T>::ComputeInternal` 在 [cudnn_rnn_base.cc:199](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/rnn/cudnn_rnn_base.cc:199) 拒绝 P。
+
+不能直接用 ORT 标准 LSTM/cuDNN 调用替换 SimoQuantizeLSTM：SIMO 必须在每个时间步的 `X_t` 和 `H_{t-1}` 上插入配置指定的 QDQ，而一次完整的 `cudnnRNNForward` 把内部 H recurrence 封装在 cuDNN 内部，无法在相邻时间步之间插入 SIMO H-QDQ。标准 ORT CUDA LSTM 当前也没有 BF16 kernel 注册，而 SIMO ABI 支持 BF16。
+
+### 92.2 当前 SimoQuantizeLSTM 的 Torch 依赖边界
+
+当前 QDQ 数值 kernel 本身不是 Torch kernel；Torch 负责 QDQ 周围的内存、布局和浮点 recurrence：
+
+| 文件+行号 | 函数/类型 | 当前职责 |
+|---|---|---|
+| [simo_lstm_ops.cc:246](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:246) | `CudaStreamAndDevice` | 获取 ORT CUDA stream/device；`ComputeImpl` 第 669-674 行再把它包装成 c10 external stream，并建立 `CUDAStreamGuard`。 |
+| [simo_lstm_ops.cc:276](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:276) | `WrapOrtTensor` / `WrapOrtOutput` | 用 `at::from_blob` 零拷贝包装 ORT 输入输出；输出内存本身仍由 ORT `Tensor<T>::Allocate` 分配。 |
+| [simo_lstm_ops.cc:467](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:467) | `SimoQuantizeLstmCustomOp<T>::DequantizeGate` | `at::empty` 分配 W/R DQ 输出，并用 `reshape/slice/permute/contiguous` 恢复 gate 权重布局。 |
+| [simo_lstm_ops.cc:517](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:517) | `SimoQuantizeLstmCustomOp<T>::QuantizeDequantizeState` | 用 ATen 完成 transpose、contiguous、reshape、MX padding、临时 Q/scale/DQ buffer 分配以及输出布局恢复。 |
+| [simo_lstm_ops.cc:616](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:616) | `SimoQuantizeLstmCustomOp<T>::ComputeImpl` | 第 698-707 行每次调用 DQ W/R；第 713-728 行准备 H/C 和 bias；第 730-755 行执行逐步 recurrence 和输出 copy。 |
+| [simo_lstm_ops.cc:739](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:739) | `SimoQuantizeLstmCustomOp<T>::ComputeImpl` | 每个 direction/time/gate 调两次 `at::matmul`；随后执行 Add、3 次 sigmoid、2 次 tanh、C/H 的 Mul/Add 和输出 `copy_`。每步共 8 个二维 GEMM。 |
+| [simo_qdq_ops.cc:574](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_qdq_ops.cc:574) | `LaunchQdqKernelForRuntime` | 转发到第 264 行的 `LaunchQdqKernel`，在 ORT compute stream 上执行项目自己的 QDQ kernel。 |
+| [triton_loader.cc:80](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/triton_loader.cc:80) | `TritonLoader::Launch` | 第 116-129 行通过 CUDA Driver `cuLaunchKernel` 启动预编译 Triton cubin。 |
+
+`C` “保持浮点”是“不经过 QDQ”，不是“强制使用 FP32”。[simo_lstm_ops.cc:37](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:37) 的 `LstmIoDtype<T>` 和 `SimoQuantizeLstmCustomOp<T>::ComputeImpl` 决定 FP32/FP16/BF16 模型中的 H、C、gate 和输出分别保持对应的 IO dtype。
+
+动态库层面的依赖是实质性的：当前 `.so` 的 `DT_NEEDED` 包含 `libtorch.so`、`libtorch_cpu.so`、`libtorch_cuda.so`、`libc10.so` 和 `libc10_cuda.so`。[build_runtime.py:52](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/build_runtime.py:52) 的 `build_sm90_runtime` 在第 87-110 行加入 Torch headers、library path、五个 Torch/c10 链接项和 Torch rpath；[runtime.py:29](/share/users/like/package/simo_conda_sglang/simo/onnx/runtime.py:29) 的 `register_custom_ops` 还会先 `import torch` 再加载插件。
+
+### 92.3 ORT CUDA 原生算子能否覆盖所需数学
+
+答案是：对当前 SIMO 支持的 FP32/FP16/BF16 子集，数学和 dtype 覆盖均足够。
+
+| SIMO 需求 | ORT 文件+行号 | 函数 | 覆盖判断 |
+|---|---|---|---|
+| `X @ W^T`、`H @ R^T` | [matmul.cc:94](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/math/matmul.cc:94) | `MatMul<T>::ComputeInternal` / `MatMul<T>::ComputeDefault` | 第 15-47 行注册 float/double/FP16/BF16；第 324-341 行调用 cuBLAS GEMM。满足二维 GEMM。 |
+| sigmoid | [activations.cc:34](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/activation/activations.cc:34) | `Sigmoid<T>::ComputeInternal`（由 `UNARY_ACTIVATION_COMPUTE` 生成） | 第 80-81 行注册 Sigmoid，opset 13 路径包含 BF16；[activations_impl.cu:48](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/activation/activations_impl.cu:48) 的 `OP_Sigmoid<T>::operator()` 是 CUDA device 实现。 |
+| tanh | [activations.cc:34](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/activation/activations.cc:34) | `Tanh<T>::ComputeInternal`（由 `UNARY_ACTIVATION_COMPUTE` 生成） | 第 84-85 行注册 Tanh，opset 13 路径包含 BF16；[activations_impl.cu:83](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/activation/activations_impl.cu:83) 的 `OP_Tanh<T>::operator()` 调设备端 `_Tanh`。 |
+| gate/bias/C/H 的 Add、Mul | [binary_elementwise_ops.cc:127](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/math/binary_elementwise_ops.cc:127) | `Add<T>::ComputeInternal` / `Mul<T>::ComputeInternal`（由 `BINARY_ELEMENTWISE_COMPUTE` 生成） | 第 276-289 行注册 Add/Mul；opset 14 覆盖 FP16、FP32、BF16，并支持 bias broadcast。 |
+| Add/Mul CUDA 数值 kernel | [binary_elementwise_ops_impl.cu:13](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/math/binary_elementwise_ops_impl.cu:13) | `Impl_Add<T>` / `Impl_Mul<T>` | 第 153-157 行实例化包括 half/float/BFloat16 的 device kernel。 |
+
+仍需解决的是张量工程，不是算子缺失：
+
+- ONNX `MatMul` 没有 `transB` 属性。当前 `ComputeImpl` 用 ATen 非连续 transpose view；去 Torch 后应让 W/R DQ 直接产出 `[K,H]` 连续布局，或改用带 `transB=1` 的 ORT `Gemm`，而不是每步额外启动 `Transpose`。
+- `reshape/select/slice` 多数可表示为 raw pointer + shape/stride view，不需要 kernel；真正的 transpose、pad/unpad、contiguous copy 要用自有 CUDA kernel、`cudaMemcpyAsync/cudaMemsetAsync` 或 ORT native op。
+- 临时 Q/scale/DQ、GEMM 和 gate buffer 必须改由 ORT CUDA allocator/workspace 管理。`KernelContext_GetAllocator` 在 [onnxruntime_c_api.h:4924](/share/users/like/package/onnxruntime/include/onnxruntime/core/session/onnxruntime_c_api.h:4924) 的 `OrtApi::KernelContext_GetAllocator` 中是公开 API；该 API 自 ORT 1.15 可用。
+- Torch 和 ORT 的 GEMM algorithm、TF32 设置及 half/BF16 activation 细节可能不同，因此只能要求符合公式和误差门槛，不能预设逐位一致。
+
+### 92.4 正确调用 ORT 算子的边界
+
+外部 custom-op 不应直接链接 `onnxruntime::cuda::MatMul<T>`、`Impl_Sigmoid<T>`、`Impl_Add<T>` 等内部 C++/CUDA symbol。它们依赖私有 `CudaKernel`、`OpKernelContext`、provider handle 和非稳定 ABI；例如 [matmul.cc:261](/share/users/like/package/onnxruntime/onnxruntime/core/providers/cuda/math/matmul.cc:261) 的内部 `FuncMatMul` 只显式实例化 float/FP16，并不是覆盖 SIMO 三种 dtype 的公共插件接口。
+
+规范路径是公开的 standalone-op API：
+
+| 文件+行号 | 函数 | 含义 |
+|---|---|---|
+| [onnxruntime_c_api.h:4128](/share/users/like/package/onnxruntime/include/onnxruntime/core/session/onnxruntime_c_api.h:4128) | `OrtApi::CreateOp` / `OrtApi::InvokeOp` | 自 ORT 1.12 提供的公共 C API，用 kernel info 创建并调用 ORT native operator。 |
+| [standalone_op_invoker.cc:365](/share/users/like/package/onnxruntime/onnxruntime/core/session/standalone_op_invoker.cc:365) | `onnxruntime::standalone::CreateOp` | 第 378-416 行从父 custom op 的 execution provider 及其 kernel registry 查找 kernel；Simo op 属于 CUDA EP，因此创建的是 CUDA MatMul/Sigmoid/Tanh/Add/Mul。 |
+| [standalone_op_invoker.cc:441](/share/users/like/package/onnxruntime/onnxruntime/core/session/standalone_op_invoker.cc:441) | `onnxruntime::standalone::InvokeOp` | 第 447-460 行把父 context 的 temp allocator、thread pool、logger 和 compute stream 传给被调用 kernel。 |
+| [custom_op_utils.cc:379](/share/users/like/package/onnxruntime/onnxruntime/test/shared_lib/custom_op_utils.cc:379) | `StandaloneCustomKernel::StandaloneCustomKernel` | ORT 自己的 custom-op 示例在构造时缓存 `Ort::Op::Create(..., "Add", ...)`。 |
+| [custom_op_utils.cc:631](/share/users/like/package/onnxruntime/onnxruntime/test/shared_lib/custom_op_utils.cc:631) | `StandaloneCustomKernel::Compute` | 第 639-642 行把父 custom op 的输入输出交给 `op_add_.Invoke`；[test_inference.cc:821](/share/users/like/package/onnxruntime/onnxruntime/test/shared_lib/test_inference.cc:821) 的 `StandaloneOpHandler` 在 CUDA 构建中明确把该 custom op 注册到 CUDA EP。 |
+
+当前 SIMO 的 `kOrtApiVersion=17` 定义在 [simo_qdq_ops.h:11](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_qdq_ops.h:11)，已覆盖 ORT 1.12 的 Create/Invoke 和 ORT 1.15 的 context allocator API。建议在 `SimoQuantizeLstmCustomOp<T>` 构造阶段按 IO dtype 创建并缓存 native op，不能在每个 time step 重建 kernel。
+
+这个路径有两个必须验证的限制：
+
+- [standalone_op_invoker.cc:20](/share/users/like/package/onnxruntime/onnxruntime/core/session/standalone_op_invoker.cc:20) 的 `ORT_MINIMAL_BUILD && !ORT_MINIMAL_BUILD_CUSTOM_OPS` 分支中，`OrtApi::CreateOp/InvokeOp` 会返回 `ORT_NOT_IMPLEMENTED`。当前本机完整 ORT 1.27 Debug build 不受影响，但如果发布 minimal ORT，需要启用相应 custom-op 支持或改用自有 CUDA kernel。
+- [standalone_op_invoker.cc:187](/share/users/like/package/onnxruntime/onnxruntime/core/session/standalone_op_invoker.cc:187) 的 `StandAloneKernelContext::GetDeviceId` 在第 262-264 行固定返回 0。MatMul 当前主要从 CUDA EP/provider 和 compute stream 取 device/handle，但在正式采用前仍必须在 CUDA device 1-7 上做专项回归，不能只验证 GPU 0。
+
+### 92.5 工程规范与推荐实现
+
+在题目给出的两个选项中，推荐 ORT public native-op 路径，理由如下：
+
+| 维度 | Torch ATen | ORT `CreateOp/InvokeOp` |
+|---|---|---|
+| 运行时边界 | 同一插件同时嵌入 ORT 和 Torch/c10 runtime | 只依赖宿主 ORT 的公开 C API 和当前 EP |
+| CUDA stream/allocator | 需要 external-stream bridge、c10 guard 和 Torch caching allocator | 继承父 ORT context 的 stream 和 temp allocator |
+| 二进制兼容 | 受 Torch 版本、C++ ABI、CUDA build 和五个共享库影响 | 受公开 ORT API version 和 native-op availability 约束，边界更稳定 |
+| 部署 | 当前必须先 import Torch，`.so` 才能解析依赖 | 可在不加载 Torch 的 ORT 进程中注册 |
+| 性能 | ATen 每个小算子有 dispatcher 和临时分配；但实现成熟 | standalone ORT op 同样有逐算子调度、分配和 kernel launch，不会自动 graph fusion |
+
+因此，“ORT 更规范”不等于“把每一个 ATen 表达式机械地换成一个 ORT InvokeOp 就一定更快”。当前每个 time step 有 8 个小 GEMM 和多次 pointwise launch；Silero 常见 `batch=1`、短 sequence 时，launch/dispatch 成本占比很高。
+
+建议按两层实施：
+
+1. **先解除依赖并建立正确性基线**：通过公开 `Ort::Op::Create/Invoke` 替换 MatMul/Gemm、Sigmoid、Tanh、Add、Mul；用 ORT allocator/workspace 和 raw shape view 替换 ATen 内存与布局操作。该版本容易复用 ORT 已验证的 dtype/broadcast 行为。
+2. **再做生产性能实现**：把四个 W gate 合并成 `[4H,I]`、四个 R gate 合并成 `[4H,H]`，每步只做 `X @ W^T` 和 `H @ R^T` 两个 cuBLAS/cuBLASLt GEMM；随后用一个 SIMO 自有 fused CUDA kernel 完成两路 GEMM 相加、Wb+Rb、三次 sigmoid、两次 tanh、浮点 C update、H update 和输出写回。ORT 仍负责 custom-op ABI、输出和 workspace，QDQ 继续用现有 Triton cubin。
+
+第二层比“直接链接 ORT 内部 CUDA 函数”更规范：cuBLAS/CUDA 是公开、稳定的底层依赖，fused recurrence 的语义由 SIMO 自己拥有；不会绑定 ORT provider 私有 ABI，也不会为每个 pointwise 表达式重复进入 standalone dispatcher。
+
+### 92.6 真正做到“不依赖 Torch”的改动与验收边界
+
+仅替换 recurrence 数学还不够，至少需要同步完成：
+
+- 在 `SimoQuantizeLstmCustomOp<T>::DequantizeGate` 和 `QuantizeDequantizeState` 中移除 `at::Tensor`、`empty/zeros/reshape/slice/transpose/permute/contiguous/copy_`，改成 ORT workspace、pointer view 和 CUDA layout kernel。
+- 在 `SimoQuantizeLstmCustomOp<T>::ComputeImpl` 中移除 c10 stream guard、InferenceMode、ATen matmul/activation/elementwise 和 `c10::Error` catch；直接使用 `KernelContext_GetGPUComputeStream` 已提供的 stream。
+- 修改 [build_runtime.py:52](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/build_runtime.py:52) 的 `build_sm90_runtime`，删除 Torch include/library/ABI/rpath；修改 [runtime.py:29](/share/users/like/package/simo_conda_sglang/simo/onnx/runtime.py:29) 的 `register_custom_ops`，删除强制 `import torch`；更新 [test_public_api.py:199](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_public_api.py:199) 的 `test_build_sm90_runtime_uses_system_compiler_and_temporary_sources` 链接断言。
+- 用 `readelf -d`/`ldd` 验收新 `.so` 不再出现 torch/c10 `DT_NEEDED`，并在未 import Torch、甚至没有 Torch library path 的独立进程中注册和运行 custom op。
+- 复跑 FP32/FP16/BF16、forward/reverse/bidirectional、非零 initial H/C、全部 QDQ granularity 和多 GPU 0-7；与当前 float-C reference 比较。ORT 与 Torch 的 kernel 数学可能不逐位相同，FP32 仍应保持当前 `1e-6` 级门槛，FP16/BF16 应按 dtype 制定明确 tolerance。
+- 对 Silero 的 `batch=1, sequence=1, hidden=128` 及较长 sequence 分别 benchmark。去掉 Torch 是部署/依赖目标；性能结论必须由端到端 latency、kernel launch 数和 workspace 峰值验证，不能从框架名称推断。
+
+最后还要区分两个目标：上述工作可以让 **ONNX custom-op 动态库运行时** 不依赖 Torch；它不会自动让整个 `simo` Python 包无 Torch。[pyproject.toml:1](/share/users/like/package/simo_conda_sglang/pyproject.toml:1) 的 build-system 和第 12 行 project dependency、[setup.py:36](/share/users/like/package/simo_conda_sglang/setup.py:36) 的 `get_extensions` 仍以 Torch 为构建基础；[build_qdq_cubins.py:11](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/build_qdq_cubins.py:11) 的 cubin 构建也间接导入含 Torch 的 SIMO 模块。若目标是 `pip install simo` 全链路不安装 Torch，需要再拆分 ONNX-only wheel/build path，这是独立的打包工程。
+
+## 93. SimoQuantizeLSTM custom-op 运行时去 Torch 实施结果（2026-08-06）
+
+### 93.1 实现范围和代码位置
+
+本轮保持 `SimoQuantizeLSTM` v2 的八输入、三输出、属性、QDQ Triton kernel 和转换接口不变，只替换 custom-op 动态库中的 ATen/c10 运行时路径。没有实现四门合并 GEMM，每个 time step 仍执行四次 `X @ W^T` 和四次 `H @ R^T`。
+
+| 文件名 + 行号 | 函数名 | 实现说明 |
+|---|---|---|
+| [simo_lstm_ops.cc:324](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:324) | `LstmWorkspace` | 从父 `OrtKernelContext` 取得 CUDA allocator，以 RAII 保存所有临时分配，并为 raw CUDA pointer 建立非 owning `OrtValue` shape view。 |
+| [simo_lstm_ops.cc:599](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:599) | `SimoQuantizeLstmCustomOp<T>::DequantizeGate` | 保留 W/R 四门独立 Triton DQ；reshape 仅改变解释方式，unpad/transpose/contiguous 交给 CUDA layout kernel。 |
+| [simo_lstm_ops.cc:661](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:661) | `SimoQuantizeLstmCustomOp<T>::QuantizeDequantizeState` | 覆盖 per-tensor flatten、axis transpose、MX padding/unpadding 和所有原有输入 QDQ layout；C 不进入该函数。 |
+| [simo_lstm_ops.cc:768](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:768) | `SimoQuantizeLstmCustomOp<T>::CreateNativeOps` | 构造时按 FP32/FP16/BF16 缓存 `Gemm-13`、`Sigmoid-13`、`Tanh-13`、`Add-14`、`Mul-14`。`Gemm` 使用 `transB=1`，并显式提供 ORT standalone kernel 所需的 `transA=0`、`alpha=1`、`beta=1`。 |
+| [simo_lstm_ops.cc:844](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:844) | `SimoQuantizeLstmCustomOp<T>::ComputeImpl` | 预分配 weight/state/gate workspace；每步调用八次缓存 GEMM，bias 合并、gate 加法、activation、浮点 C recurrence 和 H update 全部调用 ORT native op；initial/final/Y copy 使用父 ORT CUDA stream。 |
+| [simo_lstm_layout.cu:69](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_layout.cu:69) | `LaunchSimoLstmLayout2D` | 对 FP32 和两种 16-bit carrier 执行二维 transpose、padding、unpadding 和连续化；[第 111 行](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_layout.cu:111) 的 `LaunchSimoLstmCopy` 与第 119 行的 `LaunchSimoLstmZero` 使用当前 stream 异步执行。 |
+| [build_runtime.py:21](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/build_runtime.py:21) | `_cuda_home` | CUDA toolkit 只取 `os.environ.get("CUDA_HOME", "/usr/local/cuda")`；检查 root、`include/cuda.h` 和精确的 `<CUDA_HOME>/bin/nvcc`，不从 `PATH` 选择 nvcc。 |
+| [build_runtime.py:73](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/build_runtime.py:73) | `build_sm90_runtime` | 指定 nvcc 编译 layout `.cu`，系统 C++ 编译器完成最终链接；命令不再含 Torch/c10 include、library、ABI define 或 rpath，并新增 `libcudart`。 |
+| [runtime.py:29](/share/users/like/package/simo_conda_sglang/simo/onnx/runtime.py:29) | `register_custom_ops` | 删除注册前强制 `import torch`。 |
+| [MANIFEST.in:1](/share/users/like/package/simo_conda_sglang/MANIFEST.in:1) | source manifest | sdist 现在包含新增 `.cu` 和 `.h`；实际构建的 tarball 已确认包含 layout source/header 和 LSTM C++ source。 |
+
+所有 `ATen`、`at::Tensor`、c10 stream guard、`InferenceMode`、ATen 算子和 `c10::Error` catch 均已从 LSTM C++ 实现删除。
+
+### 93.2 实际构建环境和 CUDA 解析
+
+按计划实际执行了：
+
+```bash
+export CUDA_HOME=/share_data/users/like/opt/cuda-13.0
+python -m pip uninstall -y simo
+python -m pip install -e ".[dev]" --no-build-isolation
+```
+
+卸载和 editable wheel 重建均成功，安装版本为 `simo-0.6.1.dev20260805+1b11286`。实际环境为 Python 3.12.12、Torch 2.11.0+cu130（仅构建链）、ONNX 1.22.0、ONNX Runtime GPU 1.27.0、H100 SM90。`CUDA_HOME` 解析为 `/share_data/users/like/opt/cuda-13.0`，实际 nvcc 为 `/share_data/users/like/opt/cuda-13.0/bin/nvcc`，版本 `13.0.48`。
+
+[test_public_api.py:199](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_public_api.py:199) 的 `test_build_sm90_runtime_uses_system_compiler_and_temporary_sources` 在 `PATH` 放入另一个可执行 `nvcc`，仍断言第一个编译命令只能是 `$CUDA_HOME/bin/nvcc`；[第 260 行](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_public_api.py:260) 还覆盖 CUDA root 不存在、缺少 `cuda.h` 和 nvcc 不可执行三种即时错误。
+
+### 93.3 Torch/c10 动态依赖验收
+
+新库为 `simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so`。`readelf -d` 的 `DT_NEEDED` 只有：
+
+```text
+libcuda.so.1
+libcudart.so.13
+libstdc++.so.6
+libm.so.6
+libgcc_s.so.1
+libc.so.6
+```
+
+没有 `libtorch*`、`libc10*`、RPATH 或 RUNPATH；`ldd` 没有 missing dependency，也没有 Torch/c10。`nm -D` 和 `strings` 同样没有 Torch/c10/ATen symbol 或 Torch library path。
+
+[test_lstm_standalone_runtime.py:120](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_lstm_standalone_runtime.py:120) 的 `test_simo_lstm_runs_in_subprocess_without_importing_simo_or_torch` 在 `python -I` 子进程中只导入 NumPy 和 ONNX Runtime，通过模型文件和 `.so` 注册、执行 custom op；执行前后均断言 `torch` 与 `simo` 不在 `sys.modules`。该测试通过。[第 189 行](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_lstm_standalone_runtime.py:189) 的 `readelf`/`ldd` 两组测试也通过，独立 `ctypes.CDLL` 无 Torch 加载检查通过。
+
+### 93.4 正确性和工程验证
+
+- 静态 LSTM/QDQ 转换：`test_qdq_utils.py`，187 passed。
+- build/runtime 公共 API：`test_public_api.py`，11 passed。
+- 全 custom-op CUDA runtime：`test_dynamic_qdq_runtime_debug.py`，80 passed；其中 LSTM 子集 23 passed。
+- standalone 和动态依赖：`test_lstm_standalone_runtime.py`，3 passed。
+- forward/reverse/bidirectional、bias 可选、zero/nonzero initial H/C、固定三输出、全部已有 QDQ layout、FP32/FP16/BF16 均通过。
+- [test_dynamic_qdq_runtime_debug.py:1884](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_dynamic_qdq_runtime_debug.py:1884) 的 nonzero CUDA device + user stream 测试在本机八张 H100 环境通过。
+- FP32 stepwise reference 实测最大绝对误差 `1.862645149e-08`；浮点-C 专项实测 `8.940696716e-08`，相对旧 C-QDQ reference 的可观测差异为 `1.476369612e-02`。
+- FP16/BF16 reference 实测最大绝对误差分别为 `0` 和 `6.103515625e-04`，均低于 `5e-3`/`5e-2` 门槛。
+- C++ `-Wall -Wextra -Wpedantic -fsyntax-only`、CUDA 13 nvcc layout 编译、Ruff、`py_compile`、13 个 Silero 产物的 ONNX checker、sdist 内容检查和 `git diff --check` 全部通过。
+
+### 93.5 Silero 真实 LSTM 256 步结果
+
+重新执行了：
+
+```bash
+like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py --overwrite
+```
+
+使用 4 个 constant-folded 真实 LSTM、16 组 zero-state 独立样本、16 组 random-state 独立样本，以及 `X std=0.01/0.1/0.5` 三组各 256 步闭环。每个 float、Dynamic、SIMO operator 和 SIMO Torch reference 都独立回灌自己的 `Y_h/Y_c`。详细数据在 [comparison.json](/share/users/like/package/simo_conda_sglang/temp/compare-silero-vad-lstm/comparison.json:1)。
+
+W/R 反量化 relative L2 没有实质变化：
+
+| 张量 | ORT Dynamic | SIMO |
+|---|---:|---:|
+| W | 0.759128% 至 0.766885% | 0.763012% 至 0.772502% |
+| R | 0.780751% 至 0.808861% | 0.786390% 至 0.815239% |
+
+独立同输入 combined relative L2：
+
+| 初始状态 | ORT Dynamic | SIMO | 更接近 float 的节点数 |
+|---|---:|---:|---:|
+| zero H/C | 1.099799% 至 1.286380% | 1.142180% 至 1.240529% | Dynamic 3，SIMO 1 |
+| random H/C | 1.037288% 至 1.173058% | 1.087185% 至 1.184296% | Dynamic 4，SIMO 0 |
+
+完整 256 步轨迹的 combined 指标：
+
+| X std | ORT relative L2 | SIMO relative L2 | ORT cosine | SIMO cosine | 更接近 float 的节点数 |
+|---:|---:|---:|---:|---:|---:|
+| 0.01 | 0.520541% 至 1.550736% | 0.618710% 至 1.514955% | 0.999885046 至 0.999986512 | 0.999887956 至 0.999986701 | Dynamic 2，SIMO 2 |
+| 0.1 | 0.496676% 至 1.768203% | 0.495027% 至 1.654911% | 0.999847111 至 0.999990279 | 0.999864158 至 0.999988226 | Dynamic 1，SIMO 3 |
+| 0.5 | 1.406521% 至 1.917638% | 1.677899% 至 1.847131% | 0.999816515 至 0.999901138 | 0.999831804 至 0.999859368 | Dynamic 3，SIMO 1 |
+
+最终第 256 步：
+
+| X std | ORT relative L2 | SIMO relative L2 | ORT max abs | SIMO max abs | 更接近 float 的节点数 |
+|---:|---:|---:|---:|---:|---:|
+| 0.01 | 0.578220% 至 1.758210% | 0.665433% 至 1.668240% | 0.093307 至 0.423362 | 0.106495 至 0.342290 | Dynamic 3，SIMO 1 |
+| 0.1 | 0.517559% 至 1.800074% | 0.454983% 至 1.915295% | 0.050969 至 0.321968 | 0.093874 至 0.221564 | Dynamic 1，SIMO 3 |
+| 0.5 | 0.958375% 至 1.886528% | 1.766449% 至 1.947748% | 0.029813 至 0.041746 | 0.034174 至 0.140919 | Dynamic 4，SIMO 0 |
+
+按完整轨迹 relative L2 计，12 组中 Dynamic 和 SIMO 各胜 6 组；按最终步计，Dynamic 胜 8 组、SIMO 胜 4 组。因此结论仍是两种量化各有输入区域优势，不能声称 SIMO 全面优于 DynamicQuantizeLSTM。
+
+### 93.6 与旧结果的变化及原因
+
+新的 ORT native-op 结果与第 90 节旧 ATen 浮点-C结果总体一致：权重误差、独立样本范围、12 组完整轨迹的 6:6 和最终步的 8:4 均未改变。可见变化集中在少数对后端舍入敏感的长期闭环，例如 `X std=0.1` 的 SIMO 轨迹上界从约 `1.6493%` 变为 `1.6549%`，最终步上界从约 `1.8968%` 变为 `1.9153%`；`X std=0.5` 的最终步下界从约 `1.7961%` 变为 `1.7664%`。
+
+原因不是 QDQ 或 C 语义变化，而是 GEMM 和 pointwise 后端从 ATen/CUDA 换成 ORT CUDA。单步 FP32 operator/reference 最大绝对误差只有 `1.8626e-08`，但两个实现各自回灌状态 256 次后，微小舍入会被 recurrent dynamics 放大。三组 rollout 中 SIMO operator 对 SIMO Torch reference 的 combined relative L2 最大值分别为 `0.0503%`、`0.1788%`、`0.1757%`；因此 [compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:684](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:684) 的 `_run_closed_loop_rollout` 继续记录两条独立轨迹，但将旧的 `1e-6 max-abs` 长期闭环门禁改成 `1% combined relative L2` 明显失配保护。单步 `1e-4` 正确性门槛仍由 CUDA pytest 独立执行。
+
+运行条件仍是完整 ORT 1.27 及其公开 standalone-op API；minimal ORT 不在本轮支持范围。整个 SIMO Python 包和 QDQ cubin 构建链仍可依赖 Torch，本轮保证的是 ONNX custom-op `.so` 的运行时边界不依赖 Torch/c10。
+
+## 94. 长期闭环门禁、TF32 与制定计划前的选择（2026-08-06）
+
+### 94.1 为什么从 `1e-6 max-abs` 改为 `1% combined relative-L2`
+
+根本原因不是公式、QDQ 或浮点 C 语义发生变化，而是**验收对象不再是同一个数值后端的逐位同一性检查**。
+
+旧 custom op 和 `simo_torch_reference` 都使用 ATen/CUDA 加同一套 Triton QDQ 路径；相同输入和状态会进入相同 kernel 栈，旧结果可以逐位一致，因此长期 `1e-6 max-abs` 是合理的实现同一性门禁。新 custom op 在 [simo_lstm_ops.cc:774](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:774) 的 `SimoQuantizeLstmCustomOp<T>::CreateNativeOps` 中创建 ORT `Gemm/Sigmoid/Tanh/Add/Mul`，并在 [simo_lstm_ops.cc:1124](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/simo_lstm_ops.cc:1124) 的 recurrence 中调用；参考实现仍使用 Torch/ATen。两套实现数学等价，但 GEMM algorithm、累加顺序、pointwise kernel 和舍入不保证逐位相同。
+
+单步 FP32 operator/reference 最大绝对误差实测仅为 `1.862645149e-08`。但是 [compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:684](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:684) 的 `_run_closed_loop_rollout` 让 ORT custom op 和 Torch reference 各自回灌自己的 `Y_h/Y_c`；微小的单步状态扰动会被某些 Silero recurrent trajectory 在 256 步内放大。因此，独立演化轨迹的长期 max-abs 不再是稳定的正确性不变量。
+
+[compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:50](/share/users/like/package/simo_conda_sglang/like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py:50) 的 `1% combined relative-L2` 是尺度归一化的长期“明显失配”保护，不是把单步数值正确性容差放宽到 1%。三组实测的 operator/reference combined relative-L2 最大值分别只有 `0.0503%`、`0.1788%` 和 `0.1757%`；严格的单步 FP32 `1e-4` 门禁仍由 CUDA pytest 独立承担。
+
+### 94.2 这次是不是 TF32 导致的
+
+**不是。** ORT CUDA EP 确实默认 `use_tf32=true`，其 `Gemm` 会把该设置传给 cuBLAS；当前 Torch 2.11 环境则是 `torch.backends.cuda.matmul.allow_tf32=False` 和 `float32_matmul_precision=highest`。所以在没有消融前，TF32 是合理的怀疑项，但不能仅凭配置不同就归因。
+
+本次对同一新 `.so` 做了直接控制实验：4 个真实 Silero LSTM、`X std=0.01/0.1/0.5`、每组 256 步独立闭环，唯一变量是 ORT CUDA EP 的 `use_tf32=1` 或 `0`。共 12 条轨迹全部逐位一致，每条的 max-abs 和 combined relative-L2 都为 `0`。另外，在已发生长期放大的敏感轨迹上切换 Torch TF32，结果同样逐位一致；ORT 相对 Torch 的 `0.0503%` 至 `0.1788%` 长期差异没有消失。
+
+因此，TF32 在当前 H100、Silero shape 和 MXINT8 QDQ 路径上没有产生这次差异，也不能修复长期门禁。真正原因仍是 ORT 与 ATen 两套 native kernel 的非逐位同一性，以及独立状态回灌对微小舍入的动态放大。这个结论只针对本次受控路径，不表示 TF32 对任意 FP32 GEMM 都无影响。
+
+### 94.3 制定计划前的选择及全部选项
+
+当时的问题原文是：
+
+> 切换到 ORT native ops 后，custom-op 与 Torch 逐步参考的验收方式采用哪一种？
+
+全部三个选项是：
+
+1. **后端感知容差（Recommended）**：保留默认 CUDA EP/TF32 配置，按 FP32/FP16/BF16 设置明确容差并记录实际误差。
+2. **禁用 TF32**：测试和对比会话显式关闭 TF32，优先维持 FP32 的 `1e-6` 严格基线，但偏离默认部署配置。
+3. **坚持 `1e-6`**：保持默认 EP 且不放宽阈值，若 ORT Gemm 数值差异超过阈值则任务不通过。
+
+最终选择的是第 1 项“后端感知容差”。这个选择决定了保留默认部署配置，并允许根据 dtype 和实测误差制定验收标准；它**没有预先选择 `1% combined relative-L2`**。`1%` 是实现完成后，针对“双方各自回灌状态的 256 步长期闭环”根据实测动态放大另行确定的门禁，而 FP32/FP16/BF16 单步正确性仍分别使用明确的严格容差。
+
+### 94.4 本轮提交与重装确认
+
+主仓库提交为 `2c461994345c8e1aa27e8b53cd97daeb5c5c0e8f`（`fix(onnx): remove Torch from LSTM custom-op runtime`）。随后在 `CUDA_HOME=/share_data/users/like/opt/cuda-13.0` 下重新执行：
+
+```bash
+python -m pip install -e ".[dev]" --no-build-isolation
+```
+
+editable 安装成功，版本为 `simo-0.6.1.dev20260806+2c46199`；重装后的 standalone/no-Torch 子进程测试为 `3 passed`，stepwise 与浮点-C 回归为 `2 passed`。主仓库只提交了本轮 9 个源码/测试文件；本答案文件位于主仓库外的 `like-useful` 路径，按要求追加但未纳入该提交。
+
+## 95. bjh5 同配置 Silero 全量量化结果（2026-08-06）
+
+### 95.1 运行范围与完整性
+
+本次只核对主仓库生成的 custom-op `.so`，在共享 NFS 上的
+`/share/users/like/package/jdjv/silero_vad_clean` 使用
+`/share_data/users/like/miniconda3/envs/simo_sglang/` 环境执行。CUDA 工具链入口为
+`/share_data/users/like/opt/cuda-13.0/bin//nvcc`，两次命令都注册了：
+
+```text
+/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so
+```
+
+核对的主日志和输出根目录分别是：
+
+| 配置 | 主日志 | 输出根目录 |
+|---|---|---|
+| Linear+Conv（无 LSTM 量化） | `temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.2026_08_06___17_09_53.gpu005.rd.sio-software.com` | `logs/simo_sglang_pip.no-listm.2026_08_06___17_09_53.gpu005.rd.sio-software.com/` |
+| Linear+Conv+LSTM | `temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.SimoQuantizeLSTM.2026_08_06___17_10_21.gpu005.rd.sio-software.com` | `logs/simo_sglang_pip.SimoQuantizeLSTM.2026_08_06___17_10_21.gpu005.rd.sio-software.com/` |
+
+前者使用 `CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_no_lstm/`，后者使用
+`CONFIG_DIR=/share/users/like/package/jdjv/quant_schema/`；其余 `MODEL`、`CUSTOM_OP_LIBRARY`、
+`SIMPLIFY=true`、设备列表、数据集和 shard 参数相同。
+
+两次均按 `test_quant_onnx.sh` 的 10 个默认量化配置顺序执行。脚本本身是
+`set -euo pipefail`，不是并行吞错：某个配置失败时后续配置不会继续。两组每个配置都具备
+`quantized_model.onnx`、`run_metadata.json`、`summary.json` 和 shard 输出；每个
+`summary.json` 都记录：
+
+- `files=20`、`chunks=1,431,607`、`hours=12.7253`；
+- `num_shards=24`，24/24 shard 的 `status=done`，总错误数 `errors=0`；
+- 主日志各有 10 个 `Aggregated results` 和 `Wrote .../summary.json`，最后一个配置也正常写出汇总。
+
+这里 24 个 shard 中有 4 个 `files=0` 是因为 aishell4 本次只有 20 个文件，并非失败或漏跑。
+两份日志及全部 shard 日志没有发现 `Traceback`、`Exception`、segmentation fault、`core dumped`、
+`abort`、`fatal`、CUDA error、OOM 或 killed；两个输出根目录下也没有 `core` 文件。因此，
+从可获得的日志、汇总和文件系统证据看，两次测试都完整结束，没有 core dump，也没有抛出未处理异常。
+原始命令通过 shell `&` 放到后台，未另存顶层 `$?`；“成功”结论因此以每个配置的完成汇总和
+`set -e` 执行链为依据，而不是臆造一个未记录的后台 shell 返回码。
+
+量化插入日志也确认了实验变量：除 FP8 2D-block/1D-block 外的 9 种配置，无 LSTM 版本
+各插入 12 个 `Conv` QDQ，有 LSTM 版本各插入 12 个 `Conv` 加 2 个 `LSTM` QDQ（共 14 个），
+且 `skipped=0`。FP8 2D-block/1D-block 的 `Conv` 目标在两次运行中都未匹配：无 LSTM 版本为
+`inserted=0, skipped=12`，有 LSTM 版本为 `inserted=2`（仅 `LSTM`）和 `skipped=12`（`Conv`）。
+因此该行的前后差异确实只增加了 LSTM QDQ，其余 9 行则是在相同 Conv QDQ 基础上增加 LSTM QDQ。
+
+### 95.2 各量化数据类型的精度变化
+
+下表使用每个 `summary.json` 的 `overall` 指标。`Acc@0.11` 是阈值 0.11 的准确率；差值均为
+“Linear+Conv+LSTM - Linear+Conv”，单位是百分点（pp）。
+
+| 量化类型（W/A） | 无 LSTM ROC-AUC | 有 LSTM ROC-AUC | Δ ROC-AUC | 无 LSTM Acc@0.11 | 有 LSTM Acc@0.11 | Δ Acc |
+|---|---:|---:|---:|---:|---:|---:|
+| MXFP4 E2M1 / E2M1 | 0.927573551 | 0.928321347 | +0.0748 pp | 0.633506961 | 0.697572728 | +6.4066 pp |
+| MXFP6 E2M3 / E2M3 | 0.941489341 | 0.942496103 | +0.1007 pp | 0.766767695 | 0.767603819 | +0.0836 pp |
+| MXFP6 E3M2 / E3M2 | 0.936454016 | 0.935633730 | -0.0820 pp | 0.729514455 | 0.710186525 | -1.9328 pp |
+| INT8 per-channel / per-channel | 0.946673264 | 0.946292071 | -0.0381 pp | 0.828686225 | 0.826537590 | -0.2149 pp |
+| INT8 per-channel / per-tensor | 0.947513758 | 0.947147986 | -0.0366 pp | 0.853844665 | 0.852176610 | -0.1668 pp |
+| INT8 per-tensor / per-tensor | 0.945294879 | 0.946194274 | +0.0899 pp | 0.831787634 | 0.833268488 | +0.1481 pp |
+| FP8 2D-block / 1D-block | 0.947480001 | 0.946536685 | -0.0943 pp | 0.835417122 | 0.832378579 | -0.3039 pp |
+| MXFP8 E4M3 / E4M3 | 0.941704435 | 0.942613595 | +0.0909 pp | 0.765562756 | 0.764273994 | -0.1289 pp |
+| MXFP8 E5M2 / E5M2 | 0.938949216 | 0.938594025 | -0.0355 pp | 0.767449447 | 0.748922016 | -1.8527 pp |
+| MXINT8 / MXINT8 | 0.946729208 | 0.946457422 | -0.0272 pp | 0.828047781 | 0.825348717 | -0.2699 pp |
+
+### 95.3 结论
+
+加入 LSTM QDQ 后，ROC-AUC 的变化很小，范围是 `-0.0943` 至 `+0.1007 pp`，10 种类型的
+平均变化仅 `+0.0043 pp`。这说明整体排序能力基本保持。Acc@0.11 的变化则明显依赖数据类型：
+MXFP4 E2M1 提升最大（`+6.4066 pp`）；MXFP6 E3M2 和 MXFP8 E5M2 分别下降
+`1.9328 pp` 和 `1.8527 pp`；其余配置在约 `-0.3039` 至 `+0.1481 pp` 内。也就是说，
+LSTM 量化没有带来统一方向的精度变化，影响主要集中在低精度格式及阈值型准确率；不能据此说
+“增加 LSTM 量化必然变好”或“必然变差”。
+
+## 96. 原始 Silero 中为什么有 4 个 LSTM、实际只量化 2 个（2026-08-07）
+
+### 96.1 原始模型到底有几个 LSTM
+
+用 ONNX protobuf API 递归遍历
+`/share/users/like/package/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx`
+的主图及所有 `GRAPH/GRAPHS` 属性后，结果是：
+
+- 主图本身有 5 个节点，顶层 `LSTM` 数量为 **0**；
+- 主图的 `If_0` 及其嵌套子图中共有 **4 个 `ai.onnx::LSTM`**；
+- 四个节点均为默认 `forward`、`hidden_size=128`。
+
+主图的 `If_0` 条件是 `Equal(sr, 16000)`。外层 then/else 两个采样率分支各自又包含一个
+`decoder/If_1`，而这个内部 `If` 的两个分支各放一个 LSTM，所以序列化文件中是
+`2 个采样率分支 x 2 个 state 分支 = 4 个 LSTM`。
+
+这 4 个是**文件中的静态节点数**，不是一次推理会同时执行 4 次 LSTM。运行时先从外层
+`If_0` 选择一个采样率分支，再从内部 `decoder/If_1` 选择一个 state 分支，所以一次有效推理
+只执行其中 1 个 LSTM。
+
+### 96.2 四个原始节点的名称和最终去向
+
+| 外层分支 | 原始 ONNX 节点名称 | `SIMPLIFY=true` 后的去向 | 含 LSTM 量化输出中的 op type |
+|---|---|---|---|
+| `If_0.else_branch`（`sr != 16000`） | `If_0_else_branch__Inline_0__/decoder/rnn/LSTM` | 保留并量化 | `com.simo::SimoQuantizeLSTM` |
+| `If_0.else_branch`（`sr != 16000`） | `If_0_else_branch__Inline_0__/decoder/rnn_1/LSTM` | 在量化前被裁掉，未量化 | 不存在 |
+| `If_0.then_branch`（`sr == 16000`） | `If_0_then_branch__Inline_0__/decoder/rnn/LSTM` | 保留并量化 | `com.simo::SimoQuantizeLSTM` |
+| `If_0.then_branch`（`sr == 16000`） | `If_0_then_branch__Inline_0__/decoder/rnn_1/LSTM` | 在量化前被裁掉，未量化 | 不存在 |
+
+因此，实际被量化的节点名称是：
+
+```text
+If_0_else_branch__Inline_0__/decoder/rnn/LSTM
+If_0_then_branch__Inline_0__/decoder/rnn/LSTM
+```
+
+未量化的两个原始节点名称是：
+
+```text
+If_0_else_branch__Inline_0__/decoder/rnn_1/LSTM
+If_0_then_branch__Inline_0__/decoder/rnn_1/LSTM
+```
+
+这里“未量化”准确地说是**先被简化器删除**，不是在最终含 LSTM 量化模型中仍以浮点
+`ai.onnx::LSTM` 存在。检查 10 个含 LSTM 量化输出，它们的节点集合完全一致：每个模型都有
+上述 2 个 `com.simo::SimoQuantizeLSTM`，标准 `ai.onnx::LSTM` 数量为 0。
+
+作为对照，无 LSTM 量化但同样使用 `SIMPLIFY=true` 的输出中，仍存在的未量化 LSTM 名称为：
+
+```text
+If_0_else_branch__Inline_0__/decoder/rnn/LSTM
+If_0_then_branch__Inline_0__/decoder/rnn/LSTM
+```
+
+它们的 op type 仍是 `ai.onnx::LSTM`；两个 `rnn_1/LSTM` 同样已被简化器删除。
+
+### 96.3 为什么内部两个分支必然被裁掉
+
+原模型两个采样率分支中的 `decoder/If_1` 条件都等价于：
+
+```text
+bool(state.shape[0])
+```
+
+具体 ONNX 链是 `Shape(state) -> Gather(axis 0) -> Squeeze -> Cast(bool)`。模型输入签名把
+`state` 声明为 `[2, batch, 128]`，所以 `state.shape[0]` 静态等于 2，转成 bool 恒为 true。
+ONNXSlim 因而保留 then 分支的 `decoder/rnn/LSTM`，删除 else 分支的
+`decoder/rnn_1/LSTM`。外层 `Equal(sr, 16000)` 依赖运行时输入 `sr`，不能被折叠，所以两个
+采样率分支各留下一个 LSTM，总计正好 2 个。
+
+语义上，保留的 `rnn/LSTM` 分支从 `state[0]` 和 `state[1]` 取得 initial H/C；被删除的
+`rnn_1/LSTM` 分支通过 `ConstantOfShape` 创建零 initial H/C。后者用于“state 第一维为空”的
+情况，但这与当前模型声明的固定第一维 2 不相容，因此在当前 ONNX 输入契约下不可达。
+
+代码执行顺序也与此一致：[onnx_quant.py:263](/share/users/like/package/simo_conda_sglang/simo/onnx/onnx_quant.py:263)
+的 `apply_qdq_quantization` 在 `simplify=True` 时先调用
+[onnx_quant.py:475](/share/users/like/package/simo_conda_sglang/simo/onnx/onnx_quant.py:475)
+的 `simplify_onnx_model`，随后才在主图及递归子图中查找 target 并把 LSTM 替换为 custom op。
+
+简化还有第二个必要作用：原始 4 个 LSTM 的 W/R 输入都是 `Unsqueeze` 节点的输出，不是直接
+initializer；ONNXSlim 把保留的两个 LSTM 的 W/R 折叠成 initializer，才满足当前离线权重量化
+要求。受控对照中，`simplify=False` 会扫描到 4 个 LSTM target，但四个均以
+`dynamic_weight` 跳过，结果是 0 个 LSTM 被替换；这说明“关闭简化即可量化四个”并不成立。

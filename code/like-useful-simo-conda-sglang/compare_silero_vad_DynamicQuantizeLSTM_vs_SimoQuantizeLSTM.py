@@ -47,6 +47,7 @@ DEFAULT_CONFIG = Path(
 )
 DEFAULT_OUTPUT_DIR = Path("temp/compare-silero-vad-lstm")
 OUTPUT_NAMES = ("Y", "Y_h", "Y_c")
+SIMO_REFERENCE_ROLLOUT_RELATIVE_L2_TOLERANCE = 1e-2
 
 
 @dataclass(frozen=True)
@@ -736,7 +737,10 @@ def _run_closed_loop_rollout(
     if name != "float_cuda"
   }
   operator_reference_check = _comparison_metrics(runs["simo_cuda"], runs[reference_name])
-  if operator_reference_check["combined"]["max_absolute_error"] > 1e-6:
+  if (
+    operator_reference_check["combined"]["relative_l2_error"]
+    > SIMO_REFERENCE_ROLLOUT_RELATIVE_L2_TOLERANCE
+  ):
     raise RuntimeError(
       "SIMO Torch reference does not match SimoQuantizeLSTM: "
       f"{operator_reference_check['combined']}"

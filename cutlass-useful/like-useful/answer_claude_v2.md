@@ -825,3 +825,200 @@ cluster_sync();   // ← release (arrive) + acquire (wait)
 - `cluster_wait()` 保证 CTA 0 之后的所有 mbarrier 读取能看到 CTA 1 的 barrier 初始化写入
 - 如果 CTA 1 的 release 已完成但 CTA 0 没有 acquire，CTA 0 的后续 TMA 操作（行 206-213）可能读的是本地 L1 cache 中 stale 的 mbarrier 值
 
+
+## 追问：`size<0>(tAsA)=0`、`K_PIPE_MAX=0`、`size<0>(tAgA)=0` 的真相（`%d` 打印假象）
+
+### 结论先行
+
+这三个 `0` 全部是 **`printf("%d", cute静态整型对象)` 造成的类型不匹配假象**，不是真值。
+`size<N>(...)`、`size<1>(tAsA)` 返回的是 CuTe 的**编译期整型对象**（`Int<N>` / `Constant`），不是一个普通的 `int`。
+把它当 `%d` 传入，等于把一个非 `int` 对象的字节按 `int` 乱读，恰好读出 `0`。真正的循环(`gemm_device`，`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:196`)照样跑了 3 次（日志 `pipe=0,1,2`），反证 `K_PIPE_MAX` 真值不是 0。
+
+### 证据链（用日志与源码互相印证）
+
+1. **`k_tile_count` 能打对就是因为它是真 `int`**
+   - `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:179` 显式写成 `int k_tile_count = size<1>(tAgA);`
+   - 日志第 87 行打印 `k_tile_count:32` 正确（2048/64=32 个 K-tile）。
+   - 而 `K_PIPE_MAX` 用 `auto`（`:176` `auto K_PIPE_MAX = size<1>(tAsA);`）持有 cute 对象，`%d` 就打错。
+
+2. **循环证明了 `K_PIPE_MAX` 真值是 3，不是 0**
+   - `gemm_device`，`:196` `for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)`
+   - 日志第 88-90 行确实打印了 `pipe=0/1/2` → 循环体执行了 3 次。
+   - 若 `K_PIPE_MAX` 真是 0，循环体一次都不会跑，`pipe=...` 一行都不该出现。这条是决定性反证。
+   - 真值 3 来自 pipeline 深度 `bP = Int<3>`（`:331` `auto bP = Int<3>{};  // Pipeline`），
+     而 `tAsA` 的形状是 `((_512,_16),(_1,_3))`（日志第 78 行），`size<1>(tAsA)=product(_1,_3)=3`。
+
+3. **`size<0>(tAsA)` 真值是 8192**
+   - `print(tAsA)`（日志第 78 行）显示 mode0 形状 `(_512,_16)`：`size<0>(tAsA)=512*16=8192`。
+   - 按 `include/cute/tensor_impl.hpp:552`（`size`，模板参数 `<int... Is>` 传给 layout 的 `size`），
+     再进 `include/cute/int_tuple.hpp:267`（`size` 当 `Is` 非空时返回 `size(get<Is...>(a))`）→ 是个 cute 静态对象。
+
+4. **`size<0>(tAgA)` 真值也是 8192**
+   - `print(tAgA)`（日志第 76 行）显示 mode0 形状 `((( _64,_8),(_2,_8)),32)` 的取 0 号：`64*8*2*8=8192`。
+
+5. **`size(tAsA)` 为何打了 32768 而非 24576？**
+   - `size(tAsA)` 走 `size(shape)`（`include/cute/tensor_impl.hpp:552` → `include/cute/layout.hpp:607`），
+     `size(IntTuple)` 无下标时返回 `product(a)`（`include/cute/int_tuple.hpp:270`），同样是 cute 对象，经 `%d` 依旧是乱值。
+   - 所以这个 32768 也是假象，不是 tAsA 的元素数。
+
+> 教训：CuTe 里打印整型一律 `printf("%d", (int)X)` 或使用位移后的 `static_cast`；session 日志中真正可靠的是 `k_tile_count=32`（真 `int`）和 `tma_transaction_bytes=32768`（`constexpr int`，`:160`）。
+
+---
+
+## tAgA 打印解释 & `ArithmeticTuple` 坐标系
+
+### 这是什么 tensor
+
+`tAgA` 是 `tma_partition` 产出的**全局内存坐标张量（coord tensor）**，不是存值的 tensor。
+它的 `data()` 是 `ArithmeticTupleIterator`，`operator()` 返回 `cute::ArithmeticTuple<int,unsigned>`，
+即：(全局M坐标, 全局K坐标) 的**整数元组**，代表当前 CTA 要取的 A 块左上角在 gmem 中的元素坐标。
+
+数据结构来自 `tma_a.get_tma_tensor`（`include/cute/atom/copy_traits_sm90_tma.hpp:390`
+`get_tma_tensor` → `make_coord_tensor(make_layout(g_shape, g_stride))`），
+`make_coord_tensor` 在 `include/cute/tensor_impl.hpp:484`：把 layout 绑定到 `make_inttuple_iter(coprofile(layout))`。
+
+### 打印行的逐段含义（日志第 76 行）
+
+```
+ArithTuple(128,_0) o (((_64,_8),(_2,_8)),32):(((_1@0,_1@1),(_64@0,_8@1)),_64@1)
+```
+
+- `ArithTuple(128,_0)`：坐标基（当前块块的左上角）=(M=128, K=0)。
+  CTA 在行列坐标 `cta_coord=(1,0)`（日志第 56-57 行），A 的 BLK_M=128（`:327`），
+  所以 M 偏移 = `blockIdx.x * BLK_M = 1*128 = 128`；K 从 0 开始。命令参数 `512 1024 2048 N T` 走 `gemm_nt`，A 是 (M,K)。
+- `o`：读取/打印格式 `"base o shape : stride"`。
+- **shape** `(((64,8),(2,8)),32)`：
+  - mode0 = `((64,8),(2,8))`，元素数 64*8*2*8 = 8192 = 一个 (128M,64K) A-tile 的全部元素（按 swizzle 交织）。
+  - mode1 = `32`，即 32 个 K-tile（2048/64）。
+- **stride** 带 `@`：
+  - `@` 是 CuTe 的 **ScaledBasis / 基向量打印格式**，`X@j` 表示「沿第 j 个 coord 坐标轴方向推进 X 个元」。
+    源码见 `include/cute/numeric/arithmetic_tuple.hpp:474`（`printf("@%d", Ns)`）与 `:489`（`os << "@" << Ns`）。
+  - `_1@0`：推进 coord0(M) 1；`_1@1`：推进 coord1(K) 1；
+    `_64@0`：推进 coord0 64；`_8@1`：推进 coord1 8。
+  - 例如 stride 里的 `_64@1`（mode1=32 那个）→ 每 +1 个 K-tile，K 坐标 +64。完美对应 BLK_K=64。
+
+### tAgA(i) 的 operator() 解释
+
+对 rank-2 张量 `tAgA`（(tile, k_tile) 两维），`tAgA(i)` 只提供一个标量下标时，
+按 CuTe 的 slice/partial-coord 约定（`include/cute/underscore.hpp:123` `slice`，
+先 `has_underscore` 分支，`include/cute/tensor_impl.hpp:238`）解析；
+单数下标映射到 **最后一维（此例为 k_tile）**，其余维取全量 `_`。
+（代码里 `tAgA(_, k_tile)` 同样把 k_tile 放第二维，见 `:216`。）
+
+因此 k-slot 循环：
+```cuda
+for (int i = 0; i < 16; i++) {
+  auto elem = tAgA(i);   // = tAgA(_, i) 的坐标
+  // print(elem);
+}
+```
+期望看到（共享同一 CTA 行，M 固定 128，K 随 i 每次 +64）：
+```
+ArithTuple(128,0)
+ArithTuple(128,64)
+ArithTuple(128,128)
+...
+ArithTuple(128,960)   // i=15 → 15*64=960
+```
+即第 0 个元素 = 块左上角 (128,0)；第 i 个元素 = (128, i*64)。
+（若 `tAgA` 的 mode0 被取下标，则打的是 tile 内部的 M/K 微坐标交织；本例单下标命中 mode1=k_tile。）
+
+> 注意：对所有线程/CTA 而言 `tAgA.mode1` 形状是**静态已知的 32**，`k_tile_count=32` 正是 `size<1>(tAgA)` 的真值（`:179`），又一次佐证 `%d` 的 0 是假象。
+
+---
+
+## copy 如何使用 ArithmeticTuple 坐标 —— TMA 的硬件坐标语义
+
+### 为什么源不是 tensor value 而是一堆坐标
+
+普通 `copy(A, B)` 逐元素读 `A` 的值。但 **TMA（`cp.async.bulk.tensor.*`）是「描述符 + 坐标」硬件指令**：
+- 硬件用一个 `TmaDescriptor`（编码 box 各维度尺寸、gmem stride、smem swizzle 模式等，由 host `make_tma_atom` 构造）来描述「一次搬一块多大的、怎么布局」的块；
+- kernel 侧只需给出 **每块在 gmem 中的左上角坐标** 和 **smem 目标地址**；
+- 数据搬运、地址计算、逐渐落 smem 全部由 MMA/拷贝硬件完成，不需要逐元素访存。
+
+于是 CuTe 把「全局坐标张量」作为源传给 copy，`operator()` 求出的 `ArithmeticTuple<int,unsigned>` 就是给硬件的那串坐标寄存器。
+
+调用链：
+1. `copy(tma_a.with(producer_mbar), tAgA(_,k_tile), tAsA(_,pipe))`
+   （`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:216`）
+2. `TMA_LOAD_Unpack<>::copy_unpack` 取 `auto src_coord = src(Int<0>{})`
+   （`include/cute/atom/copy_traits_sm90_tma.hpp:77`），`src(0)` 是 `tAgA(0, k_tile)`，
+   即该 k-tile 的 `ArithmeticTuple(M,K)` 坐标。
+3. `detail::explode_tuple(CallCOPY<CopyOp>{}, opargs..., dst_ptr, src_coord)`
+   （`:86`）把 `ArithmeticTuple` 逐位「炸开」成若干个 `int32_t` 寄存器参数。
+4. `CallCOPY::operator()`（`include/cute/arch/util.hpp:154`）转调 `CopyOp::copy(desc_ptr, mbar, cache, smem_ptr, crd0, crd1, ...)`。
+5. `SM90_TMA_LOAD::copy`（`include/cute/arch/copy_sm90_tma.hpp:329`）按坐标个数分发到 2D 版，最终一条内联汇编：
+   ```
+   cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes
+     [smem_dst], [tma_desc, {crd0, crd1}], [mbar];
+   ```
+   （对应 `SM90_TMA_LOAD_2D` 的 asm，`include/cute/arch/copy_sm90_tma.hpp:117-131` 附近的 2D 模板；寄存器 `crd0/crd1` 即 M、K 坐标。）
+
+所以：**源张量提供的是「坐标」，TMA 描述符 + 该坐标 + smem 地址三样东西拼起来，硬件才知道从 gmem 哪里搬、搬到 smem 哪里**。这就是为什么这批「源」是 `ArithTuple(int,unsigned)` 的坐标流，而不是元素值流。
+
+---
+
+## wgmma_tma_sm90_like.cu 的 TMA Descriptor 生成与初始化调用栈（A 矩阵）
+
+### 结论：会调用 `cuTensorMapEncodeTiled`，但调用点不在示例文件里
+
+`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu` **没有直接调用** `cuTensorMapEncodeTiled`。
+它是通过 `gemm_nt` 里的 `make_tma_atom(...)`（`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:346`）在**主机侧（host）**间接触发的。
+真正的 `cuTensorMapEncodeTiled` 位于 CuTe 库内部 `include/cute/atom/copy_traits_sm90_tma.hpp:1046`，藏在 `detail::make_tma_copy_desc` 里。
+
+> 命令参数 `512 1024 2048 N T` → `gemm(...)`（`:497` gemm）→ transA='N', transB='T' 走 `gemm_nt`（`:505` 分支 → `:506` gemm_nt）。
+
+### 完整调用栈（仅 A；B 的 `tmaB`/`make_tma_atom(SM90_TMA_LOAD{}, mB, sB(...))` 完全对称）
+
+```
+gemm_nt  (examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:346)
+└─ make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK))
+    (examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:346)
+    └─ detail::make_tma_copy_atom<TmaType>
+        (include/cute/atom/copy_traits_sm90_tma.hpp:1390)
+        ├─ detail::construct_tma_gbasis<TmaInternalType>
+        │   (include/cute/atom/copy_traits_sm90_tma.hpp:1151 → 定义于 :734)
+        │   └─ 从 smem layout / cta_v_map 推出「TMA 各 mode 对应 gmem 哪个 mode」
+        │       (返回 tma_gbasis，:849)
+        └─ detail::make_tma_copy_desc<TmaInternalType>
+            (include/cute/atom/copy_traits_sm90_tma.hpp:1157 → 定义于 :928)
+            ├─ recast<TmaInternalType>(gtensor)            (:944)  按内部类型重铸(16b)
+            ├─ fill_tma_gmem_shape_stride                  (:952 → 定义于 :857)
+            │     填充 gmem_prob_shape[5] / gmem_prob_stride[5]（global shape/stride，:949-952）
+            │     再把单位片 stride 换算成字节 stride（×sizeof_bits/8，:971-973）
+            ├─ 计算 smem_box_shape（swizzle 布局每个 mode 的大小，:989-1001，含 multicast 截断）
+            │   smem_box_stride 初始化为全 1（:990）
+            │   ：memory_stride 由 get_swizzle_portion 得到
+            ├─ get_tma_swizzle_bits(swizzle)   (:1043 → include/cute/atom/copy_traits_sm90_tma_swizzle.hpp:48)
+            │      Sw<3,4,3> → SmemSwizzleBits::B128（M==4,B==3）
+            ├─ get_tma_swizzle_base(swizzle)   (:1044 → 同头文件 :79)
+            │      Sw<3,4,3> → SWIZZLE_BASE_16B（M==4,S==3）
+            ├─ TMA::to_CUtensorMapDataType<TmaInternalType>()   (:1037) 16b→CU_TENSOR_MAP_DATA_TYPE_UINT16
+            └─ CUresult result = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(...)
+                (include/cute/atom/copy_traits_sm90_tma.hpp:1046)
+                    填充 &tma_desc（一个 128B 的 CUtensorMap 结构）
+```
+
+### `cuTensorMapEncodeTiled` 被喂进哪些参数（:1046-1058）
+
+| 参数 | 来源 | 对该例(A)的值 |
+|---|---|---|
+| `&tma_desc` | 栈上 `TmaDescriptor tma_desc{}`（:1029） | 输出的 128B 描述符 |
+| `tma_format` | `to_CUtensorMapDataType`（:1037） | UINT16（half） |
+| `tma_dim` | `decltype(rank(tma_gbasis))`（:937） | 2（A 是 (M,K) 二维） |
+| `gmem_address` | `raw_pointer_cast(gtensor_T.data())`（:946） | 全局 A 基地址；:954 assert 16B 对齐 |
+| `gmem_prob_shape` | `fill_tma_gmem_shape_stride`（:952） | 整个 A 的 global dim |
+| `gmem_prob_stride`（+1） | 同上（:952），:971-972 转字节 stride | byte stride；:968 断言 stride[0]==1 |
+| `smem_box_shape` | :989-1001（从 tma_gbasis size 推，并截断 multicast） | 每步搬进 smem 的 box 形状 |
+| `smem_box_stride` | :990 | element stride（供 swizzle） |
+| `tma_interleave` | :1038 | NONE |
+| `smem_swizzle` | `to_CUtensorMapSwizzle`（:1045） | 128B swizzle |
+| `tma_l2Promotion` | :1039 | L2_128B |
+| `tma_oobFill` | :1040 | NONE |
+
+### 关键点总结
+
+1. **描述符生成 = host 端一次性动作**。整条链都运行在 `gemm_nt`（host）里，生成的是一个**不可变描述符对象** `tma_a`（`Copy_Atom`），包含 `tma_desc_` 128B 描述符 + `aux_params_`（含 `g_stride_`，即上一节讲的 TMA 坐标基 strides）。
+2. **描述符与坐标解耦**：描述符编码「搬一块形状/布局」的静态信息；每次 TMA 搬运时的动态坐标（`ArithmeticTuple`，见上一节 `tAgA(k)`）在 kernel 里由 `tma_partition` 生成的 coord tensor 提供，两者在 `copy(tma_a.with(mbar), tAgA(_,k), tAsA(_,pipe))`（`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:216`）时结合。
+3. **`smem_box_stride` 与 swizzle 的关系**：box 在 smem 中的铺排由 `smem_box_shape` + `smem_box_stride` + `smem_swizzle` 三件套共同描述；对 `Layout_MN_SW128_Atom`（Sw<3,4,3>）正好是 128B swizzle（见 `get_tma_swizzle_bits` :48 的 B128 + `get_tma_swizzle_base` :79 的 16B base）。
+4. 若驱动版本 ≤13010 且 tile 小于 128KB，还会手动清掉描述符第 21 位（`:1063-1069`），这是对旧驱动 bug 的 workaround，不影响结构理解。

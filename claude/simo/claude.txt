@@ -3403,3 +3403,66 @@ CUSTOM_OP_LIBRARY=/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plug
 把答案追加到 like-useful/answer_codex_v3.md
 写一个脚本 like-useful/check_kill.sh, 检查当前系统是否具备 事后排查 kill 信号的配置或者条件
 }
+{
+要求: 讲解代码的时候，要以 文件名+行号 + 函数名  的形式, 把答案追加到 like-useful/answer_claude_v2.md
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/ simo 代码位于  /share/users/like/package/simo_conda_sglang
+onnxruntime 代码位于 /share/users/like/package/onnxruntime onnx 代码位于 /share/users/like/package/onnx/
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+# onnxruntime  对于 CUDAExecutionProvider 的 浮点 的LSTM实现，是直接调用 cudnn，还是有自己的 onnxrunntime cuda kernel?
+# 当前 SimoQuantizeLSTM 的 matmul/tanh/sigmoid/elementwise 等 QDQ 之外的算子，都是调用的 torch 算子，还有另外一种选项，调用 onnxruntime 的 matmul/tanh/sigmoid/elementwise cuda 算子。
+## 当前 onnxruntime 的cuda 算子能够满足 SimoQuantizeLSTM   对 matmul/tanh/sigmoid/elementwise 等 QDQ 之外的算子需求？从而让 SimoQuantizeLSTM 不再依赖 torch
+## 如果 SimoQuantizeLSTM  可以摆脱 torch 依赖， matmul/tanh/sigmoid/elementwise cuda 算子, 调用  torch 算子，和调用 onnxruntime 算子，哪种实现更符合工程规范 ？
+要求: 讲解代码的时候，要以 文件名+行号 + 函数名  的形式, 把答案追加到 like-useful/answer_codex_v2.md
+}
+
+{ # 帮我完成**ONNX custom-op 动态库运行时** 不依赖 Torch的改造 
+nvcc 位于 /share_data/users/like/opt/cuda-13.0/bin//nvcc
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/. simo 代码位于  /share/users/like/package/simo_conda_sglang.
+onnxruntime 代码位于 /share/users/like/package/onnxruntime.  onnx 代码位于 /share/users/like/package/onnx/
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+# SimoQuantizeLSTM 激活值的 quantize + dequantize, 权重的dequantize, 保持 c++ 调用 triton kernel的方法，simo已经实现
+# **先解除依赖并建立正确性基线**：通过公开 `Ort::Op::Create/Invoke` 替换 torch MatMul/Gemm、Sigmoid、Tanh、Add、Mul；用 ORT allocator/workspace 和 raw shape view 替换 ATen 内存与布局操作。
+# 使用公开的 ORT standalone-op API
+# 在 `SimoQuantizeLstmCustomOp<T>` 构造阶段按 IO dtype 创建并缓存 native op，不能在每个 time step 重建 kernel。
+# 对于 A * B^T 类型矩阵乘法,改用带 `transB=1` 的 ORT `Gemm`，而不是每步额外启动 `Transpose`。
+# 临时 Q/scale/DQ、GEMM 和 gate buffer 改由 ORT CUDA allocator/workspace 管理
+#  四个 W gate 合并成 `[4H,I]`、四个 R gate 合并成 `[4H,H]` 的生产性能实现, 在本轮任务中先不要做
+# 在 `SimoQuantizeLstmCustomOp<T>::DequantizeGate` 和 `QuantizeDequantizeState` 中移除 `at::Tensor`、`empty/zeros/reshape/slice/transpose/permute/contiguous/copy_`，改成 ORT workspace、pointer view 和 CUDA layout kernel。
+# 在 `SimoQuantizeLstmCustomOp<T>::ComputeImpl` 中移除 c10 stream guard、InferenceMode、ATen matmul/activation/elementwise 和 `c10::Error` catch；直接使用 `KernelContext_GetGPUComputeStream` 已提供的 stream。
+# 修改 [build_runtime.py:52](/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/build_runtime.py:52) 的 `build_sm90_runtime`，删除 Torch include/library/ABI/rpath；修改 [runtime.py:29](/share/users/like/package/simo_conda_sglang/simo/onnx/runtime.py:29) 的 `register_custom_ops`，删除强制 `import torch`；更新 [test_public_api.py:199](/share/users/like/package/simo_conda_sglang/simo/onnx/tests/test_public_api.py:199) 的 `test_build_sm90_runtime_uses_system_compiler_and_temporary_sources` 链接断言。
+# 用 `readelf -d`/`ldd` 验收新 `.so` 不再出现 torch/c10 `DT_NEEDED`，并在未 import Torch 的独立进程中注册和运行 custom op。
+
+# 写完代码，用指定 conda环境, 先  pip uninstall simo ,再 pip install -e ".[dev]" --no-build-isolation, 
+# 安装完后 ,再次运行 like-useful/compare_silero_vad_DynamicQuantizeLSTM_vs_SimoQuantizeLSTM.py 再重新跑一遍, 要执行 Silero 风格的闭环 rollout，把每个实现自己的 `Y_h/Y_c` 回灌到下一步。 分析新的结果, 把答案追加到 like-useful/answer_codex_v2.md
+# 写代码前先把执行计划写入 like-useful/PLAN_SIMO_CUSTOM_OP_REMOVE_TORCH_LSTM.md
+ONNX custom-op .so ，本轮新增 layout CUDA kernel 后, 不要因为PATH 中存在 /usr/local/cuda-12.8/bin/nvcc 而误用 CUDA 12.8, 不要使用固定 /share_data/users/like/opt/cuda-13.0/bin/nvcc, 使用 CUDA_HOME 环境变量，比如 os.environ.get("CUDA_HOME", "/usr/local/cuda"), 
+在 pip install -e ".[dev]" --no-build-isolation 之前，export CUDA_HOME=/share_data/users/like/opt/cuda-13.0
+即: 构建脚本依赖 CUDA_HOME, 不要有固定路径， pip install之前 export CUDA_HOME .
+你现在更新改造任务的执行计划
+
+}
+{ 
+nvcc 位于 /share_data/users/like/opt/cuda-13.0/bin//nvcc
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/. simo 代码位于  /share/users/like/package/simo_conda_sglang.
+onnxruntime 代码位于 /share/users/like/package/onnxruntime.  onnx 代码位于 /share/users/like/package/onnx/
+onnx 算子文档位于 /share/users/like/package/onnx/docs/Operators.md, 其中 ### <a name="LSTM"></a><a name="lstm">**LSTM**</a> 部分，有 LSTM 的相关内容。
+移除 Torch/aten/c10的依赖 之后， 我在工作目录 /share/users/like/package/jdjv/silero_vad_clean 中使用 /share_data/users/like/miniconda3/envs/simo_sglang/ 环境  执行下面的命令:
+虽然是在 bjh5 机器上执行的，但是本机和 bjh5 GPU配置相同， /share目录是共享 nfs 文件系统.
+
+# 没有 lstm 量化:
+CUSTOM_OP_LIBRARY=/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so CONFIG_DIR=/share/users/like/package/jdjv/quant_schema_no_lstm/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.no-listm.`nowstr.sh`.`hostname` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.`nowstr.sh`.`hostname` 2>&1 &
+日志: temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.no-lstm.2026_08_06___17_09_53.gpu005.rd.sio-software.com  
+不同量化类型的输出: logs/simo_sglang_pip.no-listm.2026_08_06___17_09_53.gpu005.rd.sio-software.com/
+# 有 lstm量化:
+CUSTOM_OP_LIBRARY=/share/users/like/package/simo_conda_sglang/simo/onnx/ort_plugin/libSimoOnnxCustomOps_sm90.so CONFIG_DIR=/share/users/like/package/jdjv/quant_schema/ MODEL=onnx_float_baseline/silero_vad.onnx OUTPUT_ROOT=logs/simo_sglang_pip.SimoQuantizeLSTM.`nowstr.sh`.`hostname` SIMPLIFY=true bash test_quant_onnx.sh > temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.SimoQuantizeLSTM.`nowstr.sh`.`hostname` 2>&1 &
+日志:  temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.SimoQuantizeLSTM.2026_08_06___17_10_21.gpu005.rd.sio-software.com
+不同量化类型的输出:  logs/simo_sglang_pip.SimoQuantizeLSTM.2026_08_06___17_10_21.gpu005.rd.sio-software.com/
+1.  两次测试都完整地生成模型精度数据了吗？有没有 core dump？有没有抛异常?
+2. 两次测试，Linear+Conv的配置，和Linear+Conv+LSTM的配置， 增加  LSTM量化后，不同量化数据类型的模型精度有什么变化 ？
+把答案追加到 like-useful/answer_codex_v2.md
+
+}
+{
+为什么实际只量化了2个LSTM? /share/users/like/package/jdjv/silero_vad_clean/onnx_float_baseline/silero_vad.onnx 本身有几个 LSTM?
+把答案追加到 like-useful/answer_codex_v2.md
+}
