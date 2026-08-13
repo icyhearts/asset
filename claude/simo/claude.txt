@@ -3693,3 +3693,9 @@ QUANT_CONSTS_AFTER_APPLY=1 CONFIG_DIR=/share/users/like/package/jdjv/quant_schem
 把答案追加到 like-useful/answer_codex_v2.md
 
 }
+{
+vllm-sipu 项目位于 /share/users/like/package/vllm-sipu
+对 /share/users/like/package/vllm-sipu/tools/setup_vllm_dev_conda.sh 进行讲解
+把答案追加到 like-useful/answer_codex_v2.md
+
+}

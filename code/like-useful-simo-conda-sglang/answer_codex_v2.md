@@ -14907,3 +14907,329 @@ GEMM/Conv 后端中的某一项，原因是两边至少还有以下结构差异�
    需要进一步逐层定位；
    FP8 2D-block 的 PyTorch AUC/Acc 低 `0.372121/4.703037 pp`，但两边量化覆盖不同，这一行不能用来
    判断 PyTorch 与 ONNX 量化实现谁更准确。
+
+## 103. `setup_vllm_dev_conda.sh` 执行过程详解（2026-08-13）
+
+### 103.1 脚本的定位
+
+本节的相对路径都以 `/share/users/like/package/vllm-sipu` 为 code base。
+
+`tools/setup_vllm_dev_conda.sh` 的目标不是简单地在当前环境执行一次 `pip install -e .`，而是从
+conda 环境开始，重建一套与当前 vLLM-SIPU 版本绑定的完整开发环境。它依次完成：
+
+```text
+解析版本和参数
+  -> 校验 SDK、wheel 和 conda
+  -> 删除旧 conda 环境（仅 --recreate 且环境已存在）
+  -> 创建 Python 3.10 conda 环境
+  -> 安装 host 编译工具链
+  -> 安装 CPU Torch、SIPU vLLM baseline、torch_sipu、Triton 和测试依赖
+  -> 安装 pre-commit hook
+  -> 清理两个 FetchContent 源码缓存
+  -> source SIPU SDK 并 editable 编译 vllm_sipu
+  -> 在 SDK 环境下做六项 import/version smoke check
+```
+
+入口的 `set -euo pipefail` 位于 `tools/setup_vllm_dev_conda.sh:6 (top-level)`：任一未被处理的命令
+失败、未定义变量或 pipeline 中间命令失败，脚本都会立即终止。脚本没有 rollback trap，所以失败前
+已经删除的环境、已经安装的包或已经清掉的缓存不会自动恢复。
+
+### 103.2 启动时如何确定路径和版本
+
+`tools/setup_vllm_dev_conda.sh:8-10 (top-level initialization)` 用脚本自身位置计算 `script_dir` 和
+`repo_root`，所以可以从任意工作目录调用；随后 source `tools/dependency_versions.sh`。
+
+`tools/dependency_versions.sh:4-23 (resolve_pinned_requirement_version)` 从
+`requirements/sipu.txt` 中查找形如 `vllm == VERSION` 的行，而且要求恰好匹配一次。当前解析结果为：
+
+```text
+vllm_baseline_version=0.27.1+sipu1
+```
+
+如果找不到 vLLM pin 或出现多个 pin，脚本会在做任何 conda 修改前失败。这避免默认 wheel 文件名与
+项目声明的 baseline 版本各维护一份而发生漂移。
+
+`tools/setup_vllm_dev_conda.sh:29-41 (top-level defaults)` 设置的当前默认值如下：
+
+| 项目 | 当前默认值 | 来源 |
+|---|---|---|
+| conda 环境名 | `vllm_dev` | 脚本默认值 |
+| conda 环境定义 | `conda/env.yaml` | 固定路径 |
+| Python | `3.10.16` | `conda/env.yaml:7-10 (dependencies)` |
+| vLLM baseline | `0.27.1+sipu1` | `requirements/sipu.txt:4` |
+| vLLM wheel | `/share_data/vllm-sipu/wheels/vllm-0.27.1+sipu1-cp310-cp310-linux_x86_64.whl` | 由上述版本拼出 |
+| Torch / torchvision | `2.10.0+cpu` / `0.25.0+cpu` | 脚本中的精确 pip spec |
+| `torch_sipu` | `0.7.0...sdk260801` nightly | `requirements/sipu.txt:5` |
+| SiOrigin Triton | `3.3.1+siorigin.v0.5.0.git5f924ab6` | `requirements/sipu.txt:7-8` |
+| editable 编译并发 | `64` | `MAX_JOBS` 未设置时 |
+| vllm_sipu pretend version | `0.27.1` | 从 `0.27.1+sipu1` 去掉 local suffix |
+| OpenSSL | `>=3.0.15,<3.1` | 脚本固定范围 |
+
+当前 `sdk.version` 是 `2608121443`，默认解析到
+`/share_data/sicx_sdk/release/2608121443`。SDK 的实际选择顺序由
+`sipu_sdk_setup.sh:11-29 (resolve_version/resolve_path)` 决定：显式函数参数、`SDK_VERSION`、
+`sdk_version`、`sdk.version`，先出现者优先；SDK 根目录还可由 `SIPU_SDK_RELEASE_ROOT` 改写。
+
+### 103.3 命令行参数和环境变量优先级
+
+`tools/setup_vllm_dev_conda.sh:43-107 (usage/argument loop)` 支持：
+
+| 参数 | 作用 |
+|---|---|
+| `--recreate` | 如果目标环境存在，先执行 `conda env remove -n NAME -y` |
+| `--env-name NAME` | 改目标 conda 环境名 |
+| `--vllm-wheel PATH` | 改 baseline vLLM wheel 的完整路径 |
+| `--local-wheel-dir DIR` | 改 Torch/torchvision wheel 搜索目录 |
+| `--max-jobs N` | 改 editable CMake 构建并发数 |
+| `-h/--help` | 打印帮助后退出 |
+
+初始化时先读取环境变量，之后命令行参数再覆盖它们：
+
+- `LOCAL_WHEEL_DIR` 对应 `--local-wheel-dir`；
+- `VLLM_WHEEL_PATH` 对应 `--vllm-wheel`；
+- `MAX_JOBS` 对应 `--max-jobs`；
+- `VLLM_SIPU_PRETEND_VERSION` 没有命令行选项，只能通过环境设置。
+
+还有若干变量会原样继承到 SDK 或构建子进程，例如 `SDK_VERSION`、`SIPU_SDK_RELEASE_ROOT`、
+`VLLM_SIPU_BUILD_JIT`、`CMAKE_BUILD_TYPE`、`CMAKE_BUILD_PARALLEL_LEVEL`、
+`VLLM_SIPU_SIKERNEL_SRC_DIR` 和 `VLLM_SIPU_DISTRIBUTED_SRC_DIR`。脚本不会清除这些调用方设置。
+
+帮助文本把 `--recreate` 写在 Usage 主命令上，但实现并没有无条件要求它：目标环境不存在时，不传
+`--recreate` 也会创建成功；只有同名环境已经存在时，第 188-193 行才要求 `--recreate`。也就是说，
+它的准确语义是“允许删除并重建”，不是“每次调用都必填”。
+
+### 103.4 本地 wheel 目录选择
+
+`tools/setup_vllm_dev_conda.sh:12-27 (default_local_wheel_dir)` 按顺序选择第一个已经存在的目录：
+
+```text
+/share_data/vllm-sipu/wheels
+/share/wheels
+```
+
+如果两个都不存在，它仍返回第一个路径，后面的 preflight 再给出明确错误。这里有两个细节：
+
+1. 它选择的是“第一个存在的目录”，不是“第一个包含所需 wheel 的目录”。如果第一个目录存在但缺少
+   Torch wheel，不会继续 fallback 到第二个目录，而是在第 128-129 行失败。
+2. `--local-wheel-dir` 只影响 Torch/torchvision；默认 vLLM wheel 始终位于
+   `/share_data/vllm-sipu/wheels`。若在只有 `/share/wheels` 的机器上运行，通常还需要同时传
+   `--vllm-wheel`。
+
+第 123-129 行用 glob 预检精确的 CPython 3.10 wheel：
+
+```text
+torch-2.10.0+cpu-cp310-*.whl
+torchvision-0.25.0+cpu-cp310-*.whl
+```
+
+当前 `/share_data/vllm-sipu/wheels` 和 `/share/wheels` 都有匹配的 Torch/torchvision wheel，默认
+vLLM wheel也存在。实际安装用的是 `pip --find-links=DIR`，不是把 glob 得到的某个文件直接传给
+pip；并且没有 `--no-index`，所以这只是保证本地候选存在，并不把整个安装过程变成严格离线模式。
+
+### 103.5 修改系统状态前的检查
+
+`tools/setup_vllm_dev_conda.sh:109-129 (top-level preflight)` 在删除环境前检查：
+
+- `conda` 必须在 `PATH`；
+- `conda/env.yaml` 和仓库的 `sipu_sdk_setup.sh` 必须存在；
+- 本地 wheel 目录、baseline vLLM wheel 和两个 CPython 3.10 CPU wheel 必须存在；
+- 当前 shell 不能正处在准备删除的目标环境中。
+
+最后一项同时检查 `CONDA_DEFAULT_ENV` 和 `CONDA_PREFIX`。这样可以避免脚本一边运行，一边删除承载
+自身命令和动态库的环境。它并不要求退出任意 conda 环境，只要求当前不是目标环境。
+
+`tools/setup_vllm_dev_conda.sh:131-147 (env_exists/conda_python/conda_pip/
+conda_python_with_sdk)` 的所有 Python/pip 操作都通过 `conda run -n NAME` 执行，而不是在父 shell 中
+`conda activate`。同时设置 `PYTHONNOUSERSITE=1`，防止 `~/.local` 中的同名包污染新环境。
+
+### 103.6 SDK 预检与 conda 环境生命周期
+
+第 181-186 行先打印最终路径并执行：
+
+```bash
+bash sipu_sdk_setup.sh --resolve-sdk
+```
+
+`sipu_sdk_setup.sh:32-43 (--resolve-sdk branch)` 只解析、验证并打印 `SDK_VERSION`、`SI_SDK_ROOT`、
+`SI_CROSS_COMPILE_PATH` 等值。因为它以子进程 `bash` 运行，这一步不会把变量 export 到 setup 脚本
+自身；真正构建和验证时会在各自的子 shell 里再次 `source sipu_sdk_setup.sh`。
+
+`tools/setup_vllm_dev_conda.sh:188-203 (environment create/toolchain install)` 随后：
+
+1. 用 `conda env list` 判断名称是否存在；
+2. 存在且没有 `--recreate` 就失败；
+3. 存在且指定 `--recreate` 就永久删除该环境；
+4. 用 `conda env create -n NAME -f conda/env.yaml -y` 创建环境；
+5. 再从清华 conda-forge 镜像显式安装一遍指定 host 工具链。
+
+`conda/env.yaml:7-23 (dependencies)` 已经声明了 Python、GCC/Clang、sysroot 和部分运行库；后面的
+`conda install` 看起来有重复，但还补充/固定了 CMake、Ninja、Jinja2、PyYAML 和 OpenSSL。OpenSSL
+保持在 3.0.x，是为了规避 FetchContent 使用 git clone 时 conda OpenSSL 与 git 链接版本不一致，
+对应说明见 `README.zh.md:87-99 (第 2 步)`。
+
+### 103.7 四层 Python 依赖如何安装
+
+第 205-217 行按以下层次安装：
+
+1. **Torch 基础层**：从 local find-links 安装 `torch==2.10.0+cpu` 和
+   `torchvision==0.25.0+cpu`。这里故意不是 CUDA Torch；SIPU 设备能力由后面的 `torch_sipu` 提供。
+2. **vLLM baseline 层**：用 `pip install --no-deps VLLM_WHEEL` 安装精确的
+   `vllm==0.27.1+sipu1` wheel。`--no-deps` 只对这一步生效，避免安装 baseline wheel 时立刻改写
+   已选定的 Torch/依赖集合。
+3. **SIPU 开发层**：安装 `requirements/sipu.txt`。该文件通过 `-r` 继续包含
+   `requirements/build.txt` 和 `requirements/lint.txt`，所以会安装 scikit-build、CMake/Ninja Python
+   构建依赖、Ray、lint/pre-commit 工具、特定 `torch_sipu` nightly、SiOrigin Triton 及 TileLang。
+4. **测试层**：安装 `requirements/test.txt` 中的 modelscope、OpenAI client、pytest、xdist、timeout
+   等测试依赖。
+
+之后 `tools/setup_vllm_dev_conda.sh:169-179 (install_precommit_hook)` 检查当前目录是否为 git
+worktree；如果是，就在新环境中执行 `python -m pre_commit install`。这会修改仓库的
+`.git/hooks/pre-commit`，不是单纯修改 conda 环境。
+
+这套安装仍可能访问网络和内部服务：build/test requirements 中的普通 PyPI/conda 包可能访问所配置
+的镜像，`pyproject.toml:30-39 (project.dependencies)` 还包含四个 `git+ssh` 私有依赖。最后的
+`pip install -e .` 没有 `--no-deps`，缺失时会尝试从内部 GitLab 安装它们。因此本地 Torch/vLLM
+wheel 齐全不等于整套脚本可离线执行，还需要镜像和内部 GitLab SSH 权限，或事先把所有依赖装好。
+
+### 103.8 为什么构建前要删除 `.deps` 中的目录
+
+`tools/setup_vllm_dev_conda.sh:157-167 (clean_fetchcontent_cache)` 删除四个路径：
+
+```text
+.deps/sikernel-src
+.deps/sikernel-subbuild
+.deps/vllm-sipu-distributed-src
+.deps/vllm-sipu-distributed-subbuild
+```
+
+这针对的是两个 CMake FetchContent 项目的源码和下载状态，目的是避免旧 checkout 缺少新算子源码；
+对应故障背景见 `README.zh.md:134-154 (.deps 下缺少 sikernel 源文件)`。
+
+清理后，若没有设置本地源码覆盖：
+
+- `cmake/external_projects/sikernel.cmake:1-41 (sikernel FetchContent setup)` 从内部
+  `oplib/sikernel.git` 的 `dev` 分支重新拉取；
+- `cmake/external_projects/vllm-sipu-distributed.cmake:1-51
+  (vllm-sipu-distributed FetchContent setup)` 从内部 `sipu_custom_op.git` 的 `dev` 分支重新拉取。
+
+所以这一步会令后续构建依赖 GitLab SSH/network，而且 `dev` 是移动分支，不能视为完全可复现的固定
+源码输入。可通过 `VLLM_SIPU_SIKERNEL_SRC_DIR`、`VLLM_SIPU_DISTRIBUTED_SRC_DIR` 或各自的 repository/tag
+环境变量覆盖。
+
+这个函数也不是完整 clean build：它没有删除整个 `.deps`，更没有删除 `pyproject.toml:61-73
+(tool.scikit-build)` 指定的 `build/`。因此 `--recreate` 会重建 conda 环境并刷新两个外部源码缓存，
+但 CMake build tree/已有 object 仍可能被增量复用；需要真正从零编译时还要单独处理 `build/`。
+
+### 103.9 editable 安装实际做了什么
+
+核心命令位于 `tools/setup_vllm_dev_conda.sh:221-224 (editable install block)`。它在目标 conda
+环境的新 bash 中执行以下逻辑：
+
+1. `cd` 到仓库；
+2. `source sipu_sdk_setup.sh`；
+3. 设置 `PYTHONNOUSERSITE=1`；
+4. 解析目标环境里的 `cmake` 和 `ninja` 绝对路径；
+5. 设置两个 setuptools-scm pretend-version 变量、`CMAKE_EXECUTABLE`、`CMAKE_MAKE_PROGRAM` 和
+   `MAX_JOBS`；
+6. 运行 `python -m pip install -e . --no-build-isolation -vvv`。
+
+source SDK 时，`sipu_sdk_setup.sh:46-68 (source mode)` 会 export `SI_SDK_ROOT`、
+`SI_CROSS_COMPILE_PATH` 等变量，再 source SDK 自带环境和 SIPU 1.5 CModel 环境，最后把 conda 的
+`lib` 放入 `LD_LIBRARY_PATH`。这不是 CUDA 构建：脚本不读取 `CUDA_HOME` 或 `nvcc`；
+`cmake/Modules/CMakeDetermineSIPUCompiler.cmake:1-17 (SIPU compiler setup)` 使用的是
+`${SI_CROSS_COMPILE_PATH}/clang`。
+
+`--no-build-isolation` 表示 PEP 517 构建直接复用刚才安装到目标环境的 Torch、vLLM、scikit-build 等
+依赖，而不再创建临时 build env。这正是前面安装顺序不能打乱的原因。
+
+项目在 `pyproject.toml:1-16 (build-system)` 指定自定义 `build_backend.py`，再委托给
+scikit-build-core。`build_backend.py:536-589 (_configured_build_env/build_editable)` 会：
+
+- 默认按 `VLLM_SIPU_BUILD_JIT=1` 生成 JIT 模式的 `vllm_sipu/jit/env.py`；
+- 把数字形式的 `MAX_JOBS` 转成 `CMAKE_BUILD_PARALLEL_LEVEL`，但调用方已经设置
+  `CMAKE_BUILD_PARALLEL_LEVEL` 时以后者为准；
+- 修补目标环境内 `torch_sipu` 的 `TorchSIPUConfig.cmake`，将缺失的 `siccl.cmake` include 改为
+  optional，见 `build_backend.py:500-532 (_patch_torch_sipu_siccl_cmake)`；
+- 调用 scikit-build-core 生成 editable wheel，并保留生成的 JIT `env.py`。
+
+pretend version 当前为 `0.27.1`，是 package metadata 的版本输入，不是把 baseline vLLM wheel 从
+`0.27.1+sipu1` 降级。前者是正在构建的 `vllm_sipu` distribution，后者是它依赖的 `vllm`
+distribution，两者是不同包。
+
+CMake 阶段在 `CMakeLists.txt:67-106 (Torch/SIPU discovery and FetchContent)` 中查找 Torch、
+TorchSIPU、SDK 和两个外部项目；随后：
+
+- 根据 `csrc/op_list.yaml` 准备 sikernel 源码；
+- 构建并安装 `vllm_sipu._C`，见 `CMakeLists.txt:131-203 (_C target)`；
+- 构建 distributed 项目中的 `deep_ep_cpp`，见
+  `cmake/external_projects/vllm-sipu-distributed.cmake:56-121 (deep_ep_cpp target)`。
+
+默认 `CMAKE_BUILD_TYPE` 是 Release，见 `CMakeLists.txt:86-90 (build type)`。所谓 editable 主要是
+Python 源码仍指向工作树；C++/SIPU 扩展仍必须在安装阶段真实配置和编译，并非“只写一个链接”。
+
+### 103.10 最后的验证覆盖到什么程度
+
+`tools/setup_vllm_dev_conda.sh:149-155 (verify_import)` 和第 226-231 行依次在“目标 conda 环境 +
+已 source SDK”的子 shell 中验证：
+
+```text
+Python      major/minor 必须是 3.10
+Torch       版本字符串必须以 2.10.0 开头
+torch_sipu  能 import
+Triton      版本字符串必须以 3.3.1 开头
+vllm        能 import，并打印版本
+vllm_sipu   能 import
+```
+
+这能发现包未安装、动态库缺失或基本版本错配，但它不运行 pytest，不检查 SIPU device count，不加载
+模型，也不执行任何 kernel。因此脚本成功的含义是“开发环境安装和基础 import 通过”，不是“硬件推理
+和全部算子正确”。另外，vLLM 只打印版本而没有 assert 精确等于 `0.27.1+sipu1`；精确 pin 主要由
+安装阶段保证。
+
+所有 `conda run` 和 `source sipu_sdk_setup.sh` 都发生在子进程里，不会激活或污染调用者的当前 shell。
+脚本结束后只打印 `conda activate NAME`。如果后续命令依赖 SDK/CModel 动态库，稳妥的使用方式是：
+
+```bash
+cd /share/users/like/package/vllm-sipu
+conda activate vllm_dev
+source sipu_sdk_setup.sh
+```
+
+仅执行 `conda activate` 并不会继承安装时子 shell 中 export 的 SDK 环境变量。
+
+### 103.11 破坏性、副作用和常见边界
+
+- `--recreate` 会永久删除整个同名 conda 环境；脚本禁止在该环境已激活时执行。
+- 无 `--recreate` 时不能“补装”或修复已有环境，而是直接报错。中途失败留下半成品环境后，通常也要
+  用 `--recreate` 重跑。
+- 每次都会删除两个 FetchContent 项目的默认源码/下载状态，但不会清理 `build/`。
+- 在 git worktree 中会安装/覆盖 pre-commit hook。
+- editable backend 会在源码树保留生成的 `vllm_sipu/jit/env.py`，并可能修改目标环境中
+  `torch_sipu` 自带的 CMake config。
+- 默认 64 个并行 job 对内存有限的机器可能过大，可以用 `--max-jobs 16` 等方式降低。脚本只要求参数
+  非空，没有自行校验它是正整数；应由调用方传合法值。
+- 本地 wheel、conda/PyPI 镜像、内部 GitLab、SIPU SDK 和 CModel 缺一不可；这不是通用公网环境安装器。
+- 外部 FetchContent 默认跟随两个 `dev` 分支。即使 vLLM/Torch 版本固定，不同日期重建仍可能取得
+  不同外部源码。
+
+### 103.12 推荐调用方式
+
+重建默认环境：
+
+```bash
+cd /share/users/like/package/vllm-sipu
+tools/setup_vllm_dev_conda.sh --recreate --env-name vllm_dev
+```
+
+降低编译并发并显式固定输入路径：
+
+```bash
+tools/setup_vllm_dev_conda.sh \
+  --recreate \
+  --env-name vllm_dev \
+  --local-wheel-dir /share_data/vllm-sipu/wheels \
+  --vllm-wheel /share_data/vllm-sipu/wheels/vllm-0.27.1+sipu1-cp310-cp310-linux_x86_64.whl \
+  --max-jobs 16
+```
+
+第一次创建一个确定不存在的新环境时可以省略 `--recreate`；对已有环境执行时则必须保留。
