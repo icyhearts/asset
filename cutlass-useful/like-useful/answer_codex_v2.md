@@ -4902,3 +4902,1117 @@ WGMMA 实际定位：
 因此，丢弃的是在 GMMA shared-address 语境中不需要的 generic-address-space 表示，以及由 16-byte 对齐保证为 0 的 4 个低位；有效的 CTA-relative shared-memory 地址信息没有丢失。
 
 外部规范依据：NVIDIA [PTX ISA 8.0 的 Matrix Descriptor Format](https://docs.nvidia.com/cuda/archive/12.0.1/parallel-thread-execution/index.html) 和 [Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html)。
+
+## Section 37. 一个 64-bit `GmmaDescriptor` 如何描述 `tCsA` 的 `64x16` 非连续布局
+
+### 37.1 先给出结论
+
+本例不需要把完整的 CuTe shape/stride tree 全部逐项塞进 64-bit descriptor。信息来自两个地方：
+
+1. `wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16` 指令本身硬编码了数学矩阵形状和元素类型，因此硬件已经知道 A 是 `64x16`、B 是 `16x64`、D 是 `64x64`，也知道每个元素是 `f16`。
+2. `GmmaDescriptor` 只补充不能从 opcode 推出的 shared-memory 信息：起始地址、leading-dimension byte offset、stride-dimension byte offset、base offset 和 swizzle mode。
+
+对于问题中的 A atom：
+
+```text
+tCsA atom 的非 swizzle layout：
+  (_64,(_8,_2)):(_1,(_64,_1024))       单位：half elements
+
+descriptor 打印：
+  start_addr  = 0x0040
+  leading_off = 0x0000
+  stride_off  = 0x0080
+  layout_type = 1 (B128)
+```
+
+关键等式是：
+
+```text
+stride_off 解码后的 byte offset
+  = 0x0080 << 4
+  = 128 * 16
+  = 2048 bytes
+  = 1024 half elements
+```
+
+所以用户指出的非连续 `stride=1024 half` **没有丢失**，它正是 descriptor 中 bits `[45:32]` 的 `stride_byte_offset_ = 0x80`。打印名称中的 `stride_off=128` 是编码后的 16-byte 单位值，不是 128 bytes。
+
+而 `stride=1`、`stride=64` 以及 `64x16` 的 shape，大部分属于该 opcode、`.f16` 类型、`Major::MN` 和 B128 canonical layout 已经固定的规则，不需要作为任意 shape/stride 数组再次编码。
+
+### 37.2 先准确解释 `(_64,(_8,_2)):(_1,(_64,_1024))`
+
+日志 `temp/run.wgmma_tma_sm90_like.log:148-149` 为：
+
+```text
+Sw<3,4,3>_smem_ptr[16b](0x7fdc01000400) o
+((_64,(_8,_2)),_2,_4,(_1,_3)):
+((_1,(_64,_1024)),_512,_2048,(_0,_8192))
+```
+
+取第 0 个顶层 mode，也就是一个 MMA atom 的 A tile，得到：
+
+```text
+shape  = (_64, (_8, _2))
+stride = (_1,  (_64, _1024))
+```
+
+暂时忽略最外面的 `Sw<3,4,3>`，令：
+
+```text
+m  in [0,64)
+k0 in [0,8)
+k1 in [0,2)
+```
+
+则 non-swizzled half-element offset 是：
+
+```text
+offset_half(m,k0,k1) = m + 64*k0 + 1024*k1
+```
+
+因此：
+
+```text
+k1=0：offset 0    ... 511
+k1=1：offset 1024 ... 1535
+```
+
+你的判断是正确的：组合 mode `(64,8)` 覆盖 512 个相邻 half-element slots；若整个 `64x16` 都是普通紧密布局，`k1` 的 stride 应当为 `64*8=512`，但这里实际是 1024。
+
+不过，“连续”只是在讨论 `Swizzle` 之前的线性 layout。`tCsA.data()` 是一个 `swizzle_ptr`，其 `operator[]` 会在 pointer addition 以后应用 swizzle，见 `include/cute/pointer_swizzle.hpp:68-105`（类型 `cute::swizzle_ptr`，函数 `operator[]`）。`Swizzle<3,4,3>::apply` 使用 XOR 修改地址位，见 `include/cute/swizzle.hpp:54-87`（类型 `cute::Swizzle`，函数 `apply`）。所以真正的 shared-memory bank/address 顺序还会经过 B128 swizzle。
+
+### 37.3 `stride=1024` 之间的“空洞”放了什么
+
+这个空洞并不是未使用空间。`tCsA` 的下一个顶层 mode 是：
+
+```text
+MMA_M shape  = 2
+MMA_M stride = 512 half = 1024 bytes
+```
+
+因此忽略内部 swizzle 后，一个 `128x16` 区域的 atom 交错关系是：
+
+```text
+相对 tCsA base 的 half offset     内容
+--------------------------------  ---------------------------
+   0 ...  511                     MMA_M=0, K=0...7
+ 512 ... 1023                     MMA_M=1, K=0...7
+1024 ... 1535                     MMA_M=0, K=8...15
+1536 ... 2047                     MMA_M=1, K=8...15
+```
+
+换成 byte window：
+
+```text
+0x000 ... 0x3ff   MMA_M=0, K=0...7
+0x400 ... 0x7ff   MMA_M=1, K=0...7
+0x800 ... 0xbff   MMA_M=0, K=8...15
+0xc00 ... 0xfff   MMA_M=1, K=8...15
+```
+
+每个 1 KiB window 内部仍按 B128 规则 swizzle。这样就能看清两个不同层次：
+
+- descriptor 内的 `SBO=0x800 bytes`：同一个 `64x16` atom 从 `K=0...7` 跳到 `K=8...15`；
+- `tCrA` 外层 `MMA_M stride=64 descriptor units`：从 `MMA_M=0` 移到 `MMA_M=1`，即 `64*16=1024 bytes`。
+
+`tCrA` 的日志正是：
+
+```text
+GMMA::DescriptorIterator o (_1,_2,_4,(_1,_3)):
+                           (_0,_64,_256,(_0,_1024))
+```
+
+见 `temp/run.wgmma_tma_sm90_like.log:160-164`。例如：
+
+```text
+tCrA 的 MMA_M=0 descriptor start = 0x0040，解码为 shared 0x0400
+tCrA 的 MMA_M=1 descriptor start = 0x0080，解码为 shared 0x0800
+
+两者差值：(0x80 - 0x40) << 4 = 0x400 bytes = 512 half
+```
+
+对应 descriptor 打印见 `temp/run.wgmma_tma_sm90_like.log:168-182`。
+
+### 37.4 descriptor 的 64 bits 实际保存了什么
+
+`GmmaDescriptor` 的 source-level bitfield 定义为：
+
+```cpp
+struct {
+  uint16_t start_address_       : 14, : 2;
+  uint16_t leading_byte_offset_ : 14, : 2;
+  uint16_t stride_byte_offset_  : 14, : 2;
+  uint8_t  : 1, base_offset_    : 3,  : 4;
+  uint8_t  : 6, layout_type_    : 2;
+} bitfield;
+```
+
+代码位于 `include/cute/arch/mma_sm90_desc.hpp:80-131`（类型 `cute::GmmaDescriptor`）。字段对应关系为：
+
+```text
+bits  0...13：start address >> 4
+bits 14...15：reserved
+bits 16...29：leading-dimension byte offset >> 4
+bits 30...31：reserved
+bits 32...45：stride-dimension byte offset >> 4
+bits 46...48：reserved
+bits 49...51：base offset
+bits 52...61：reserved
+bits 62...63：swizzle layout type
+```
+
+所有三个 14-bit address/offset 字段都省略了 4 个为零的低位，即都以 16 bytes 为编码单位。`include/cute/arch/mma_sm90_desc.hpp:107-125`（类型 `cute::GmmaDescriptor::bitfield`）的注释也逐项写着 `4LSB not included`。
+
+本例第一个 A descriptor 为：
+
+```text
+0x4000008000000040
+```
+
+可以直接拆成：
+
+```text
+layout_type = 1      -> 1ULL    << 62 = 0x4000000000000000
+SBO         = 0x80   -> 0x80ULL << 32 = 0x0000008000000000
+LBO         = 0      ->                 0x0000000000000000
+start       = 0x40   ->                 0x0000000000000040
+                                              ------------------
+descriptor                                    0x4000008000000040
+```
+
+这与 `temp/run.wgmma_tma_sm90_like.log:168-174` 完全一致。
+
+### 37.5 CUTE 如何从 half layout 提取 `SBO=0x80`
+
+#### 37.5.1 只取一个 MMA atom 的 mode
+
+构造 descriptor tensor 时，CUTE 明确调用：
+
+```cpp
+SM90::GMMA::make_gmma_desc<MajorMode>(tensor<0>(smem_tensor))
+```
+
+代码位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:361-372`（函数 `MakeTensor<SM90::GMMA::smem_desc<MajorMode>>::operator()`）。
+
+`tensor<0>` 保留相同 data pointer，但只取 layout 的第 0 个 mode，实现在 `include/cute/tensor_impl.hpp:506-516`（函数 `cute::tensor<Is...>`）。因此传给 `make_gmma_desc` 的正是：
+
+```text
+Sw<3,4,3>_smem_ptr[16b](base) o
+(_64,(_8,_2)):(_1,(_64,_1024))
+```
+
+#### 37.5.2 从 half 单位归一化到 128-bit 单位
+
+`make_gmma_desc` 首先执行：
+
+```cpp
+Tensor u128_tensor = recast<uint128_t const>(tensor);
+```
+
+代码位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:196-216`（函数 `SM90::GMMA::make_gmma_desc`）。一个 `uint128_t` 是 16 bytes，也就是 8 个 half，因此：
+
+```text
+half layout：  (_64,(_8,_2)):(_1,(_64,_1024))
+                         recast half -> uint128_t
+u128 layout：  (_8, (_8,_2)):(_1,(_8, _128))
+```
+
+变化逐项为：
+
+```text
+连续 mode：64 half / 8 = 8 uint128_t
+stride 64 half / 8 = 8 uint128_t
+stride 1024 half / 8 = 128 uint128_t
+```
+
+Tensor recast 会调用 `recast_layout`，见 `include/cute/tensor_impl.hpp:756-779`（函数 `cute::recast`）；layout 的 upcast 规则是“stride-1 mode 的 size 除以 N，其他 stride 除以 N”，见 `include/cute/layout.hpp:1802-1834`（函数 `cute::upcast`）。
+
+#### 37.5.3 整理成 B128 canonical layout
+
+`layout_type(u128_tensor)` 从 pointer 中的 `Swizzle<3,4,3>` 得到 `LayoutType::B128`，实现位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:124-151`（函数 `SM90::GMMA::layout_type`）。于是：
+
+```text
+W = 8
+```
+
+`make_gmma_desc<Major::MN>` 再执行：
+
+```cpp
+Layout canonical_layout = logical_divide(
+    layout(u128_tensor),
+    Tile<Layout<Int<W>,_1>, Layout<Int<8>,_1>>{});
+```
+
+代码位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:227-259`（函数 `SM90::GMMA::make_gmma_desc`）。本例得到：
+
+```text
+canonical shape  = ((_8,_1),(_8,_2))
+canonical stride = ((_1,_0),(_8,_128))
+```
+
+四个关键 stride 是：
+
+```text
+stride_00 = 1
+stride_01 = 0
+stride_10 = 8
+stride_11 = 128
+```
+
+对于 `Major::MN + B128`，代码执行：
+
+```cpp
+desc.bitfield.stride_byte_offset_  = stride_11;
+desc.bitfield.leading_byte_offset_ = stride_01;
+```
+
+所以：
+
+```text
+SBO encoded = stride_11 = 128 = 0x80
+LBO encoded = stride_01 = 0
+```
+
+`stride_11` 已经以 `uint128_t` 为单位，所以它在数值上就是 PTX 所需的 `byte_offset >> 4`：
+
+```text
+128 uint128_t * 16 bytes/uint128_t = 2048 bytes
+2048 bytes >> 4 = 128 = 0x80
+```
+
+### 37.6 为什么 `stride=1` 和 `stride=64` 不需要单独字段
+
+`make_gmma_desc` 对 `Major::MN + B128` 接受的不是任意 layout，而是受限的 canonical form：
+
+```text
+half-element canonical form：
+Swizzle<3,4,3> o
+((T,8,m),(8,k)):((1,T,LBO),(8T,SBO))
+```
+
+其中：
+
+```text
+T = 128 / sizeof_bits(value_type)
+```
+
+相关定义和注释位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:158-179`（函数 `SM90::GMMA::make_gmma_desc` 的格式说明）。本例 `value_type=half`，所以：
+
+```text
+T  = 128 / 16 = 8 half
+8T = 8 * 8    = 64 half
+```
+
+这就是两个隐式 stride 的来源：
+
+```text
+stride 1 ：MN-major 下 half 沿 M 方向相邻
+stride 64：B128 canonical core layout 的固定 8T
+```
+
+硬件已经从以下信息得知它们：
+
+```text
+.f16                  -> T=8 half per normalized 128-bit element
+imm-trans-a / MN-major -> 哪个数学维度是 contiguous/major
+layout_type=B128      -> W=8 以及 B128 swizzle/canonical structure
+```
+
+CUTE 在生成 descriptor 前还用 `static_assert` 检查 `stride_00==1`、`stride_10==W` 和 K-size 是否符合 GMMA canonical layout，见 `include/cute/atom/mma_traits_sm90_gmma.hpp:236-252`（函数 `SM90::GMMA::make_gmma_desc`）。不符合这种受限结构的任意 CuTe layout，不能仅凭该 64-bit descriptor 交给 WGMMA。
+
+### 37.7 B128 swizzle 本身也只需要 2 bits
+
+本例 shared layout 从：
+
+```cpp
+GMMA::Layout_MN_SW128_Atom<TA>{}
+```
+
+开始构造，代码位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:366-378`（函数 `gemm_nt`）。该 atom 的 bit-level 定义是：
+
+```cpp
+using Layout_MN_SW128_Atom_Bits =
+  ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag,
+                 Layout<Shape<_1024,_8>,Stride<_1,_1024>>>;
+```
+
+代码位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:68-94`（类型 `GMMA::Layout_MN_SW128_Atom_Bits` 和别名 `Layout_MN_SW128_Atom`）。
+
+`Swizzle<3,4,3>` 是一种固定的地址位 XOR 规则，不需要保存 1024 个元素各自的地址。它的核心实现是：
+
+```cpp
+return offset ^ shiftr(offset & yyy_msk{}, msk_sft{});
+```
+
+代码位于 `include/cute/swizzle.hpp:54-87`（函数 `cute::Swizzle::apply`）。对于 B128，descriptor 只需写：
+
+```text
+layout_type = 1
+```
+
+硬件就按预定义的 128-byte swizzle 解释 core-matrix 地址。也就是说，descriptor 使用“选择一种硬件已知布局”的方式压缩信息，并不存放完整的地址置换表。
+
+### 37.8 `64x16` shape 是否硬编码在 PTX 指令里
+
+是。`m64n64k16` 是 PTX opcode 的 shape qualifier：
+
+```text
+M = 64
+N = 64
+K = 16
+```
+
+数学运算是：
+
+```text
+A[64,16] * B[16,64] -> D[64,64]
+```
+
+CUTE wrapper 直接发出：
+
+```cpp
+asm volatile(
+  "wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16 ..."
+);
+```
+
+代码位于 `include/cute/arch/mma_sm90_gmma.hpp:410-455`（函数 `SM90::GMMA::MMA_64x64x16_F16F16F16_SS::fma`）。同一个类型还声明：
+
+```cpp
+using ARegisters = uint64_t[1];
+using BRegisters = uint64_t[1];
+```
+
+也就是 A、B 各向指令提供一个 64-bit descriptor，而非在 descriptor 里另存 shape。
+
+CUTE traits 也在编译期把同一 shape 写成：
+
+```cpp
+using Shape_MNK = Shape<_64,_64,_16>;
+using ALayout = GMMA::ABLayout<64,16>;
+using BLayout = GMMA::ABLayout<64,16>;
+```
+
+代码位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:656-671`（类型 `MMA_Traits<SM90_64x64x16_F16F16F16_SS<...>>`）。`ABLayout` 的定义让 128 个 warpgroup threads 都看到同一个 logical `64x16` operand view，见 `include/cute/atom/mma_traits_sm90_gmma.hpp:462-465`（类型别名 `SM90::GMMA::ABLayout`）。这与日志 `temp/run.wgmma_tma_sm90_like.log:140-145` 的 `Shape_MNK` 和 `LayoutA_TV` 一致。
+
+这里需要区分数学矩阵 B 与 CuTe 的 GEMM API 表示：
+
+```text
+PTX 数学语义： A(M,K) * B(K,N) -> D(M,N)
+CuTe gemm view：A(M,K) * B(N,K) -> C(M,N)
+```
+
+CuTe 的约定写在 `include/cute/algorithm/gemm.hpp:42-55`（算法 `cute::gemm` 的接口说明），shared-memory overload 也把 A/B 标成 `(M,K)` 和 `(N,K)`，见 `include/cute/algorithm/gemm.hpp:428-459`（函数 `cute::gemm`）。`Major`/transpose immediate 再把这个存储 view 映射到 PTX 所需的数学方向。
+
+本例 `Major::MN` 的枚举值是 1，定义于 `include/cute/arch/mma_sm90_gmma.hpp:105-110`（枚举 `SM90::GMMA::Major`）；wrapper 将 `tnspA`、`tnspB` 作为 PTX immediate operands 传入，见 `include/cute/arch/mma_sm90_gmma.hpp:438-451`（函数 `SM90::GMMA::MMA_64x64x16_F16F16F16_SS::fma`）。
+
+### 37.9 Tensor Core 定位本例 A 数据的完整信息来源
+
+可以把信息分成“opcode/固定规则”和“descriptor”两组：
+
+```text
+来自 opcode 和 immediate：
+  m64n64k16       -> A=64x16, B=16x64, D=64x64
+  f16.f16.f16     -> D/A/B element types
+  imm-trans-a     -> A 的 major/transpose 方向
+  WGMMA canonical -> core-matrix 内固定的坐标映射和 thread mapping
+
+来自 A descriptor：
+  start=0x40      -> shared byte start 0x400
+  LBO=0           -> 本例 atom 没有需要使用的额外 leading repeat
+  SBO=0x80        -> 两个 K=8 band 相隔 0x800 bytes
+  base=0          -> swizzle pattern base adjustment
+  layout=B128     -> 使用预定义 128-byte swizzle
+```
+
+于是对于 `MMA_M=0` 的 A atom，先不展开 B128 内部 XOR 时，可概念化为：
+
+```text
+K=0...7  band base = shared 0x400
+K=8...15 band base = shared 0x400 + (0x80 << 4)
+                       = shared 0xc00
+```
+
+具体元素在各 1 KiB band 内的物理 bank/address 再由 B128 swizzle 和 WGMMA 固定 core-matrix 坐标规则决定。对于 `MMA_M=1`，CuTe 的 `DescriptorIterator` 先把 descriptor start 增加 `64` 个 16-byte units，再交给同一条指令。
+
+`DescriptorIterator::operator+` 只更新 descriptor 低 32 bits、保留高 32 bits 的 SBO 和 swizzle 信息，代码位于 `include/cute/atom/mma_traits_sm90_gmma.hpp:303-329`（函数 `SM90::GMMA::DescriptorIterator::operator+`）。因此每个外层 atom 可以改变 start address，同时共享同一套内部 `64x16` stride/swizzle 规则。
+
+### 37.10 为什么 64 bits 足够，但不能描述任意 Tensor
+
+64 bits 足够的根本原因不是硬件完成了通用 shape/stride 压缩，而是 WGMMA 只接受一族严格受限的 canonical shared-memory layouts：
+
+```text
+硬编码：M/N/K shape、数据类型、core-matrix 结构、thread mapping
+枚举选择：major/transpose、32B/64B/128B/no-swizzle
+descriptor 参数：start、LBO、SBO、base offset
+```
+
+所以 descriptor 没有以下能力：
+
+```text
+- 运行时声明任意 M、N、K；
+- 保存任意 rank 的 CuTe shape tree；
+- 为每个维度保存任意 element stride；
+- 保存一张逐元素地址表。
+```
+
+如果把 `tCsA` 改成不满足 GMMA canonical form、16-byte alignment 或字段范围的 layout，`make_gmma_desc` 的静态检查会失败，或者产生不合法的 WGMMA 使用；不能期待相同 64-bit descriptor 自动表达它。
+
+最终可以把本例压缩成一行：
+
+```text
+64x16 half A tile
+= opcode 固定的 64x16/core layout
++ descriptor.start 0x40
++ descriptor.SBO 0x80 (即 1024-half stride)
++ descriptor.layout_type B128
++ Major::MN immediate
+```
+
+因此 Tensor Core 确实知道 `stride=1024`：它不是从 `64*8` 猜出来的，而是由 descriptor 的 `stride_byte_offset_` 字段明确提供；`64x16` shape 则由 `m64n64k16` opcode 明确提供。
+
+外部规范依据：NVIDIA [PTX ISA 的 WGMMA Matrix Shape、Canonical Layouts 与 Matrix Descriptor Format](https://docs.nvidia.com/cuda/parallel-thread-execution/)。
+
+## Section 38. `wgmma.mma_async` 的异步语义与结果可见性
+
+### 38.1 `mma_async` 到底“异步”在哪里
+
+本例由 `gemm_device` 在主循环中调用：
+
+```cpp
+warpgroup_arrive();
+gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);
+warpgroup_commit_batch();
+warpgroup_wait<0>();
+```
+
+代码位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:297-311`（函数 `gemm_device`）。`gemm` 最终发出：
+
+```text
+wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16
+```
+
+这里的 `mma_async` 不是“CPU 异步调用”，也不是说 PTX 指令本身不执行；它表示：
+
+1. 当前 warpgroup 发出一个 WGMMA 请求；
+2. 请求进入 Hopper 的 WGMMA asynchronous proxy；
+3. 发出线程可以继续执行后续、与该矩阵乘加无数据依赖的指令；
+4. A/B 读取和乘加、以及对 accumulator registers 的更新可能在后续周期才完成；
+5. 软件必须用 `wgmma.commit_group` 和 `wgmma.wait_group` 管理这个未完成请求。
+
+因此，`mma_async` 的核心是“**发射和完成分离**”。它允许把 WGMMA 计算与下一次地址计算、同步、其他流水线工作重叠；它不改变矩阵乘加的数学结果。
+
+### 38.2 `.sync` 和 `.aligned` 不等于计算完成
+
+指令名称中还有两个容易误解的限定符：
+
+```text
+wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16
+                         ^    ^
+                         |    +-- warpgroup 一致执行
+                         +------- issue/参与同步
+```
+
+`wgmma.mma_async` 的 `fma` wrapper 位于 `include/cute/arch/mma_sm90_gmma.hpp:416-455`（函数 `SM90::GMMA::MMA_64x64x16_F16F16F16_SS::fma`）。PTX 中：
+
+- `.sync` 约束执行线程与同一 warp 中其他线程在该指令上的同步参与；
+- `.aligned` 要求 warpgroup 的所有线程执行同一条、同一控制路径的 WGMMA；
+- 这些限定符只保证指令的参与/发射协议，不保证 Tensor Core 已完成整个 `64x64x16` 乘加。
+
+可以用下面的时间线区分两件事：
+
+```text
+线程到达 WGMMA 指令
+        |
+        | .sync/.aligned：保证 warpgroup 正确共同发射
+        v
+WGMMA 请求已发出，但计算可能仍在进行
+        |
+        | wgmma.commit_group：把请求归入一个 group
+        v
+请求仍可能 pending
+        |
+        | wgmma.wait_group 0
+        v
+该 group 完成，受影响的 accumulator 才可安全读取
+```
+
+所以不能因为指令名字含有 `.sync` 就把它理解成 CPU 意义上的 synchronous GEMM。
+
+### 38.3 本例从 `gemm` 到 PTX 的调用链
+
+`tCrA`/`tCrB` 是 descriptor view，`tCrC` 是寄存器 accumulator。主循环的调用位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:240-251` 和 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:307`（函数 `gemm_device`）。相关链路为：
+
+1. `include/cute/algorithm/gemm.hpp:462-497`（函数 `cute::gemm`，rank-3 shared-memory overload）沿 K 维切片；
+2. `include/cute/algorithm/gemm.hpp:428-460`（函数 `cute::gemm`，rank-2 shared-memory overload）把 operand 视图扩展成带 vector mode 的形式；
+3. `include/cute/atom/mma_atom.hpp:87-105`（函数 `MMA_Atom::call`）调用 `mma_unpack`；
+4. `include/cute/atom/mma_traits_sm90_gmma.hpp:385-430`（函数 `SM90::GMMA::mma_unpack`）把一个 `GmmaDescriptor` 转成 `uint64_t` operand，并把 accumulator 拆成底层寄存器参数；
+5. `include/cute/arch/mma_sm90_gmma.hpp:423-451`（函数 `SM90::GMMA::MMA_64x64x16_F16F16F16_SS::fma`）通过 inline PTX 发出 `wgmma.mma_async...`。
+
+这条链说明 `gemm(...)` 返回时只表示“本次 WGMMA 指令已由 warpgroup 发出”，不表示 `tCrC` 的最终数值已经可读。
+
+### 38.4 `warpgroup_arrive` 实际是 `wgmma.fence`
+
+教程中的：
+
+```cpp
+warpgroup_arrive();
+```
+
+实现位于 `include/cute/arch/mma_sm90_gmma.hpp:47-57`（函数 `cute::warpgroup_arrive`），展开为：
+
+```cpp
+asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
+```
+
+它不是“等待上一次 WGMMA 完成”的函数，也不是 `commit_group`。`wgmma.fence` 的作用是建立寄存器访问和 WGMMA async-proxy 访问之间的顺序，尤其包括：
+
+- 第一次 WGMMA 前，`clear(tCrC)` 等先前对 accumulator registers 的写入必须先于 WGMMA；
+- 重新使用 accumulator 或 A fragment registers 时，普通寄存器访问与后续 WGMMA 访问之间必须有正确顺序；
+- shared-memory producer 已经写入新 tile 后，WGMMA async proxy 读取该 tile 的顺序必须建立起来。
+
+`wgmma.fence` 不提供“计算已完成”的保证。因此：
+
+```text
+wgmma.fence  !=  wgmma.wait_group
+```
+
+前者是 ordering/fence，后者是 completion/wait。PTX 规范要求在 warpgroup 第一次 WGMMA 前以及相关寄存器复用位置执行 `wgmma.fence`；缺少它会进入未定义行为，而不是仅仅变慢。
+
+### 38.5 `warpgroup_commit_batch` 实际是 `wgmma.commit_group`
+
+教程中的：
+
+```cpp
+warpgroup_commit_batch();
+```
+
+实现位于 `include/cute/arch/mma_sm90_gmma.hpp:73-84`（函数 `cute::warpgroup_commit_batch`），展开为：
+
+```cpp
+asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
+```
+
+它做的是“提交/分组”，不是“等待”：
+
+```text
+commit_group：
+  把当前 warpgroup 之前发出的、尚未提交的 WGMMA 放进一个 wgmma-group
+  创建 group 的边界
+  不保证 group 内的矩阵乘加已经完成
+```
+
+如果此前没有未提交的 WGMMA，它甚至可以创建一个空 group。真正等待 group 完成由下一步 `wait_group` 完成。
+
+在本例中，一个 K tile 内 `gemm(...)` 可能展开为多个同形状 WGMMA；`warpgroup_commit_batch()` 将该 K tile 发出的这些操作作为一个逻辑批次提交，随后统一等待。
+
+### 38.6 `warpgroup_wait<0>` 才是结果可用的关键
+
+教程中的：
+
+```cpp
+warpgroup_wait<0>();
+```
+
+实现位于 `include/cute/arch/mma_sm90_gmma.hpp:59-71`（函数 `cute::warpgroup_wait<N>`），展开为：
+
+```cpp
+asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
+```
+
+PTX `wait_group N` 的语义是：等待到最近仍 pending 的 WGMMA group 数量不超过 `N`，并保证更早提交的 groups 已完成。因此：
+
+```text
+wait_group 0：所有此前提交的 WGMMA group 都完成
+wait_group 1：最老的 groups 完成，但最近最多 1 个 group 仍可 pending
+```
+
+在本例使用 `N=0`，所以从该指令返回后：
+
+1. 当前 K tile 发出的所有 WGMMA 已完成；
+2. `tCrC` 中被这些 WGMMA 更新的 accumulator registers 可以被普通 CUDA 指令读取；
+3. 后续 `ConsumerBarType::arrive` 可以安全地宣布该 shared-memory pipe 已经不再被 WGMMA 读取；
+4. 该 pipe 之后才允许被下一次 TMA 覆盖。
+
+PTX 还规定：WGMMA 完成后会跟随一个隐式的 generic-to-async proxy fence；当 `wait_group` 观察到完成时，结果对 generic proxy 的后续访问可见。这里的“可见”是指后续设备指令可以安全读取 accumulator/register 结果，不是说结果已经自动写入 global memory。
+
+### 38.7 本例完整的生产者/消费者与 WGMMA 时序
+
+将 `gemm_device` 的相关代码（`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:287-329`，函数 `gemm_device`）抽象后，时序如下：
+
+```text
+TMA producer                              WGMMA consumer
+------------                              -------------
+arrive_and_expect_tx                     ProducerBarType::wait
+TMA copy G->S                             // async issue; tile later ready
+                                           |
+                                           | wgmma.fence.sync.aligned
+                                           | wgmma.mma_async ...  (issue)
+                                           | wgmma.commit_group   (submit)
+                                           | wgmma.wait_group 0   (complete)
+                                           | ConsumerBarType::arrive
+                                           v
+ConsumerBarType::wait                     shared pipe 可复用
+下一次 TMA copy 覆盖该 pipe
+```
+
+代码中的关键位置是：
+
+```cpp
+ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+warpgroup_arrive();
+gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);
+warpgroup_commit_batch();
+warpgroup_wait<0>();
+ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+```
+
+见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:290-315`（函数 `gemm_device`）。之后 producer 只有在：
+
+```cpp
+ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+```
+
+返回后，才会重新对同一个 pipe 发 TMA，见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:317-329`（函数 `gemm_device`）。
+
+这里有两种不同的异步操作和两种不同的完成协议：
+
+```text
+TMA G->S：ProducerBarType / mbarrier transaction completion
+WGMMA：   wgmma.commit_group + wgmma.wait_group
+```
+
+`ProducerBarType::wait` 不能代替 `wgmma.wait_group`；它只说明 TMA 已把数据写好。反过来，`wgmma.wait_group` 也不能代替 producer barrier；它不能证明当前 pipe 的 TMA 写入已经完成。
+
+### 38.8 指令之后“结果是否仍不可见”的准确回答
+
+分时刻回答如下：
+
+| 时刻 | 能否安全读取 `tCrC` 中受影响的 accumulator | 能否覆盖当前 shared pipe |
+|---|---|---|
+| `wgmma.mma_async` 刚发出后 | 不能保证，读取属于未定义行为 | 不能，WGMMA 可能仍在读 A/B |
+| `wgmma.commit_group` 返回后 | 仍不能保证 | 仍不能 |
+| `wgmma.wait_group 1` 返回后 | 仅更早 groups 完成；最近 group 的结果仍不能读 | 最近 group 仍可能读 pipe |
+| `wgmma.wait_group 0` 返回后 | 可以由后续设备指令读取 | 可以在额外 consumer 协议完成后覆盖 |
+| kernel 完成并 stream/device synchronize 后 | host 可以看到最终 global-memory C | 不适用 |
+
+最后一行还需要强调：WGMMA 的结果首先位于分布在 warpgroup 各线程中的 accumulator registers。`tCrC` 在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:245-247`（函数 `gemm_device`）创建；WGMMA 不会自动把它写回 `gmem`。本例在主循环结束后才调用：
+
+```cpp
+axpby(alpha, tCrC, beta, tCgC);
+```
+
+见 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:336-341`（函数 `gemm_device`）。因此：
+
+```text
+wait_group 0：让设备端 accumulator 结果可用
+axpby：       把结果写到 global-memory C
+kernel/stream synchronize：让 host 观察到 global-memory C
+```
+
+这三个层次不能混为一个“结果可见”。
+
+### 38.9 如果省略同步步骤，会发生什么
+
+#### 38.9.1 省略 `wgmma.fence`
+
+可能出现：
+
+- 第一次 WGMMA 读取 `clear(tCrC)` 之前/之后的未定义寄存器值；
+- 普通指令对 accumulator/A registers 的访问与 WGMMA async proxy 访问重排；
+- TMA 对 shared tile 的写入与 WGMMA 对同一 tile 的读取没有规定顺序。
+
+PTX 对这种情况定义为 undefined behavior，不是“硬件总会自动等一下”。
+
+#### 38.9.2 省略 `wgmma.commit_group`
+
+发出的 WGMMA 仍可能在异步执行，但它没有被纳入后续 `wait_group` 所等待的 group。此时即使随后调用 `wait_group 0`，也不能据此证明刚才漏提交的操作完成；读取 accumulator 或覆盖 shared tile 都没有合法完成保证。
+
+#### 38.9.3 省略 `wgmma.wait_group<0>`
+
+这是本例最直接的错误：
+
+```cpp
+gemm(...);                         // WGMMA 可能 pending
+ConsumerBarType::arrive(...);      // 错误地宣布 pipe 可回收
+TMA copy(..., same_pipe);          // 可能覆盖 WGMMA 尚未读完的数据
+```
+
+同时，循环结束后 `axpby` 可能在 accumulator 更新完成前读取 `tCrC`。结果可能是错误数值、偶发错误或在不同编译/时钟条件下表现不同。
+
+#### 38.9.4 用 `wait_group 1` 代替 `wait_group 0`
+
+`wait_group 1` 允许最近一个 group 仍 pending。它只有在后续代码不访问该 group 正在更新的 accumulator、且不复用它所读取的 shared tile 时才安全。当前教程需要消费当前 K tile 的完整 `tCrC`，并在流水线中回收 pipe，因此使用 `wait_group<0>` 是正确的保守选择。
+
+#### 38.9.5 只使用 `__syncthreads()` 或 `cluster_sync()`
+
+CTA/cluster barrier 不能代替 WGMMA async-group completion：
+
+```text
+__syncthreads()/cluster_sync：线程之间的控制/内存同步
+wgmma.wait_group：             WGMMA async proxy 的完成协议
+```
+
+即使所有线程都到达一个 CTA barrier，未完成的 WGMMA group 也不因此自动完成。反之，`wait_group` 也不是任意 CTA shared-memory 写入的通用 barrier，所以本例仍需要 producer/consumer mbarrier。
+
+### 38.10 一个最小正确用法与流水化用法
+
+最小的单批次模式是：
+
+```text
+wgmma.fence.sync.aligned;
+wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16 ...;
+wgmma.commit_group.sync.aligned;
+wgmma.wait_group.sync.aligned 0;
+
+// 现在才读取受影响的 accumulator
+use_accumulator();
+```
+
+代码对应本仓库的三个 wrapper：
+
+- `include/cute/arch/mma_sm90_gmma.hpp:47-57`（函数 `cute::warpgroup_arrive`）；
+- `include/cute/arch/mma_sm90_gmma.hpp:73-84`（函数 `cute::warpgroup_commit_batch`）；
+- `include/cute/arch/mma_sm90_gmma.hpp:59-71`（函数 `cute::warpgroup_wait<N>`）。
+
+流水化时可以提交多个 group：
+
+```text
+fence
+issue WGMMA group G0
+commit G0
+issue 与 G0 不冲突的独立工作
+fence（若重新访问相关寄存器/共享矩阵）
+issue WGMMA group G1
+commit G1
+wait_group 1   // G0 完成，G1 仍可能 pending
+...
+wait_group 0   // 最终排空所有 group
+```
+
+`wait_group 1` 是性能流水化工具，不是“等待编号为 1 的 group”；其参数是允许保留的最近 pending group 数量。教程选择每个 K tile 后 `wait_group<0>`，因为它还要立即宣布 shared pipe 消费结束，并最终读取完整 accumulator。
+
+### 38.11 最终结论
+
+对问题“`mma_async` 是否意味着执行完后结果仍不可见、什么时候保证可见”的直接回答是：
+
+1. `mma_async` 表示 WGMMA 计算以异步 proxy 操作发出，发出后结果**可能尚未完成**；不能立即读取 accumulator，也不能立即复用其 shared-memory 输入。
+2. `.sync.aligned` 只保证 warpgroup 共同、对齐地发射指令，不是计算完成标志。
+3. `wgmma.fence.sync.aligned` 建立前序寄存器/shared-memory 访问与 WGMMA 访问的顺序，但不等待计算。
+4. `wgmma.commit_group.sync.aligned` 把未提交 WGMMA 纳入 group，但不等待计算。
+5. `wgmma.wait_group.sync.aligned 0` 返回后，所有此前提交的 WGMMA 完成；受影响 accumulator 对后续设备指令可安全读取，且 WGMMA 输入 pipe 才能在 consumer 协议完成后回收。
+6. 要让 host 看到最终 C，还必须等 `axpby` 的 global stores 完成，并在 kernel/stream 层进行同步；`wait_group` 本身不会把结果写回 host。
+
+外部规范依据：NVIDIA [PTX ISA：WGMMA async proxy、`wgmma.fence`、`wgmma.commit_group` 和 `wgmma.wait_group`](https://docs.nvidia.com/cuda/parallel-thread-execution/)。
+
+## Section 39. producer/consumer mbarrier 的 `phase` 参数与环形流水线翻转
+
+本节分析以下两个等待：
+
+```cpp
+ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+```
+
+它们位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:287-330`（函数 `gemm_device`）。虽然两个 barrier 分别表示“槽位为空”和“槽位已装满”，但底层都是可重复使用的 PTX `mbarrier`，所以每次等待都必须指出：**当前等待的是这个物理 barrier 的哪一轮使用**。这里传递的 `phase` 更准确地说是目标 phase 的 **parity（奇偶位）**。
+
+### 39.1 先给出结论
+
+1. `phase` 不是 pipe 下标、到达线程数、TMA transaction bytes，也不是一个普通布尔条件；它是同一个 `mbarrier` 被反复使用时的“代际标签”。
+2. 本实现调用的是 PTX `mbarrier.try_wait.parity`。传入 `p` 的含义是“等待 parity 为 `p` 的那一轮完成”。目标轮尚未完成时返回 false；目标轮完成、barrier 自动进入下一轮后返回 true。
+3. `producer_mbar[pipe]` 和 `consumer_mbar[pipe]` 是两套独立 barrier，每一套都反复使用同样的三个 shared-memory 地址，因此两种 `wait` 都需要 phase。
+4. `PipelineState<Stages_>` 每前进一次只切换到下一个 stage；前进 `Stages_` 次才重新访问同一个物理 stage/barrier。因此只有 index 回绕时，才将 `phase_` 执行 `phase_ ^= 1`。
+5. 从程序语义看，mbarrier 会经历 `0,1,2,3,...` 这样的连续逻辑 phase，并非一生只有两轮；但是 `.parity` 指令只接收 `phase mod 2`，所以合法输入只有 0 和 1。这不表示硬件需要保存一个无界整数 phase number。
+
+### 39.2 一个 mbarrier 为什么会有 phase
+
+`mbarrier` 不是一次性 barrier。初始化之后，它可以连续完成很多轮同步：
+
+```text
+逻辑 phase 0 完成 -> 自动进入逻辑 phase 1
+逻辑 phase 1 完成 -> 自动进入逻辑 phase 2
+逻辑 phase 2 完成 -> 自动进入逻辑 phase 3
+...
+```
+
+`include/cutlass/arch/barrier.h:390-405`（函数 `cutlass::arch::ClusterBarrier::init`）用
+
+```cpp
+mbarrier.init.shared::cta.b64 [addr], count;
+```
+
+初始化一个 mbarrier。硬件将它初始化在 phase 0，并设置 expected/pending arrival count。对本例使用的 layout，当前 phase 只有在以下两个条件都满足时才完成：
+
+- pending arrival count 降到 0；
+- tx-count 降到 0。
+
+phase 完成时，硬件自动进入下一 phase，并把 pending arrival count 恢复为 expected arrival count，以便同一地址立即用于下一轮。TMA barrier 还会跟踪 tx-count；其 `arrive_and_expect_tx` 实现在 `include/cutlass/arch/barrier.h:586-602`（函数 `cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx`）。
+
+因此，“barrier 已经完成过”不是充分信息。调用者必须说明它正在等待第几轮，否则可能把上一轮完成误认为本轮完成。这就是 phase 要解决的 ABA 问题：
+
+```text
+同一地址                  旧状态 A -> 使用中 B -> 又回到看似相同的 A
+缺少 generation/phase     无法判断看到的是上一轮 A，还是新一轮 A
+```
+
+### 39.3 CUTLASS 的 `wait` 如何使用 phase
+
+`ProducerBarType` 是 `cutlass::arch::ClusterTransactionBarrier`，它继承 `ClusterBarrier`；`ConsumerBarType` 直接是 `cutlass::arch::ClusterBarrier`。类型别名位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:194-206`（函数 `gemm_device`）。因此两个静态 `wait` 最终都使用 `ClusterBarrier::wait`。
+
+`include/cutlass/arch/barrier.h:408-431`（函数 `cutlass::arch::ClusterBarrier::wait`）的核心是：
+
+```cpp
+static void wait(ValueType const* smem_ptr, uint32_t phase) {
+  // ...
+  asm volatile(
+      "{\n\t"
+      ".reg .pred       P1; \n\t"
+      "LAB_WAIT: \n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2; \n\t"
+      "@P1 bra DONE; \n\t"
+      "bra     LAB_WAIT; \n\t"
+      "DONE: \n\t"
+      "}"
+      :
+      : "r"(smem_addr), "r"(phase), "r"(ticks)
+      : "memory");
+}
+```
+
+这里 `%1` 就是 C++ 参数 `phase`，直接成为 PTX 的 `phaseParity` 操作数。循环会不断执行 `mbarrier.try_wait.parity`，直到谓词 `P1` 为 true。
+
+要特别注意它的判定方向：
+
+```text
+目标 parity p 仍是 barrier 的当前未完成 phase -> false，继续等待
+目标 parity p 已成为紧邻的上一 phase       -> true，等待完成
+```
+
+例如等待逻辑 phase 0 时传入 0：
+
+```text
+barrier 当前仍在 phase 0：wait(0) -> false
+phase 0 完成，barrier 进入 phase 1：wait(0) -> true
+```
+
+所以参数不是“等到 barrier 的当前 parity 变成 0”，而是“等 parity 0 所代表的目标轮完成”。PTX 只允许查询当前未完成 phase 或紧邻的上一已完成 phase；软件不能落后 barrier 两轮以上。
+
+### 39.4 两个 wait 分别在等待什么
+
+本例为每个 stage 分配了两套 barrier，定义在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:55-64`（类型 `SharedStorage`）：
+
+```cpp
+uint64_t tma_barrier[size<2>(SmemLayoutA{})];
+uint64_t mma_barrier[size<2>(SmemLayoutA{})];
+```
+
+在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:194-206`（函数 `gemm_device`）中，它们被解释为：
+
+```cpp
+uint64_t* producer_mbar = smem.tma_barrier;
+uint64_t* consumer_mbar = smem.mma_barrier;
+
+using ProducerBarType = cutlass::arch::ClusterTransactionBarrier;
+using ConsumerBarType = cutlass::arch::ClusterBarrier;
+
+ProducerBarType::init(&producer_mbar[pipe],   1);
+ConsumerBarType::init(&consumer_mbar[pipe], 128);
+```
+
+两类 barrier 的含义如下：
+
+| barrier | 谁推进它 | 谁等待它 | 完成代表什么 |
+|---|---|---|---|
+| `producer_mbar[stage]`，full barrier | 被选中的一个 TMA producer 调用 `arrive_and_expect_tx`；TMA 完成时扣减 tx-count | 128 个 WGMMA consumer | 当前 stage 的 A/B tile 已经装入 shared memory，可以读取 |
+| `consumer_mbar[stage]`，empty barrier | 128 个 consumer 在 WGMMA 完成后分别 `arrive` | 被选中的一个 TMA producer | 所有 consumer 都不再读取当前 stage，可以覆盖 |
+
+#### 39.4.1 `ProducerBarType::wait(..., read_state.phase())`
+
+`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:215-228`（函数 `gemm_device`）先预取三个 stage：producer 对相应 full barrier 调用 `arrive_and_expect_tx`，再发出 A/B TMA copy。该 barrier 的 phase 只有在 arrival count 和 TMA tx-count 都归零后才完成。
+
+随后 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:287-315`（函数 `gemm_device`）执行：
+
+```cpp
+int read_pipe = read_state.index();
+ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+// ... WGMMA reads this stage ...
+ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+++read_state;
+```
+
+这里的 `read_state.phase()` 指明“当前要读取的是该 full barrier 的哪一代数据”。等待成功后，才允许 WGMMA 从这一 stage 读取 A/B。
+
+#### 39.4.2 `ConsumerBarType::wait(..., write_state.phase())`
+
+WGMMA 完成后，所有 128 个 consumer 对 empty barrier 执行一次 `arrive`。底层 arrive 指令见 `include/cutlass/arch/barrier.h:507-523`（函数 `cutlass::arch::ClusterBarrier::arrive`）。最后一个 arrival 使当前 consumer-barrier phase 完成。
+
+在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:317-330`（函数 `gemm_device`）中，下一次覆盖该 stage 之前执行：
+
+```cpp
+int pipe = write_state.index();
+ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
+                                      tma_transaction_bytes);
+copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+++write_state;
+```
+
+这里的 `write_state.phase()` 指明“当前准备覆盖的 stage，必须等哪一代 consumer 使用完”。等待成功后，producer 才拥有这个 stage，并可由下一轮 TMA 覆盖。
+
+因此两个 wait 缺一不可：
+
+```text
+full wait：  防止 consumer 读取尚未完成的 TMA 数据
+empty wait： 防止 producer 覆盖 WGMMA 尚未消费完的数据
+phase：      防止本轮 wait 错把同一 barrier 的上一轮完成当成本轮完成
+```
+
+### 39.5 为什么每递加 `Stages_` 次才翻转 phase
+
+`PipelineState` 的实现位于 `include/cutlass/pipeline/sm90_pipeline.hpp:168-250`（类型 `cutlass::PipelineState<Stages_>`）。默认状态是：
+
+```cpp
+int      index_ = 0;
+uint32_t phase_ = 0;
+uint32_t count_ = 0;
+```
+
+其 `operator++` 位于 `include/cutlass/pipeline/sm90_pipeline.hpp:203-213`（成员函数 `cutlass::PipelineState<Stages_>::operator++`）：
+
+```cpp
+++index_;
+++count_;
+if (index_ == Stages) {
+  index_ = 0;
+  phase_ ^= 1;
+}
+```
+
+这是一个环形索引。对于从默认状态开始的第 `t` 次流水线操作，可以写成：
+
+```text
+index(t) = t mod Stages_
+phase(t) = floor(t / Stages_) mod 2
+```
+
+本例在 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:366-375`（函数 `gemm_nt`）设置 `bP = Int<3>{}`，因此 A/B shared layout 有三个 pipe。`examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:183-186`（函数 `gemm_device`）从 `tAsA` 取得 `K_PIPE_MAX`，日志 `temp/run.wgmma_tma_sm90_like.log:129-133` 也确认 `K_PIPE_MAX=3`。
+
+于是状态序列是：
+
+| 流水线操作 `t` | `index=t%3` | 逻辑 reuse generation `floor(t/3)` | 传给 wait 的 parity |
+|---:|---:|---:|---:|
+| 0 | 0 | 0 | 0 |
+| 1 | 1 | 0 | 0 |
+| 2 | 2 | 0 | 0 |
+| 3 | 0 | 1 | 1 |
+| 4 | 1 | 1 | 1 |
+| 5 | 2 | 1 | 1 |
+| 6 | 0 | 2 | 0 |
+| 7 | 1 | 2 | 0 |
+| 8 | 2 | 2 | 0 |
+
+phase 并不是每处理一个 tile 就翻转，因为连续三个 tile 分别使用三个不同的物理 barrier：
+
+```text
+t=0 使用 barrier[0] 的第 0 轮
+t=1 使用 barrier[1] 的第 0 轮
+t=2 使用 barrier[2] 的第 0 轮
+t=3 才再次使用 barrier[0]，此时应等待它的第 1 轮
+```
+
+也就是说，对于任意一个固定 `barrier[i]`，相邻两次访问恰好相隔 `Stages_` 次状态递增。只有绕环回到同一组物理 barrier 时，generation 才应增加一次，其 parity 才应翻转。
+
+日志 `temp/run.wgmma_tma_sm90_like.log:200-215` 正好打印出：
+
+```text
+(0,0), (1,0), (2,0),
+(0,1), (1,1), (2,1),
+(0,0), (1,0), (2,0), ...
+```
+
+这不是因为 `Stages_=3` 决定 phase 有三个值；`3` 只决定多久回到同一个 barrier，phase 本身始终只保存 generation 的奇偶位。
+
+### 39.6 以 stage 0 为例看两套 barrier 的完整时序
+
+初始化和预取代码位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:194-228`（函数 `gemm_device`）；主循环握手代码位于同一文件 `:287-330`（函数 `gemm_device`）。只观察 stage 0：
+
+| 时刻 | `producer_mbar[0]`（full） | `consumer_mbar[0]`（empty） | state / 动作 |
+|---|---|---|---|
+| 初始化 | 当前 phase 0，未完成 | 当前 phase 0，未完成 | 两个 state 均为 `(index=0, parity=0)` |
+| 初始预取 | TMA 被 phase 0 跟踪；完成后 barrier 进入 phase 1 | 仍在 phase 0 | 尚未消费 |
+| 第一次读 | `wait(full,0)` 观察到 phase 0 已完成 | phase 0 等待 128 次 arrive | `read_state=(0,0)` |
+| 第一次消费完 | 已在 phase 1，等待下一次 TMA | 第 128 次 arrive 完成 phase 0，进入 phase 1 | stage 0 变为空 |
+| 第一次复写 | producer 准备 full barrier 的 phase 1 | `wait(empty,0)` 成功 | `write_state=(0,0)`，发出下一次 TMA |
+| 状态绕过 3 stages | TMA 完成 phase 1 后进入 phase 2 | 当前 phase 1，等待下一轮消费 | state 回到 `(index=0, parity=1)` |
+| 第二次读/写 | `wait(full,1)`；随后 `wait(empty,1)` | 分别等待逻辑 phase 1 | 不会接受上一轮 parity 0 的完成事件 |
+| 再绕一周 | 使用逻辑 phase 2 | 使用逻辑 phase 2 | parity 又回到 0 |
+
+这里还能看出，传给 `wait` 的 parity 是**刚刚应该完成的目标 phase**。例如 full barrier 的 phase 0 TMA 完成后，barrier 自身已经进入 phase 1，但 consumer 仍调用 `wait(full, 0)`；0 表示它要验证“上一轮 phase 0 已完成”。
+
+### 39.7 为什么 `read_state` 和 `write_state` 都有自己的 phase
+
+两个状态的定义位于 `examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:279-282`（函数 `gemm_device`）：
+
+```cpp
+auto write_state = cutlass::PipelineState<K_PIPE_MAX>(); // TMA writes
+auto read_state  = cutlass::PipelineState<K_PIPE_MAX>(); // MMA reads
+```
+
+它们分别描述 producer 和 consumer 在环形 buffer 中的进度：
+
+- `read_state`：下一块要由 MMA 消费的 stage 及其 generation parity；
+- `write_state`：下一块可以由 TMA 复写的 stage 及其 generation parity。
+
+本教程先预取所有 stage，随后采用“一次消费对应至多一次补充”的简单循环，所以日志里两者大部分时间打印为相同的 `(index,phase)`。这只是本例调度方式的结果，不意味着两个对象可以合并。更一般的 warp-specialized pipeline 中 producer 和 consumer 可以相隔多个 stage、独立推进；两者必须各自保留进度。
+
+而且，两者即使数值相同，等待的也不是同一个 barrier：
+
+```text
+read_state.phase()  -> producer_mbar[read_pipe]  -> 等数据 full
+write_state.phase() -> consumer_mbar[write_pipe] -> 等槽位 empty
+```
+
+### 39.8 为什么 `.parity` 只允许 0/1
+
+PTX 的完整逻辑 phase 是递增序列：
+
+```text
+phase number: 0, 1, 2, 3, 4, 5, ...
+parity:       0, 1, 0, 1, 0, 1, ...
+```
+
+本例使用的是 `mbarrier.try_wait.parity`，不是携带完整 64-bit arrival state token 的 `mbarrier.try_wait` 形式。按照 PTX 定义，`phaseParity` 是 phase number 的整数奇偶性：偶数 phase 为 0，奇数 phase 为 1。因此合法值严格是 0 或 1，不是任意整数。
+
+CUTLASS 在 `include/cutlass/pipeline/sm90_pipeline.hpp:203-213`（成员函数 `cutlass::PipelineState<Stages_>::operator++`）使用 `phase_ ^= 1`，直接保证存储值始终在 `{0,1}` 中。`advance` 的批量前进版本也只在跨越奇数次 stage 边界时执行异或，见 `include/cutlass/pipeline/sm90_pipeline.hpp:228-243`（成员函数 `cutlass::PipelineState<Stages_>::advance`）。
+
+只保留一位仍然足够，是因为 PTX 规定 parity wait 只能检查“当前未完成 phase”或“紧邻的上一已完成 phase”。正确的流水线所有权协议保证 waiter 不会落后同一个 barrier 两个 phase；因此只需区分相邻两代，1 bit 就能消除歧义。
+
+### 39.9 如果 phase 不翻转或传错会怎样
+
+假设 stage 0 第一轮使用 parity 0，第二轮本应使用 parity 1，却仍错误地调用 `wait(...,0)`：
+
+```text
+第一轮 phase 0 已完成
+barrier 当前正在执行第二轮 phase 1
+错误调用 wait(barrier, 0)
+```
+
+如果第二轮 phase 1 仍未完成，parity 0 正好表示紧邻的上一已完成 phase，所以 wait 可以立即成功，形成错误的“提前放行”。后果取决于是哪套 barrier：
+
+- 对 `ProducerBarType::wait`：MMA 可能在第二轮 TMA 尚未完成时读取 shared memory；
+- 对 `ConsumerBarType::wait`：TMA 可能在第二轮 WGMMA 尚未消费完时覆盖同一 shared stage。
+
+如果第二轮 phase 1 已经完成，barrier 已自动进入 phase 2（parity 0），那么错误的 `wait(...,0)` 又会把尚未开始的 phase 2 当成目标轮，可能一直等待未来的 arrival/transaction，造成停滞甚至死锁。因此传错 parity 的表现受时序影响，可能是提前返回，也可能是不返回；它不是一种可容忍的近似。
+
+反过来，传入既不表示当前 phase、也不表示紧邻上一 phase 的值，不满足 PTX 对 `.parity` wait 的使用前提。不能把 2、3 等完整 phase number 直接传给该接口，也不能依靠“非零都等价于 true”的 C++ 布尔规则；该操作数是 PTX 规定的整数 parity，合法值只有 0 和 1。
+
+### 39.10 最终回答
+
+对三个问题可以归纳为：
+
+1. 两个 `wait` 都需要 phase，是因为 full barrier 和 empty barrier 都位于环形 buffer 中，并且都会在同一个 shared-memory 地址上反复完成多轮同步。phase 用于确定等待的是本轮，而不是上一轮残留的完成状态。
+2. `write_state.phase()` 和 `read_state.phase()` 每递增 `Stages_` 次才翻转，是因为一次递增切换一个 stage；经过 `Stages_` 次才回到同一个物理 barrier。回到它时，其 reuse generation 才增加一轮。
+3. 从程序语义看，mbarrier 经历连续递增的逻辑 phase；这里只有 0/1，是因为代码调用 PTX `.parity` 形式，只携带 `phase_number mod 2`。正确协议保证只需区分当前轮和紧邻上一轮。
+
+外部规范依据：NVIDIA [PTX ISA：mbarrier phases 以及 `mbarrier.test_wait` / `mbarrier.try_wait`](https://docs.nvidia.com/cuda/parallel-thread-execution/)，以及 [CUDA Programming Guide：Memory Barrier Primitives API](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/device-callable-apis.html#memory-barrier-primitives-api)。

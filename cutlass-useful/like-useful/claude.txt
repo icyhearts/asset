@@ -656,3 +656,53 @@ Sw<3,4,3>_smem_ptr[16b](0x7fdc01000400) o ((_64,(_8,_2)),_2,_4,(_1,_3)):((_1,(_6
 tCsA 基地址是 0x7fdc01000400,至少需要48 bit存储， GmmaDescriptor 只用 14 bit 存储起始地址，这样不会出错吗？ 原始地址 0x7fdc01000400 的高位被丢弃， 只剩下 低14bit, tensorcore mma 指令是如何找到完整的 shared memory 地址的?
 引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
 }
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+tCrA的定义是：
+```
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
+```
+# tCsA 打印结果显示，
+Tensor tCsA = thr_mma.partition_A(sA);                               // (MMA,MMA_M,MMA_K,PIPE):
+Sw<3,4,3>_smem_ptr[16b](0x7fdc01000400) o ((_64,(_8,_2)),_2,_4,(_1,_3)):((_1,(_64,_1024)),_512,_2048,(_0,_8192))
+
+tCsA 一个 mma atom 的元素个数是 64x8x2, 即64x16, 这64x8x2 个元素并不是连续的, 64x8x2 对应的 stride=_1,(64,1024)
+64 对应 stride = _1, 连续
+8 对应 stride = 64, 连续
+2 对应 stride = 1024, 不连续, 因为连续的 stride 应该等于 内部 shape 做乘法: 64*8=512.
+# 一个GmmaDescriptor 只有64 bit就要描述 64x16个 half value 的 stride信息, GmmaDescriptor 是如何编码这个  stride=_1,(64,1024) 的信息的? tensor core 是如何知道这个不连续的 stride?
+# 64x16 的shape 是硬编码进 ptx 指令的吗?  mma atom 使用的 ptx 指令是 wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+
+
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+mma atom 使用的 ptx 指令是 wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16, 这个指令的 mma_async 是什么意思？
+意味着指令执行完，结果仍旧是不可见的吗？如果保证结果可见?
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}
+
+{
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_claude_v2.md 里面
+
+examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 运行日志位于 temp/run.wgmma_tma_sm90_like.log
+运行时候，命令参数是 ./build-bjh100/examples/cute/tutorial/hopper/cute_tutorial_wgmma_tma_sm90_like 512 1024 2048 N T 
+```
+      ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+    ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+```
+为什么两个wait 都需要 phase 参数? phase 参数的作用是什么?
+write_state.phase 和 read_state.phase  为什么每 递加 Stages_ 次，就翻转一次？
+为什么 wati 需要的 phase 只有0/1两种值 ？
+
+引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ， 把答案追加到  /softhome/like/asset/cutlass-useful/like-useful/answer_codex_v2.md 里面
+}

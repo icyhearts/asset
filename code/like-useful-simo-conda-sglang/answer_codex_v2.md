@@ -13924,3 +13924,986 @@ ONNXSlim 因而保留 then 分支的 `decoder/rnn/LSTM`，删除 else 分支的
 initializer；ONNXSlim 把保留的两个 LSTM 的 W/R 折叠成 initializer，才满足当前离线权重量化
 要求。受控对照中，`simplify=False` 会扫描到 4 个 LSTM target，但四个均以
 `dynamic_weight` 跳过，结果是 0 个 LSTM 被替换；这说明“关闭简化即可量化四个”并不成立。
+
+## 97. `test.sh` 的实际执行链与量化类型（2026-08-10）
+
+### 97.1 先明确：这是另一条 PyTorch 路径
+
+本节的代码引用约定如下：`test.sh` 和其下的 `scripts/` 路径均相对于
+`/share/users/like/package/jdjv/silero_vad_clean`；`simo/...` 路径均相对于
+`/share/users/like/package/simo_conda_sglang`。配置文件路径另以配置根目录说明。
+
+`test.sh` 当前真正执行的只有第 66-69 行的一个命令；第 16-64 行都是注释，不会执行。它设置
+`PY=python`、8 个设备、`aishell4`、24 shards、8 workers，并传入 `--no-skip-existing`
+（`test.sh:2-13`，顶层 shell；`test.sh:66-69`，顶层 shell 命令）。因此它不会因为文件已存在而跳过
+本次 shard。脚本本身没有写死 conda Python，调用者必须先激活
+`/share_data/users/like/miniconda3/envs/simo_sglang/`；`CUDA_HOME`、`nvcc`、ONNX Runtime
+源码和 `libSimoOnnxCustomOps_sm90.so` 都不参与这条运行时路径。
+
+这条命令使用的是：
+
+```text
+JIT:    weights/silero_vad.jit
+config: w8a8/w_mxint8_a_mxint8.json
+```
+
+`scripts/run_silero_simo_quant_sharded.py:37-120 (parse_args)` 的默认值来自
+`scripts/quantize_equivalent_silero_simo.py:28-30 (module constants)`：JIT 为
+`weights/silero_vad.jit`，配置根为 `/share_data/mtang/simo_quant_config`。所以当前活动配置实际是
+`/share_data/mtang/simo_quant_config/w8a8/w_mxint8_a_mxint8.json`，不是
+`/share/users/like/package/jdjv/quant_schema/...` 下的新版 ONNX QDQ 配置。活动 JSON 的
+`module_configs` 只有 `Conv2d/Conv3d` 和 `Linear`，两者 input/weight 都是动态 `mxint8`
+（配置根相对路径 `w8a8/w_mxint8_a_mxint8.json:2-35`）。它没有 `LSTM` target。
+
+runner 在 `scripts/run_silero_simo_quant_sharded.py:154-158 (command_for_task)` 用
+`sys.executable` 启动 evaluator；本次实际解析为
+`/share_data/users/like/miniconda3/envs/simo_sglang/bin/python`，并从
+`/share/users/like/package/simo_conda_sglang/simo/__init__.py` 导入 SIMO，因此每个 shard 都使用同一
+个 conda editable 源码环境。
+
+### 97.2 量化和运行的逐步流程
+
+整体调用链是：
+
+```text
+test.sh
+  -> run_silero_simo_quant_sharded.py
+  -> 24 个 evaluate_silero_vad_simo_quantized.py 子进程
+  -> JIT 权重 + EquivalentWrapper
+  -> simo.quantize（PyTorch 模块替换）
+  -> 每个音频文件的分窗 stateful forward
+  -> 每 shard 写 NPZ
+  -> 主进程合并分数并计算 ROC-AUC / Acc@0.11
+```
+
+1. `scripts/run_silero_simo_quant_sharded.py:500-522 (main)` 解析参数、创建输出目录和
+   `run_metadata.json`；`scripts/run_silero_simo_quant_sharded.py:137-151 (build_tasks)` 按设备轮转生成 24 个
+   shard。`scripts/run_silero_simo_quant_sharded.py:535-550 (main)` 用 8 个线程并发提交任务。
+
+2. `scripts/run_silero_simo_quant_sharded.py:154-207 (command_for_task)` 为每个任务调用
+   `scripts/evaluate_silero_vad_simo_quantized.py`，传入 `--device cuda`、shard index 和配置。
+   `scripts/run_silero_simo_quant_sharded.py:210-253 (run_task)` 为子进程设置
+   `CUDA_VISIBLE_DEVICES`，把 stdout/stderr 写入 shard log，并检查返回码。
+
+3. `scripts/evaluate_silero_vad_simo_quantized.py:409-427 (main)` 首先执行
+   `scripts/quantize_equivalent_silero_simo.py:499-505 (load_original_from_jit)` 加载 TorchScript JIT
+   并复制 state dict，然后调用
+   `scripts/quantize_equivalent_silero_simo.py:417-423 (EquivalentWrapper.from_original)` 构造可被
+   SIMO 识别的 PyTorch 等价模型，最后执行
+   `from simo import quantize` 和 `quantize(equivalent.eval(), ..., None)`。
+
+4. 等价模型不是 `nn.LSTM`。`scripts/quantize_equivalent_silero_simo.py:284-325 (LSTMCellAsLinear)`
+   用两个投影 `x_proj`、`h_proj` 计算四门，再执行 sigmoid/tanh、C recurrence 和 H update；
+   `scripts/quantize_equivalent_silero_simo.py:328-358 (EquivalentDecoder)` 处理 state；
+   `scripts/quantize_equivalent_silero_simo.py:361-405 (EquivalentBranch)` 和
+   `scripts/quantize_equivalent_silero_simo.py:409-468 (EquivalentWrapper)` 分别建立 16 kHz/8 kHz
+   两个分支并维护 context/state。
+   所以活动配置的 `Linear` target 实际命中的是 2 个分支 x 2 个投影 = **4 个 Linear**，不是
+   一个 `nn.LSTM` 节点。
+
+5. `simo/quantization/entry.py:48-125 (quantize)` 读取配置，调用
+   `simo/quantization/model_transform.py:57-67 (quantize_apply)`；
+   `simo/quantization/model_transform.py:85-103 (quantize_annotate)` 按模块类名匹配配置，
+   `simo/quantization/model_transform.py:106-125 (replace_with_quantized_module)` 将 12 个 `Conv2d` 和 4 个 `Linear` 替换为
+   `QuantizedConv2d`、`QuantizedLinear`。随后 `simo/quantization/entry.py:256-274 (calibrate)` 使用默认
+   `NaiveCalibrationConfig`。
+
+6. 由于活动配置的 input/weight 都是动态量化，`simo/quantization/calibrator.py:91-121 (NaiveCalibrator._calibrate)` 判断不需要
+   静态 activation calibration，直接跳过 calibration forward；每个 quantizer 在真正 forward
+   时自己更新 scale。当前运行日志也记录了 `QuantizedConv2d=12, QuantizedLinear=4`、
+   `Backend: SIMO quantized equivalent PyTorch`。
+
+7. `scripts/evaluate_silero_vad_simo_quantized.py:32-52 (SimoQuantizedVad.__init__)` 将量化后的
+   PyTorch 模型移动到 CUDA 并 reset state。`scripts/evaluate_silero_vad_simo_quantized.py:54-73 (SimoQuantizedVad.predict_proba)` 对每个文件 reset、补齐到 512（16 kHz）或 256（8 kHz）
+   样本的窗口，然后在 `torch.inference_mode()` 中逐窗调用模型。数据集循环在
+   `scripts/evaluate_silero_vad_simo_quantized.py:170-244 (evaluate_dataset)` 中完成：加载音频、生成标签、收集每窗概率；`index % num_shards`
+   将文件分配给当前 shard。
+
+8. 每个 shard 的 `scripts/evaluate_silero_vad_simo_quantized.py:383-406 (write_npz)` 保存 labels、scores、文件数、时长、chunks 和错误数。
+   所有子进程结束后，`scripts/run_silero_simo_quant_sharded.py:342-405 (aggregate_results)` 合并原始
+   chunk scores，`scripts/run_silero_simo_quant_sharded.py:311-339 (summarize_arrays)` 计算 ROC-AUC 和
+   `(scores >= 0.11)` 的准确率，`scripts/run_silero_simo_quant_sharded.py:571-587 (main)` 写出最终
+   `summary.json`。本次已有运行目录 `logs/sharded_w8a8_mxint8_24shards` 的
+   `summary.json` 记录 24 个 shard 均 `done`，20 个文件、1,431,607 个 chunks、`errors=0`，整体
+   ROC-AUC=`0.9464517848820468`、Accuracy=`0.8253221729147734`。
+
+### 97.3 是真量化还是伪量化
+
+结论：`test.sh` 做的是**伪量化（fake quantization / QDQ 数值仿真）**，不是低比特存储和低比特
+GEMM 的真实量化部署；但它不是 no-op，round/clamp/scale 造成的量化误差会真实进入 forward。
+
+证据如下：
+
+- `simo/quantization/nn/modules/linear.py:60-78 (QuantizedLinear.from_float)` 只是把原模块的
+  `float_module.weight` 和 bias 赋给新模块，没有把权重持久化成 int8/MX packed storage。
+  `simo/quantization/nn/modules/linear.py:45-57 (QuantizedLinear.forward)` 每次先量化
+  input/weight/bias，再调用普通的 `torch.nn.functional.linear`；
+  `simo/quantization/nn/modules/conv.py:58-64 (_QuantizedConv.forward)` 同样调用普通 `F.conv*`。
+- `simo/quantization/quantizer.py:58-65 (TensorQuantizerBase.forward)` 在动态模式更新 observer/scale，然后调用 quantize。
+  `simo/quantization/quantizer.py:189-213 (IntQuantizer.quantize)` 在默认 `real_quant=False` 时走
+  `fake_quantize_int`；`simo/quantization/quantizer.py:216-231 (MXQuantizer.quantize)` 直接走
+  `fake_quantize_mx`，并没有走 real-quant 分支。
+- `simo/ops/fake_quant.py:322-359 (fake_quantize_int_per_group_affine)` 最终用 PyTorch fake-quant 算子并把结果恢复为
+  输入的浮点 dtype；`simo/ops/fake_quant.py:362-415 (fake_quantize_mx)` 对 MXINT8 也执行量化后反量化，最后在第 413
+  行恢复输入 dtype。它的某些 MXFP 格式会调用 CUDA native fake-quant kernel，但后续仍是浮点
+  `F.linear/F.conv`，不是低比特 GEMM。
+- 对本次实际模型的直接检查显示：`q._model.decoder.rnn.x_proj` 是 `QuantizedLinear`，其
+  `weight.dtype=torch.float32`，forward 输出也是 `torch.float32`；运行报告的模块计数为
+  `QuantizedConv2d=12, QuantizedLinear=4`。
+
+SIMO 代码确实另有 `real_quant` 分支（`simo/quantization/quantizer.py:189-203 (IntQuantizer.quantize)`）
+和导出 API 的 `real_quantize` 选项（`simo/quantization/entry.py:453-485 (export_quantized)`），但
+`test.sh` 的调用没有执行该导出路径，也没有调用 ONNX `create_session`。因此不能把日志中的
+`QuantizedLinear` 类名或 CUDA fake-quant kernel 误认为已经完成真实低比特推理。
+
+### 97.4 与 ONNX custom-op 流程的区别
+
+此前的 `test_quant_onnx.sh` 才是“ONNX 图插入 QDQ + ORT CUDA custom-op”的路径；本节的
+`test.sh` 使用 JIT 权重、PyTorch 等价模型和 `simo.quantize`。两者都可能产生“quantized”字样，
+但运行时边界不同：前者通过 ONNX Runtime 执行图，后者通过 PyTorch 模块和 fake-QDQ tensor
+执行。分析 `test.sh` 的精度时，应将它归类为 PyTorch fake-quant baseline，而不是
+`libSimoOnnxCustomOps_sm90.so` 的 standalone runtime 测试。
+
+## 98. `silero_vad_clean/scripts/` Python 文件功能与调用关系（2026-08-10）
+
+### 98.1 阅读口径
+
+以下所有 `scripts/...` 路径都相对于 Silero code base：
+`/share/users/like/package/jdjv/silero_vad_clean`。引用均给出相对路径、行号和函数/方法名。
+`scripts/` 共有 13 个 Python 文件；它没有一个总入口，而是由独立 CLI、worker evaluator、模型转换器和
+并行 launcher 组成。多数文件使用同目录的裸 import（例如 `import evaluate_silero_vad_public_v5`），因此
+应从 code base 根目录运行，或让 `scripts/` 在 `PYTHONPATH` 中。
+
+这批脚本不直接调用 `nvcc`，也不读取 `/share/users/like/package/onnxruntime` 源码目录；运行时使用当前
+conda 环境中安装的 `onnxruntime`、PyTorch 和 editable SIMO。只有 ONNX 量化 launcher 会动态调用
+`simo.onnx.quantize`，而 ONNX evaluator 在传入 custom-op library 时向 ORT 注册 `.so`。
+
+### 98.2 公共数据与后端评测层
+
+#### `scripts/evaluate_silero_vad_public_v5.py`
+
+这是整个目录的共享基础库，同时也可以独立执行。它负责：
+
+- `AudioExample`（`scripts/evaluate_silero_vad_public_v5.py:57-70 (AudioExample)`）统一表示一个数据样本及
+  音频、标签区间和来源信息；`scripts/evaluate_silero_vad_public_v5.py:38-45 (DEFAULT_DATASETS)` 定义
+  `esc50`、`alimeeting`、`earnings21`、`msdwild`、`aishell4`、`voxconverse` 六个默认数据集。
+- `scripts/evaluate_silero_vad_public_v5.py:72-125 (SileroVadOnnx.__init__)` 创建 ORT
+  `InferenceSession`、设置 provider/线程，并在给出 `custom_op_library` 时注册 custom op；
+  `scripts/evaluate_silero_vad_public_v5.py:127-155 (SileroVadOnnx.reset/predict_proba)` 维护 `(state,
+  context)`，将每个音频切成 512（16 kHz）或 256（8 kHz）样本窗口，逐窗调用 ORT。
+- `scripts/evaluate_silero_vad_public_v5.py:401-609 (iter_esc50/iter_voxconverse/iter_aishell4/iter_earnings21/iter_msdwild/iter_alimeeting)`
+  从 Parquet、wav/flac、RTTM 和 TextGrid 读取六类数据；`scripts/evaluate_silero_vad_public_v5.py:610-628
+  (iter_dataset_examples)` 按数据集名分派到对应 loader。
+- `scripts/evaluate_silero_vad_public_v5.py:631-647 (load_audio)` 读取 bytes/path、转单声道并重采样；
+  `scripts/evaluate_silero_vad_public_v5.py:650-678 (truncate_for_debug/labels_from_segments)` 把语音区间映射到
+  模型窗口；`scripts/evaluate_silero_vad_public_v5.py:695-715 (roc_auc_score_binary)` 计算二分类 ROC-AUC。
+- `scripts/evaluate_silero_vad_public_v5.py:772-909 (evaluate_dataset)` 完成单数据集的 manifest、推理、
+  chunk/file 统计、ESC-50 全文件噪声规则、accuracy 和 ROC-AUC；`scripts/evaluate_silero_vad_public_v5.py:924-1018
+  (write_report)` 写 Markdown 报告。
+- `scripts/evaluate_silero_vad_public_v5.py:1021-1090 (main)` 解析参数、创建 manifest/per-file 文件，
+  逐数据集调用 `evaluate_dataset`，最后写 `results.json`、`EVALUATION_PUBLIC_V5.md` 和 manifest。
+
+因此它既是公共 evaluator，也是其他 evaluator/runner 共享的“数据、音频、标签、指标”库；后面的脚本
+主要替换 `vad` 后端或改变调度方式。
+
+#### `scripts/evaluate_silero_vad_simple.py`
+
+这是更灵活的 ONNXRuntime evaluator，仍复用公共库的数据与 `SileroVadOnnx`：
+
+- `scripts/evaluate_silero_vad_simple.py:24-182 (parse_args)` 除模型/provider 外，还提供
+  `context`/`sherpa-window` 两种概率路径、`raw`/`sherpa-state` 两种决策路径、缓存、batch 和
+  segment IoU 参数。
+- `scripts/evaluate_silero_vad_simple.py:241-364 (cache_path/read_cached_probs/write_cached_probs/get_probs)`
+  按模型 hash、采样率、窗口和 inference mode 校验概率缓存；没有有效缓存时调用
+  `scripts/evaluate_silero_vad_public_v5.py:131-155 (SileroVadOnnx.predict_proba)` 或
+  `scripts/evaluate_silero_vad_simple.py:300-322 (predict_proba_sherpa_window)`。
+- `scripts/evaluate_silero_vad_simple.py:367-417 (predict_proba_batch)` 在 batch>1 时自行维护每个样本的
+  state/context，并直接调用 ORT session；`scripts/evaluate_silero_vad_simple.py:420-618
+  (mask_to_segments/segment_metrics/sherpa_style_mask_and_segments/decision_outputs_from_probs)` 把概率转成
+  chunk mask 或 Sherpa 风格语音段。
+- `scripts/evaluate_silero_vad_simple.py:629-677 (update_metrics)` 计算 chunk、噪声文件和可选 segment
+  指标；`scripts/evaluate_silero_vad_simple.py:679-808 (evaluate_dataset)` 逐文件读取、推理、聚合；
+  `scripts/evaluate_silero_vad_simple.py:900-969 (main)` 初始化 ORT backend、运行所有数据集并可写 summary JSON。
+
+它是“完整功能 evaluator”，不是单纯的打印脚本：默认 `inference_mode=context`、`decision_mode=raw` 时，
+结果口径接近其他 chunk evaluator；切到 Sherpa 模式才会额外产生 segment Precision/Recall/F1/IoU。
+
+#### `scripts/compare_restored_silero_v5.py`
+
+这是模型结构校验工具，不跑公共数据集：
+
+- `scripts/compare_restored_silero_v5.py:37-200 (STFT/VADDecoderRNNJIT/VADRNNJIT/VADRNNJITMerge)`
+  用普通 PyTorch 重建 8 kHz/16 kHz 分支、LSTMCell、context 和 recurrent state。
+- `scripts/compare_restored_silero_v5.py:203-209 (load_restored_from_jit)` 加载 TorchScript JIT 的 state_dict，
+  以 `strict=True` 复制到重建模型。
+- `scripts/compare_restored_silero_v5.py:220-237 (metrics/fmt)` 定义 max-abs、mean-abs、RMSE、relative-L2；
+  `scripts/compare_restored_silero_v5.py:240-283 (compare_branch)` 用随机 branch input 同时比较 restored
+  PyTorch、JIT branch 和 CPU ORT ONNX；`scripts/compare_restored_silero_v5.py:286-306
+  (compare_stateful_wrapper)` 比较 stateful wrapper 的多步输出。
+- `scripts/compare_restored_silero_v5.py:318-336 (main)` 对 16 kHz 和 8 kHz 各执行两类比较。
+
+#### `scripts/evaluate_silero_vad_pytorch.py`
+
+这是 PyTorch backend 的公共数据评测入口：
+
+- `scripts/evaluate_silero_vad_pytorch.py:23-65 (SileroVadPytorch.__init__/reset/predict_proba)` 调用
+  `scripts/compare_restored_silero_v5.py:203-209 (load_restored_from_jit)`，把 restored model 放到 CPU/CUDA，并提供与
+  `SileroVadOnnx` 相同的 `predict_proba` 形状。
+- `scripts/evaluate_silero_vad_pytorch.py:109-143 (main)` 固定 `inference_mode=context`、batch=1、关闭
+  概率缓存，然后直接复用 `scripts/evaluate_silero_vad_simple.py:679-808 (evaluate_dataset)` 和
+  `scripts/evaluate_silero_vad_simple.py:825-873 (print_table)`；所以它不是
+  另一套标签/指标实现，而是替换推理 backend 的薄适配器。
+
+#### `scripts/evaluate_silero_vad_onnx_float.py`
+
+这是 sharded worker 形式的 ONNX evaluator：
+
+- `scripts/evaluate_silero_vad_onnx_float.py:22-49 (parse_args)` 接收单模型、provider、shard、NPZ 和可选
+  custom-op library；`scripts/evaluate_silero_vad_onnx_float.py:72-150 (evaluate_dataset)` 复用公共
+  dataset/audio/label/AUC 函数，按 `index % num_shards` 只处理本 shard。
+- `scripts/evaluate_silero_vad_onnx_float.py:200-250 (main)` 校验文件和 CUDA provider，创建
+  `public_v5.SileroVadOnnx`，评测后由 `scripts/evaluate_silero_vad_onnx_float.py:182-197 (write_npz)`
+  保存 labels/scores/文件数/时长/chunks/errors。
+
+文件名虽然叫 `onnx_float`，但当上层传入 QDQ 模型和 `--custom-op-library` 时，它也可以作为 ONNX
+量化模型的 worker；“float”主要指默认不传 quant config 时的 baseline。
+
+### 98.3 SIMO 等价模型与量化入口
+
+#### `scripts/quantize_equivalent_silero_simo.py`
+
+这是 PyTorch/SIMO 路径的模型转换核心，不是 ONNX 图量化器：
+
+- `scripts/quantize_equivalent_silero_simo.py:33-188 (STFT/Conv1dBlock/OriginalDecoder/OriginalBranch/OriginalWrapper)`
+  重建与 JIT 权重结构一致的原始 PyTorch wrapper。
+- `scripts/quantize_equivalent_silero_simo.py:191-237 (Conv1dAsConv2d.from_conv1d/forward)` 把 SIMO 不识别的
+  Conv1d 包成带 singleton height 的 Conv2d；`scripts/quantize_equivalent_silero_simo.py:239-281
+  (EquivalentSTFT/EquivalentBlock)` 完成 STFT 和 encoder 的等价替换。
+- `scripts/quantize_equivalent_silero_simo.py:284-325 (LSTMCellAsLinear.from_lstm_cell/forward)` 把
+  LSTMCell 拆成 `x_proj`、`h_proj` 两个 Linear，再手写四门、sigmoid/tanh 和 state recurrence；
+  `scripts/quantize_equivalent_silero_simo.py:328-358 (EquivalentDecoder)` 和
+  `scripts/quantize_equivalent_silero_simo.py:361-406 (EquivalentBranch)` 组装 decoder/branch；
+  `scripts/quantize_equivalent_silero_simo.py:409-468 (EquivalentWrapper.from_original/forward)` 组装
+  16 kHz/8 kHz 双分支并维护 context/state。
+- `scripts/quantize_equivalent_silero_simo.py:499-505 (load_original_from_jit)` 载入 JIT；
+  `scripts/quantize_equivalent_silero_simo.py:508-525 (compare_float_equivalence)` 在量化前验证等价模型；
+  `scripts/quantize_equivalent_silero_simo.py:528-547 (load_simo_config/count_quantized_modules)` 读取
+  JSON 并统计替换模块；`scripts/quantize_equivalent_silero_simo.py:550-561 (smoke_forward)` 做两采样率
+  有限值 smoke test。
+- `scripts/quantize_equivalent_silero_simo.py:564-656 (main)` 解析 JIT/config/device，调用
+  `simo.quantize`（`scripts/quantize_equivalent_silero_simo.py:603-636 (main)`），对每个配置复制等价模型、量化、统计模块并 smoke forward。
+
+#### CPU/GPU 两个薄 wrapper
+
+- `scripts/quantize_equivalent_silero_simo_cpu.py:4-10 (main wrapper)` 直接调用核心 `main`，默认设备和
+  smoke 筛选为 CPU。
+- `scripts/quantize_equivalent_silero_simo_gpu.py:4-10 (main wrapper)` 直接调用核心 `main`，默认设备和
+  smoke 筛选为 CUDA。
+
+两者不重新实现模型或量化逻辑；差异只在默认 `--device` 和 `--select-smoke-device`。
+
+### 98.4 并行 launcher / 汇总器
+
+#### `scripts/run_silero_onnx_float_sharded.py`
+
+这是 ONNX float/QDQ 路径的总调度器：
+
+1. `scripts/run_silero_onnx_float_sharded.py:45-83 (parse_args)` 接收模型、设备、shard、worker、
+   `--quant-config`、`--simplify` 和 custom-op library。
+2. 不传 `--quant-config` 时直接评测原 ONNX；传入时，`scripts/run_silero_onnx_float_sharded.py:149-180
+   (prepare_model)` 调用 `simo.onnx.quantize` 生成 `quantized_model.onnx`，并通过
+   `scripts/run_silero_onnx_float_sharded.py:182-239 (normalize_quant_config)` 先把配置规范化到
+   `onnx_quant_config.json`。
+3. `scripts/run_silero_onnx_float_sharded.py:93-146 (build_tasks/command_for_task)` 按 GPU 轮转生成
+   shard command；command 的真正 worker 是 `scripts/evaluate_silero_vad_onnx_float.py`。
+4. `scripts/run_silero_onnx_float_sharded.py:242-283 (run_task)` 设置 `CUDA_VISIBLE_DEVICES`、运行
+   子进程并记录 shard NPZ/log；`scripts/run_silero_onnx_float_sharded.py:302-419
+   (split_npz_by_dataset/aggregate_results)` 合并 labels/scores 并计算指标；
+   `scripts/run_silero_onnx_float_sharded.py:479-542 (main)` 用 `ThreadPoolExecutor` 并发、失败则返回
+   非零、最后写 `summary.json`。
+
+#### `scripts/run_silero_simo_quant_sharded.py`
+
+这是单个 SIMO PyTorch 配置的 sharded runner：
+
+- `scripts/run_silero_simo_quant_sharded.py:37-120 (parse_args)` 解析 JIT、config、dataset、设备、24
+  shards、8 workers 等；`scripts/run_silero_simo_quant_sharded.py:137-151 (build_tasks)` 设备轮转创建任务。
+- `scripts/run_silero_simo_quant_sharded.py:154-207 (command_for_task)` 只负责构造
+  `evaluate_silero_vad_simo_quantized.py` 子进程命令；真正的 `simo.quantize` 在该 worker 的
+  `scripts/evaluate_silero_vad_simo_quantized.py:409-427 (main)` 内执行。
+- `scripts/run_silero_simo_quant_sharded.py:210-269 (run_task/load_shard_result)` 写 log、检查 return code、
+  读取 NPZ；`scripts/run_silero_simo_quant_sharded.py:535-587 (main)` 并发 24 个任务，调用
+  `scripts/run_silero_simo_quant_sharded.py:342-419 (aggregate_results/summarize_arrays)` 汇总并写 summary。
+
+所以它本身不做 ONNX 转换，也不加载 ORT custom-op；它只调度 PyTorch/SIMO evaluator。
+
+#### `scripts/run_silero_two_quant_configs_all_datasets.py`
+
+这是一个固定实验矩阵 launcher：
+
+- `scripts/run_silero_two_quant_configs_all_datasets.py:25-36 (CONFIGS/DEFAULT_DATASETS)` 固定
+  `int8_pcpt`（CPU）和 `mxint8`（CUDA），默认覆盖六个 public-v5 数据集。
+- `scripts/run_silero_two_quant_configs_all_datasets.py:90-106 (build_jobs)` 生成
+  dataset × config × shard 的 Job；`scripts/run_silero_two_quant_configs_all_datasets.py:109-162
+  (build_command/launch)` 启动同一个 `evaluate_silero_vad_simo_quantized.py` worker。
+- `scripts/run_silero_two_quant_configs_all_datasets.py:165-248 (roc_auc/best_accuracy/aggregate)` 读取
+  每个 worker 的 NPZ，除固定 `Acc@threshold` 外还寻找最佳阈值 accuracy；
+  `scripts/run_silero_two_quant_configs_all_datasets.py:271-321 (main)` 维护 CPU 并发上限和 GPU 空闲队列，
+  全部完成后写 `summary.json`。
+
+#### `scripts/run_simo_quantized_accuracy_parallel.py`
+
+这是另一套固定配置并发 launcher，重点是一次覆盖 10 个 SIMO 配置：
+
+- `scripts/run_simo_quantized_accuracy_parallel.py:23-37 (CPU_CONFIGS/GPU_CONFIGS)` 将 5 个配置放到
+  CPU（每个默认 8 shards），5 个配置放到 GPU（每个单 shard）；
+  `scripts/run_simo_quantized_accuracy_parallel.py:79-85 (build_jobs)` 展开 Job。
+- `scripts/run_simo_quantized_accuracy_parallel.py:102-141 (build_command)` 为每个 Job 构造同一个
+  `evaluate_silero_vad_simo_quantized.py` 命令；`scripts/run_simo_quantized_accuracy_parallel.py:158-186
+  (aggregate_config)` 聚合一个 config 的 NPZ 并计算 ROC-AUC/Acc@threshold。
+- `scripts/run_simo_quantized_accuracy_parallel.py:228-266 (main)` 直接启动全部 subprocess、等待并检查
+  return code，最后 `print_summary/write_summary` 写汇总。它与 `run_silero_simo_quant_sharded.py` 的区别是
+  配置矩阵固定、同时混跑 CPU/GPU，而不是命令行接收一个 config。
+
+### 98.5 直接调用关系
+
+下面图中的短名只是调用图节点标签；每个节点对应的代码引用（相对路径、行号、函数名）已在
+98.2-98.4 的条目中完整列出，图中的箭头表示 import 或 subprocess 方向。
+
+```text
+公共数据/指标层
+  evaluate_silero_vad_public_v5.main
+    -> SileroVadOnnx
+    -> iter_dataset_examples -> iter_* loader
+    -> load_audio -> labels_from_segments -> roc_auc_score_binary
+    -> evaluate_dataset -> write_report/results.json
+
+后端 evaluator
+  evaluate_silero_vad_simple.main
+    -> public_v5.SileroVadOnnx
+    -> simple.evaluate_dataset
+    -> public_v5.iter_dataset_examples/load_audio/labels/AUC
+
+  evaluate_silero_vad_pytorch.main
+    -> compare_restored_silero_v5.load_restored_from_jit
+    -> SileroVadPytorch
+    -> simple.evaluate_dataset/print_table
+    -> public_v5 数据/标签/指标函数
+
+  evaluate_silero_vad_onnx_float.main
+    -> public_v5.SileroVadOnnx
+    -> scripts/evaluate_silero_vad_onnx_float.py:72-150 (evaluate_dataset)
+    -> public_v5.iter_dataset_examples/load_audio/labels/AUC
+
+  evaluate_silero_vad_simo_quantized.main
+    -> quantize_equivalent_silero_simo.load_original_from_jit
+    -> EquivalentWrapper.from_original
+    -> simo.quantize
+    -> SimoQuantizedVad
+    -> public_v5.iter_dataset_examples/load_audio/labels/AUC
+
+模型检查/转换
+  quantize_equivalent_silero_simo_cpu.py / _gpu.py
+    -> quantize_equivalent_silero_simo.main
+    -> load_original_from_jit -> EquivalentWrapper.from_original
+    -> compare_float_equivalence -> simo.quantize -> smoke_forward
+
+并行边界（均通过 subprocess，不是 Python 函数直接调用）
+  test.sh
+    -> run_silero_simo_quant_sharded.main
+    -> evaluate_silero_vad_simo_quantized.main (每个 shard 一个进程)
+
+  test_float.sh / test_quant_onnx.sh
+    -> run_silero_onnx_float_sharded.main
+    -> [可选] prepare_model -> simo.onnx.quantize
+    -> evaluate_silero_vad_onnx_float.main (每个 shard 一个进程)
+
+  run_silero_two_quant_configs_all_datasets.main
+  run_simo_quantized_accuracy_parallel.main
+    -> evaluate_silero_vad_simo_quantized.main (多个配置/数据集/ shard)
+```
+
+关键边界是：launcher 负责任务编排、环境变量、日志和 NPZ 汇总；`evaluate_*` 负责一次进程中的模型
+推理；`evaluate_silero_vad_public_v5.py` 负责共享数据/标签/指标；量化 API 的触发点是
+`scripts/quantize_equivalent_silero_simo.py:564-656 (main)`、
+`scripts/evaluate_silero_vad_simo_quantized.py:409-427 (main)` 和
+`scripts/run_silero_onnx_float_sharded.py:149-180 (prepare_model)`。前两者是 PyTorch/SIMO 等价模型
+量化，后者是 ONNX 图 QDQ/custom-op 路径。
+
+## 99. `LSTMCellAsLinear` 的时间步、输入形状与 JIT/ONNX 等价性（2026-08-10）
+
+### 99.1 先给结论
+
+1. 当前 `LSTMCellAsLinear` **没有内部的时间步循环**。它实现的是一次 `LSTMCell` 更新：输入一个
+   `x_t` 和上一时刻 `(h_{t-1}, c_{t-1})`，输出 `(h_t, c_t)`。
+   严格区分术语：sequence-level 的 `nn.LSTM` 接收时间序列；`nn.LSTMCell` 和这里的
+   `LSTMCellAsLinear` 都是单步 primitive，是否形成长序列取决于外层是否反复调用并回传 state。
+2. 在当前 Silero 模型契约下，每次调用它接收的是一个 batch 的**单个时间步特征**，实际形状为
+   `[batch, 128]`，不是 `[seq_len, batch, 128]` 的多时间步序列。
+3. 时间循环在外层 `SimoQuantizedVad.predict_proba` 中：每个音频文件被切成多个 512（16 kHz）或
+   256（8 kHz）样本 chunk，每次模型调用推进一次 state。因而“没有 cell 内部循环”不等于“没有
+   时间递归”。
+4. `weights/silero_vad.jit` 使用的是 `nn.LSTMCell`，不是 `nn.LSTM`。导出到 ONNX 后出现的是
+   ONNX `LSTM` 算子；本模型每次调用给它的 `seq_length` 是 1，所以 ONNX 算子的序列递归也只执行
+   一个时间步。
+
+### 99.2 `LSTMCellAsLinear` 本身做什么
+
+`scripts/quantize_equivalent_silero_simo.py:284-325 (LSTMCellAsLinear.__init__/from_lstm_cell/forward)`
+的实现可以直接展开为：
+
+```text
+gates = x_proj(x_t) + h_proj(h_{t-1})
+(i, f, g, o) = chunk(gates, 4)
+c_t = sigmoid(f) * c_{t-1} + sigmoid(i) * tanh(g)
+h_t = sigmoid(o) * tanh(c_t)
+```
+
+- `scripts/quantize_equivalent_silero_simo.py:289-300 (LSTMCellAsLinear.__init__/from_lstm_cell)` 建立
+  两个 `Linear`，并把原 `LSTMCell` 的 `weight_ih`/`weight_hh` 和 `bias_ih`/`bias_hh` 原样复制到
+  `x_proj`/`h_proj`。
+- `scripts/quantize_equivalent_silero_simo.py:302-325 (LSTMCellAsLinear.forward)` 只执行一次
+  `x_proj`、`h_proj`、gate split、激活和 C/H recurrence；函数体没有 `for`/`while`。
+- `scripts/quantize_equivalent_silero_simo.py:346-358 (EquivalentDecoder.forward)` 先对 encoder 输出
+  做 `x.squeeze(-1)`，再只调用一次 `self.rnn(...)`，随后把 `(h, c)` stack 成 `[2, batch, 128]`。
+
+这里的 `Linear` 不是把 LSTM 变成“没有 recurrence 的普通全连接层”。`h_proj(h_{t-1})` 和
+`c_{t-1}` 仍然参加当前步计算；只是把一个 cell step 的两个 affine projection 显式写出来，便于
+SIMO 按 `Linear` 模块匹配量化。
+
+### 99.3 实际输入为什么是一个时间步
+
+当前推理链的形状如下（`B` 是 batch）：
+
+```text
+raw audio chunk       [B, 512]       (16 kHz；8 kHz 为 [B, 256])
+        + context     [B, 64]       (8 kHz 为 [B, 32])
+        ------------------------------------------------
+EquivalentWrapper     [B, 576]      (8 kHz 为 [B, 288])
+EquivalentSTFT         [B, 129, 4]   (8 kHz 为 [B, 65, 4])
+encoder                [B, 128, 1]
+squeeze(-1)           [B, 128]
+LSTMCellAsLinear       [B, 128] -> h_t,c_t
+```
+
+代码上的约束和传递顺序是：
+
+- `scripts/evaluate_silero_vad_simo_quantized.py:57-73 (SimoQuantizedVad.predict_proba)` 把一个文件
+  切 chunk，并在每个 chunk 调 `self.model(tensor, self.sample_rate)`；函数开头的
+  `scripts/evaluate_silero_vad_simo_quantized.py:54-55 (SimoQuantizedVad.reset)` 只在新文件开始时清空 state。
+- `scripts/quantize_equivalent_silero_simo.py:446-468 (EquivalentWrapper.forward)` 要求输入长度严格为
+  512/256，将上一次 context 拼到当前 chunk，并把上一次 `_state` 传入 branch；返回后把新 state 和
+  context 保存起来。
+- `scripts/quantize_equivalent_silero_simo.py:397-406 (EquivalentBranch.forward)` 经过 STFT/encoder
+  后把 `[B,128,1]` 交给 decoder。当前实际 hook 检查得到 16 kHz 为 STFT `[1,129,4]`、encoder
+  `[1,128,1]`，8 kHz 为 `[1,65,4]`、`[1,128,1]`；因此 `squeeze(-1)` 后确实是 `[B,128]`。
+
+`LSTMCellAsLinear` 的代码虽然没有显式写 shape assert，但它的 recurrence 假定 `h`、`c` 是
+`[B,128]`，并在 `gates.chunk(4, dim=1)` 上按 batch 后的 gate 维切分。它不是一个接收任意
+`seq_len` 的 sequence API；把多时间步张量直接塞入当前实现并不会得到一个内部 time loop。
+
+### 99.4 时间循环实际在哪里
+
+对同一个文件，真正的递归序列是：
+
+```text
+reset: (h_0,c_0) = zeros
+chunk 0 -> LSTMCellAsLinear(x_0, h_0,c_0) -> (h_1,c_1)
+chunk 1 -> LSTMCellAsLinear(x_1, h_1,c_1) -> (h_2,c_2)
+chunk 2 -> LSTMCellAsLinear(x_2, h_2,c_2) -> (h_3,c_3)
+...
+```
+
+也就是说，外层循环的“时间步”是**模型 chunk**，不是 512 个原始采样点，也不是 STFT 的 4 个
+频谱 frame。STFT/encoder 先把一个 chunk 压成一个 `[B,128,1]` decoder feature，RNN 只对这个
+feature 做一次更新。ONNX/PyTorch 两条路径都遵守同一个 stateful chunk contract：
+
+- PyTorch SIMO 路径：`scripts/evaluate_silero_vad_simo_quantized.py:57-73 (SimoQuantizedVad.predict_proba)`。
+- 普通 ONNX 路径：`scripts/evaluate_silero_vad_public_v5.py:131-155 (SileroVadOnnx.predict_proba)`，
+  每个 chunk 传 `state`，收到 `state` 输出后再更新 context。
+
+### 99.5 为什么能与 ONNX `LSTM` 等价
+
+ONNX schema（相对于 `/share/users/like/package/onnx` code base）规定：
+`docs/Operators.md:17375-17382 (LSTM equations)` 定义逐时间步的 gate/C/H 方程，
+`docs/Operators.md:17408-17418 (LSTM layout/inputs)` 规定 `layout=0` 时
+`X=[seq_length,batch,input_size]`、`W=[num_directions,4*hidden_size,input_size]`；输出
+`Y` 是所有时间步，`Y_h/Y_c` 是最后 state（`docs/Operators.md:17433-17442 (LSTM outputs)`）。
+
+当前 `weights/silero_vad.onnx` 的每个分支 LSTM 节点满足：
+
+- `hidden_size=128`，`W/R` 的形状为 `[1,512,128]`，`B` 为 `[1,1024]`，即 `4*128` 和 `8*128`；
+- LSTM 的 `X` 来自 decoder feature 的 `Unsqueeze(axis=0)`，当前 active branch 的语义形状是
+  `[1,B,128]`，所以 `seq_length=1`；
+- 因此 `Y` 的语义形状是 `[1,1,B,128]`，`Y_h/Y_c` 是 `[1,B,128]`。只有一个时间步时，ONNX
+  的递推方程恰好就是一次 cell update。
+
+等价性不是因为 `LSTMCellAsLinear` 模拟了 ONNX 的整个长序列，而是因为两边都把长序列拆成同样的
+单步调用，并在调用之间传递同样的 `(h,c)`：
+
+```text
+ONNX call t:  X_t, Y_h(t-1), Y_c(t-1) -> Y_t, Y_h(t), Y_c(t)
+PyTorch call t: x_t, h(t-1), c(t-1)      -> h(t), c(t)
+```
+
+`W/R/B` 的门拼接顺序、两个 bias 的相加、sigmoid/tanh、`c_t` 和 `h_t` 更新都由
+`scripts/quantize_equivalent_silero_simo.py:293-325 (from_lstm_cell/forward)` 保持一致；
+`scripts/quantize_equivalent_silero_simo.py:417-423 (EquivalentWrapper.from_original)` 则把两种
+采样率分支分别转换。因此在相同初始 state、相同 chunk 顺序和相同浮点精度下，逐步 rollout 与
+ONNX sequence-length-1 LSTM 等价。
+
+### 99.6 `weights/silero_vad.jit` 到底是什么 RNN
+
+结论是：**JIT 使用 `nn.LSTMCell`，不是 `nn.LSTM`。** 证据有两层：
+
+1. 代码恢复模型本身明确声明 `nn.LSTMCell`：
+   `scripts/quantize_equivalent_silero_simo.py:75-98 (OriginalDecoder.__init__/forward)` 和
+   `scripts/compare_restored_silero_v5.py:84-107 (VADDecoderRNNJIT.__init__/forward)`。
+2. 对实际 `weights/silero_vad.jit` 做 TorchScript 图检查时，
+   `_model.decoder.rnn.forward.graph` 的类型是 `__torch__.torch.nn.modules.rnn.LSTMCell`，核心节点是
+   `aten::lstm_cell`；state_dict 键是 `weight_ih/weight_hh/bias_ih/bias_hh`（两个采样率分支各一套），
+   没有 `nn.LSTM` 常见的 `weight_ih_l0` 等层级命名。
+
+所以需要区分三个名字：
+
+```text
+JIT/PyTorch 原始模块       nn.LSTMCell       一次调用 = 一个时间步
+SIMO 等价模块              LSTMCellAsLinear  一次调用 = 同一个时间步
+导出后的 ONNX 图算子       LSTM              本模型每次调用 seq_length = 1
+```
+
+如果未来要让单次 `LSTMCellAsLinear.forward` 接收真正的多时间步序列，就必须新增显式的时间维
+循环（或改用 sequence-capable `nn.LSTM`/融合 kernel），并明确 state 的 `[T,B,H]` 或 `[B,T,H]`
+布局；当前实现没有这层功能，也不需要它来匹配现有 Silero JIT/ONNX 模型。
+
+## 100. `weight.is_dynamic=false` 到底约束哪一个 `quantize`（2026-08-10）
+
+### 100.1 体现限制的直接代码行
+
+第 10031 行所说的限制，最直接对应
+`simo/onnx/onnx_quant.py:596-597 (load_quantization_config)`：
+
+```python
+if field_name == "weight" and spec.get("is_dynamic", False):
+  raise ValueError("weight.is_dynamic must be False in SIMO ONNX QDQ v2")
+```
+
+这里不是把值强制改成 `False`，而是在遍历 `field_name == "weight"` 时拒绝显式为真的值。
+`spec.get("is_dynamic", False)` 还说明了未写该字段时按 `False` 处理；因此旧 JSON 若写成
+`"is_dynamic": true` 会直接报错，删除该字段或明确写 `false` 才能通过这一项检查。对应的
+回归测试是 `simo/onnx/tests/test_qdq_utils.py:2032-2049
+(test_load_quantization_config_rejects_unsupported_weight_options)`，其中 `is_dynamic=True`
+是参数化的拒绝用例。
+
+### 100.2 `simo.onnx.api.quantize`：会受约束
+
+这是 ONNX 图改写 API，不是通用 PyTorch 量化 API。其签名和返回值位于
+`simo/onnx/api.py:15-25 (quantize)`：输入是 ONNX 路径/`ModelProto`，返回改写后的
+`ModelProto`；函数体第 22 行把工作委托给
+`simo/onnx/onnx_quant.py:263-280 (apply_qdq_quantization)`。后者在第 279 行先调用
+`load_quantization_config()`，然后才遍历 ONNX 图插入 QDQ。因此通过
+`simo.onnx.quantize(...)` 传入 mapping、JSON 路径或 `QuantizeConfig`，都会进入上述
+`simo/onnx/onnx_quant.py:596-597 (load_quantization_config)` 检查；`output_path` 和
+`simplify` 不会绕过它。
+
+同一个 loader 还明确体现了 QDQ v2 的输入/权重不对称性：
+`simo/onnx/onnx_quant.py:598-600 (load_quantization_config)` 对 input 缺省补成动态，
+而 `simo/onnx/onnx_quant.py:614-615 (load_quantization_config)` 拒绝静态 input；weight 则没有
+这种补动态逻辑，动态 weight 在 `simo/onnx/onnx_quant.py:596-597
+(load_quantization_config)` 被拒绝。
+
+注意，通用 `QuantizeConfig` 对象本身可以先构造成功；
+`simo/onnx/onnx_quant.py:490-492 (load_quantization_config)` 会把它重新导出为 mapping，
+再执行 ONNX 专属校验，所以“能构造 `QuantizeConfig`”不等于“能被 ONNX API 接受”。
+
+### 100.3 `simo.quantization.entry.quantize`：不受这条 ONNX 约束
+
+虽然函数名相同，但这是 PyTorch `nn.Module` 量化入口，签名见
+`simo/quantization/entry.py:48-53 (quantize)`，返回值也是 `nn.Module`。它在
+`simo/quantization/entry.py:102-108 (quantize)` 将字典/JSON 解析成通用 `QuantizeConfig`，
+随后只走 `simo/quantization/entry.py:112-125 (quantize)` 的
+`prepare_model_for_quantization -> quantize_apply -> calibrate` 链路，没有调用
+`simo.onnx.onnx_quant.load_quantization_config()`，所以不会触发
+`weight.is_dynamic must be False in SIMO ONNX QDQ v2`。
+
+通用配置模型也没有对 weight 加这条禁止规则：
+`simo/quantization/config.py:345-350 (ModuleQuantizeConfig.validate_dynamic)` 的字段验证器
+只注册在 `input`、`output`，不包含 `weight`；
+`simo/quantization/config.py:450-483 (QuantizeSpecMX)` 将 `is_dynamic` 定义为普通布尔字段，
+默认值为 `False`，也允许调用方显式传 `True`。通用量化测试甚至用动态 weight 构造并执行
+`QuantizedLinear`：`tests/simo_quant/test_mx_quantization.py:697-752 (test_quant_linear)`。
+顶层 `from simo import quantize` 也通过 `simo/__init__.py:5-16 (__getattr__/_LAZY_EXPORTS)`
+指向这个 PyTorch 入口，而不是 `simo.onnx.api.quantize`。
+
+因此结论是：
+
+```text
+simo.onnx.quantize(...)       -> ONNX QDQ v2 -> weight.is_dynamic=True 直接 ValueError
+simo.quantization.quantize(...) / from simo import quantize
+                              -> PyTorch quantization -> 不受这条 ONNX 专属检查
+```
+
+“不受”只表示不受这一个 ONNX QDQ v2 校验；通用 PyTorch 量化仍可能因模型、dtype、算法或
+校准条件产生其他错误。实际区分入口时应看导入路径：`simo/onnx/api.py` 的 `quantize`
+与 `simo/quantization/entry.py` 的 `quantize` 不是同一函数。
+
+## 101. PyTorch `quantize` 中 `weight.is_dynamic` 的行为差异（Linear/Conv）
+
+### 101.1 先给结论
+
+这里讨论的是 `simo/quantization/entry.py:48-53 (quantize)` 的 PyTorch 入口，并以默认的
+`naive` 算法为主；默认值见
+`simo/quantization/config.py:293-295 (QuantizeConfig.algorithm)`。
+
+| `weight.is_dynamic` | 权重 qparams（scale/zero_point）的生成时机 | 普通 forward | 权重后来被修改 |
+|---|---|---|---|
+| `false` | `quantize()` 收尾校准时，从当前 Parameter 计算一次并缓存 | 使用缓存 qparams 做 weight fake-quant | qparams 不自动更新，可能过期并发生额外饱和/截断 |
+| `true` | 不走静态权重初始化；第一次及此后每次 forward 都从当前 Parameter 重算 | 先 observer/update qparams，再做 weight fake-quant | 下一次 forward 会适配新权重范围 |
+
+因此这里的“动态”指**权重量化参数的计算时机**，不是说 Linear/Conv 换成了另一个动态图算子，
+也不是说 weight 被换成了一个随 input 变化的张量。Linear 和 Conv 都仍持有原来的 float
+Parameter；`simo/quantization/nn/modules/linear.py:59-78 (QuantizedLinear.from_float)` 和
+`simo/quantization/nn/modules/conv.py:66-90 (_QuantizedConv.from_float)` 都直接把原模块的
+`weight`/`bias` 赋给量化模块。
+
+还有一个重要细节：在默认 `quant_consts_after_apply=False` 下，`is_dynamic=false` 只是“不再重算
+qparams”，**并不表示 weight 已经预量化并完全消除了每次 forward 的 fake-quant**。静态和动态
+两种模式仍都会经过 weight quantizer；动态模式比静态模式多了 observer 和 qparams 更新开销。
+
+### 101.2 `quantize()` 如何把这个字段传到运行时
+
+`simo/quantization/entry.py:102-125 (quantize)` 的主流程是：
+
+```text
+解析 QuantizeConfig
+  -> prepare_model_for_quantization
+  -> quantize_apply（替换模块）
+  -> 可选 fake_quant_consts_after_apply
+  -> calibrate
+```
+
+`quantize()` 自己没有写 `if weight.is_dynamic`。它在
+`simo/quantization/model_transform.py:57-67 (quantize_apply)` 中根据配置标注并替换模块；
+具体 target 的类型/名称匹配位于
+`simo/quantization/model_transform.py:85-103 (quantize_annotate)`，实际调用各量化模块
+`from_float()` 的位置是
+`simo/quantization/model_transform.py:106-125 (replace_with_quantized_module)`。
+
+量化模块初始化时，`simo/quantization/nn/modules/mixin.py:17-22
+(QuantizationMixin.init_quantizer)` 为 input/output/weight/bias 分别构造 quantizer。
+`simo/quantization/quantizer.py:33-49 (TensorQuantizerBase.__init__)` 再把配置中的
+`spec.is_dynamic` 保存为 `self.is_dynamic`。真正的共同分支在
+`simo/quantization/quantizer.py:58-65 (TensorQuantizerBase.forward)`：
+
+```python
+if self.is_observing or self.is_dynamic:
+  self.observer(x.detach())
+  self.update_parameters(x)
+
+if self.is_quantizing:
+  x = self.quantize(x)
+```
+
+校准完成后 observer 通常已关闭，但 `is_dynamic=true` 仍使第一个条件恒成立，所以每次 forward
+都会观察当前 weight 并更新 scale/zero_point；`false` 则跳过这两步，只执行最后的 fake-quant。
+对于本批配置中的 min-max/per-channel observer，动态模式会先清空旧统计，再统计当前 tensor，见
+`simo/quantization/observer.py:173-180 (UniformScalingObserver.reset_statistics_if_dynamic)` 和
+`simo/quantization/observer.py:247-282 (PerChannelMinMaxObserver._forward)`；MX block observer
+则在动态模式直接用当前 block amax 覆盖旧值，见
+`simo/quantization/observer.py:356-369 (PerBlockMXObserver.forward)`。
+
+### 101.3 `false`：静态 weight 的完整时序
+
+默认 naive 校准器会先调用
+`simo/quantization/calibrator.py:65-88 (initialize_static_const_quantizers)`。它只处理
+`is_dynamic=false` 的 weight/bias：打开 observer、暂时关闭 fake-quant、把 Parameter 本身送进
+quantizer 一次，然后关闭 observer 并打开 fake-quant。也就是说，静态 weight 的 qparams 直接由
+weight 计算，不依赖校准样本。
+
+`simo/quantization/calibrator.py:91-121 (NaiveCalibrator._calibrate)` 还明确区分了权重和激活：
+如果没有静态 input/output quantizer，weight-only 配置不需要 `data_loader`，也不需要跑一次模型
+forward。需要校准数据的是静态激活，不是静态权重。
+
+之后每次 Linear/Conv forward 调到 weight quantizer 时，因为 observer 已关闭且
+`is_dynamic=false`，`TensorQuantizerBase.forward()` 不再更新 qparams，但仍用缓存的
+scale/zero_point fake-quant 当前 weight。如果 Parameter 后来改变，缓存值不会随之变化。
+
+### 101.4 `true`：动态 weight 的完整时序
+
+`initialize_static_const_quantizers()` 在
+`simo/quantization/calibrator.py:76-85 (initialize_static_const_quantizers)` 遇到动态 weight 会
+直接 `continue`，所以它不会在 `quantize()` 收尾阶段固定 qparams。
+
+进入真正 forward 后，即使全局校准流程已经 disable observer，
+`simo/quantization/quantizer.py:58-65 (TensorQuantizerBase.forward)` 仍会因为
+`self.is_dynamic` 执行以下顺序：
+
+```text
+当前 weight -> observer -> 更新 scale/zero_point -> fake-quant weight -> Linear/Conv 计算
+```
+
+因此它能跟随训练、手工赋值、adapter merge 或重新加载参数等造成的权重变化；代价是每次 forward
+都要重新扫描整个 weight、计算统计量和 qparams。对于推理期不变的大权重，这通常是重复工作。
+
+如果 weight 始终不变，在 dtype、axis/group/block、rounding 和 observer 配置完全相同的前提下，
+静态初始化得到的 qparams 与动态 forward 得到的 qparams 通常相同，因而 fake-quant weight 和输出
+通常也相同；主要差别是计算时机与重复开销，而不是量化公式。
+
+### 101.5 Linear 示例
+
+通用设备路径中，`simo/quantization/nn/modules/linear.py:45-57
+(QuantizedLinear.forward)` 的关键顺序是：
+
+```text
+quantize_input(input)
+quantize_weight(self.weight)
+quantize_bias(self.bias)
+F.linear(...)
+quantize_output(output)
+```
+
+`quantize_weight()` 本身只是把 weight 交给对应 quantizer，见
+`simo/quantization/nn/modules/mixin.py:24-28 (QuantizationMixin._quantize)` 和
+`simo/quantization/nn/modules/mixin.py:50-51 (QuantizationMixin.quantize_weight)`。
+
+例如 Linear weight 形状为 `[out_features, in_features]`，int8 `axis=0` 时通常为每个输出通道
+生成一组 qparams：
+
+```text
+false: quantize() 结束时对 W 算一次 scale_W；每次 forward 用同一个 scale_W
+true : 每次 forward 都对当前 W 重算 scale_W；然后再执行 F.linear
+```
+
+本地最小实验在第一次 forward 后执行 `weight *= 2`：静态 Linear 的 scale 比例保持 `1.0`，
+动态 Linear 的 scale 比例变为 `2.0`，正好对应上述代码路径。
+
+需要单列一个后端例外：当 weight 位于 SIPU 且 input spec 是 `QuantizeSpecMX` 时，
+`simo/quantization/nn/modules/linear.py:45-47 (QuantizedLinear.forward)` 会直接进入
+`simo/quantization/nn/modules/sipu_linear.py:66-127 (sipu_linear)`，绕过通用的
+`quantize_weight()`/`TensorQuantizerBase.forward()`。这个专用实现每次调用时直接转换 input 和
+weight，当前没有读取 `config.weight.is_dynamic`；因此在该 SIPU Linear 分支上，仅把此字段从
+`false` 改成 `true` 不会产生上述通用分支的静态/动态 qparams 行为差异。
+
+### 101.6 Conv 示例
+
+Conv1d/2d/3d 共享
+`simo/quantization/nn/modules/conv.py:58-64 (_QuantizedConv.forward)`：
+
+```text
+quantize_input(input)
+quantize_weight(self.weight)
+quantize_bias(self.bias)
+_conv_forward(...)
+quantize_output(output)
+```
+
+所以它与通用 Linear 使用完全相同的 weight quantizer 分支，只是最后分别调用 conv1d/2d/3d。
+以 Conv2d 为例，weight 形状为
+`[out_channels, in_channels/groups, kernel_h, kernel_w]`；int8 `axis=0` 时，每个 output channel
+的统计范围独立：
+
+```text
+false: quantize() 结束时从卷积核计算并缓存每通道 qparams
+true : 每次 Conv2d forward 都从当前卷积核重算每通道 qparams
+```
+
+同样的本地实验把 Conv2d weight 乘 2 后，静态 scale 比例保持 `1.0`，动态 scale 比例变为
+`2.0`。Conv 当前没有 Linear 的 SIPU 快捷分支，因此会走上述通用逻辑。
+
+### 101.7 `quant_consts_after_apply=True` 会进一步拉开差异
+
+`simo/quantization/entry.py:117-125 (quantize)` 只在调用方显式传
+`quant_consts_after_apply=True` 时启用这条路径。
+`simo/quantization/model_transform.py:128-145 (fake_quant_consts_after_apply)` 只选择
+`not quantizer.is_dynamic` 的 weight/bias：立即 fake-quant 一次、写回 `parameter.data`，然后删除
+对应 quantizer。此时静态 weight 后续 forward 连 fake-quant 都不再执行。
+
+动态 weight 会被这段逻辑跳过并保留运行时 quantizer，仍在每次 forward 重算 qparams 和
+fake-quant。因此：
+
+```text
+默认 False: static = 每次 fake-quant、qparams 缓存；dynamic = 每次重算 qparams + fake-quant
+显式 True : static = 一次写回 Parameter 后删除 quantizer；dynamic = 仍每次运行时量化
+```
+
+最后再次限定入口：以上行为属于 `simo/quantization/entry.py` 的 PyTorch `quantize()`；前一节
+所述 `simo.onnx.quantize()` 的 QDQ v2 仍会拒绝 `weight.is_dynamic=true`，两者不能混用。
+
+### 101.8 本地验证
+
+使用 SIMO 所在 conda 环境加载新目录的全部 JSON，27 个文件、78 个 `module_configs` 都通过
+`QuantizeConfig.from_json()` 校验，且每个 `weight.is_dynamic` 都为 `true`。
+
+同时运行 `tests/simo_quant/test_weight_only_no_calibration.py`，结果为 `8 passed`。其中静态
+Linear 的无数据初始化覆盖在
+`tests/simo_quant/test_weight_only_no_calibration.py:26-78
+(test_weight_only_static_mx_quantize_without_dataloader_or_forward/
+test_weight_only_static_int_quantize_without_dataloader_or_forward)`，静态 weight 只观察一次覆盖在
+`tests/simo_quant/test_weight_only_no_calibration.py:111-156
+(test_static_activation_calibration_does_not_reobserve_weight_qparams)`，静态 Conv2d 的无数据初始化
+覆盖在 `tests/simo_quant/test_weight_only_no_calibration.py:262-295
+(test_weight_only_static_conv_quantize_without_dataloader_or_forward)`。
+
+## 102. PyTorch 与 ONNX Silero 全量量化结果对比（2026-08-13）
+
+### 102.1 核对范围和对比口径
+
+本节核对以下两次共享 NFS 上的 bjh5 实测结果：
+
+| 路径 | 主日志 | 输出根目录 |
+|---|---|---|
+| PyTorch fake-QDQ | `temp/test.sh.log.jit.2026_08_12___17_44_53.gpu005.rd.sio-software.com` | `logs/jit.2026_08_12___17_44_53.gpu005.rd.sio-software.com/` |
+| ONNX QDQ/custom op | `temp/simo_sglang_pip.test_quant_onnx.sh.log.siplify.SimoQuantizeLSTM.2026_08_06___17_10_21.gpu005.rd.sio-software.com` | `logs/simo_sglang_pip.SimoQuantizeLSTM.2026_08_06___17_10_21.gpu005.rd.sio-software.com/` |
+
+两边都按 `silero_vad_clean/test.sh:31-42 (DEFAULT_CONFIGS)` 和
+`silero_vad_clean/test_quant_onnx.sh:24-35 (DEFAULT_CONFIGS)` 的相同 10 个配置顺序运行，数据集都是
+aishell4、阈值都是 `0.11`，每项都是 24 shards。逐个读取每边各 240 个 NPZ（共 480 个）后，
+10 组比较中每一组的 `1,431,607` 个标签均逐项相同，因此下面的 ROC-AUC、Acc@0.11 和原始概率
+差异具有直接配对意义。
+
+但“同名配置”不等于“同一个可执行图”：
+
+- PyTorch 命令显式设置 `QUANT_CONSTS_AFTER_APPLY=1`。该值经
+  `silero_vad_clean/test.sh:66-75 (run_one_config)` 和
+  `silero_vad_clean/scripts/run_silero_simo_quant_sharded.py:167-223 (command_for_task)` 传入 evaluator；
+  `silero_vad_clean/scripts/evaluate_silero_vad_simo_quantized.py:422-445 (main)` 重建等价 PyTorch 模型，
+  再调用 `simo.quantize(..., data_loader=None, quant_consts_after_apply=True)`。
+- ONNX 命令使用 `SIMPLIFY=true`，先简化原 ONNX，再插入 QDQ 和
+  `com.simo::SimoQuantizeLSTM`，最后由 ONNX Runtime CUDA EP 执行；入口见
+  `silero_vad_clean/scripts/run_silero_onnx_float_sharded.py:149-179 (prepare_model)`。
+
+所以本节回答的是“这两条实际部署/参考路径的端到端精度差多少”，不是证明两种后端逐元素同构。
+
+### 102.2 PyTorch 任务是否完整，有没有 core dump 或异常
+
+结论是：**完整生成了 10/10 个配置的精度数据；没有发现 core dump，也没有未处理异常。** 证据为：
+
+1. 主日志有 10 个 `QUANT_CONFIG`、10 个 `Aggregated results`，并在最后一个 MXINT8 配置正常写出
+   `summary.json`。最后汇总位于
+   `temp/test.sh.log.jit.2026_08_12___17_44_53.gpu005.rd.sio-software.com:3224-3230`。
+2. 10 个输出目录都包含 `summary.json`；每个 summary 都是 `files=20`、`hours=12.7253036111`、
+   `chunks=1,431,607`、`errors=0`，并记录 24/24 shard 的 `status=done`。
+3. 每项都有 24 个 `shard_*.log` 和 24 个 `shard_*.npz`，总计 240 个 shard 日志、240 个 NPZ；
+   240 个日志末尾全部是 `returncode=0`。runner 在
+   `silero_vad_clean/scripts/run_silero_simo_quant_sharded.py:226-269 (run_task)` 记录子进程返回码，
+   在第 590-603 行的 `main` 中只要任何 shard 失败就退出，全部成功后才聚合并写 summary。
+4. shard 20-23 的 `files=0, chunks=0, errors=0` 是 20 个输入文件分到 24 shards 的正常空分片，
+   不是漏跑。它们同样生成 NPZ、日志并返回 0；例如最后一个 summary 的第 353-379 行。
+5. 主日志和所有 shard 日志中没有匹配到 `Traceback`、`Exception`、`RuntimeError`、CUDA error、
+   OOM、segmentation fault、`core dumped`、abort、fatal 或 killed；工作目录和该输出根目录中也没有
+   `core`、`core.*` 或 `*.core` 文件。
+
+原命令由 shell 的 `&` 放到后台，没有单独保存最外层后台 job 的 `$?`。因此这里没有虚构一个
+未记录的顶层返回码；完整性判断来自全部 240 个真实子进程返回码、10 个最终 summary 和主日志
+已经执行到最后一项。这个证据链足以判定该批任务正常完成。
+
+### 102.3 10 种量化配置的实测精度变化
+
+下表直接读取两边每个 `summary.json` 的 `overall`。差值定义为
+**PyTorch - ONNX**，单位为百分点（pp）；正值表示 PyTorch 更高，负值表示 ONNX 更高。
+
+| 量化类型（W/A） | PyTorch ROC-AUC | ONNX ROC-AUC | Delta AUC | PyTorch Acc@0.11 | ONNX Acc@0.11 | Delta Acc |
+|---|---:|---:|---:|---:|---:|---:|
+| MXFP4 E2M1 / E2M1 | 0.928153264 | 0.928321347 | -0.016808 pp | 0.697303799 | 0.697572728 | -0.026893 pp |
+| MXFP6 E2M3 / E2M3 | 0.942520144 | 0.942496103 | +0.002404 pp | 0.767647825 | 0.767603819 | +0.004401 pp |
+| MXFP6 E3M2 / E3M2 | 0.935590307 | 0.935633730 | -0.004342 pp | 0.710098512 | 0.710186525 | -0.008801 pp |
+| INT8 per-channel / per-channel | 0.946311320 | 0.946292071 | +0.001925 pp | 0.826815600 | 0.826537590 | +0.027801 pp |
+| INT8 per-channel / per-tensor | 0.947146571 | 0.947147986 | -0.000142 pp | 0.852390356 | 0.852176610 | +0.021375 pp |
+| INT8 per-tensor / per-tensor | 0.945381011 | 0.946194274 | -0.081326 pp | 0.835257162 | 0.833268488 | +0.198867 pp |
+| FP8 E4M3 2D-block / 1D-block | 0.942815471 | 0.946536685 | -0.372121 pp | 0.785348214 | 0.832378579 | -4.703037 pp |
+| MXFP8 E4M3 / E4M3 | 0.942596812 | 0.942613595 | -0.001678 pp | 0.764218113 | 0.764273994 | -0.005588 pp |
+| MXFP8 E5M2 / E5M2 | 0.935620023 | 0.938594025 | -0.297400 pp | 0.709968588 | 0.748922016 | -3.895343 pp |
+| MXINT8 / MXINT8 | 0.946451785 | 0.946457422 | -0.000564 pp | 0.825322173 | 0.825348717 | -0.002654 pp |
+
+可归纳为：
+
+- 除 FP8 2D-block 和 MXFP8 E5M2 两个离群项外，其余 8 项的绝对 AUC 差不超过
+  `0.081326 pp`，绝对 Acc 差不超过 `0.198867 pp`；8 项平均差分别为
+  `-0.012566 pp` 和 `+0.026064 pp`。这些配置的端到端 aggregate 精度总体接近。
+- 两边表现最好的都是 INT8 weight per-channel / activation per-tensor：PyTorch/ONNX AUC 分别为
+  `0.947146571/0.947147986`，Acc 分别为 `0.852390356/0.852176610`。
+- 两边表现最差的都是 MXFP4：AUC 约 `0.9282`，Acc 约 `0.6974`。因此多数配置的相对排序也一致。
+- 没有“PyTorch 全面更好”或“ONNX 全面更好”的统一方向。显著差异集中在两个 FP8 配置，且
+  其中 FP8 2D-block 的算子覆盖本来就不同，不能当作同覆盖后端对比。
+
+aggregate 指标接近也不表示原始概率逐位相同。对相同标签顺序配对全部输出后，MXINT8 的
+PyTorch/ONNX 概率 relative-L2 为 `0.308870%`，INT8 per-channel/per-channel 为 `0.382950%`；
+FP8 2D-block 和 MXFP8 E5M2 则分别为 `16.477770%`、`15.327598%`。后两项分别有
+73,721 和 66,800 个 chunk 在阈值 `0.11` 两侧发生分歧，正好解释其 Acc 差距为什么远大于其他项。
+
+### 102.4 为什么 FP8 2D-block 不能直接比较
+
+这是本次对比中最重要的限制。PyTorch 每个配置的 rank-0 model report 都记录：
+
+```text
+QuantizedConv2d=12, QuantizedLinear=4
+```
+
+`LSTMCellAsLinear` 自身不是 SIMO 注册的量化模块；它在
+`silero_vad_clean/scripts/quantize_equivalent_silero_simo.py:284-325
+(LSTMCellAsLinear.forward)` 中用 `x_proj` 和 `h_proj` 两个 `nn.Linear` 表达门计算。两个采样率分支
+各有两个投影，因此 `Linear` 配置最终量化 4 个 Linear；模块匹配和替换发生在
+`simo/quantization/model_transform.py:85-125 (quantize_annotate/replace_with_quantized_module)`。
+这意味着 PyTorch 配置里的 `LSTM` target 实际没有直接匹配一个 `nn.LSTM`，LSTM 数学部分是通过
+`Linear` target 被量化的。
+
+ONNX 则不同。`Linear` alias 映射到 `MatMul/Gemm`、`Conv2d/Conv3d` 映射到 `Conv`，见
+`simo/onnx/onnx_quant.py:36-53 (TARGET_OP_ALIASES/SUPPORTED_MX_DTYPES)`；简化后的图直接保留两个
+`LSTM`，并在 `simo/onnx/onnx_quant.py:910-1068 (_prepare_lstm_quantization_target)` 中分别处理
+W/R 和四门，再替换为两个 custom op。
+
+对于 FP8 E4M3 2D-block weight，ONNX 代码在
+`simo/onnx/onnx_quant.py:665-718 (prepare_quantization_target)` 明确跳过 Conv per-block。对应主日志
+`...SimoQuantizeLSTM.2026_08_06___17_10_21.gpu005.rd.sio-software.com:338` 的实际统计是：
+
+```text
+targets=14 inserted=2 skipped=12
+inserted_by_op={"LSTM": 2}
+skip_reasons={"conv_fp8_per_block": 12}
+```
+
+因此该行实际比较的是：
+
+```text
+PyTorch: 12 个 Conv2d + 4 个 LSTM 投影 Linear 被量化
+ONNX   : 12 个 Conv 保持 float，仅 2 个 LSTM custom op 被量化
+```
+
+所以 PyTorch 的 `AUC -0.372121 pp / Acc -4.703037 pp` 不能归因于 PyTorch fake-QDQ 比 ONNX QDQ
+差；它首先是量化覆盖不同造成的非等价实验。若要公平比较该格式，必须先让 ONNX 支持并实际插入
+12 个 Conv FP8 per-block，或者在 PyTorch 配置中也排除这 12 个 Conv。
+
+### 102.5 MXFP8 E5M2 差异能说明什么，不能说明什么
+
+MXFP8 E5M2 的 ONNX 日志第 436 行记录 `targets=14 inserted=14 skipped=0`，即 12 个 Conv 和
+2 个 LSTM 均已量化；PyTorch report 同样覆盖 12 个 Conv2d 和 4 个 LSTM 投影 Linear。因此它不是
+FP8 block 那种明显的节点漏量化问题，`AUC -0.297400 pp / Acc -3.895343 pp` 是真实的端到端路径差异。
+
+现有 aggregate 日志仍不足以把该差异唯一归因到 Conv、LSTM、权重 QDQ、activation QDQ 或
+GEMM/Conv 后端中的某一项，原因是两边至少还有以下结构差异：
+
+- PyTorch 的 `quant_consts_after_apply=True` 会在
+  `simo/quantization/model_transform.py:128-145 (fake_quant_consts_after_apply)` 中把静态 weight
+  fake-quant 后写回 Parameter 并删除 weight quantizer；这个开关由
+  `simo/quantization/entry.py:117-125 (quantize)` 执行。动态 activation 仍在每次 forward 重新观察并
+  fake-quant，见 `simo/quantization/quantizer.py:58-65 (TensorQuantizerBase.forward)`。
+- ONNX 把静态权重转换为 carrier，在运行时 DQ；LSTM W/R 还在
+  `simo/onnx/onnx_quant.py:1036-1062 (_prepare_lstm_quantization_target)` 中按 I/O/F/C 四门独立量化，
+  recurrence 由 `SimoQuantizeLSTM` 执行。
+- PyTorch 用 `F.linear`/`Conv2d` 和 Python 等价 cell，ONNX 用 ORT CUDA Conv 与 custom-op 内的
+  ORT native ops。Silero 又会逐 chunk 回灌自己的 H/C，单步微小差异可沿长音频递推放大。
+
+因此，严谨结论是“MXFP8 E5M2 在当前两条实际实现之间存在明显差距”，而不是仅凭这批汇总就宣称
+某个 kernel 或 `QUANT_CONSTS_AFTER_APPLY=1` 是根因。`quant_consts_after_apply=True` 对静态常量做的是
+一次性写回，同一量化公式下本来不应单独造成数个百分点损失；要继续定位，应做相同音频逐层/逐 chunk
+消融，至少分别对齐 Conv-only、LSTM-only、权重反量化值、每步 LSTM X/H/C 和最终 probability。
+
+### 102.6 对两个问题的直接回答
+
+1. **PyTorch 测试完整。** 10/10 配置、240/240 shards 全部返回 0，均生成完整 summary 和概率
+   NPZ，所有配置 `errors=0`；未发现 core dump、segfault、abort、CUDA/OOM 错误或未处理异常。
+2. **多数配置的 PyTorch 与 ONNX 精度非常接近，但不是全部。** 除两个离群项外的 8 个配置
+   AUC/Acc 差值很小；MXFP8 E5M2 的 PyTorch AUC/Acc 比 ONNX 低 `0.297400/3.895343 pp`，
+   需要进一步逐层定位；
+   FP8 2D-block 的 PyTorch AUC/Acc 低 `0.372121/4.703037 pp`，但两边量化覆盖不同，这一行不能用来
+   判断 PyTorch 与 ONNX 量化实现谁更准确。
