@@ -15442,3 +15442,201 @@ MAX_JOBS=60 python -m pip install -e . --no-build-isolation -vvv
 
 本次只修改了 `/share/users/like/package/vllm-sipu` 主仓库中的 setup/CMake/JIT 清单；没有修改
 `sipu_custom_op`、sikernel 或 pip 临时 clone 等外部仓库。
+
+## 105. SDK 的 `scc` 为什么选到 GCC 12，而系统默认明明是 GCC 11（2026-08-14）
+
+### 105.1 直接答案
+
+`scc` **不要求 GCC 12，也没有调用 `/usr/bin/gcc-12` 来编译 SIPU 源码**。实际过程是：
+
+1. `scc` 是 SiOrigin 的编译驱动；
+2. 它调用 SDK 自带的 SiOrigin Clang 20.1.8；
+3. 这个 Clang 需要借用一套 host GCC 工具链中的 libstdc++ 头文件、启动对象和 libgcc；
+4. 没有显式指定 `--gcc-install-dir` 时，Clang 自己扫描 `/usr/lib/gcc/...`，并选择它能发现的版本号
+   最高的候选；
+5. 本机同时存在 GCC 11 和 GCC 12 的 runtime 目录，所以 Clang 选了 12。这个选择过程不读取
+   `/usr/bin/gcc` 当前指向哪个版本。
+
+因此，“`scc` 使用 GCC 12”更准确的说法是：**`scc` 调用的 Clang 自动选择了 GCC 12 的工具链资源
+目录**。它和 shell 中运行 `gcc --version` 得到 GCC 11 是两个独立的选择机制。
+
+### 105.2 本机为什么会同时呈现“默认 GCC 11”和“Clang 选择 GCC 12”
+
+本机状态是一个不完整的 GCC 12 安装：
+
+```text
+/usr/bin/gcc -> /usr/bin/x86_64-linux-gnu-gcc-11
+/usr/bin/g++ -> /usr/bin/x86_64-linux-gnu-g++-11
+
+/usr/bin/gcc-12                                      存在
+/usr/lib/gcc/x86_64-linux-gnu/12/libgcc.a            存在
+/usr/lib/gcc/x86_64-linux-gnu/12/crtbegin.o           存在
+/usr/bin/g++-12                                      不存在
+/usr/include/c++/12                                  不存在
+```
+
+已安装的是 `gcc-12` C 编译器包，但没有安装 `g++-12`/`libstdc++-12-dev`。与此同时，GCC 11 是完整的：
+
+```text
+/usr/lib/gcc/x86_64-linux-gnu/11/libgcc.a
+/usr/lib/gcc/x86_64-linux-gnu/11/cc1plus
+/usr/include/c++/11/cstdlib
+```
+
+Clang 的 GCC installation detector 主要根据 runtime/安装目录判断候选是否存在，不等价于检查这一版本
+的整个 C++ 开发包是否完整。SDK Clang 的实际 `-v` 输出为：
+
+```text
+Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11
+Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/12
+Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/12
+```
+
+也就是说，它确实看到了 11，但按最高版本规则选择了 12；`/usr/bin/gcc` 的 symlink、PATH 中默认的
+`gcc` 和 update-alternatives 结果都不会改变这次内部探测。
+
+### 105.3 为什么选中 12 后会报 `cstdlib` 不存在
+
+选中 GCC 12 后，SDK Clang 自动生成的 C++ include 搜索路径以
+`/usr/lib/gcc/x86_64-linux-gnu/12` 为基准，但本机缺少版本 12 的 libstdc++ 头文件。于是下面这个最小
+预处理测试直接失败：
+
+```text
+#include <cstdlib>
+
+fatal error: 'cstdlib' file not found
+exit code: 1
+```
+
+显式增加：
+
+```text
+--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11
+```
+
+后，同一个 SDK Clang 输出：
+
+```text
+Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11
+```
+
+其搜索路径包含 `/usr/include/c++/11`，同一个 `<cstdlib>` 测试退出码为 0。`scc --dryrun -v` 也确认
+该参数会原样传给 SDK 的 `clang++`，不是只被 CMake 记录而未生效。
+
+### 105.4 当前修复为什么固定 GCC 11
+
+当前实现没有把整个 vllm-sipu 工程降到 GCC 11。三类编译器的职责是：
+
+| 编译工作 | 实际编译器 | GCC 11 的作用 |
+|---|---|---|
+| vllm-sipu 普通 host C/C++ | conda GCC 13.3 | 不参与 |
+| SIPU `.su` 的 host/device 部分 | SDK SiOrigin Clang 20.1.8 | 提供完整 libstdc++ 头文件、libgcc 和启动对象 |
+| `sideepgemm`/`siinfer` SIPU 源码 | SDK `scc` -> SDK Clang | 同上 |
+
+代码入口如下：
+
+- `tools/setup_vllm_dev_conda.sh:42-44 (host_gcc initialization)` 默认将
+  `VLLM_SIPU_HOST_GCC` 设为 `/usr/bin/gcc`，当前它明确解析到 GCC 11；
+- `cmake/Modules/CMakeSIPUInformation.cmake:13-34 (SIPU compile rule setup)` 用该 GCC 的
+  `-print-libgcc-file-name` 取得 `/usr/lib/gcc/x86_64-linux-gnu/11`，再生成
+  `--gcc-install-dir`；
+- `cmake/toolchains/sipu-host-gcc.cmake:1-24 (external SIPU toolchain injection)` 对使用 SDK
+  `sccConfig.cmake` 的 `sideepgemm`/`siinfer` 注入相同参数；
+- `tools/setup_vllm_dev_conda.sh:239-241 (editable install block)` 将
+  `VLLM_SIPU_HOST_GCC` 和 toolchain 文件传入完整 pip 构建。
+
+这不是因为 GCC 11 比 GCC 12 更符合 `scc` 的硬性版本要求，而是因为 **本机 GCC 11 完整、GCC 12
+不完整**。显式固定后不再依赖 Clang 的“选择最高可见版本”行为，结果也具有确定性。
+
+### 105.5 其他可选处理方式
+
+理论上还有两种系统级处理，但当前都不如显式固定合适：
+
+1. 安装完整的 `g++-12` 和 `libstdc++-12-dev`，让 Clang 自动选择的 GCC 12 真正可用。该方案会修改
+   系统包，且本轮没有验证 SDK 与这套 GCC 12 头文件的完整兼容性。
+2. 卸载残缺的 GCC 12 runtime，使 Clang 自动探测只剩 GCC 11。该方案同样影响整台机器上的其他
+   项目，而且仍然依赖自动探测。
+
+当前 `--gcc-install-dir=.../11` 只影响本项目的 SIPU 编译，既不卸载系统包，也不改变默认 gcc，因而是
+范围最小的修复。
+
+### 106. vllm-sipu 修改范围收敛、环境变量和重装结果（2026-08-14）
+
+#### 106.1 本轮修改边界
+
+本轮严格只修改了 vllm-sipu 主仓库和本答案文件，没有修改 SDK 仓库，也没有修改 sikernel 源码仓库。
+之前为 104.3.3 增加的“只初始化部分 sikernel 子模块/维护子模块缓存”逻辑已经撤销；
+`cmake/external_projects/sikernel.cmake:1-41 (FetchContent 基线配置)` 与仓库 `HEAD` 无差异，
+因此 CMake 重新按原有规则递归获取全部子模块。最终构建缓存中的递归状态共 10 项，均没有 `-`、`+` 或
+`U` 未完成标记。
+
+`/share_data/vllm-sipu/sipu_custom_op` 不再由 setup 脚本硬编码。现有的
+`cmake/external_projects/vllm-sipu-distributed.cmake:1-37 (FetchContent 声明)` 已支持
+`VLLM_SIPU_DISTRIBUTED_SRC_DIR`，setup 脚本只继承调用环境中的值。过期的 rotary JIT 头文件清单修复
+仍保留在 `vllm_sipu/jit/ops/rotary.py:31-42 (ROTARY_EMBEDDING_MODULE)`。
+
+GCC 选择相关只保留 CMake 代码：
+
+- `cmake/Modules/CMakeSIPUInformation.cmake:13-43 (SIPU 编译规则设置)` 读取
+  `VLLM_SIPU_HOST_GCC`，用该编译器的 `-print-libgcc-file-name` 和 `-print-sysroot` 生成
+  `--gcc-install-dir`/`--sysroot`；没有环境变量时仍回退到 CMake 能找到的 gcc。
+- `cmake/toolchains/sipu-host-gcc.cmake:1-24 (外部 SIPU toolchain)` 把相同的
+  `--gcc-install-dir` 注入使用 SDK `sccConfig.cmake` 的外部包。该文件由调用环境通过
+  `CMAKE_TOOLCHAIN_FILE` 指定，setup 脚本不再替用户选择 GCC。
+- `tools/setup_vllm_dev_conda.sh:227-232 (editable 安装命令)` 不再设置本地 distributed source、
+  host GCC 或 toolchain 变量；只保留给 `sipu_sdk_setup.sh` 传入空版本参数的兼容修复。
+
+#### 106.2 运行 setup 前需要的 export
+
+在未激活其他 conda 环境的 shell 中，建议显式执行：
+
+```bash
+export PATH=/share_data/users/like/miniconda3/bin:$PATH
+export VLLM_SIPU_HOST_GCC=/usr/bin/gcc
+export CMAKE_TOOLCHAIN_FILE=/share/users/like/package/vllm-sipu/cmake/toolchains/sipu-host-gcc.cmake
+export VLLM_SIPU_DISTRIBUTED_SRC_DIR=/share_data/vllm-sipu/sipu_custom_op
+export MAX_JOBS=60                 # 可选；不设置时脚本默认 64
+
+cd /share/users/like/package/vllm-sipu
+bash tools/setup_vllm_dev_conda.sh --env-name vllm_dev
+```
+
+本机 `/usr/bin/gcc` 解析到 GCC 11；如果希望不依赖 symlink，也可以把第二行改为
+`export VLLM_SIPU_HOST_GCC=/usr/bin/gcc-11`。本轮 setup 不需要通过 `PATH` 搜索 nvcc，亦不需要新增
+`CUDA_HOME`；SDK 由 `sipu_sdk_setup.sh` 根据 `sdk.version` 解析。
+
+`tools/setup_vllm_dev_conda.sh:190-202 (环境复用/创建)` 现在的行为是：已有 `vllm_dev` 时默认复用，
+不存在时创建；`--recreate` 仍然保留，但只有明确要删除并重建环境时才使用。因此本次保留环境的重跑
+不需要 `--recreate`。
+
+#### 106.3 实际卸载、重装和核验
+
+先执行了：
+
+```text
+conda run -n vllm_dev python -m pip uninstall -y vllm-sipu
+```
+
+卸载退出码为 0，`vllm_dev` 环境目录保持不变。随后使用上述 export 重跑 setup，前两次只在 GitLab
+SSH 依赖获取阶段遇到外部连接重置（分别是 `si-infer` clone 和 tilelang checkout），没有触发代码
+或 CMake 错误；第三次重跑成功退出 0。成功日志为
+`/tmp/vllm_sipu_setup_reuse_retry3.log`，其中 `tools/setup_vllm_dev_conda.sh:195`
+记录了 `Reusing existing conda environment: vllm_dev`。
+
+构建日志给出的关键证据是：
+
+```text
+-- CMAKE_SIPU_COMPILE_OBJECT = ... --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11 ...
+-- vllm-sipu-distributed is available at /share_data/vllm-sipu/sipu_custom_op
+-- SiCrossCompiler Compile Options for siinfer_kernels ... --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11
+```
+
+最终环境中 `vllm_sipu 0.27.1` 是 editable 安装，项目位置为
+`/share/users/like/package/vllm-sipu`；同时 `vllm 0.27.1+sipu1`、`sideepgemm 1.0.0`、`siinfer 0.3.0`、
+`siorigin-triton-kernels 0.1.0` 和 `siorigin-tilelang-kernels 0.1.0` 在先 source SDK 的 setup 验证环境中均可导入。
+若直接使用 `vllm_dev/bin/python` 而不 source SDK，`torch_sipu` 会因 `libsipu.so` 不在动态库搜索路径而失败；这不影响 setup 脚本的正式验证路径。setup 脚本末尾的
+Python、Torch、torch_sipu、Triton、vLLM 和 vllm_sipu 验证全部通过，另执行 `pip check` 得到
+`No broken requirements found`；`bash -n tools/setup_vllm_dev_conda.sh`、`git diff --check` 也通过。
+
+本节更正前文 104.3.3 中关于 sikernel 子模块过滤、setup 内置 distributed source，以及前文 105 中
+由 setup 脚本内部选择 GCC 的描述；那些内容保留作历史记录，但以本节的环境变量驱动方式为准。
