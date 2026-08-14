@@ -15602,8 +15602,17 @@ bash tools/setup_vllm_dev_conda.sh --env-name vllm_dev
 ```
 
 本机 `/usr/bin/gcc` 解析到 GCC 11；如果希望不依赖 symlink，也可以把第二行改为
-`export VLLM_SIPU_HOST_GCC=/usr/bin/gcc-11`。本轮 setup 不需要通过 `PATH` 搜索 nvcc，亦不需要新增
-`CUDA_HOME`；SDK 由 `sipu_sdk_setup.sh` 根据 `sdk.version` 解析。
+`export VLLM_SIPU_HOST_GCC=/usr/bin/gcc-11`。本轮修改的 setup/CMake 不自行搜索 nvcc；但如果从没有
+继承现有 CUDA 环境的干净 shell 启动，建议保留用户给定的 CUDA 变量：
+
+```bash
+export CUDA_HOME=/share_data/users/like/opt/cuda-13.0
+export CUDA_ROOT_DIR="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+```
+
+这些 CUDA 变量不是本轮 GCC/FetchContent 修改的输入；SDK 仍由 `sipu_sdk_setup.sh` 根据 `sdk.version`
+解析。
 
 `tools/setup_vllm_dev_conda.sh:190-202 (环境复用/创建)` 现在的行为是：已有 `vllm_dev` 时默认复用，
 不存在时创建；`--recreate` 仍然保留，但只有明确要删除并重建环境时才使用。因此本次保留环境的重跑
