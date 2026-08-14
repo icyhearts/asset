@@ -84,3 +84,17 @@ bash temp//debug.sh  > temp//debug.log.2 2>&1 &
 只考虑  kTileM=64 的情况, 编译器成功打印出了 Config::SLayoutX Config::SLayoutW 的类型，但是有很多 std::conditional_t, 看上去比较繁琐，你现在对 Config::SLayoutX Config::SLayoutW 进行化简。
 
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在 like-useful//answer.md 里面
+{
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+hpc-ops 安装命令是
+```
+make wheel
+pip install dist/hpc_ops-0.0.1.dev0+ga32acf4-cp39-abi3-linux_x86_64.whl
+```
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+#hpc-ops code base tests/test_group_gemm_pertensor_like.py 会调用 hpc.group_gemm_pertensor_fp8 , 这个函数的cuda kernel 实现 在哪里?  对 cuda kernel进行详细讲解.
+# 把从 python 调用到 最终的 cuda kernel的调用栈整理出来.
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}

@@ -3707,3 +3707,14 @@ bash tools/setup_vllm_dev_conda.sh --recreate --env-name vllm_dev > temp/setup_v
 修复后，再次运行 tools/setup_vllm_dev_conda.sh 还需要 --recreate 吗?
 把答案追加到 like-useful/answer_codex_v2.md
 }
+{
+
+# sikernel 所有 submodule 我已经有权限, 104.3.3 sikernel 不能递归初始化无权限的测试子模块 相关修改，你要去掉。
+
+# /share_data/vllm-sipu/sipu_custom_op 可以通过运行脚本前 export VLLM_SIPU_DISTRIBUTED_SRC_DIR ，使用本地  sipu_custom_op 吗？如果可以，去掉相关的修改.
+# gcc 11/12 选择相关的修改，只保留 cmake 相关的修改，然后在运行脚本 前显式 export 环境变量，让你的 cmake修改读取这个环境变量
+# JIT rotary 打包清单有一条过期头文件, 这个修改保留。
+# 总之，尽量减少 vllm-sipu 改动，需要 export 环境变量的地方，在运行脚本前 export
+# 修改完成后, 保留 vllm_dev  conda 环境，你先 uninstall vllm-sipu , 再重新运行  tools/setup_vllm_dev_conda.sh , 并告诉我， tools/setup_vllm_dev_conda.sh 前，需要 export 什么变量
+把答案追加到 like-useful/answer_codex_v2.md
+}
