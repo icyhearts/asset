@@ -15233,3 +15233,212 @@ tools/setup_vllm_dev_conda.sh \
 ```
 
 第一次创建一个确定不存在的新环境时可以省略 `--recreate`；对已有环境执行时则必须保留。
+
+## 104. `setup_vllm_dev_conda.sh` 失败原因、修复和是否需要再次 `--recreate`（2026-08-14）
+
+### 104.1 结论
+
+原命令没有完整执行成功，但 conda 环境创建、Torch/vLLM/开发依赖/测试依赖安装都已完成。它只在最后的
+`vllm_sipu` editable 安装入口失败：
+
+```text
+SIPU SDK path not found:
+/share_data/sicx_sdk/release//share/users/like/package/vllm-sipu
+```
+
+证据是 `temp/setup_vllm_dev_conda.sh.log.2026_08_13___17_48_09:15668-15679
+(setup 脚本最后阶段)`：pre-commit hook 和 FetchContent 清理均完成，第 15676 行进入 editable 安装，
+第 15678-15679 行随即因 SDK 路径错误退出。日志中没有进入 vllm-sipu CMake/编译阶段。
+
+根因已经修复，并在现有 `vllm_dev` 环境中完成了等价的完整
+`python -m pip install -e . --no-build-isolation -vvv`。最终状态为：
+
+```text
+vllm_sipu                  0.27.1（editable 指向主仓库）
+sideepgemm                 1.0.0
+siinfer                    0.2.7
+siorigin-tilelang-kernels  0.1.0
+siorigin-triton-kernels    0.1.0
+apache-tvm-ffi             0.1.11
+```
+
+`pip check` 输出 `No broken requirements found.`，所以当前环境已经修好，不需要再次运行整个 setup
+脚本，也不需要删除重建 conda 环境。
+
+如果一定要再次执行 **整个** `tools/setup_vllm_dev_conda.sh`，则仍必须带 `--recreate`。这是脚本当前
+接口的硬要求，不代表本次修复本身需要重建环境：`tools/setup_vllm_dev_conda.sh:142-144
+(env_exists)` 判断同名环境是否存在，`tools/setup_vllm_dev_conda.sh:203-208 (existing-env guard)` 在环境已
+存在且没有 `--recreate` 时直接退出；带上该参数则会先删除整个环境。
+
+### 104.2 原日志的直接根因：source 继承了调用者的 `$1`
+
+原 editable 命令使用了下面这种结构：
+
+```bash
+bash -lc 'repo="$1"; ...; source "$repo/sipu_sdk_setup.sh"; ...' \
+  bash /share/users/like/package/vllm-sipu 60 0.27.1
+```
+
+在 `bash -lc COMMAND bash ARG1 ...` 中，紧跟 COMMAND 的 `bash` 是新 shell 的 `$0`，仓库路径是
+`$1`。外层逻辑先用 `$1` 设置 `repo`，但 source SDK 脚本时没有给 source 传独立参数。Bash 对
+`source FILE` 的语义是：没有额外参数时，被 source 的文件继续看到调用者的位置参数。因此
+`sipu_sdk_setup.sh` 也看到了：
+
+```text
+$1=/share/users/like/package/vllm-sipu
+```
+
+`sipu_sdk_setup.sh:11-20 (resolve_version)` 明确把函数参数放在版本解析优先级第一位；随后
+`sipu_sdk_setup.sh:23-29 (resolve_path)` 将它拼到 `/share_data/sicx_sdk/release/` 后面。这正好生成日志
+中的错误路径，而不是读取仓库的 `sdk.version`（当前值为 `2608121443`）。
+
+修复位于两处：
+
+- `tools/setup_vllm_dev_conda.sh:154-160 (conda_python_with_sdk)`；
+- `tools/setup_vllm_dev_conda.sh:236-241 (editable install block)`。
+
+两处都显式写成：
+
+```bash
+source "$repo/sipu_sdk_setup.sh" ""
+```
+
+给 source 传入一个显式空参数后，被 source 的脚本在执行期间看到空的 `$1`，于是按其既有优先级继续
+查找 `SDK_VERSION`/`sdk_version`/`sdk.version`；source 返回后，调用者自己的位置参数会恢复。实测解析到：
+
+```text
+SIPU_SDK_PATH=/share_data/sicx_sdk/release/2608121443
+```
+
+### 104.3 为什么不仅改一处 source
+
+直接根因修掉后，继续做端到端安装又依次暴露了三个原日志尚未来得及触发的问题。这些不是第 15678 行
+错误的根因，但不一起处理，修复后的 setup 仍不能走到最终成功。
+
+#### 104.3.1 distributed 源码应优先使用本机已有 checkout
+
+未设置覆盖变量时，`cmake/external_projects/vllm-sipu-distributed.cmake:1-37
+(vllm-sipu-distributed FetchContent setup)` 会通过 SSH clone 内部
+`algo/framework/sipu_custom_op.git`；当前账号对该地址没有访问权限。本机已有有效源码：
+
+```text
+/share_data/vllm-sipu/sipu_custom_op
+```
+
+`tools/setup_vllm_dev_conda.sh:42-48 (distributed source defaults)` 现在仅在该目录实际存在时将其作为默认
+`VLLM_SIPU_DISTRIBUTED_SRC_DIR`；`tools/setup_vllm_dev_conda.sh:118-124 (input validation)` 会提前拒绝
+无效的显式路径；`tools/setup_vllm_dev_conda.sh:239-241 (editable install block)` 把最终路径传给 CMake。
+路径不存在时仍保留原来的 FetchContent clone 行为，用户显式设置的环境变量优先于默认值。
+
+#### 104.3.2 SIPU 编译器必须使用完整的系统 GCC 11 头文件树
+
+SDK 的 `scc` 自动发现到了 `/usr/lib/gcc/x86_64-linux-gnu/12`，但这台机器只有 GCC 12 runtime 目录，
+没有 `/usr/include/c++/12`，因此外部 SIPU 源码编译会报：
+
+```text
+fatal error: 'cstdlib' file not found
+```
+
+`/usr/bin/gcc` 实际为 GCC 11.4.0，其 `/usr/include/c++/11` 完整，且
+`/usr/bin/gcc -print-libgcc-file-name` 返回 `/usr/lib/gcc/x86_64-linux-gnu/11/libgcc.a`。修复没有把
+GCC 11 设为整个工程的 host C++ 编译器；host C/C++ 仍使用 conda GCC 13.3，只给 SIPU device compiler
+指定标准库工具链：
+
+- `tools/setup_vllm_dev_conda.sh:42-44 (host_gcc default)` 默认选择 `/usr/bin/gcc`；
+- `cmake/Modules/CMakeSIPUInformation.cmake:13-34 (SIPU compile rule setup)` 用同一个
+  `VLLM_SIPU_HOST_GCC` 同时查询 libgcc 目录和 sysroot，避免原实现“从一个 gcc 取 libgcc、从另一个
+  gcc 取 sysroot”的混用；
+- `cmake/toolchains/sipu-host-gcc.cmake:1-24 (external SIPU toolchain injection)` 将同一个
+  `--gcc-install-dir` 注入 `sideepgemm`/`siinfer` 使用的 SDK `sccConfig.cmake`，并保证多次读取 toolchain
+  文件也不会重复追加参数；
+- `tools/setup_vllm_dev_conda.sh:239-241 (editable install block)` 同时 export
+  `VLLM_SIPU_HOST_GCC` 和 `CMAKE_TOOLCHAIN_FILE`。
+
+最终主工程、`sideepgemm` 和 `siinfer` 的实际配置都只出现一次：
+
+```text
+--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11
+```
+
+#### 104.3.3 sikernel 不能递归初始化无权限的测试子模块
+
+旧 FetchContent 默认递归初始化 sikernel 的全部 submodule，其中 `andesysc`、`ci_test` 是当前构建不
+使用的测试/CI 子模块，且当前账号无访问权限。Git 会先以 `--no-checkout` 克隆其他 submodule，随后在
+这两个仓库失败；这会留下目录存在、但运行时 submodule 也尚未 checkout 的半初始化 `.deps`。其直接
+后果是 `sikernel/include/simma.h` 成为断开的 symlink，wheel 打包直到所有 C++/SIPU 编译完成后才失败。
+
+`cmake/external_projects/sikernel.cmake:3-9 (runtime submodule list)` 现在列出六个构建相关 submodule；
+第 37-43 行 `(FetchContent git arguments)` 只递归初始化这六个，不再访问 `andesysc`/`ci_test`；第
+55-80 行 `(managed-cache repair)` 对项目自己管理的 `.deps` 检查 `simma.h`，必要时只修复这六个
+submodule。用户通过 `VLLM_SIPU_SIKERNEL_SRC_DIR` 显式提供的开发源码不会被自动 checkout/改写，只会
+在不完整时给出明确错误。
+
+使用全新的 `/tmp` FetchContent 和 CMake build 目录做过冷启动验证：配置成功，生成的 clone/update
+命令只含六个运行时 submodule，`andesysc`/`ci_test` 没有被初始化，`include/simma.h` 最终解析到父
+仓库锁定的 `mma_dte_tile_tensor` 提交。
+
+#### 104.3.4 JIT rotary 打包清单有一条过期头文件
+
+当前 sikernel 已把 `RopeHeadMode` 等定义并入 `rotary_embedding_dispatch.hpp`，kernel 也只 include
+dispatch 头；旧的 `rotary_embedding_types.hpp` 已不存在。`build_backend.py:256-281
+(_copy_path_tree/_populate_packaged_sikernel_sources)` 会严格检查每个 JIT spec 声明的路径，所以该旧项会
+在 editable wheel 重写阶段抛 `FileNotFoundError`。
+
+`vllm_sipu/jit/ops/rotary.py:26-41 (ROTARY_EMBEDDING_MODULE)` 已删除这一条过期路径，保留当前 kernel
+实际使用的六个源码/头文件。对全部 12 个 JIT spec 做路径检查后没有其他缺失项；独立 wheel 源码打包
+检查成功复制 44 个文件，且打包后的 `include/simma.h` 是有效文件。
+
+### 104.4 实际验证结果
+
+没有为了验证而删除重建已经可用的 `vllm_dev`；采用“空 FetchContent 冷启动配置 + 现有环境完整
+editable 安装”的组合验证：
+
+1. 全新 `/tmp` FetchContent/CMake 配置成功，只初始化六个运行时 sikernel submodule；
+2. 主工程此前已完整构建 51 个 target；最终安装复用有效 object，Ninja 输出 `no work to do`，随后
+   成功创建 `vllm_sipu-0.27.1` editable wheel；
+3. `sideepgemm` 和 `siinfer` 从源码重新完成全部 SIPU kernel、host binding 和 shared library 构建；
+4. 最终 pip 输出 `Successfully built vllm_sipu sideepgemm siinfer ...` 和
+   `Successfully installed ... vllm_sipu-0.27.1`，退出码为 0；
+5. `pip show vllm-sipu` 的 `Editable project location` 为
+   `/share/users/like/package/vllm-sipu`；
+6. `pip check` 无破损依赖；
+7. 在 source `sipu_sdk_setup.sh` 后实际 import 通过：Python 3.10.16、Torch 2.10.0+cpu、
+   torch_sipu 0.7.0、Triton 3.3.1、vLLM 0.27.1+sipu1、vllm_sipu 0.27.1、sideepgemm 1.0.0、
+   siinfer 0.2.7，以及两个 siorigin kernel 包；
+8. `bash -n tools/setup_vllm_dev_conda.sh`、Python `py_compile`、Ruff、`git diff --check` 均通过。
+
+SDK 日志中的 `Build failed with PCH, retrying without PCH` 是 `scc` 的自动 fallback；对应 target 随后均
+显示 `Built target`，最终 wheel 和 pip 事务成功，因此它不是此次失败。
+
+### 104.5 修复后到底要不要 `--recreate`
+
+分两种操作回答：
+
+1. **只完成本次失败留下的环境：不需要 `--recreate`。** 原日志已经完成环境和依赖安装，只需在该
+   环境中重跑最后的 editable 安装。本次已经这样执行成功，所以当前机器上连这一步也无需再跑。
+2. **重新执行整个 `tools/setup_vllm_dev_conda.sh`：需要 `--recreate`。** 因为 `vllm_dev` 已存在，
+   脚本没有 resume/reuse 模式；不带参数会在 `tools/setup_vllm_dev_conda.sh:203-204
+   (existing-env guard)` 立即报错。如果要验证真正从零的全流程，先退出当前 `vllm_dev`，再执行：
+
+```bash
+cd /share/users/like/package/vllm-sipu
+bash tools/setup_vllm_dev_conda.sh --recreate --env-name vllm_dev
+```
+
+这里的 `--recreate` 会删除当前已经验证成功的环境，只有明确需要从零重建时才应使用。若以后在 final
+editable 步骤再次失败，保留环境并只重跑下面的安装更省时：
+
+```bash
+cd /share/users/like/package/vllm-sipu
+conda activate vllm_dev
+source ./sipu_sdk_setup.sh ""
+export VLLM_SIPU_HOST_GCC=/usr/bin/gcc
+export CMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchains/sipu-host-gcc.cmake"
+export VLLM_SIPU_DISTRIBUTED_SRC_DIR=/share_data/vllm-sipu/sipu_custom_op
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_SIPU=0.27.1
+export SETUPTOOLS_SCM_PRETEND_VERSION=0.27.1
+MAX_JOBS=60 python -m pip install -e . --no-build-isolation -vvv
+```
+
+本次只修改了 `/share/users/like/package/vllm-sipu` 主仓库中的 setup/CMake/JIT 清单；没有修改
+`sipu_custom_op`、sikernel 或 pip 临时 clone 等外部仓库。
