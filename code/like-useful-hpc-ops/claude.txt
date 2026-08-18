@@ -98,3 +98,42 @@ tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/pac
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
 
 }
+
+{
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+hpc-ops 安装命令是
+```
+make wheel
+pip install dist/hpc_ops-0.0.1.dev0+ga32acf4-cp39-abi3-linux_x86_64.whl
+```
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+#hpc-ops code base tests/test_group_gemm_pertensor_like.py 会调用 hpc.group_gemm_pertensor_fp8 , 这个函数的cuda kernel 实现 在哪里?  对 cuda kernel进行详细讲解.
+# 把从 python 调用到 最终的 cuda kernel的调用栈整理出来.
+ 整理 /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 格式，所有一级标题以 1,2,3...开始
+ 二级标题以 1.1, 1.2, 2.1,2.2, ... 开始
+
+
+}
+
+{
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+# 对 src/group_gemm/entry.cc 64 行代码进行完善，获取 tmas 的 shape, dtype, stride, device, 然后打印出来.
+# 并解释:  dtype, device是 enum 类型吗？ tensor dtype, device enum  是在哪里定义的 ？ 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面. 
+# 修改完代码，用 CUDA_HOME=/share_data/users/like/opt/cuda-13.0 ENABLE_LIKE_DEBUG=1 make wheel > temp/make.log  命令保证编译通过
+
+
+}
+
+{
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+根据 /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md, tests/test_group_gemm_pertensor_like.py 会调用 src/group_gemm/kernels.cuh update_grouped_tma,
+以本次运行的数据类型和tensor shape为例, 对 update_grouped_tma 进行详细讲解
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}

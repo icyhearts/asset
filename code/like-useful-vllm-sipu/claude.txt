@@ -1,0 +1,76 @@
+{
+对以下命令的功能进行讲解:
+python3 examples/offline/offline_inference_recipe.py  --recipe  examples/recipes/deepseek/deepseek_v32_tiny.json
+答案追加到 like-useful/answer_codex.md
+答案文件 不同层级标题以 1.1, 1.2, 2.1, 2.2, ... 的方式编号
+}
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+
+对 vllm_sipu/model_executor/layers/quantization/mxint8.py 进行讲解
+
+答案追加到 like-useful/answer_codex.md
+}
+
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+python3 examples/offline/offline_inference_recipe.py  --recipe  examples/recipes/qwen/qwen25_05b_instruct_dummy___mxint8.json > temp/qwen25_05b_instruct_dummy___mxint8.json.log.`nowstr.sh` 2>&1 &
+日志位于 temp/qwen25_05b_instruct_dummy___mxint8.json.log.2026_08_17___14_55_46
+
+请对 examples/recipes/qwen/qwen25_05b_instruct_dummy___mxint8.json quantization 字段 如何传给 vllm LLM engine 进行解析.
+
+答案追加到 like-useful/answer_codex_v2.md
+}
+{
+}
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+python3 examples/offline/offline_inference_recipe.py  --recipe  examples/recipes/qwen/qwen25_05b_instruct_dummy___mxint8.json > temp/qwen25_05b_instruct_dummy___mxint8.json.log.`nowstr.sh` 2>&1 &
+日志位于 temp/qwen25_05b_instruct_dummy___mxint8.json.log.2026_08_17___14_55_46
+
+vllm_sipu/model_executor/layers/quantization/mxint8.py MXInt8LinearMethod create_weights 函数会 调用 torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ), 这里 是如何决定 memory 在什么device上分配?
+
+答案追加到 like-useful/answer_codex_v2.md
+}
+
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+python3 examples/offline/offline_inference_recipe.py  --recipe  examples/recipes/qwen/qwen25_05b_instruct_dummy___mxint8.json > temp/qwen25_05b_instruct_dummy___mxint8.json.log.`nowstr.sh` 2>&1 &
+日志位于 temp/qwen25_05b_instruct_dummy___mxint8.json.log.2026_08_17___14_55_46
+like-useful/answer_codex.md 477 行有如下调用链 ：
+```
+MXInt8LinearMethod.apply
+  -> apply_mxint8_linear
+     -> vllm_sipu.ops.quantization.quantize_to_mxint8
+        -> JIT provider -> hp_to_mx<sifmt::mxint8, ...>
+     -> vllm_sipu.ops.quantization.mxint8_bf16_matmul
+        -> JIT provider -> mma_bf16_mxi8_universal
+        -> _tileformat_to_linear
+```
+hp_to_mx, _tileformat_to_linear 的功能分别是什么？函数定义在哪里?
+
+答案追加到 like-useful/answer_codex.md
+}
+
+{
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+把 tests/kernels/quantization/test_mxint8.py copy 成 tests/kernels/quantization/test_mxint8_unpack_pytest.py,  tests/kernels/quantization/test_mxint8_unpack_pytest.py, 改成直接用  main 函数跑所有测试用例，即只需要 python tests/kernels/quantization/test_mxint8_unpack_pytest.py 就可以运行。
+对于  pytest.mark.parametrize 的参数，以笛卡尔积形式展开，送给测试用例，
+修改完成后，使用指定 conda 环境，source sipu_sdk_setup.sh, python tests/kernels/quantization/test_mxint8_unpack_pytest.py 要能成功运行
+ 
+答案追加到 like-useful/answer_codex.md
+}
