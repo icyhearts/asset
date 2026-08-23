@@ -1000,3 +1000,886 @@ BF16 activation / BF16 weight
 因此二者分别解决两个独立问题：`hp_to_mx` 负责“如何把高精度输入变成 GEMM 可消费的
 MXInt8”，`_tileformat_to_linear` 负责“如何把 GEMM 的硬件排布输出恢复成 vLLM 后续
 算子可正常索引的 BF16 tensor”。
+
+# 6. `quantize_to_mxint8()` 从 Python 到 SiKernel 的完整过程
+
+## 6.1 函数定位与返回值
+
+本章讲解的入口是：
+
+```text
+vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:163-180
+```
+
+函数签名为：
+
+```python
+def quantize_to_mxint8(
+    x: torch.Tensor,
+    padded_shape: tuple[int, int] | None = None,
+    *,
+    for_weight: bool = False,
+) -> tuple[torch.Tensor, tuple[int, int]]:
+```
+
+它接受一个二维 BF16/FP16/FP32 dense tensor，完成 shape padding、CPU tile reorder、
+SIPU MXInt8 量化和物理打包，返回：
+
+1. 一维、连续、`torch.uint8` 的 opaque packed buffer；
+2. packed buffer 所代表的二维逻辑 padded shape。
+
+第二个返回值非常重要。packed tensor 自身只有 `[packed_bytes]` 这一维，原来的 rows 和
+cols 已不能从 PyTorch shape 直接恢复；后续 GEMM 必须另外接收 padded rows/cols。
+
+这里还有三个同名函数，需要按层次区分：
+
+| 层次 | 位置 | 返回值 |
+| --- | --- | --- |
+| 高层 helper | `.../quantization/utils/mxint8_utils.py:163` | `(packed, padded_shape)` |
+| JIT provider | `vllm_sipu/ops/backends/sikernel/jit/mxint8.py:104` | `packed` |
+| C++ FFI export | `csrc/jit/quantization/mxint8.cpp:72` | 原地写入预分配的 `output` |
+
+## 6.2 Python 高层函数逐行说明
+
+函数主体可拆成五步：
+
+```python
+if x.ndim != 2:
+    raise ValueError(...)
+
+if padded_shape is None:
+    padded_shape = get_padded_mxint8_shape(...)
+
+x_padded = pad_to_mxint8_shape(x, padded_shape)
+x_tiled_cpu = build_mxint8_tile_tensor_on_cpu(x_padded, padded_shape)
+x_tiled = x_tiled_cpu.to(device=x.device)
+packed = quantize_mxint8_op(x_tiled)
+return packed, padded_shape
+```
+
+具体含义如下：
+
+1. **只接受二维 tensor。** Linear activation 在进入这里前已把前导维展平成 `[M,K]`，
+   weight 原本就是 `[N,K]`。
+2. **计算 padded shape。** rows 至少为 32 并向上对齐到 32；cols 至少为 128 并向上
+   对齐到 128。
+3. **在原 device 上补零。** `pad_to_mxint8_shape()` 创建 padded tensor，把原值复制到
+   左上角，其余区域为零。
+4. **在 CPU 上重排高精度数据。** tensor 被搬到 CPU，再由
+   `linear_to_tileformat()` 从普通行优先顺序改成 SIPU tiled 顺序。
+5. **搬回原 device 并量化。** tiled BF16 tensor 回到 `x.device`，通过 operator
+   dispatch 进入 JIT SiKernel provider，输出同 device 上的 packed MXInt8 buffer。
+
+当前 `get_padded_mxint8_rows()` 的 `for_weight` 参数并未参与计算，所以 activation 和
+weight 的 row padding 规则实际相同。`for_weight=True` 目前只是保留在接口中，并不会
+选择另一种 layout 或 tile family。
+
+## 6.3 Padding 规则与 storage 公式
+
+若输入 shape 为 `[rows, cols]`：
+
+```text
+padded_rows = ceil(max(rows, 32) / 32) * 32
+padded_cols = ceil(max(cols, 128) / 128) * 128
+```
+
+packed storage 公式为：
+
+```text
+packed_bytes = padded_rows * padded_cols / 1024 * 1088
+```
+
+每 1024 个 padded 高精度逻辑元素会变成：
+
+```text
+1024 bytes  MXInt8 element data
+  64 bytes  scale/header metadata
+----------
+1088 bytes  packed storage
+```
+
+MXInt8 的 micro block size 是 32 elements，每个 block 共享一个 `uint8` scale。scale
+嵌在 tiled header 中，没有单独返回 `scale` tensor。
+
+## 6.4 `linear_to_tileformat()` 到底改变了什么
+
+测试使用 BF16，每个 element 为 2 bytes。`MXINT8_TILE_BYTES=32`，所以输入 tile 的列宽
+为：
+
+```text
+32 bytes / 2 bytes per BF16 = 16 columns
+```
+
+`linear_to_tileformat()` 执行：
+
+```python
+x.reshape(num_tile_m, 32, num_tile_n, 16)
+ .permute(0, 2, 1, 3)
+ .contiguous()
+ .reshape(m, n)
+```
+
+元素的物理遍历顺序由：
+
+```text
+[tile_m, row_in_tile, tile_n, col_in_tile]
+```
+
+变为：
+
+```text
+[tile_m, tile_n, row_in_tile, col_in_tile]
+```
+
+也就是先存完整的 `32 x 16` tile，再存下一个 column tile。
+
+需要区分两种“layout”含义：
+
+- 从 PyTorch metadata 看，重排前后都是 `torch.strided`、二维、contiguous，stride 也
+  都是 `(cols, 1)`；
+- 从 buffer 内元素的语义顺序看，重排前是普通 row-major，重排后是 tile-major。
+
+因此不能仅根据 `is_contiguous() == True` 或 stride 判断这块 buffer 是否仍按普通矩阵
+顺序存放。`x_tiled_cpu` 的 shape 仍为 `[padded_rows,padded_cols]`，只是相同坐标不再能
+按普通二维语义直接解释。
+
+## 6.5 从 public operator 到 JIT provider
+
+高层 helper 导入的是：
+
+```python
+from vllm_sipu.ops.quantization import quantize_to_mxint8 as quantize_mxint8_op
+```
+
+`vllm_sipu/ops/quantization.py:107-109` 本身只调用 `_dispatch()`。provider 映射定义在：
+
+```text
+vllm_sipu/ops/op_list.yaml:668-674
+```
+
+其中 `quantize_to_mxint8` 唯一 provider 是：
+
+```text
+vllm_sipu.ops.backends.sikernel.jit.mxint8:quantize_to_mxint8
+```
+
+JIT provider 做三件事：
+
+1. 确保输入是二维 contiguous tensor；
+2. 根据 `(rows * cols / 1024) * 1088` 在 `input.device` 上分配一维 `uint8` output；
+3. 调用运行时加载的 `quantization_mxint8` JIT module：
+
+```python
+get_mxint8_module().quantize_to_mxint8(input, packed)
+```
+
+`MXINT8_MODULE` 在 `vllm_sipu/ops/backends/sikernel/jit/mxint8.py:26-49` 注册。它把仓库内
+的 C++ FFI 和 `.deps/sikernel-src` 中的 `hp_to_mx` 源文件一起编译/加载，并通过
+`lru_cache(maxsize=1)` 在进程内复用已加载 module。
+
+## 6.6 C++ FFI 层的检查与模板选择
+
+C++ 入口位于：
+
+```text
+csrc/jit/quantization/mxint8.cpp:72-112
+```
+
+它检查：
+
+- input 是二维 contiguous；output 是一维 contiguous；
+- input/output 的 device type 和 device id 相同；
+- rows 属于 8/16/32 alignment family，cols 为 128 的倍数；
+- output 长度等于预期 packed bytes；
+- output dtype 是 `uint8`；
+- input dtype 是 BF16、FP16 或 FP32 之一。
+
+本测试输入是 BF16，因此选择 `HPType=sifmt::bfloat16`，实际调用：
+
+```cpp
+hp_to_mx<sifmt::mxint8, sifmt::bfloat16, 0>(
+    input_ptr,
+    output_ptr,
+    1,            // batch_size
+    rows,         // dim0
+    cols,         // dim1
+    current_stream(input.device()));
+```
+
+省略的模板参数采用默认值：
+
+```text
+INPUT_LAYOUT = sipu::TMAP_FORMAT_TILED
+ZERO_OUTPUT  = false
+```
+
+这与 Python 先做 `linear_to_tileformat()` 相匹配。若把普通 row-major buffer 直接传给该
+模板实例，SiKernel 会按 tiled tensor map 错误解释数据。
+
+## 6.7 SiKernel `hp_to_mx` host wrapper
+
+公共声明位于：
+
+```text
+.deps/sikernel-src/include/sikernel.h:2282-2313
+```
+
+host wrapper 定义位于：
+
+```text
+.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/
+  hp_to_mx_kernel.su:26-87
+```
+
+它先校验 shape 和指针，然后根据 `dim0` 选择硬件 row geometry：
+
+```text
+dim0 > 16  -> Rows=32
+dim0 > 8   -> Rows=16
+其他       -> Rows=8
+```
+
+测试中的 padded rows 分别为 32 和 96，所以两者都选择 `Rows=32`。
+
+对于 `HP_T=BF16`、`OUT_T=MXInt8`、`Rows=32`，traits 推导为：
+
+```text
+BF16 element bytes       = 2
+input_tile_dim0          = 1024 / (32 * 2) = 16 columns
+input_lmul               = 2
+MX output_tile_dim0      = 2 * 16 = 32 columns
+MX output tile data      = 32 * 32 * 1 byte = 1024 bytes
+MX output tile header    = 64 bytes
+MX physical tile         = 1088 bytes
+```
+
+因此 Python 输入侧用 `32 x 16` BF16 tiles 重排，而一次 MX 转换消费两个相邻的 BF16
+input tiles，生成一个覆盖 `32 x 32` logical elements 的 MXInt8 output tile。两种 tile
+尺寸描述的是不同阶段，不矛盾。
+
+wrapper 随后：
+
+1. 计算 row/output-column tile 数量及 supertile geometry；
+2. 用 `siTensorMapEncodeTiled()` 编码输入 tensor map；
+3. 根据 logical tile 数计算 grid/block；
+4. 在当前 SIPU stream 上 launch `hp_to_mx_kernel`。
+
+## 6.8 SiKernel device kernel
+
+device kernel 定义位于：
+
+```text
+.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/
+  hp_to_mx_kernel.hpp:53-108
+```
+
+每个工作线程的主要数据流是：
+
+```text
+SIPU global tiled BF16 input
+  -> DTE/tacp 搬到线程私有 shared/L2B staging
+  -> tile register load
+  -> HpToOutputTraits::convert<Rows>()
+  -> tcvt_mxi8 hardware intrinsic
+  -> MXInt8 register（element data + scale/header）
+  -> 按 physical tile/supertile index 写入 global packed output
+```
+
+`HpToOutputTraits<sifmt::mxint8, HP_T>` 定义在
+`hp_to_output_traits.hpp:132-164`，它指定 8-bit packed element、64-byte header 和
+`tcvt_mxi8` intrinsic。kernel 将 logical `[batch,row_tile,col_tile]` 映射为硬件期望的
+supertile-interleaved `physical_tile`，所以最终 output 不只是“数值转成 INT8”，还完成了
+GEMM 所需的物理打包。
+
+最终返回的 PyTorch tensor 是一维 `uint8`，其 bytes 同时包含：
+
+- MXInt8 element data；
+- 每 32 elements 的共享 scale；
+- header padding；
+- tile/supertile 物理排列。
+
+它不是普通 `uint8` 数值数组，也不能用 `reshape(padded_rows,padded_cols)` 恢复矩阵。
+
+## 6.9 `main()` 中实际触发的量化调用
+
+`tests/kernels/quantization/test_mxint8_unpack_pytest.py` 当前参数为：
+
+```text
+M_VALUES   = [7]
+N_VALUES   = [65]
+K_VALUES   = [96]
+SEQ_LENS   = [7]
+dtype      = torch.bfloat16
+device     = sipu:0
+```
+
+三个 test case 内部总共调用 `quantize_to_mxint8()` 5 次：
+
+| test case | 被量化对象 | 原始 shape | 调用方式 |
+| --- | --- | --- | --- |
+| `test_quantize_to_mxint8` | `x` | `[7,96]` | 自动计算 shape |
+| `test_mxint8_bf16_matmul` | `x` | `[7,96]` | 自动计算 shape |
+| `test_mxint8_bf16_matmul` | `weight` | `[65,96]` | `for_weight=True` |
+| `test_mxint8_linear_method` | `weight` | `[65,96]` | method 先算出并显式传入 `[96,128]` |
+| `test_mxint8_linear_method` | activation `x` | `[7,96]` | method 显式传入 `[32,128]` |
+
+因此只有两种唯一的 shape 变化：activation 的 `[7,96]` 路径和 weight 的 `[65,96]`
+路径。bias `[65]` 不进入该函数，也不会被 MXInt8 量化。
+
+## 6.10 Activation `[7,96]` 的完整变化表
+
+当前环境实测结果如下：
+
+| 阶段 | Python shape / stride | device | dtype | 语义 layout |
+| --- | --- | --- | --- | --- |
+| 原始 `x` | `[7,96]` / `(96,1)` | `sipu:0` | BF16 | linear row-major |
+| `x_padded` | `[32,128]` / `(128,1)` | `sipu:0` | BF16 | linear row-major，右侧和下方补零 |
+| `x_cpu` | `[32,128]` / `(128,1)` | CPU | BF16 | linear row-major |
+| `x_tiled_cpu` | `[32,128]` / `(128,1)` | CPU | BF16 | tile-major，tile=`32x16` |
+| `x_tiled` | `[32,128]` / `(128,1)` | `sipu:0` | BF16 | tile-major，tile=`32x16` |
+| provider 预分配 `packed` | `[4352]` / `(1)` | `sipu:0` | `uint8` | 未初始化的一维 output storage |
+| `hp_to_mx` 完成后 | `[4352]` / `(1)` | `sipu:0` | `uint8` | opaque MXInt8 tile/supertile packed |
+
+大小计算为：
+
+```text
+原始 BF16       = 7 * 96 * 2       = 1344 bytes
+padded BF16     = 32 * 128 * 2     = 8192 bytes
+MXInt8 packed   = 32 * 128 / 1024 * 1088
+                = 4 * 1088         = 4352 bytes
+```
+
+SiKernel geometry 为：
+
+```text
+row_tiles          = 32 / 32 = 1
+output_col_tiles   = 128 / 32 = 4
+logical MX tiles   = 1 * 4 = 4
+physical MX tiles  = 4
+output bytes       = 4 * 1088 = 4352
+```
+
+## 6.11 Weight `[65,96]` 的完整变化表
+
+weight 路径的实测结果为：
+
+| 阶段 | Python shape / stride | device | dtype | 语义 layout |
+| --- | --- | --- | --- | --- |
+| 原始 `weight` | `[65,96]` / `(96,1)` | `sipu:0` | BF16 | linear row-major |
+| `x_padded` | `[96,128]` / `(128,1)` | `sipu:0` | BF16 | linear row-major，右侧和末尾 31 行补零 |
+| `x_cpu` | `[96,128]` / `(128,1)` | CPU | BF16 | linear row-major |
+| `x_tiled_cpu` | `[96,128]` / `(128,1)` | CPU | BF16 | tile-major，tile=`32x16` |
+| `x_tiled` | `[96,128]` / `(128,1)` | `sipu:0` | BF16 | tile-major，tile=`32x16` |
+| provider 预分配 `packed` | `[13056]` / `(1)` | `sipu:0` | `uint8` | 未初始化的一维 output storage |
+| `hp_to_mx` 完成后 | `[13056]` / `(1)` | `sipu:0` | `uint8` | opaque MXInt8 tile/supertile packed |
+
+大小计算为：
+
+```text
+原始 BF16       = 65 * 96 * 2      = 12480 bytes
+padded BF16     = 96 * 128 * 2     = 24576 bytes
+MXInt8 packed   = 96 * 128 / 1024 * 1088
+                = 12 * 1088        = 13056 bytes
+```
+
+SiKernel geometry 为：
+
+```text
+row_tiles          = 96 / 32 = 3
+output_col_tiles   = 128 / 32 = 4
+logical MX tiles   = 3 * 4 = 12
+physical MX tiles  = 12
+output bytes       = 12 * 1088 = 13056
+```
+
+这里能看出小 shape 的 padding 成本：packed weight `13056 bytes` 甚至略大于原始 BF16
+weight 的 `12480 bytes`。这不是 MXInt8 element 本身比 BF16 大，而是 `[65,96]` 必须先
+扩展到 `[96,128]`。
+
+## 6.12 临时 tensor 与 device 往返
+
+以当前未对齐输入为例，量化期间可能同时存在：
+
+```text
+SIPU: 原始 x + x_padded + x_tiled + packed
+CPU : x_cpu + x_tiled_cpu
+```
+
+`build_mxint8_tile_tensor_on_cpu()` 中再次调用 `pad_to_mxint8_shape()`，但传入 tensor 已经
+是目标 shape 且 contiguous，所以该次通常直接返回 `x_cpu`，不会再创建第二个 padded
+CPU tensor。真正的新 CPU layout buffer来自 `permute(...).contiguous()`。
+
+函数返回后只保留 `packed` 和 Python tuple `padded_shape`；其余临时 tensor 可释放，但
+内存可能仍留在 PyTorch allocator cache 中。因而：
+
+- 最终 packed storage 大小不等于量化过程峰值内存；
+- activation 每次 forward 都产生这套临时量和 SIPU/CPU 往返；
+- weight 通常仅在 model post-load 阶段执行一次该过程。
+
+## 6.13 调用链总结
+
+完整调用链为：
+
+```text
+mxint8_utils.quantize_to_mxint8
+  -> get_padded_mxint8_shape
+  -> pad_to_mxint8_shape                    # SIPU linear BF16
+  -> build_mxint8_tile_tensor_on_cpu
+     -> SIPU -> CPU
+     -> linear_to_tileformat                # CPU tiled BF16
+  -> CPU -> SIPU                            # SIPU tiled BF16
+  -> vllm_sipu.ops.quantization.quantize_to_mxint8
+     -> operator _dispatch
+     -> JIT SiKernel provider quantize_to_mxint8
+        -> allocate 1D SIPU uint8 packed buffer
+        -> quantization_mxint8 JIT module
+           -> C++ FFI quantize_to_mxint8
+              -> hp_to_mx<sifmt::mxint8, sifmt::bfloat16, 0>
+                 -> encode tiled tensor map
+                 -> hp_to_mx_kernel<..., Rows=32, ...>
+                    -> DTE load
+                    -> tcvt_mxi8
+                    -> tiled/supertile packed store
+```
+
+在指定 conda 和 SDK/CModel 环境中重新运行：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+source ./sipu_sdk_setup.sh
+python tests/kernels/quantization/test_mxint8_unpack_pytest.py
+```
+
+结果为 `All 3 MXInt8 test cases passed.`，退出码为 `0`。这验证了上述两种 shape 的
+quantize、GEMM 和 Linear 集成路径在当前单设备 CModel 环境中可执行。
+
+# 7. `build_mxint8_tile_tensor_on_cpu` 为什么要先 copy 到 CPU 再做 `linear_to_tileformat`
+
+## 7.1 直接回答
+
+`linear_to_tileformat()` 的核心操作是：
+
+```python
+x.reshape(num_tile_m, 32, num_tile_n, 16)
+ .permute(0, 2, 1, 3)
+ .contiguous()
+ .reshape(m, n)
+```
+
+这些全是标准 PyTorch op（reshape、permute、contiguous），在 `sipu` tensor 上**能正常执行、结果正确**。实验验证了这一点：对 `[32, 32]` 和 `[96, 128]` 的 BF16 tensor，直接在 `sipu` 上调用 `linear_to_tileformat`，输出与 CPU 路径**逐 byte 完全一致**。后续经过 `hp_to_mx` 量化后，packed MXInt8 结果也**完全相同**。
+
+所以搬 CPU **不是因为 `sipu` 上不能做**，而是出于性能和工程考虑。
+
+## 7.2 性能实测：CPU 路径反而更快
+
+在 CModel 环境中对 `[96, 128]` BF16 tensor benchmark（20 次取平均）：
+
+| 路径 | 耗时 |
+| --- | --- |
+| 直接在 `sipu` 上做 tile reorder | 83.24 ms |
+| copy 到 CPU + CPU tile reorder + copy 回 `sipu` | 1.70 ms |
+
+CPU 路径快了约 **49 倍**。
+
+## 7.3 为什么 CPU 更快
+
+三个原因叠加：
+
+1. **CModel 是纯软件仿真器。** 每一条 `sipu` kernel 都被 host 端逐指令模拟，设备端 `.contiguous()`（实质是一个 permuted read + linear write 的 element-wise copy kernel）在 CModel 上的开销远大于原生 CPU memcpy。这在物理硬件上差距会缩小，但下面两个因素在物理硬件上仍然成立。
+
+2. **tile reorder 是纯内存搬运、不做计算。** `.permute(0, 2, 1, 3).contiguous()` 本质是按新顺序读、按线性顺序写——它是 memory-bandwidth-bound 的 copy 操作，不涉及任何浮点计算。加速器的优势在大规模并行计算，对这种 memory-bound copy 的加速效果有限，而 CPU 本地内存的延迟和带宽对小/中尺寸 tensor 已经足够。
+
+3. **避免不必要的设备 kernel launch 和同步开销。** 在设备上做 reorder 意味着额外一次 kernel launch + 可能的 stream 同步。对 weight（只执行一次）影响不大，但对 activation（每次 forward 都执行）这些固定开销会累积。
+
+## 7.4 工程层面的考量
+
+除了性能，还有两个实际因素：
+
+- **与 `hp_to_mx` 的 tensor map 对齐。** `hp_to_mx` 的 C++ FFI 使用 `TMAP_FORMAT_TILED` 模板参数，即假设输入已按 tiled layout 排列。在 CPU 上用确定性的 Python 代码完成 tile reorder，可以保证无论 `sipu` 的 `.contiguous()` 实现细节如何变化，传给 `hp_to_mx` 的字节顺序始终一致。如果在设备上做 reorder，就需要假设设备 `.contiguous()` 的行为与 CPU 完全一致——虽然目前确实一致，但多了一层隐式依赖。
+
+- **CModel 与物理硬件的一致性。** 当前开发和测试大量依赖 CModel。在 CPU 上做 reorder 消除了 CModel vs 物理硬件在 `.contiguous()` kernel 实现上可能存在的行为差异，使 tile layout 转换在所有环境下表现相同。
+
+## 7.5 如果改成直接在 `sipu` 上做会怎样
+
+功能上完全可行。只需把 `build_mxint8_tile_tensor_on_cpu` 改为：
+
+```python
+def build_mxint8_tile_tensor_on_device(
+    x: torch.Tensor,
+    padded_shape: tuple[int, int],
+) -> torch.Tensor:
+    if x.ndim != 2:
+        raise ValueError(f"x must be 2D, got {x.shape}")
+    x_padded = pad_to_mxint8_shape(x, padded_shape)
+    return linear_to_tileformat(
+        x_padded,
+        m_alignment_elem=MXINT8_TILE_ROWS,
+        n_alignment_bytes=MXINT8_TILE_BYTES,
+    )
+```
+
+即可省去 `sipu` → CPU → `sipu` 的两次 copy。实测 packed 结果逐 byte 一致。
+
+但在当前环境下这样做**会变慢**（CModel 上约慢 50×）。在物理硬件上需要重新 benchmark，才能量化省去 copy 后设备 kernel launch 开销与设备 reorder kernel 效率之间的净收益。
+
+## 7.6 一句话结论
+
+搬 CPU 不是因为 `sipu` 上做不了或会出错，而是因为 tile reorder 是纯内存搬运、不做计算，在 CPU 上做更快（CModel 实测快 49 倍），同时避免了设备 `.contiguous()` 实现的隐式依赖。
+
+# 8. SIMO `SIMOLinearMethod.apply` 为什么会调用 CPU downcast 实现
+
+## 8.1 直接结论
+
+在 SIMO 的这条路径中，`input_2d` 确实先位于 `sipu:0`。但是
+`self.input_downcast_kernel` 不是直接调用某个 Python CPU 函数，而是
+`torch.ops.simo.downcast_to_mxfmt` 的 wrapper：
+
+```text
+SIMOLinearMethod.__init__                         # quantization_method.py:152-157
+  -> get_downcast_kernel(input_spec, ...)         # kernels.py:48-88
+     -> lambda src: torch.ops.simo.downcast_to_mxfmt(src, ...)
+```
+
+SIMO 给这个 custom op 注册了 `CUDA` 和 `CPU` 两个 dispatch implementation，但没有
+注册 `PrivateUse1`/`SIPU` implementation：
+
+```text
+simo::downcast_to_mxfmt
+  CPU       -> downcast_to_mxfmt_cpu_impl
+  CUDA      -> downcast_to_mxfmt_cuda_impl
+  Meta      -> fake implementation
+  PrivateUse1/SIPU -> 没有专用 kernel
+```
+
+因此，`downcast_to_mxfmt_cpu_impl` 不是因为 Python 看到 `input_2d.device == cpu` 才被
+选择，而是因为 SIPU 的 dispatch key 没有对应 kernel，触发了 SIPU 的 CPU fallback。
+
+## 8.2 为什么 SIPU 对应 `PrivateUse1`
+
+当前 conda 环境的 `torch_sipu/__init__.py:35-37` 执行：
+
+```python
+torch._register_device_module("sipu", torch_sipu.sipu)
+torch.utils.rename_privateuse1_backend("sipu")
+torch.utils.generate_methods_for_privateuse1_backend()
+```
+
+所以用户看到的 `torch.device("sipu:0")`，底层 dispatcher key 仍然是
+`PrivateUse1`。而 `simo/ops/mx_api.py:364-378` 注册 downcast 时只有：
+
+```python
+direct_register_custom_op(..., dispatch_key="CUDA")
+direct_register_custom_op(..., dispatch_key="CPU")
+```
+
+`direct_register_custom_op()` 的实现 `simo/ops/torch_utils.py:13-55` 会把函数直接挂到
+指定 dispatch key；它不会把 `CPU` implementation 自动变成 SIPU implementation。
+
+在当前运行环境打印 dispatcher 表，实际结果是：
+
+```text
+CPU:       registered
+CUDA:      registered
+Meta:      registered
+PrivateUse1: False
+```
+
+## 8.3 `src_tensor` 为什么在进入 CPU 函数时已经是 CPU
+
+torch-sipu 为缺少 SIPU kernel 的算子安装了 boxed fallback。其头文件
+`torch_sipu/include/torch_sipu/csrc/aten/native/sipu/aten_fallback.h:270-276` 中，
+`sipu_fallback_op()` 最终调用：
+
+```cpp
+at::native::cpu_fallback(op, stack);
+```
+
+PyTorch 的 `$CONDA_PREFIX/lib/python3.10/site-packages/torch/include/ATen/native/CPUFallback.h:13-16`
+将它定义为“boxed fallback to CPU”。这个 fallback 在 custom-op 的边界处理 boxed
+参数：
+
+```text
+SIPU tensor 参数
+  -> copy 到 CPU tensor
+  -> 调用该 op 的 CPU dispatch implementation
+  -> 得到 CPU 输出
+  -> 按原始设备把输出 copy 回 SIPU
+```
+
+因此，搬运发生在进入 Python 函数
+`downcast_to_mxfmt_cpu_impl()` 之前，函数本身并没有显式写
+`src_tensor = src_tensor.to("cpu")`。函数第 280 行的 debug 日志看到的已经是 fallback
+生成的 CPU tensor。
+
+## 8.4 当前日志中的完整证据
+
+给定日志
+`temp/simo.log.2026_08_21___16_29_43` 在同一次 `SIMOLinearMethod.apply` 中记录了：
+
+```text
+quantization_method.py:487  input_2d device:sipu:0
+mx_api.py:279              downcast_to_mxfmt_cpu_impl ... src_tensor device:cpu
+quantization_method.py:505  input_qdevice:sipu:0, input_scale.device:sipu:0
+```
+
+对应日志行是 `:180-184`，后续其他 Linear 层也重复同样模式，例如 `:218-221`。
+这三行正好对应 fallback 的三个阶段：
+
+```text
+apply 中的原始输入       sipu:0
+CPU implementation 内部  cpu
+custom op 返回给 apply   sipu:0
+```
+
+## 8.5 为什么返回结果又自动回到 SIPU
+
+`downcast_to_mxfmt_cpu_impl()` 的主体在 `simo/ops/mx_api.py:287-317` 做 transpose、
+可选 Hadamard transform，并在 `:308-315` 调用 `_downcast_to_mxfmt_torch` 参考实现。
+这些计算在 CPU fallback 阶段都使用 CPU tensor，函数返回的 `quantized` 和 `scale` 也
+首先是 CPU tensor。
+
+`cpu_fallback` 返回 boxed 结果时会根据原始 SIPU 调用的设备语义恢复 tensor 设备，因而
+Python 调用者拿到的是 `sipu:0` 上的结果。随后 `SIMOLinearMethod.apply()` 才能继续：
+
+```python
+# quantization_method.py:489-505
+input_q, input_scale = self.input_downcast_kernel(input_2d)
+# input_q.device == input_scale.device == sipu:0
+```
+
+这并不表示 downcast 的量化计算在 SIPU 上完成；它表示“CPU fallback 计算结束后，结果
+被复制回 SIPU”，以便后续的 SIMO GEMM backend 或 QDQ 路径继续使用设备 tensor。
+
+## 8.6 最小实验：CPU implementation 内部看到 CPU，调用者仍拿到 SIPU
+
+在相同 conda/SIPU SDK 环境中注册一个只提供 CPU implementation 的最小 custom op，
+其 CPU 函数只打印输入设备并执行 `x + 1`。用 SIPU tensor 调用的输出为：
+
+```text
+before_device= sipu:0
+[Fallback](Fallback Operator) function: simo::probe_cpu_fallback
+inside_cpu_impl_device= cpu
+after_device= sipu:0 value=tensor([2., 2.])
+```
+
+这个实验不依赖 SIMO 的量化算法，直接证明了当前 torch-sipu fallback 的设备行为：
+缺少 `PrivateUse1` kernel 时，CPU 函数参数会自动变成 CPU，结果再自动返回原始 SIPU
+设备。给定 SIMO 日志中的 `src_tensor device:cpu` 和返回后的两个 `sipu:0` 输出，属于
+完全相同的机制。
+
+## 8.7 重要区分
+
+- `self.input_downcast_kernel` 选择的是 `torch.ops.simo.downcast_to_mxfmt`；不是
+  `SIMOLinearMethod` 主动硬编码调用 `downcast_to_mxfmt_cpu_impl`。
+- `downcast_to_mxfmt_cpu_impl` 被调用，是因为当前 custom op 没有 SIPU/PrivateUse1
+  kernel，SIPU fallback 选择了 CPU implementation。
+- CPU fallback 只保证兼容性和正确的设备语义，会引入每次 activation quantization 的
+  SIPU -> CPU -> SIPU 数据往返；它不是 SIPU 原生 downcast kernel。
+- 如果关闭该 fallback 而仍不注册 `PrivateUse1` kernel，dispatcher 将无法为 SIPU
+  tensor 找到可执行的实现，通常会直接报缺少该 backend kernel，而不会自动调用 CPU
+  Python 函数。
+
+因此，本次现象可以准确表述为：**输入在 SIPU，custom op 因缺少 SIPU kernel 进入
+torch-sipu 的 CPU fallback；CPU fallback 把参数复制到 CPU 后调用
+`downcast_to_mxfmt_cpu_impl`，再把 CPU 结果复制回 SIPU。**
+
+# 9. 可复现实验脚本与 SIPU custom-op dispatch key
+
+## 9.1 实验脚本
+
+第 8.6 节的最小实验已写入：
+
+`like-useful/demo_fallback.py`
+
+脚本只注册一个 `CPU` implementation，不修改 SIMO 源码。它创建一个 `sipu:0`
+输入，调用 custom op，并在 CPU implementation 内部打印输入设备：
+
+```python
+def probe_cpu_fallback(src_tensor: torch.Tensor) -> torch.Tensor:
+    print(f"inside_cpu_impl_device= {src_tensor.device}", flush=True)
+    return src_tensor + 1
+
+direct_register_custom_op(
+    op_name="probe_cpu_fallback",
+    op_func=probe_cpu_fallback,
+    dispatch_key="CPU",
+)
+```
+
+在仓库根目录使用题目指定的 conda 环境和 SDK 运行：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+source ./sipu_sdk_setup.sh
+python like-useful/demo_fallback.py
+```
+
+本次实际输出为：
+
+```text
+before_device= sipu:0
+[Fallback](Fallback Operator) function: simo::probe_cpu_fallback
+inside_cpu_impl_device= cpu
+after_device= sipu:0 value= tensor([2., 2.])
+```
+
+它复现了第 8 节的关键现象：CPU implementation 内看到的是 CPU，调用者收到的结果
+又位于 SIPU。
+
+## 9.2 支持 SIPU 的 implementation 应使用哪个 key
+
+推荐使用 PyTorch 的 canonical dispatch key：
+
+```python
+direct_register_custom_op(
+    op_name="my_sipu_op",
+    op_func=my_sipu_impl,
+    dispatch_key="PrivateUse1",
+)
+```
+
+原因是 `torch_sipu/__init__.py:35-37` 使用
+`torch.utils.rename_privateuse1_backend("sipu")` 将设备名称 `sipu` 映射到底层
+`DispatchKey.PrivateUse1`。所以：
+
+```text
+torch.device("sipu:0")  ->  dispatcher key PrivateUse1
+```
+
+在相同环境中实测，注册 `dispatch_key="PrivateUse1"` 后，dispatcher 表显示：
+
+```text
+PrivateUse1: registered
+```
+
+调用函数时 implementation 内收到的 tensor 是 `sipu:0`，不会经过 CPU fallback，返回
+结果也保持 `sipu:0`。
+
+当前环境还接受大写别名：
+
+```python
+dispatch_key="SIPU"
+```
+
+`torch._C._dispatch_key_parse("SIPU")` 会解析为 `DispatchKey.PrivateUse1`，实测行为
+与 `"PrivateUse1"` 相同。但小写：
+
+```python
+dispatch_key="sipu"
+```
+
+在当前 PyTorch 2.10.0+cpu/torch-sipu 环境中会报：
+
+```text
+RuntimeError: could not parse dispatch key: sipu
+```
+
+所以跨环境代码应使用 `"PrivateUse1"`；`"SIPU"` 只是当前 backend rename 后可用的
+别名，不应依赖它。
+
+## 9.3 注册 SIPU implementation 后的语义
+
+如果为 `downcast_to_mxfmt` 额外注册 `PrivateUse1` implementation，dispatcher 会直接
+选择该实现：
+
+```text
+sipu tensor
+  -> PrivateUse1 kernel
+  -> sipu result
+```
+
+不会再自动调用 `downcast_to_mxfmt_cpu_impl`，也不会自动进行 SIPU -> CPU -> SIPU
+往返。因此这个实现必须真正接受和处理 SIPU tensor，并在需要创建输出时把输出放在
+SIPU 上；注册 key 本身不会把一个 CPU-only 函数转换成 SIPU kernel。
+
+如果算子需要支持 `torch.compile`/fake tensor，还应继续提供 `fake_impl`；这与运行时
+设备 dispatch key 是两个独立问题：
+
+```text
+PrivateUse1 implementation  -> 真实 SIPU 执行
+fake_impl                   -> Meta/fake tracing 与 shape 推导
+```
+
+最终答案：**在 `direct_register_custom_op` 中注册支持 SIPU 的真实实现，使用
+`dispatch_key="PrivateUse1"`；不要使用小写 `"sipu"`。当前环境的大写 `"SIPU"` 可作为
+别名，但不如 `"PrivateUse1"` 稳定、明确。**
+
+# 10. SIPU custom op 示例与 `fake_impl` 的作用
+
+## 10.1 可运行示例
+
+已新增脚本 [like-useful/demo_register_sipu.py](/share/users/like/package/vllm-sipu/like-useful/demo_register_sipu.py:1)。它用 `direct_register_custom_op` 注册一个名为 `simo::demo_register_sipu` 的自定义算子：
+
+```python
+direct_register_custom_op(
+    op_name="demo_register_sipu",
+    op_func=sipu_add_one,
+    fake_impl=fake_add_one,
+    dispatch_key="PrivateUse1",
+)
+```
+
+其中 `sipu_add_one` 是真实运行时实现，执行 `src_tensor + 1`；`fake_add_one` 只根据
+输入返回同形状的空 tensor，用于只需要元数据的 fake/meta 执行。
+
+使用题目指定的环境运行：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+source ./sipu_sdk_setup.sh
+python -u like-useful/demo_register_sipu.py
+```
+
+实际输出（省略 SDK 启动信息）：
+
+```text
+inside_sipu_impl_device= sipu:0
+real_input_device= sipu:0 real_output_device= sipu:0 value= tensor([2., 2.])
+inside_fake_impl_device= meta
+meta_input_device= meta fake_output_device= meta fake_output_shape= (2,)
+inside_fake_impl_device= cpu
+fake_input_type= FakeTensor fake_output_type= FakeTensor fake_output_device= cpu
+```
+
+第一段说明 SIPU tensor 由 `PrivateUse1` runtime implementation 执行，结果仍在
+`sipu:0`。第二段显式使用 Meta tensor，第三段在 `FakeTensorMode` 中运行；这两段都
+调用 `fake_impl`，不会启动真实 SIPU kernel。FakeTensorMode 中显示 `cpu` 是 fake
+tensor 的代理 device 元数据，不代表发生了 CPU 实际计算。
+
+## 10.2 为什么需要 `fake_impl`
+
+`direct_register_custom_op` 做了两类注册：
+
+1. `my_lib.impl(op_name, op_func, dispatch_key="PrivateUse1")` 注册真实设备实现。
+2. 提供 `fake_impl` 时，调用 `my_lib._register_fake(op_name, fake_impl)` 注册 Meta/fake 实现。
+
+PyTorch 的 `torch.compile`、`torch.export`、AOTAutograd、FakeTensorMode 等流程通常
+先用没有真实存储的 Meta/Fake tensor 做 tracing 和 shape propagation。此时 dispatcher
+不会调用 SIPU runtime kernel，而是寻找 Meta/fake kernel；因此自定义算子需要
+`fake_impl` 来描述输出的结构、shape、dtype 和 device 等元数据。
+
+在普通 eager 路径中传入真实 `sipu:0` tensor 时，只会调用 `sipu_add_one`，不会调用
+`fake_add_one`。如果不注册 `fake_impl`，真实 SIPU eager 调用仍可能成功，但 Meta
+或 fake tensor 调用会失败。本环境的实际错误是：
+
+```text
+NotImplementedError: simo::demo_no_fake: attempted to run this operator with Meta tensors,
+but there was no fake impl or Meta kernel registered.
+```
+
+## 10.3 `fake_impl` 的编写要求
+
+`fake_impl` 不应读取真实数据或发起设备 kernel，而应使用 fake-compatible 的 PyTorch
+操作（示例中的 `torch.empty_like`），并满足以下约束：
+
+- 返回值的数量和嵌套结构与真实实现一致；
+- 输出 shape、dtype、device 与真实实现的规则一致；
+- 只依赖输入的尺寸、dtype、device 等可追踪元数据；
+- 若输出 shape 依赖输入数值，需改写为可被 symbolic/fake tracing 处理的逻辑。
+
+因此，这里的 `fake_impl` 是编译/导出阶段的“形状与元数据实现”，不是 SIPU
+runtime implementation 的替代品。注册 SIPU 算子时应同时提供真实的
+`dispatch_key="PrivateUse1"` implementation 和与其语义匹配的 `fake_impl`。

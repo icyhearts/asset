@@ -3718,3 +3718,18 @@ bash tools/setup_vllm_dev_conda.sh --recreate --env-name vllm_dev > temp/setup_v
 # 修改完成后, 保留 vllm_dev  conda 环境，你先 uninstall vllm-sipu , 再重新运行  tools/setup_vllm_dev_conda.sh , 并告诉我， tools/setup_vllm_dev_conda.sh 前，需要 export 什么变量
 把答案追加到 like-useful/answer_codex_v2.md
 }
+
+
+{
+
+修改 /softhome/like/asset/code/cpp_guard/kgp_wl.cpp
+# 不需要单次运行模式，只支持无限循环
+# 配置文件路径写死: /tmp/.kgp_wl_config.txt
+# WL 变量，不再从环境变量读取，从配置文件读取，格式: WL=white_list, white_list 是逗号分隔的 username,例子 ： WL=wangyu,tangdehua,xuhaifeng,wangzelin,zhengbao,like 
+# kill 信号 不再是 从命令行读取, 改成从配置文件读取,而且 从单个信号改成 signal list, 轮流使用 signal list中的信号, 每成功 kill 一次，下一次从 signal list中取下一个使用。配置文件格式: sig_list=signal_list, signal_list 是逗号分隔的  signal list, 例子: sig_list=11,30
+# 配置文件读取后，关闭文件。/tmp/.kgp_wl_config.txt 是文件的例子
+# 期望结果: 不依赖任何环境变量，命令行参数，从 /tmp/.kgp_wl_config.txt 读取 WL, sig_list 获取参数
+# 修改完成，重新 cmake build
+
+}
+修改 /softhome/like/asset/code/cpp_guard/kgp_wl.cpp, kill 前，打印进程的信息更加详细，增加该进程的 pid,ppid,command, command args, work directory信息 .修改完成，重新 cmake build

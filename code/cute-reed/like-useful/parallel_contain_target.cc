@@ -1,3 +1,4 @@
+/* 多线程加速版本 : 数组中是否包含两个数, a0, a1, 满足a0+a1 = = target?*/
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -108,6 +109,7 @@ bool parallel_contain_target(const vector<int>& arr, int target) {
   for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
     workers.emplace_back([&local_buckets, &bucket_counts, thread_count, bucket]() {
       size_t total = 0;
+      // total 有必要吗？用 原始输入 arr.size() 代替
       for (unsigned int tid = 0; tid < thread_count; ++tid) {
         total += local_buckets[tid][bucket].size();
       }

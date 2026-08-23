@@ -137,3 +137,34 @@ tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/pac
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
 
 }
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+src/group_gemm/kernels.cuh policy=2的时候，会调用get_next_tile_vert
+get_next_tile_vert 的功能是什么？输入参数输出参数分别是有什么业务上的含义 ？
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+src/group_gemm/group_gemm_pertensor_fp8.cu printf("shm_seq:%d, config.get_shm_size():%d, shm_size:%d\n\n", shm_seq, config.get_shm_size(), shm_size); 能打印出来，说明 kTaskLoopPolicy = 2
+但是 group_gemm_fp8_kernel内部打印
+        printf("kTaskLoopPolicy:%d, iblock:%d, num_group:%d, igroup:%d, itile_m:%d, itile_n:%d, total_m:%d\n",
+                kTaskLoopPolicy,    iblock, num_group, igroup, itile_m, itile_n, total_m);
+又显示 kTaskLoopPolicy=1, 为什么有这种矛盾的情况 ?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}
+如何让 编译器 对这种低级错误直接报错? 比如加上 -Werror=narrow-range之类的参数 ？
+你修改 setup.py 或者 CMakeLists.txt实现我的目的。不要一下子把所有 warning变成 error，尽量缩小范围，只控制 这种  窄化初始化的情况。

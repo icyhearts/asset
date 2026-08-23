@@ -1177,3 +1177,188 @@ cute::tma_desc_wait_group();
 - 真正以 `td_x`/`td_y` 作为 descriptor 发起数据搬运的是后续 `group_gemm_fp8_kernel` 中的 `cute::copy`：load 在 `src/group_gemm/kernels.cuh:379-380`，store 在 `src/group_gemm/kernels.cuh:520-522`。该主 kernel 在 host 侧由 updater 之后启动（`src/group_gemm/group_gemm_pertensor_fp8.cu:178-246`、`:248` 之后）。
 
 因此，当前路径真正必须保留的发布机制是 201 行的 warp 对齐及 206 行的 `tensormap.cp_fenceproxy`（消费端在需要时以 `tma_descriptor_fence_acquire` 获取）；203--204 不能替代这些 fence，也不负责把 189/196 的 `tensormap.replace` “提交”。若未来把 descriptor 更新和实际 TMA 请求放进同一个、会复用 descriptor 的 producer kernel，才需要依据该线程此前是否有 in-flight bulk group 来保留这对 `commit + wait`。
+
+---
+
+## 8. 为什么 host 看起来是 policy 2，而 kernel 打印 policy 1
+
+### 8.1 直接原因：`kTaskLoopPolicy` 被声明成了 `bool`
+
+`group_gemm_fp8_kernel` 的模板参数明确是 `int`：`src/group_gemm/kernels.cuh:215-221`（函数 `group_gemm_fp8_kernel`）。但 host 端 `launch_group_gemm_fp8` 的六个 dispatch 分支都写成了 `constexpr bool kTaskLoopPolicy`：
+
+- PDL 分支：`src/group_gemm/group_gemm_pertensor_fp8.cu:137`、`:152`、`:165`（函数 `launch_group_gemm_fp8`）；
+- 非 PDL 分支：同文件 `:182`、`:196`、`:208`（函数 `launch_group_gemm_fp8`）。
+
+因此第三个分支中的
+
+```cpp
+constexpr bool kTaskLoopPolicy = 2;
+```
+
+在声明时就发生 C++ 布尔转换：`2 != 0`，所以变量的实际值是 `true`，数值表现为 `1`。随后它在 `src/group_gemm/group_gemm_pertensor_fp8.cu:169-171`（函数 `launch_group_gemm_fp8`）作为非类型模板实参传给 `group_gemm_fp8_kernel`；`true` 再转换为该模板要求的 `int` 后仍然是 `1`。所以 device printf 打印 `kTaskLoopPolicy=1` 是编译期实例化结果，并不是运行时把 `2` 改成了 `1`。
+
+这不是 `printf` 的格式问题，也不是 host/device 变量不同步，而是 `constexpr bool` 的类型错误。策略 0 和策略 1 恰好不会暴露问题；只有策略 2 被压成了策略 1。
+
+### 8.2 为什么 `shm_seq:36` 仍然能打印
+
+host 的 `shm_seq` 打印位于第三个 `else` 分支的局部代码中。该分支的选择条件是运行时条件：`task_map_ptr == nullptr` 且 `k > 1024`、`n > 1024`，见 `src/group_gemm/group_gemm_pertensor_fp8.cu:136-176`（函数 `launch_group_gemm_fp8`）。进入这个分支只说明选择了“原本意图对应 policy 2 的代码块”，并不说明其中 `constexpr bool kTaskLoopPolicy` 的值是整数 2。
+
+本次日志也逐项吻合：
+
+- `temp/run.log:10-14` 显示 `n=4096`、`k=7168`；因此 `k <= 1024 || n <= 1024` 为假；
+- `temp/run.log:73` 显示 `task_map_ptr(nil)`，所以没有进入 task-map 的 policy 0 分支；
+- `temp/run.log:75` 的 `shm_seq:36` 等于 `sizeof(int) * (num_group + 1)`，这里 `num_group=8`，即 `4 * 9 = 36`；这只是该分支的 shared-memory 计算结果。
+
+另外，`src/group_gemm/entry.cc:61-68`（函数 `group_gemm_fp8_entry`）只有在 `num_seq_per_group_avg <= 8` 且提供 task-map workspace 时才设置 `task_map_ptr`。本次平均 sequence length 为 72（日志中的 `16,32,...,128`），因此 `task_map_ptr` 为 null 是预期行为。
+
+### 8.3 kernel 实际编译和执行的是 policy 1
+
+在 `group_gemm_fp8_kernel` 中，policy 1 和 policy 2 是 `if constexpr` 的不同编译路径：
+
+- policy 1 在 `src/group_gemm/kernels.cuh:310-313`（函数 `group_gemm_fp8_kernel`）读取 `tiles_ptr`；随后在 `:357-362` 调用 `get_next_tile_horizon`；
+- policy 2 在 `src/group_gemm/kernels.cuh:314-318`（函数 `group_gemm_fp8_kernel`）读取 `cu_tiles_ptr` 并设置 `total_m`；随后在 `:363-367` 调用 `get_next_tile_vert`。
+
+由于实际模板值是 1，policy 2 分支在编译期被丢弃，kernel 走的是 horizon 路径。日志中 device printf 的 `total_m:0` 也与此一致：只有 policy 2 的 `src/group_gemm/kernels.cuh:315`（函数 `group_gemm_fp8_kernel`）会给 `total_m` 赋值；policy 1 不会赋值，因此保留初始化值 0。
+
+### 8.4 还要注意 `use_pdl` 的覆盖
+
+`group_gemm_fp8_entry` 在 `src/group_gemm/entry.cc:84-86`（函数 `group_gemm_fp8_entry`）把 `use_pdl=false` 传给 `group_gemm_fp8_async`，但 `src/group_gemm/group_gemm_pertensor_fp8.cu:224-246`（函数 `group_gemm_fp8_async`）第 238 行又无条件执行 `use_pdl = true`。所以本次运行实际走 `launch_group_gemm_fp8` 的 PDL 分支，具体是 `src/group_gemm/group_gemm_pertensor_fp8.cu:121-176`（函数 `launch_group_gemm_fp8`）中的第三个 `else`。
+
+### 8.5 修复建议
+
+将 pertensor host dispatch 中的六处声明改成 `constexpr int kTaskLoopPolicy`：
+
+```text
+src/group_gemm/group_gemm_pertensor_fp8.cu:137,152,165,182,196,208
+```
+
+至少本次命中的 `:165` 必须改为 `constexpr int kTaskLoopPolicy = 2;`。重新编译后，传给 `group_gemm_fp8_kernel` 的模板实参才会是整数 2，device printf 才会打印 2，并且 `if constexpr (kTaskLoopPolicy == 2)` 会真正选择 `get_next_tile_vert`。同样的 `constexpr bool` 三态策略问题也存在 blockwise host dispatch，但不影响本次 pertensor 日志的根因。
+
+注：当前工作树的 tracked 源码中未保留问题描述里的两条临时 `printf`，但 `temp/run.log` 显然来自加入这些插桩后的构建；这不会改变上述模板类型转换结论。
+
+---
+
+## 9. `get_next_tile_vert`：policy 2 如何把线性任务映射回 group tile
+
+### 9.1 本次日志确实执行了 policy 2
+
+当前 `temp/run.log:94-570` 大量打印 `kTaskLoopPolicy:2`，`temp/run.log:648-651` 也再次打印 policy 2；因此这次运行确实进入了 `get_next_tile_vert`，不是只有 host 端进入了 policy-2 的 dispatch 分支。当前源码在 `src/group_gemm/group_gemm_pertensor_fp8.cu:309`（函数 `launch_group_gemm_fp8`）使用 `constexpr int kTaskLoopPolicy = 2`，并在 `src/group_gemm/group_gemm_pertensor_fp8.cu:320-327`（函数 `launch_group_gemm_fp8`）将它作为模板实参传给 `group_gemm_fp8_kernel`。此前第 8 节记录的是类型修复前的历史状态；本节以当前源码和当前日志为准。
+
+### 9.2 函数签名和业务对象
+
+函数定义在 `src/group_gemm/kernels.cuh:42`（函数 `get_next_tile_vert`）：
+
+```cpp
+__device__ __forceinline__ void get_next_tile_vert(
+    const int *cu_tiles_ptr, int iblock, int num_group,
+    int &igroup, int &itile_m, int &itile_n, int total_m)
+```
+
+它不是做 GEMM 或内存拷贝的函数，而是一个纯粹的“任务坐标解码器”：把 persistent CTA 当前拿到的一维任务号 `iblock`，解码成 grouped GEMM 需要的三元坐标：
+
+```text
+(igroup, itile_m, itile_n)
+```
+
+三者的业务含义是：
+
+- `igroup`：第几个 ragged group。后续用它选择该 group 的 X descriptor，例如 `src/group_gemm/kernels.cuh:419`（函数 `group_gemm_fp8_kernel`）计算 `td_x = td_xy + igroup * 2`，并在 `src/group_gemm/kernels.cuh:429`（函数 `group_gemm_fp8_kernel`）选择 W 的第三维 group 坐标。
+- `itile_m`：该 group 内沿 M/sequence 方向的 tile 编号，从 0 开始；对应的 X tile 在 `src/group_gemm/kernels.cuh:426-427`（函数 `group_gemm_fp8_kernel`）使用 `tAg(_, itile_m, itile_k)`。它是 tile index，不是元素行号；实际行起点约为 `itile_m * kTileM`，最后一个 tile 可能是部分有效。
+- `itile_n`：沿 N/output-channel 方向的 tile 编号，从 0 开始；对应 W tile 在 `src/group_gemm/kernels.cuh:429-430`（函数 `group_gemm_fp8_kernel`）使用 `tBg(_, itile_n, itile_k, igroup)`。本例 `N=4096`、`kTileN=128`，共有 32 个 N tiles。
+
+### 9.3 输入参数和输出参数
+
+`cu_tiles_ptr`、`iblock`、`num_group`、`total_m` 的含义如下：
+
+1. `cu_tiles_ptr` 是长度为 `num_group + 1` 的 M-tile 排布表。它不是每组的 tile 数，而是 exclusive prefix sum：`cu_tiles_ptr[g]` 是 group `g` 在“所有 group 的 M tiles 拼接数组”中的起始 offset，`cu_tiles_ptr[g+1]` 是结束 offset。该数组由 `src/group_gemm/kernels.cuh:143-170`（函数 `update_grouped_tma`）生成：每组 tile 数在 `src/group_gemm/kernels.cuh:149-150`（函数 `update_grouped_tma`）计算并写入 `tiles_ptr`，BlockScan exclusive sum 在 `src/group_gemm/kernels.cuh:156-159`（函数 `update_grouped_tma`）执行，前缀结果在 `src/group_gemm/kernels.cuh:161-169`（函数 `update_grouped_tma`）写入 `cu_tiles_ptr`，其中 `cu_tiles_ptr[num_group]` 是总 M-tile 数。
+
+2. `iblock` 是当前 CTA 的线性任务号，不是 group id。load warpgroup 在 `src/group_gemm/kernels.cuh:381`（函数 `group_gemm_fp8_kernel`）初始化为 `blockIdx.x`，math warpgroup 在 `src/group_gemm/kernels.cuh:463`（函数 `group_gemm_fp8_kernel`）也初始化为 `blockIdx.x`；每完成一次任务后分别在 `src/group_gemm/kernels.cuh:417` 和 `src/group_gemm/kernels.cuh:492`（函数 `group_gemm_fp8_kernel`）加上 `gridDim.x`，让一个 persistent CTA 继续领取自己的后续任务。本次 host 侧在 `src/group_gemm/group_gemm_pertensor_fp8.cu:258-263`（函数 `launch_group_gemm_fp8`）将 `gridDim` 设为 `num_sm=132`，所以一个 CTA 的任务序列形如 `blockIdx.x, blockIdx.x+132, blockIdx.x+264, ...`。
+
+3. `num_group` 是 group 数，同时也是 `cu_tiles_ptr` 的最后一个合法下标。二分查找在 `src/group_gemm/kernels.cuh:48-57`（函数 `get_next_tile_vert`）的 `[0, num_group]` 范围内查找 prefix boundary。
+
+4. `total_m` 是所有 group 的 M tiles 总数，即 `cu_tiles_ptr[num_group]`。policy 2 在 `src/group_gemm/kernels.cuh:357-361`（函数 `group_gemm_fp8_kernel`）把该值读入 `total_m` 并把 prefix table 搬到 shared memory。它必须大于 0，因为 `get_next_tile_vert` 在 `src/group_gemm/kernels.cuh:45-46` 对它做取模和整除。
+
+5. `igroup`、`itile_m`、`itile_n` 是引用输出参数；函数不会依赖调用前的 `igroup` 值，而是在 `src/group_gemm/kernels.cuh:59-60`（函数 `get_next_tile_vert`）覆盖写入。返回后，`igroup` 是 group 下标，`itile_m` 是 group-local M tile 下标，`itile_n` 是 N tile 下标。
+
+### 9.4 第一阶段：把 `iblock` 拆成 N tile 和全局 M tile
+
+函数前两行（`src/group_gemm/kernels.cuh:45-46`，函数 `get_next_tile_vert`）是：
+
+```cpp
+int itile_m_total = iblock % total_m;
+itile_n = iblock / total_m;
+```
+
+令 `r = itile_m_total`，则线性任务编号满足：
+
+```text
+iblock = itile_n * total_m + r
+```
+
+这里的 `r` 不是某个 group 内的 M tile，而是把所有 group 的 M tiles 首尾拼接后的“全局 M tile rank”。因此 policy 2 的任务顺序是：固定一个 N tile，沿所有 group 的 M tiles（纵向）遍历；遍历完该 N tile 后再进入下一个 N tile。这就是 `vert` 的含义。
+
+对比之下，policy 1 的 `get_next_tile_horizon` 在 `src/group_gemm/kernels.cuh:28`（函数 `get_next_tile_horizon`）使用另一种除法/取模顺序，先按全局 M rank 再按 N tile 展开；两种 policy 访问的是同一批输出 tiles，只是线性调度顺序不同。
+
+### 9.5 第二阶段：用 prefix sum 二分反查 group 和局部 M tile
+
+假设 `r = itile_m_total`。group `g` 覆盖的全局 M rank 区间是：
+
+```text
+[cu_tiles_ptr[g], cu_tiles_ptr[g + 1])
+```
+
+所以需要找到满足下面条件的最大 `g`：
+
+```text
+cu_tiles_ptr[g] <= r < cu_tiles_ptr[g + 1]
+```
+
+代码在 `src/group_gemm/kernels.cuh:48-57`（函数 `get_next_tile_vert`）做的是 upper-bound 风格的二分查找：
+
+- 若 `cu_tiles_ptr[mid] > r`，`mid` 及其右侧不可能是所属 group，收缩 `right`；
+- 若 `cu_tiles_ptr[mid] <= r`，`mid` 仍可能是答案，向右推进 `left`，寻找更大的合法 boundary；
+- 循环结束后，`right` 是最后一个不超过 `r` 的 prefix 下标。
+
+最后两行（`src/group_gemm/kernels.cuh:59-60`，函数 `get_next_tile_vert`）完成反查：
+
+```cpp
+itile_m = r - cu_tiles_ptr[right];
+igroup = right;
+```
+
+也就是说，`cu_tiles_ptr[right]` 把全局 M rank 转回该 group 的起点，做差后得到 group-local `itile_m`。如果某些 group 的 sequence length 为 0，prefix 中可能有重复值；取最后一个不超过 `r` 的 prefix 会跳过空 group，仍落到真正包含该 tile 的 group。
+
+### 9.6 用本次数据走一遍
+
+`temp/run.log:77-84` 给出的 sequence lengths 是 `[16,32,48,64,80,96,112,128]`；本次 `kTileM=48`，见 `temp/run.log:6`。因此 `update_grouped_tma` 在 `src/group_gemm/kernels.cuh:149`（函数 `update_grouped_tma`）计算出：
+
+```text
+每组 M tile 数 tiles = [1, 1, 1, 2, 2, 2, 3, 3]
+cu_tiles              = [0, 1, 2, 3, 5, 7, 9, 12, 15]
+total_m               = 15
+```
+
+`temp/run.log:10-14` 显示 `N=4096`，源码在 `src/group_gemm/kernels.cuh:275`（函数 `group_gemm_fp8_kernel`）得到 `num_tile_n=32`。有效任务号范围是 `0..479`，任务总数为 `15 * 32 = 480`。代表性解码如下：
+
+| `iblock` | `r = iblock % 15` | `itile_n = iblock / 15` | prefix 反查 | 输出 `(igroup,itile_m,itile_n)` |
+|---:|---:|---:|---|---|
+| 0 | 0 | 0 | `cu[0]=0 <= 0 < cu[1]=1` | `(0,0,0)` |
+| 3 | 3 | 0 | `cu[3]=3 <= 3 < cu[4]=5` | `(3,0,0)` |
+| 4 | 4 | 0 | `cu[3]=3 <= 4 < cu[4]=5` | `(3,1,0)` |
+| 9 | 9 | 0 | `cu[6]=9 <= 9 < cu[7]=12` | `(6,0,0)` |
+| 14 | 14 | 0 | `cu[7]=12 <= 14 < cu[8]=15` | `(7,2,0)` |
+| 15 | 0 | 1 | `cu[0]=0 <= 0 < cu[1]=1` | `(0,0,1)` |
+| 479 | 14 | 31 | `cu[7]=12 <= 14 < cu[8]=15` | `(7,2,31)` |
+
+这些结果与日志一致：`temp/run.log:94` 是 `iblock=0 -> (0,0,0)`，`temp/run.log:95` 是 `iblock=2 -> (2,0,0)`，`temp/run.log:99` 是 `iblock=4 -> (3,1,0)`，`temp/run.log:97` 是 `iblock=130 -> (6,1,8)`。例如 `iblock=130` 时，`130 % 15 = 10`、`130 / 15 = 8`，全局 M rank 10 落在 group 6 的区间 `[9,12)`，所以局部 M tile 是 1。
+
+### 9.7 它如何服务于 TMA load 和 WGMMA
+
+policy 2 下，load warpgroup 和 math warpgroup 都执行相同的映射：load 侧在 `src/group_gemm/kernels.cuh:390-413`（函数 `group_gemm_fp8_kernel`），math 侧在 `src/group_gemm/kernels.cuh:469-490`（函数 `group_gemm_fp8_kernel`）。这样同一个 CTA 的 producer/consumer 对同一个 `iblock` 得到相同的 `(igroup,itile_m,itile_n)`，随后：
+
+- load 侧用 `itile_m` 选择 X 的 group-local M tile、用 `itile_n` 和 `igroup` 选择 W tile，见 `src/group_gemm/kernels.cuh:426-430`（函数 `group_gemm_fp8_kernel`）；
+- math 侧等待对应 stage barrier 后消费 shared A/B 做 WGMMA，见 `src/group_gemm/kernels.cuh:501-518`（函数 `group_gemm_fp8_kernel`）；
+- epilogue 的 TMA store 也用同一组坐标：`src/group_gemm/kernels.cuh:566-569`（函数 `group_gemm_fp8_kernel`）把 `itile_m` 和 `itile_n` 映射到输出的 M/N tile，并写回该 `igroup` 的 Y 区域；
+- 当 `itile_n >= num_tile_n` 时，调用者在 `src/group_gemm/kernels.cuh:410-412` 和 `src/group_gemm/kernels.cuh:487-489`（函数 `group_gemm_fp8_kernel`）退出循环。因为 `iblock` 按 `gridDim.x` 递增，最后一轮可能超出有效任务数，正是这个边界检查负责终止。
+
+因此，`get_next_tile_vert` 的业务本质是：在 ragged group GEMM 中，把 persistent grid 的线性 work index 映射成正确的 group、该 group 内的 M tile、以及 N tile；它利用 prefix sum 处理不同 group 的 sequence length，并用二分查找避免逐 group 线性扫描。
