@@ -168,3 +168,29 @@ src/group_gemm/group_gemm_pertensor_fp8.cu printf("shm_seq:%d, config.get_shm_si
 }
 如何让 编译器 对这种低级错误直接报错? 比如加上 -Werror=narrow-range之类的参数 ？
 你修改 setup.py 或者 CMakeLists.txt实现我的目的。不要一下子把所有 warning变成 error，尽量缩小范围，只控制 这种  窄化初始化的情况。
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+src/group_gemm/kernels.cuh 437  行 
+```
+          cute::copy(tma_a.with(td_x, readable[ismem_write]), tAg(_, itile_m, itile_k),
+                     tAs(_, 0, 0, ismem_write));
+```
+调用的 with 函数是哪个重载?
+440行
+```
+          cute::copy(tma_b.with(readable[ismem_write]), tBg(_, itile_n, itile_k, igroup),
+                     tBs(_, 0, 0, ismem_write));
+```
+调用的 with 函数是哪个重载?
+为什么 tma_a.with 需要2个参数，tma_b.with只需要1个参数?
+
+这里先调用 2次 copy， 再调用 set_barrier_transaction_bytes.
+但是 /share/users/like/package/cutlass/examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu 222行，在设置期望bytes的时候，先调用ProducerBarType::arrive_and_expect_tx,再调用2个copy,  mbarrier.arrive.expect_tx.shared::cta指令和 tma copy指令，到底应该哪个先，哪个后调用？src/group_gemm/kernels.cuh和/share/users/like/package/cutlass/examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu ，谁的顺序是更推荐的 ？
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}

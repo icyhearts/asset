@@ -1362,3 +1362,121 @@ policy 2 下，load warpgroup 和 math warpgroup 都执行相同的映射：load
 - 当 `itile_n >= num_tile_n` 时，调用者在 `src/group_gemm/kernels.cuh:410-412` 和 `src/group_gemm/kernels.cuh:487-489`（函数 `group_gemm_fp8_kernel`）退出循环。因为 `iblock` 按 `gridDim.x` 递增，最后一轮可能超出有效任务数，正是这个边界检查负责终止。
 
 因此，`get_next_tile_vert` 的业务本质是：在 ragged group GEMM 中，把 persistent grid 的线性 work index 映射成正确的 group、该 group 内的 M tile、以及 N tile；它利用 prefix sum 处理不同 group 的 sequence length，并用二分查找避免逐 group 线性扫描。
+
+## 10. `tma_a.with`/`tma_b.with` 重载与 barrier 顺序
+
+### 10.1 两处调用分别命中了什么重载
+
+先区分两层 `with`：源码中看到的成员函数是 `cute::Copy_Atom::with`，它只是一个可变参数转发器；真正决定参数含义的是 `Copy_Traits<SM90_TMA_LOAD, ...>::with`。
+
+1. `src/group_gemm/kernels.cuh:437-438`（函数 `group_gemm_fp8_kernel`）中的：
+
+   ```cpp
+   tma_a.with(td_x, readable[ismem_write])
+   ```
+
+   先调用 `3rd/cutlass/include/cute/atom/copy_atom.hpp:77-83`（函数 `cute::Copy_Atom::with`），再转发到 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:135-145`（函数 `Copy_Traits<SM90_TMA_LOAD>::with`）这个重载：
+
+   ```cpp
+   with(TmaDescriptor const* new_tma_desc,
+        uint64_t& tma_mbar,
+        uint16_t const& multicast_mask = 0,
+        CacheHintSm90 const& cache_hint = EVICT_NORMAL)
+   ```
+
+   所以两个显式参数的含义是：用 `td_x` 替换本次 TMA load 使用的 tensor-map/descriptor，并把 `readable[ismem_write]` 作为完成通知 barrier。`td_x` 的 `TmaDescriptor*` 可以转换为该重载需要的 `TmaDescriptor const*`。
+
+2. `src/group_gemm/kernels.cuh:440-441`（函数 `group_gemm_fp8_kernel`）中的：
+
+   ```cpp
+   tma_b.with(readable[ismem_write])
+   ```
+
+   同样先经过 `3rd/cutlass/include/cute/atom/copy_atom.hpp:77-83`（函数 `cute::Copy_Atom::with`），但实际匹配的是 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:124-133`（函数 `Copy_Traits<SM90_TMA_LOAD>::with`）这个重载：
+
+   ```cpp
+   with(uint64_t& tma_mbar,
+        uint16_t const& multicast_mask = 0,
+        CacheHintSm90 const& cache_hint = EVICT_NORMAL)
+   ```
+
+   这里显式传入的唯一参数就是 barrier；descriptor 继续使用 `tma_b` 对象内部保存的 descriptor。两个重载后面的 multicast mask 和 cache hint 都有默认值，因此“2 个参数”和“1 个参数”说的是必需参数数量，不是该 API 能接受的总参数数量。
+
+需要排除另一个同名函数：`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:164-169`（函数 `Copy_Traits<SM90_TMA_LOAD>::with`）的单参数版本要求的是 `TmaDescriptor const*`，只返回一个仍未绑定 barrier 的 descriptor 版本；`readable[ismem_write]` 是 `uint64_t&`，因此 `tma_b.with(readable[ismem_write])` 不会匹配这个重载。
+
+`with` 本身不会搬运数据，只是返回一个已经绑定了 descriptor/barrier 的可执行 `Copy_Atom`。真正发出 TMA 指令的是后面的 `cute::copy`；`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:103-131`（函数 `SM90_TMA_LOAD_2D::copy`）最终生成 `cp.async.bulk.tensor.2d...mbarrier::complete_tx::bytes`。
+
+### 10.2 为什么 A 要替换 descriptor，而 B 不需要
+
+`src/group_gemm/config.h:90-95`（函数 `GroupGEMMFp8Config::get_tma`）为 X、W、Y 各创建一个 TMA atom；但 group GEMM kernel 的参数只显式传入了 W TMA，见 `src/group_gemm/group_gemm_pertensor_fp8.cu:286-327`（函数 `launch_group_gemm_fp8`）。X/Y 的每个 group descriptor 放在 `td_xy` 中，由更新 kernel 动态生成并发布。
+
+- X 是 ragged 输入。`src/group_gemm/kernels.cuh:180-195`（函数 `update_grouped_tma`）按 `igroup` 计算 `cu_seqlens_ptr[igroup]` 对应的基地址和 `num_seq`，再修改 X descriptor；`src/group_gemm/kernels.cuh:204-212`（函数 `update_grouped_tma`）通过 `tma_descriptor_cp_fence_release` 发布修改后的 descriptor。因此 load warp 在 `src/group_gemm/kernels.cuh:430-438`（函数 `group_gemm_fp8_kernel`）必须把 `td_x = td_xy + igroup * 2` 传给 `.with`，否则会继续使用模板 descriptor，而不是当前 group 的地址/shape。
+- W 的布局是一个固定的三维 tensor `(n, k, num_group)`，定义见 `src/group_gemm/group_gemm_pertensor_fp8.cu:37-40`（函数 `launch_group_gemm_fp8`）。`src/group_gemm/kernels.cuh:440-441`（函数 `group_gemm_fp8_kernel`）中的 `tBg(_, itile_n, itile_k, igroup)` 已经把 group 作为 TMA 坐标传入；因此不需要为每个 group 替换 W descriptor，只需给这次异步 load 绑定 barrier。
+
+换句话说，A 的两个参数分别是“本 group 的动态 descriptor + 完成 barrier”，B 的一个参数是“完成 barrier”；不是 A/B 的 TMA 指令种类不同。
+
+### 10.3 `set_barrier_transaction_bytes` 做了什么
+
+在 `src/group_gemm/kernels.cuh:325-329`（函数 `group_gemm_fp8_kernel`）中，每个 `readable` barrier 以 arrival count 1 初始化；消费者在 `src/group_gemm/kernels.cuh:510-514`（函数 `group_gemm_fp8_kernel`）调用 `wait_barrier` 等待该阶段完成。
+
+`set_barrier_transaction_bytes` 不是单纯写一个 C++ 变量，也不是等待 TMA。它在 `3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:75-87`（函数 `cute::set_barrier_transaction_bytes`）直接发出：
+
+```text
+mbarrier.arrive.expect_tx.shared::cta.b64 _, [barrier], bytes
+```
+
+该指令同时做两件事：增加当前 phase 的 expected transaction bytes，并消耗一个 pending arrival。TMA load 完成时，`cp.async.bulk.tensor...complete_tx::bytes` 再按实际完成字节数扣减 tx-count；只有 arrival count 和 tx-count 都归零，`wait_barrier` 才会通过。
+
+本例中的 `src/group_gemm/kernels.cuh:377-378`（函数 `group_gemm_fp8_kernel`）把 `kTransactionBytes` 计算为 A tile 和 B tile 的总字节数，正好对应 `src/group_gemm/kernels.cuh:437-443`（函数 `group_gemm_fp8_kernel`）提交的两次 TMA load。也就是说，一个 barrier 跟踪两次 copy 的合计，而不是每次 copy 各自跟踪一个 barrier。
+
+### 10.4 为什么当前代码可以先 copy、再设置 expected bytes
+
+当前代码的实际顺序是：
+
+```text
+wait writable
+提交 TMA A（异步）
+提交 TMA B（异步）
+mbarrier.arrive.expect_tx(total_bytes)
+```
+
+这里“提交”非常重要：`cute::copy` 只把 `cp.async.bulk.tensor` 指令发给 TMA，调用返回并不表示数据已经搬完。因此 `src/group_gemm/kernels.cuh:437-443`（函数 `group_gemm_fp8_kernel`）的两次 `copy` 与后面的 `set_barrier_transaction_bytes` 之间没有一个“等待 copy 完成”的隐含同步。
+
+按 Hopper PTX 的 mbarrier 计数模型，异步操作可以先启动，再设置用于跟踪它们的 barrier；PTX 对 tx-count 也允许负值，所以极快的 `complete_tx` 先于后面的 `expect_tx` 到达时，完成字节可以先记成负债，随后 `expect_tx` 再把预期字节加回来。只要在 barrier phase 被复用或消费者真正通过之前完成这次 `arrive.expect_tx`，这种“issue-then-arm”顺序是可行的。可参见官方 [PTX ISA 的 mbarrier tracking](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier) 和 [CUDA asynchronous copies](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html)。
+
+当前实现满足这些前提：
+
+- `src/group_gemm/kernels.cuh:381-384`（函数 `group_gemm_fp8_kernel`）只让 load warp 的一个 elected thread 发起这些操作；
+- `src/group_gemm/kernels.cuh:435-443`（函数 `group_gemm_fp8_kernel`）在同一个连续代码段中完成 writable wait、两次 TMA submit 和一次 `arrive.expect_tx`；
+- 消费者只在 `src/group_gemm/kernels.cuh:513`（函数 `group_gemm_fp8_kernel`）等待 `readable`，不会在 `arrive.expect_tx` 之前把该 phase 当作完成；
+- `bytes` 必须等于同一 barrier 上所有 TMA load 的实际传输字节数，且每个 stage 每个 phase 只能执行一次对应的 arrive。
+
+因此，当前顺序不能解释为“先把数据拷完再设置 barrier”；它是“先提交异步操作，再立即登记本 phase 的完成条件”。
+
+### 10.5 tutorial 的顺序与推荐选择
+
+外部 CUTLASS tutorial `../cutlass/examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:215-224`（函数 `gemm_device`）采用：
+
+```text
+ProducerBarType::arrive_and_expect_tx(...)
+copy(tma_a.with(...), ...)
+copy(tma_b.with(...), ...)
+```
+
+`ProducerBarType::arrive_and_expect_tx` 在 `../cutlass/include/cutlass/arch/barrier.h:586-602`（函数 `ClusterTransactionBarrier::arrive_and_expect_tx`）发出的核心 PTX 与本项目的 `set_barrier_transaction_bytes` 相同。tutorial 的 steady-state refill 也保持这一顺序，见 `../cutlass/examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:317-330`（函数 `gemm_device`）。
+
+两种顺序的结论是：
+
+1. **语义上都可以成立**：当前 hpc-ops 的 copy-then-arm 顺序不是因为 `cute::copy` 同步完成，而是利用异步 TMA 和 mbarrier tx-count 的记账模型；它必须满足上一节列出的单线程、字节数、phase 生命周期条件。
+2. **新代码更推荐 tutorial 的 arm-then-copy 顺序**：先执行 `set_barrier_transaction_bytes`/`arrive_and_expect_tx`，再提交 TMA，屏障的“本 phase 等待什么”在发起异步操作前就明确建立，代码审查和跨版本维护更直观，也与 CUTLASS Hopper tutorial 及较新的 CUTLASS 示例保持一致。
+3. **不要为了形式一致而单独改动并假设性能必然变好**：两次 TMA load 已经是异步提交，顺序通常不是主要性能因素；若保留当前写法，应加注释说明这是 issue-then-arm，并用目标 GPU 的正确性测试/benchmark 验证。若改成 tutorial 顺序，等价改写为：
+
+   ```cpp
+   set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
+   cute::copy(tma_a.with(td_x, readable[ismem_write]), tAg(_, itile_m, itile_k),
+              tAs(_, 0, 0, ismem_write));
+   cute::copy(tma_b.with(readable[ismem_write]), tBg(_, itile_n, itile_k, igroup),
+              tBs(_, 0, 0, ismem_write));
+   ```
+
+最后再强调：`tma_a.with` 的第二个参数和 `tma_b.with` 的唯一参数都是同一个 `readable` barrier；A 多出来的第一个参数只是在 group GEMM 的 ragged X 场景下替换 per-group descriptor。`with` 不负责发起搬运，`cute::copy` 才发起 TMA，`set_barrier_transaction_bytes`/`arrive_and_expect_tx` 负责把这些异步搬运纳入 barrier 的完成条件。

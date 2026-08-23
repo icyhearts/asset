@@ -134,3 +134,100 @@ igroup = right;
 ## 选择 vert 策略的条件
 
 在 `launch_group_gemm_fp8`（`src/group_gemm/group_gemm_pertensor_fp8.cu:27`）里，policy == 2 分支进入条件是 `task_map_ptr == nullptr` 且 `!(k <= 1024 || n <= 1024)`（`src/group_gemm/group_gemm_pertensor_fp8.cu:295`），即 k、n 都较大（>1024）时才用垂直分块。结合 run.log 的 `k=7168, n=4096`（`temp/run.log:8,11`）与 `num_tile_n = 32`（`temp/run.log:647`）可印证。具体为何大 k/n 场景倾向列优先，代码本身未注释，此处不做过度推断。
+
+---
+
+# group_gemm_fp8_kernel 里两处 `tma.with(...)` 分别命中哪个重载，以及 `expect_tx` 与 `tma copy` 的先后顺序
+
+## 结论
+
+1. `tma_a.with(td_x, readable[ismem_write])`（`src/group_gemm/kernels.cuh:437`）命中的是 **2 参重载**：`Copy_Traits<SM90_TMA_LOAD>::with(TmaDescriptor const* new_tma_desc, uint64_t& tma_mbar, uint16_t multicast_mask = 0, CacheHint ...)`，位于 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:138`（注释 `temp. overloaded for grouped gemm/ptr array gemm`）。
+
+2. `tma_b.with(readable[ismem_write])`（`src/group_gemm/kernels.cuh:440`）命中的是 **1 参重载**：`Copy_Traits<SM90_TMA_LOAD>::with(uint64_t& tma_mbar, uint16_t multicast_mask = 0, CacheHint ...)`，位于 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:127`。
+
+3. 两者都要多一个"为什么一个传 2 参、一个传 1 参"的根因：**A 矩阵每个 expert 的 gmem 基地址/形状随 seqlens 变化，需要在运行期换 descriptor；B 矩阵把 expert 编号编码成 gmem 张量的第 3 维，一个 descriptor 覆盖全部 expert，无需换**。所以 `tma_a.with` 多传一个 `TmaDescriptor const*`（指向 `update_grouped_tma` 预生成的 per-group descriptor），`tma_b.with` 只用给 barrier。
+
+4. `expect_tx` 与 `tma copy` 的先后：**两种顺序都正确**，因为 `set_barrier_transaction_bytes`（cute）与 `arrive_and_expect_tx`（cutlass）本质都是同一条 `mbarrier.arrive.expect_tx.shared::cta.b64` 指令，它同时完成"arrive"和"expect_tx"两步，且是在 TMA 的 `complete_tx` 之前就已被发出。但 **tutorial（`arrive_and_expect_tx` 在前、copy 在后）是更推荐/更符合惯例的顺序**，CUTLASS 生产级 warp-specialized mainloop 也是这么做的。
+
+## `with` 是怎么被解析到的：`TiledCopy` 继承自 `Copy_Atom`
+
+`tma_a` / `tma_b` 的类型是 `TiledCopy<...>`（由 `make_tma_copy` 生成），它继承自 `Copy_Atom`（`3rd/cutlass/include/cute/atom/copy_atom.hpp:188`），自身没有定义 `with`。`.with(...)` 实际调用的是 `Copy_Atom::with`（`3rd/cutlass/include/cute/atom/copy_atom.hpp:80-82`）：
+
+```cuda
+template <class... TraitsArgs>
+CUTE_HOST_DEVICE
+auto with(TraitsArgs&&... args) const {
+  auto traits = Traits::with(static_cast<TraitsArgs&&>(args)...);
+  return Copy_Atom<decltype(traits), CopyInternalType>{traits};
+}
+```
+
+它把参数原样转发给底层 `Copy_Traits<SM90_TMA_LOAD, ...>::with(...)` 去匹配重载。所以真正参与重载决议的是 `Copy_Traits` 里的几个 `with`。
+
+`make_tma_copy(SM90_TMA_LOAD{}, x, ...)` 生成的是"不可执行"的 `Copy_Traits<SM90_TMA_LOAD, ...>`（只有 `tma_desc_` 和 `aux_params_`，没有 barrier，`copy_unpack` 被 `= delete`，见 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:156-162`）。必须调用 `with` 补上 `tma_mbar`（以及可选的新 descriptor）才得到可执行的 `Copy_Traits<SM90_TMA_LOAD_OP, ...>`。
+
+该结构体里的三个 `with` 重载（`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp`）：
+
+| 行号 | 签名 | 作用 |
+|------|------|------|
+| `:127` | `with(uint64_t& tma_mbar, uint16_t multicast_mask = 0, CacheHint = EVICT_NORMAL)` | 只补 barrier（+默认 multicast mask / cache hint），descriptor 用编译期 baked-in 的那个 |
+| `:138` | `with(TmaDescriptor const* new_tma_desc, uint64_t& tma_mbar, uint16_t multicast_mask = 0, CacheHint = EVICT_NORMAL)` | 换 descriptor + 补 barrier（注释明确"temp. overloaded for grouped gemm/ptr array gemm"） |
+| `:167` | `with(TmaDescriptor const* new_tma_desc) const` | 只换 descriptor，不补 barrier，返回的仍是不可执行的 `SM90_TMA_LOAD` |
+
+## 逐处匹配
+
+### `tma_b.with(readable[ismem_write])` → 命中 `:127`
+
+- `readable` 是 `__shared__ uint64_t readable[kStage]`（`src/group_gemm/kernels.cuh:249`），所以实参 `readable[ismem_write]` 是 `uint64_t&`。
+- `:127` 第一形参 `uint64_t& tma_mbar` 精确匹配（左值引用，无需转换），后两个有默认值，1 个显式实参即可。
+- `:138` 至少要 2 个实参，不匹配；`:167` 的形参是 `TmaDescriptor const*`，`uint64_t&` 不能隐式转成指针，不匹配。
+- 唯一候选 = `:127`。
+
+### `tma_a.with(td_x, readable[ismem_write])` → 命中 `:138`
+
+- `td_x = td_xy + igroup * 2`（`src/group_gemm/kernels.cuh:430`），`td_xy` 是 `cute::TmaDescriptor*`（kernel 形参，`src/group_gemm/kernels.cuh:223`），所以 `td_x` 是 `TmaDescriptor*`，可隐式转成 `TmaDescriptor const*`。
+- 第二个实参 `readable[ismem_write]` 是 `uint64_t&`。
+- `:138` 的前两个形参 `(TmaDescriptor const*, uint64_t&)` 精确匹配，后两个有默认值。
+- `:127` 第一形参是 `uint64_t&`，`TmaDescriptor*` 转不成 `uint64_t&`，不匹配；`:167` 只有 1 个形参，实参有 2 个，不匹配。
+- 唯一候选 = `:138`。
+
+## 为什么 `tma_a` 需要换 descriptor，`tma_b` 不需要
+
+两者的 TMA 源张量不同，见 `src/group_gemm/config.h:91-95` 的 `get_tma`：
+
+```cuda
+auto tma_x = make_tma_copy(SM90_TMA_LOAD{}, x, take<0, 2>(SLayoutX{}));   // A：X 是 (m, k)
+auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, w, take<0, 2>(SLayoutW{}));   // B：W 是 (n, k, num_group)
+```
+
+- **A（X 激活）**：源张量是 `(m, k)`，`make_tma_copy` 把 descriptor 的 gmem 基地址烤死在整块 X 的首地址上。但 group GEMM 里每个 expert 的 token 行是"变长拼接"的（seqlens 不同），第 `igroup` 个 expert 的行在 X 里的起始偏移 = `cu_seqlens[igroup]`。所以每个 group 需要一份"基地址 + 形状都改过"的 descriptor。这些 descriptor 由前一个 kernel `update_grouped_tma`（`src/group_gemm/kernels.cuh:70`）预生成，写到 `td_xy` 数组里；`td_x = td_xy + igroup*2` 取第 `igroup` 个 group 的 A-descriptor（`+1` 是 `td_y`，见 `src/group_gemm/kernels.cuh:577`）。因此 `tma_a` 必须用 `:138` 这个"换 descriptor + 补 barrier"的重载，把运行期算出来的 `td_x` 传进去。
+- **B（W 权重）**：源张量是 `(n, k, num_group)`，expert 编号就是第 3 维。`tBg(_, itile_n, itile_k, igroup)`（`src/group_gemm/kernels.cuh:440`）通过 TMA 坐标直接选中第 `igroup` 个 expert 的 `n×k` 分片，一份 descriptor 覆盖全部 group，无需运行期换。所以 `tma_b` 只需 `:127` 补 barrier 即可。
+
+（对照：`tma_y` 是 `SM90_TMA_STORE`，`make_tma_copy(SM90_TMA_STORE{}, y, CopyBoxY{})`，见 `config.h:94`，它的 descriptor 同样在 `src/group_gemm/kernels.cuh:577` 用 `td_y = td_xy + igroup*2 + 1` 换，与 `tma_a` 同理。）
+
+## `expect_tx` 与 `tma copy` 谁先谁后
+
+两边发出的其实是**同一条指令**：
+
+- `set_barrier_transaction_bytes`（cute，`3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:78-87`）内联汇编是 `mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;`。
+- `ProducerBarType::arrive_and_expect_tx`（cutlass，`3rd/cutlass/include/cutlass/arch/barrier.h:588-602`）内联汇编也是 `mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0;`（寄存器顺序不同，语义相同）。
+
+即两者都是"**arrive + expect_tx**"合并的一条指令：它既让该 barrier 完成一次 arrive（`readable` 用 `initialize_barrier(readable[idx], 1)` 初始化，`src/group_gemm/kernels.cuh:327`，只需 1 次 arrive），又把本阶段两个 TMA 事务的总字节数 `kTransactionBytes` 加到 `expected-tx` 计数上。之后两个 `cute::copy` 各 issue 一条 `cp.async.bulk.tensor`，TMA 引擎搬完数据时用 `complete_tx` 把 tx 计数扣回去；当 `arrive-count==0` 且 `tx-count==0` 时相位翻转，消费者 `wait_barrier(readable[...])` 才能通过。
+
+关键点在于顺序约束：`expect_tx` 必须在 TMA 的 `complete_tx` 生效**之前**写入，否则 tx 计数会被先扣成负、barrier 提前翻转。由于：
+
+- TMA 拷贝是异步的，`cute::copy` 只是把 `cp.async.bulk.tensor` 指令 issue 出去，真正的 `complete_tx` 发生在 DMA 搬完（远晚于 issue 时刻）；
+- `set_barrier_transaction_bytes` / `arrive_and_expect_tx` 是普通指令，发出后立刻执行。
+
+所以 **hpc-ops 的"先 copy、后 set_barrier_transaction_bytes"（`kernels.cuh:437-443`）和 tutorial 的"先 arrive_and_expect_tx、后 copy"（`/share/users/like/package/cutlass/examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:222-224`）在功能上都正确**——两种写法里 `expect_tx` 都先于 `complete_tx` 生效。
+
+## 谁更推荐：tutorial 的顺序
+
+推荐 **tutorial / CUTLASS 生产代码的顺序：先 `arrive_and_expect_tx`，再发 copy**。理由：
+
+1. `expect_tx`（arrive）与 TMA issue 之间不留任何"异步事务可能先完成"的窗口，语义上最稳。
+2. 这是 CUTLASS 生产级 warp-specialized mainloop 的写法：`sm90_mma_tma_gmma_ss_warpspecialized.hpp:374` 先 `pipeline.producer_acquire(...)`（其内部在 `:512-517` 调 `full_barrier_ptr_[stage].arrive_and_expect_tx(...)`），然后 `:384-385` 才 `copy(tma_load_a.with(...))`、`copy(tma_load_b.with(...))`。与 tutorial 完全一致。
+3. hpc-ops 的"先 copy 后 set"虽然正确，但把 arrive/expect_tx 放到了两个 `cp.async.bulk.tensor` 之后，读起来不如"先声明期望字节、再发事务"直观，且是少数派写法（hpc-ops 仓库里 `src/attention/prefill/kernels.cuh`、`src/gemm/sm90/gemm_bf16xfp32.cu` 等也都是 copy 后 `set_barrier_transaction_bytes`，属同一风格）。
+
+一句话：**这条指令叫 `mbarrier.arrive.expect_tx`，官方惯例是"先 arrive+expect_tx，后发 TMA copy"（tutorial 那样）；hpc-ops 的顺序也能跑，但 tutorial 的顺序更推荐**。
+
