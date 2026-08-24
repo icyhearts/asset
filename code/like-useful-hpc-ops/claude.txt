@@ -208,3 +208,17 @@ src/group_gemm/kernels.cuh 440行，cute::copy在进行tma copy的时候, tma_b.
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
 
 }
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+src/group_gemm/kernels.cuh 437行，cute::copy 需要几次 cp.async.bulk指令才能完成 tAg(_, itile_m, itile_k) 的 copy?  tma_a.with(td_x, readable[ismem_write]) 本身是一个 TiledCopy, TiledCopy 完成几个元素的copy? TilecCopy 内部包含几个 CopyAtom?
+src/group_gemm/kernels.cuh 440行，cute::copy 需要几次 cp.async.bulk指令才能完成 tBg(_, itile_n, itile_k, igroup)的 copy?tma_b.with(readable[ismem_write]) 本身是一个 TiledCopy, TiledCopy 完成几个元素的copy? TilecCopy 内部包含几个 CopyAtom?
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}

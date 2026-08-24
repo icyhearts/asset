@@ -1533,3 +1533,66 @@ cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes
 三维指令的具体参数和汇编模板见 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:159-186`（函数 `SM90_TMA_LOAD_3D::copy`）：descriptor 提供“这块 global tensor 是谁、怎样解释”，坐标提供“这次从哪里开始”，SMEM 指针提供“写到哪里”，barrier 提供“何时报告完成”。这四类信息是互补的，不能用 `tBg` 取代 descriptor。
 
 在本 kernel 中，`igroup` 只改变 B descriptor 下的第三维坐标；因此同一个 W descriptor 可以覆盖所有 group。相对地，A 的 per-group descriptor 在 `src/group_gemm/kernels.cuh:430-441`（函数 `group_gemm_fp8_kernel`）通过 `td_x` 显式替换，正是因为 A 的每个 group 可能有不同的起始地址/有效形状。
+
+## 12. line 437/440：一次 `cute::copy` 的 TMA 指令数
+
+### 12.1 当前运行的直接答案
+
+以 `temp/run.log` 中这次运行的实例为准（`temp/run.log:6`，函数 `launch_group_gemm_fp8` 的 debug 输出）：
+
+| 代码行 | TMA box | 每次 `cute::copy` 的逻辑元素数 | 产生的 tensor TMA 指令 |
+|---|---:|---:|---:|
+| `src/group_gemm/kernels.cuh:437`（函数 `group_gemm_fp8_kernel`） | `kTileM × kTileK = 48 × 128` | `6144` 个 FP8 元素（6144 bytes） | **1 条** `cp.async.bulk.tensor.2d` |
+| `src/group_gemm/kernels.cuh:440`（函数 `group_gemm_fp8_kernel`） | `kTileN × kTileK × 1 = 128 × 128 × 1` | `16384` 个 FP8 元素（16384 bytes） | **1 条** `cp.async.bulk.tensor.3d` |
+
+这里的“1 条”是指一次已经固定了 `itile_m/itile_n` 和 `itile_k` 的 `cute::copy` 调用，不是说整个 K 维只传一次。代码在 `src/group_gemm/kernels.cuh:432-450`（函数 `group_gemm_fp8_kernel`）中对 `itile_k` 循环；日志里的 `tAg` 形状为 `(..., 12, 56)`（`temp/run.log:162-163`），所以对一个固定的 M/N tile 和 group，完整 K 扫描会发出 **56 条 A 指令 + 56 条 B 指令**。两条 copy 合计的每次迭代传输字节数为 `6144 + 16384 = 22528`，与 `src/group_gemm/kernels.cuh:377-378`（函数 `group_gemm_fp8_kernel`）计算的 `kTransactionBytes` 一致。该 TMA submit 只由 load warp 的 elected leader 发起，见 `src/group_gemm/kernels.cuh:380-383`（函数 `group_gemm_fp8_kernel`），因此不是每个 warp lane 各发一条。
+
+这里统计的是 `cp.async.bulk.tensor` 数据搬运指令；`src/group_gemm/kernels.cuh:443`（函数 `group_gemm_fp8_kernel`）的 `set_barrier_transaction_bytes` 是另一个 mbarrier 记账指令，不应算作额外的 `cp.async.bulk.tensor`。
+
+### 12.2 TiledCopy 和 CopyAtom 的实际关系
+
+用户问题中“`tma_a.with(...)` 本身是一个 TiledCopy”需要做一个类型上的修正：
+
+- `tma_a`/`tma_b` 本身是 `make_tma_copy` 返回的 `TiledCopy`。`src/group_gemm/config.h:90-95`（函数 `GroupGEMMFp8Config::get_tma`）创建了它们；`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:1193-1233`（函数 `make_tma_copy_tiled`）先构造一个 `Copy_Atom atom`，再返回 `TiledCopy<decltype(atom), ...>{atom}`。
+- `TiledCopy` 的模板参数和计数成员位于 `3rd/cutlass/include/cute/atom/copy_atom.hpp:185-203`（类型 `TiledCopy`）。因此对象中有一个 base `Copy_Atom`，另外保存 `Tiler_MN` 和 `TiledLayout_TV`，用来决定如何把一个 source/destination tensor 分区。
+- `.with(...)` 来自 `3rd/cutlass/include/cute/atom/copy_atom.hpp:76-83`（函数 `Copy_Atom::with`），返回的是绑定了运行时 descriptor/barrier 的 **executable `Copy_Atom`**，不再是 `TiledCopy`。`src/group_gemm/kernels.cuh:437` 和 `src/group_gemm/kernels.cuh:440` 的第一个实参实际是这个 executable `Copy_Atom`。
+
+即使直接把未调用 `.with` 的 `TiledCopy` 传给 `cute::copy`，`3rd/cutlass/include/cute/algorithm/copy.hpp:434-444`（函数 `copy` 的 `TiledCopy` overload）也会把它静态转换为 base `Copy_Atom` 再执行；本代码只是先通过 `.with` 绑定了 descriptor/barrier。
+
+所以，“TiledCopy 内部包含几个 CopyAtom”要分两层理解：类型/对象层面是一个 base `Copy_Atom`；在本例的 tile 布局中，它也只需要调用这个 atom **一次**，不是 6144 次或 16384 次。
+
+从日志布局还可以直接看到这个复制倍率：A 的 `TiledLayout_TV` 是 1 个逻辑线程、6144 个 value，而 atom 的 `ValLayout` 是 1 个线程、6144 个 value；B 对应为 1 个线程、16384 个 value（`temp/run.log:43-61`、`temp/run.log:93-113`）。因此 `TiledNumThr/AtomNumThr = 1` 且 `TiledNumVal/AtomNumVal = 1`，逻辑上的 CopyAtom invocation 数就是 1。
+
+### 12.3 为什么一次调用只有一条 `cp.async.bulk`
+
+当前日志给出的静态布局是：
+
+- A：`Tiler_MN=(_48,_128)`，`ValLayoutSrc/Dst/Ref=(_1,_6144)`，见 `temp/run.log:43-51` 和 `temp/run.log:93-102`（函数 `group_gemm_fp8_kernel` 的 debug 输出）。`tAg` 为 `((( _128,_48),_1),12,56)`，见 `temp/run.log:162-165`。
+- B：`Tiler_MN=(_128,_128)`，`ValLayoutSrc/Dst/Ref=(_1,_16384)`，见 `temp/run.log:53-61` 和 `temp/run.log:104-113`。`tBg` 为 `((( _128,_128),_1),32,56,8)`，见 `temp/run.log:166-169`。
+
+在 `src/group_gemm/kernels.cuh:437` 中，`tAg(_, itile_m, itile_k)` 固定了 M/K tile 的外层索引，只留下一个大小为 6144 的 TMA value mode；`src/group_gemm/kernels.cuh:440` 的 `tBg(_, itile_n, itile_k, igroup)` 同理只留下一个大小为 16384 的 TMA value mode。于是调用链没有额外的 rest-mode 循环：
+
+1. `cute::copy` 的 `Copy_Atom` overload 位于 `3rd/cutlass/include/cute/algorithm/copy.hpp:184-196`（函数 `copy`）。索引后 source/destination 是 rank-1 atom-sized tensor，直接执行 `copy_atom.call(src,dst)`；只有 rank 大于 1 时，`3rd/cutlass/include/cute/algorithm/copy.hpp:197-235`（同一函数）才会遍历剩余 mode。
+2. `Copy_Atom::call` 位于 `3rd/cutlass/include/cute/atom/copy_atom.hpp:89-114`（函数 `Copy_Atom::call`），直接进入 `copy_unpack`。
+3. TMA 的 `copy_unpack` 位于 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:64-90`（函数 `TMA_LOAD_Unpack::copy_unpack`）。它只取一次 `src_coord = src(Int<0>{})`、一次 SMEM `dst_ptr`，再用一次 `CallCOPY` 展开调用；这里没有按元素循环。
+4. A 的坐标是二维，`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:327-342`（函数 `SM90_TMA_LOAD::copy`）选择 2D overload，而 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:103-131`（函数 `SM90_TMA_LOAD_2D::copy`）在预处理后只选择一条 `cp.async.bulk.tensor.2d...` 汇编指令。
+5. B 的 W 是三维 `(n,k,num_group)`，对应 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:344-349`（函数 `SM90_TMA_LOAD::copy`）的 3D overload；`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:159-186`（函数 `SM90_TMA_LOAD_3D::copy`）在预处理后只选择一条 `cp.async.bulk.tensor.3d...` 汇编指令。第三维 box extent 是 1，`igroup` 是起始坐标，不会把一次 tile 拆成 8 条指令。
+
+也就是说，一条 tensor TMA 指令的地址操作数是“descriptor + 起始坐标”，box shape 则在 descriptor/atom 中描述；它可以一次搬完整的 2D/3D box，不需要每个 FP8 元素一条指令。
+
+### 12.4 元素数、CopyAtom 数和外层循环数的区别
+
+对当前 `GroupGEMMFp8Config`，SMEM tile 的定义见 `src/group_gemm/config.h:81-84`（类型 `GroupGEMMFp8Config`），TMA 创建见 `src/group_gemm/config.h:90-95`（函数 `GroupGEMMFp8Config::get_tma`）：
+
+```text
+A：每次 atom copy 的元素数 = kTileM * kTileK
+B：每次 atom copy 的元素数 = kTileN * kTileK * 1
+```
+
+当前运行参数为 `kTileM=48, kTileN=128, kTileK=128`，所以分别是 6144 和 16384。`kStage=8` 只是流水线的多个 SMEM buffer：`src/group_gemm/kernels.cuh:437-441`（函数 `group_gemm_fp8_kernel`）通过 `ismem_write` 选择其中一个 stage，并没有把元素数乘以 8。其他 `kTileM` specialization 仍是每次一条 TMA 指令，但 A 的元素数随 `kTileM*kTileK` 变化；若走 `src/group_gemm/group_gemm_pertensor_fp8.cu:420-425`（函数 `group_gemm_fp8_async`）中 `kTileK=64` 的分支，公式中的 `kTileK` 就是 64。边界 tile 仍由 TMA descriptor 的 OOB 规则处理，不会因为边界而自动拆成多条指令。
+
+最后要区分三个数量：
+
+- **元素数**：一条 A 指令当前搬 6144 个、一条 B 指令当前搬 16384 个 FP8 元素；
+- **CopyAtom 数**：每个 `TiledCopy` 有一个 base `Copy_Atom`，这个已索引的 tile view 只调用它一次；
+- **循环次数**：`itile_k` 每增加一次，就再次发出一条 A 和一条 B 指令。当前 K=7168、`kTileK=128` 时是 56 次，见 `src/group_gemm/kernels.cuh:387-388`（函数 `group_gemm_fp8_kernel`）及 `temp/run.log:162-167`。

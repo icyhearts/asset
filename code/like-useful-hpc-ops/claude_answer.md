@@ -336,3 +336,57 @@ CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
 
 这也是为什么 `tma_a` 需要 `.with(td_x, ...)` 换 descriptor（换 base address + shape），而 `tma_b` 只需 `.with(barrier)`：B 的所有 expert 共用一个 descriptor，第 `igroup` 维只是坐标 `crd` 的一部分，由 `tBg(_, itile_n, itile_k, igroup)` 在坐标里表达。
 
+
+---
+
+# `cute::copy` 一次 TMA copy 需要几条 `cp.async.bulk`？TiledCopy 内部有几个 CopyAtom？
+
+## 结论（以 run.log 实际实例化的 tile 配置为准：kTileM=48, kTileN=128, kTileK=128）
+
+| | `tma_a`（`kernels.cuh:437`） | `tma_b`（`kernels.cuh:440`） |
+|---|---|---|
+| Tiler_MN（一个 tile 的形状） | `(_48,_128)` | `(_128,_128)` |
+| 一次 copy 搬运的元素数 | **48×128 = 6144**（fp8，6144 bytes） | **128×128 = 16384**（fp8，16384 bytes） |
+| TiledCopy 内部 CopyAtom 个数 | **1 个** | **1 个** |
+| 需要的 `cp.async.bulk` 指令条数 | **1 条**（`.tensor.2d`，box 48×128） | **1 条**（`.tensor.3d`，box 128×128×1） |
+
+**一句话：两个 `cute::copy` 都只发 1 条 `cp.async.bulk.tensor` 指令，TiledCopy 内部都只含 1 个 CopyAtom。** 因为 TMA 的"一个 CopyAtom 的 value"就是整块 box，一条指令搬完整块，CuTe 不会对 TMA 做逐元素展开。
+
+## 为什么是 1 个 CopyAtom、1 条指令
+
+TiledCopy 里 CopyAtom 的个数 = `(TiledNumThr / AtomNumThr) × (TiledNumVal / AtomNumVal)`，这三个量都能在 `run.log` 里直接读到：
+
+- `tma_a`（`run.log:93-102`）：`TiledLayout_TV = (_1,(((_128,_48),_1)))` → TiledNumThr=1、TiledNumVal=128×48=6144；`Copy_Atom` 的 `ThrID = _1`（1 个线程）、`ValLayoutRef = (_1,_6144)` → AtomNumThr=1、AtomNumVal=6144。于是 `(1/1)×(6144/6144) = 1` 个 CopyAtom。
+- `tma_b`（`run.log:104-113`）：`TiledLayout_TV = (_1,(((_128,_128),_1)))` → TiledNumVal=128×128=16384；`ValLayoutRef = (_1,_16384)` → AtomNumVal=16384。同样 `(1/1)×(16384/16384) = 1` 个 CopyAtom。
+
+关键点：TMA Copy_Atom 的 `ThrID = _1`，即"**单线程 issue**"，且 `ValLayoutRef` 里的 6144/16384 个 value 不是"6144 次拷贝"，而是 CuTe 把整块 TMA box 的位布局抽象成"1 个线程 × N 个 value"；真正落到硬件是**一条** `cp.async.bulk.tensor` 指令搬完整块 box。
+
+执行链（`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:71-89` 的 `TMA_LOAD_Unpack::copy_unpack`）：
+
+```cuda
+auto src_coord = src(Int<0>{});                        // 只取坐标
+void* dst_ptr  = cute::raw_pointer_cast(dst.data());  // 只取 smem 地址
+return detail::explode_tuple(detail::CallCOPY<CopyOp>{},
+                             traits.opargs_, ...,      // (desc_ptr, mbar_ptr, cache_hint)
+                             make_tuple(dst_ptr), ..., // smem_ptr
+                             src_coord, ...);          // crd0..crd4
+```
+
+`copy_unpack` 被调用一次，`CallCOPY<SM90_TMA_LOAD>` 就 dispatch 一次到 `SM90_TMA_LOAD::copy`（`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:327-363`），按坐标个数选择 `.1d/.2d/.3d/...`，各自只内联一条 `cp.async.bulk.tensor.Nd`（例如 2D 见 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:103` 起的 `SM90_TMA_LOAD_2D`，3D 见 `:159` 起的 `SM90_TMA_LOAD_3D`）。
+
+## A / B 的指令维度为何不同
+
+- **A（`tma_a`）是 2D**：源 gmem 张量 `gA = tma_a.get_tma_tensor(make_shape(m, k))`（`src/group_gemm/kernels.cuh:265`）只有 `(m=576, k=7168)` 两维，坐标 `tAg(_, itile_m, itile_k)` 提供 2 个坐标 → `cp.async.bulk.tensor.2d`，box `(48, 128)`。
+- **B（`tma_b`）是 3D**：源 gmem 张量 `gB = tma_b.get_tma_tensor(make_shape(n, k, num_group))`（`src/group_gemm/kernels.cuh:266`）是 `(n=4096, k=7168, num_group=8)` 三维，坐标 `tBg(_, itile_n, itile_k, igroup)` 提供 3 个坐标 → `cp.async.bulk.tensor.3d`，box 是 `(128, 128, 1)`（第 3 维 num_group 是"纯坐标维"，box 大小 1，只有真实 stride）。
+
+这与 `run.log` 打印的坐标张量一致：`gA = (576,7168):(_1@1,_1@0)`（2 维），`gB = (4096,7168,8):(_1@1,_1@0,_1@2)`（3 维）；`tBg = (((_128,_128),_1),32,56,8)` 里 32/56/8 正是 N-tile/K-tile/group 三个坐标维。
+
+## 补充：一个 CopyAtom 不等于"一次 element copy"
+
+不要把 CuTe 里 `ValLayoutSrc: (_1,_6144)` 的 6144 理解成"6144 次拷贝操作"。对 TMA 而言，整块 box（6144 或 16384 个元素）由**一条** `cp.async.bulk.tensor` 指令完成；"6144 个 value"只是 CuTe 对"这个 box 的位布局"的抽象表示。所以：
+
+- `cute::copy(tma_a.with(...), tAg(_, itile_m, itile_k), tAs(...))` → **1 条 `cp.async.bulk.tensor.2d`，搬 6144 个 fp8（48×128）**。
+- `cute::copy(tma_b.with(...), tBg(_, itile_n, itile_k, igroup), tBs(...))` → **1 条 `cp.async.bulk.tensor.3d`，搬 16384 个 fp8（128×128）**。
+
+（注：`tAg(_, itile_m, itile_k)` 里那个 `_` 已经就是"整块 box"——`tAg` 的第 0 维是 TMA 分区 `(TMA_M,TMA_K)`，`run.log:162-163` 显示 `tAg = (((_128,_48),_1),12,56)`，切片后剩下的正是 box 本身，所以一次 `cute::copy` 就搬完一整块，无需循环。）
+
