@@ -1480,3 +1480,56 @@ copy(tma_b.with(...), ...)
    ```
 
 最后再强调：`tma_a.with` 的第二个参数和 `tma_b.with` 的唯一参数都是同一个 `readable` barrier；A 多出来的第一个参数只是在 group GEMM 的 ragged X 场景下替换 per-group descriptor。`with` 不负责发起搬运，`cute::copy` 才发起 TMA，`set_barrier_transaction_bytes`/`arrive_and_expect_tx` 负责把这些异步搬运纳入 barrier 的完成条件。
+
+## 11. line 440：`tBg` 与 TMA descriptor 的分工
+
+### 11.1 直接结论
+
+`tBg(_, itile_n, itile_k, igroup)` **不包含 W 的 global memory base address**。它是 TMA 专用的 coordinate tensor，主要负责产生本次 TMA load 的起始坐标；它的 Tensor 对象仍然有 shape/layout（因此有坐标步长和 tile 分区信息），但其 `data()` 是算术坐标迭代器，不是 `w_ptr` 对应的 `gmem_ptr`。
+
+W 的物理地址在 host/device launch 侧先进入原始 GMEM Tensor：`src/group_gemm/group_gemm_pertensor_fp8.cu:37-42`（函数 `launch_group_gemm_fp8`）用 `w_ptr`、`shape(n,k,num_group)` 和 `stride(k,1,n*k)` 构造 W。随后 `src/group_gemm/config.h:90-95`（函数 `GroupGEMMFp8Config::get_tma`）把 W 传给 `make_tma_copy`。CuTe 的 `detail::make_tma_copy_desc` 在 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:928-952`（函数 `make_tma_copy_desc`）从 `gtensor.data()` 取得 `gmem_address`，并读取全局 shape/stride；在 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:1029-1058`（函数 `make_tma_copy_desc`）把 global address、global shape/stride、shared-memory box shape/stride、数据格式和 swizzle 编入 `TmaDescriptor`。所以，**global base address 在 descriptor 中，而不在 `tBg` 中**。
+
+需要更精确地说：原始 `tma_b` 的 atom 保存 `tma_desc_`；`tma_b.with(readable[ismem_write])` 并不是再复制一份 descriptor，而是 `3rd/cutlass/include/cute/atom/copy_atom.hpp:76-83`（函数 `Copy_Atom::with`）转调 `Copy_Traits::with`。对于本例，命中 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:124-133`（函数 `Copy_Traits<SM90_TMA_LOAD>::with`），返回的 executable atom 的运行时参数是 `&tma_desc_`、barrier 地址和 cache hint。
+
+### 11.2 `tBg` 是怎样生成坐标的
+
+`src/group_gemm/kernels.cuh:265-278`（函数 `group_gemm_fp8_kernel`）先执行：
+
+```cpp
+auto gB  = tma_b.get_tma_tensor(make_shape(n, k, num_group));
+auto tBg = btma_b.partition_S(gB);
+```
+
+`get_tma_tensor` 的实现位于 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:147-154`（函数 `Copy_Traits<SM90_TMA_LOAD>::get_tma_tensor`）：它用全局 shape 和 TMA coordinate stride 构造 `make_coord_tensor`，并没有读取或复制 descriptor 的 base pointer。`make_coord_tensor` 位于 `3rd/cutlass/include/cute/tensor_impl.hpp:477-487`（函数 `make_coord_tensor`），明确把 layout 绑定到 counting/`ArithmeticTupleIterator`。
+
+因此，`btma_b.partition_S(gB)`（`3rd/cutlass/include/cute/atom/copy_atom.hpp:365-373`，函数 `ThrCopy::partition_S`）只是保留这个坐标 engine 并重新组织 layout。`tBg(_, itile_n, itile_k, igroup)` 的含义是：保留 TMA box/atom 模式，用 `itile_n`、`itile_k` 和 `igroup` 选择当前 N/K/group tile，最终得到类似 `{coord_n, coord_k, coord_group}` 的逻辑坐标 tuple。坐标是 TMA 指令使用的坐标单位，不是已经计算好的字节地址；descriptor 的 base/stride 负责把这些坐标解释成 global memory 地址。
+
+运行日志也印证了这一点：`temp/run.log:130-133`（函数 `group_gemm_fp8_kernel` 的 debug 输出）中 `gB` 打印为 `ArithTuple`，而不是 `gmem_ptr`；`temp/run.log:166-167`（同一函数）中 `tBg` 仍打印为 `ArithTuple`，并显示 `(TMA, TMA_N, TMA_K, num_group)` 的坐标分区。
+
+### 11.3 `cute::copy` 两个参数分别给什么
+
+在 line 440，`tma_b` 实际是 `make_tma_copy` 返回的 `TiledCopy`；`3rd/cutlass/include/cute/atom/copy_atom.hpp:185-189`（函数/类型 `TiledCopy`）说明它继承 `Copy_Atom`。`cute::copy` 在 `3rd/cutlass/include/cute/algorithm/copy.hpp:184-196`（函数 `copy` 的 `Copy_Atom` overload）把这个 atom 调到 `Copy_Atom::call`，再进入 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:64-90`（函数 `TMA_LOAD_Unpack::copy_unpack`）。该函数的关键代码是：
+
+```cpp
+auto src_coord = src(Int<0>{});       // 从第二个参数取坐标
+void* dst_ptr = raw_pointer_cast(dst.data()); // 从第三个参数取 SMEM 地址
+```
+
+对应关系如下：
+
+| `cute::copy` 参数 | 提供给 TMA 的信息 |
+|---|---|
+| 第 1 个：`tma_b.with(readable[ismem_write])` | TMA load 操作类型/位宽和编译期 source-destination 映射；descriptor 指针（global base、global shape/stride、TMA box、格式/swizzle 等）；`with` 注入的 completion barrier 指针和 cache hint。 |
+| 第 2 个：`tBg(_, itile_n, itile_k, igroup)` | 本次调用的动态起始坐标 tuple，以及坐标 tensor 的 rank/layout/分区关系；**不提供 W 的物理 base pointer**。 |
+| 第 3 个：`tBs(_, 0, 0, ismem_write)` | 目标 shared-memory 地址和 SMEM layout（这里只是补充完整指令所需的信息）。 |
+
+最终，`TMA_LOAD_Unpack::copy_unpack` 把上述运行时参数展开给 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:327-349`（函数 `SM90_TMA_LOAD::copy`）。W 是三维 `(n,k,num_group)` tensor，因此对应三坐标 overload，概念上形成：
+
+```text
+cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes
+    [smem_ptr], [tma_desc_ptr, {coord_n, coord_k, coord_group}], [mbar_ptr], cache_hint;
+```
+
+三维指令的具体参数和汇编模板见 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:159-186`（函数 `SM90_TMA_LOAD_3D::copy`）：descriptor 提供“这块 global tensor 是谁、怎样解释”，坐标提供“这次从哪里开始”，SMEM 指针提供“写到哪里”，barrier 提供“何时报告完成”。这四类信息是互补的，不能用 `tBg` 取代 descriptor。
+
+在本 kernel 中，`igroup` 只改变 B descriptor 下的第三维坐标；因此同一个 W descriptor 可以覆盖所有 group。相对地，A 的 per-group descriptor 在 `src/group_gemm/kernels.cuh:430-441`（函数 `group_gemm_fp8_kernel`）通过 `td_x` 显式替换，正是因为 A 的每个 group 可能有不同的起始地址/有效形状。

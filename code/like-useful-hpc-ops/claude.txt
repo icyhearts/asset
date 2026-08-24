@@ -194,3 +194,17 @@ src/group_gemm/kernels.cuh 437  行
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
 
 }
+
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+src/group_gemm/kernels.cuh 440行，cute::copy在进行tma copy的时候, tma_b.with(readable[ismem_write]) 生成的 Copy_Atom包含 tma descriptor, 已经有 global memory base address + shape + stride 信息，tBg(_, itile_n, itile_k, igroup)里面还有 global  base address信息吗？ tBg的作用是只生成 coordinate吗？
+对于 tma copy版本的 cute::copy函数，第1个参数Copy_Atom参数和 第2个参数global memory tensor, 分别提供了 TMA 硬件需要的哪些信息?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}

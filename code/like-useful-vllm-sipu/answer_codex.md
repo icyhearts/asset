@@ -1883,3 +1883,107 @@ but there was no fake impl or Meta kernel registered.
 因此，这里的 `fake_impl` 是编译/导出阶段的“形状与元数据实现”，不是 SIPU
 runtime implementation 的替代品。注册 SIPU 算子时应同时提供真实的
 `dispatch_key="PrivateUse1"` implementation 和与其语义匹配的 `fake_impl`。
+
+# 11. bf16 scale 序列化是否会丢一半 scale
+
+## 11.1 结论
+
+有条件地存在 bug。问题代码位于
+[quant.py](/share/users/like/package/simo_conda_sglang/simo/ops/formats/mx/quant.py:382)；
+bf16 scale 的来源是 [scale.py](/share/users/like/package/simo_conda_sglang/simo/ops/formats/mx/scale.py:221)。
+`quant.py` 中的代码：
+
+```python
+blocked_scale = (blocked_scale.view(torch.int32) >> 23).to(torch.uint8)
+```
+
+隐含前提是 `blocked_scale` 的每个元素是 32-bit float。`float32 -> int32` 是逐元素
+重解释，shape 不变；但 `bf16` 只有 16 bit，`bf16 -> int32` 会把相邻两个 bf16
+元素合并成一个 int32，最后一维元素数减半。右移 23 位也不是“把两个 bf16 scale
+打包成两个 E8M0 code”，而是在当前 little-endian 机器上只取每对中的后一个（高
+16-bit）bf16 的 exponent bits，前一个 scale 被丢弃。
+
+对于输入 shape `(512, 512)`、`axis=-1`、`block_size=32`：
+
+```text
+x_bw                 = (512, 16, 32)
+scale_bw             = (512, 16, 1)
+scale_bw.squeeze(-1) = (512, 16)   # 每 32 个元素一个 scale
+```
+
+MXFP4 的定义是每 32 个 FP4 元素对应一个 8-bit E8M0 scale；OCP MX v1.0 的 MXFP4
+条目也规定 scaling block size `k=32`、scale data type `E8M0`、scale width `8`。
+因此 512 列应有 `512 / 32 = 16` 个 scale，每行的 scale shape 应为 `(512, 16)`，
+而不是 `(512, 8)`。[OCP MX v1.0 specification](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
+
+`(512, 8)` 不是合法的“两个 scale 共用一个 scale byte”的 MX 编码：代码没有做
+两个 uint8 的 bit packing，消费者也会把它解释为每 64 个元素一个 scale。
+
+## 11.2 在指定环境中的实测
+
+使用 `/share_data/users/like/miniconda3/envs/vllm_dev/`、SIPU SDK
+`/share_data/sicx_sdk/release/2608121443/`，并从 `simo_conda_sglang` 源码导入
+`_downcast_to_mxfmt_torch.__wrapped__`，构造每个 32-element block 具有不同
+power-of-two 最大值的 512x512 bf16 输入：
+
+```text
+scale_bw: dtype=torch.bfloat16, shape=(512, 16, 1)
+direct blocked_scale.view(torch.int32): shape=(512, 8)
+downcast result scale: dtype=torch.uint8, shape=(512, 8)
+bad scale row 0:  [118, 120, 122, 124, 126, 128, 130, 132]
+```
+
+先把 bf16 scale 转成 float32，再提取 FP32 exponent：
+
+```python
+good_scale = (
+    blocked_scale.to(torch.float32).view(torch.int32) >> 23
+).to(torch.uint8)
+```
+
+得到：
+
+```text
+good scale shape: (512, 16)
+good scale row 0: [117, 118, 119, 120, 121, 122, 123, 124,
+                   125, 126, 127, 128, 129, 130, 131, 132]
+```
+
+同一个量化 payload 用错误的 `(512, 8)` scale 反量化时，`_upcast_from_mxfmt_torch`
+会根据 `256 / 8` 推断 block size 为 64，而不是实际的 32。上述构造输入的实测
+反量化误差为：
+
+```text
+bad scale:  MSE=273.066650390625, max_abs_error=64.0
+correct scale: MSE=0.0, max_abs_error=0.0
+```
+
+## 11.3 影响范围
+
+问题取决于 scale 的实际 dtype，不是仅由输入名字“bf16”决定：
+
+- `E8M0_FLOOR` 的 `OCPScaleMode` 使用 `exponent.float()` 和 `torch.pow`，本版本
+  生成 float32 scale，序列化后 shape 正常为 `(512, 16)`；
+- `E8M0_SIPU` 的 `SIPUScaleMode` 保存 `amax.dtype`，bf16 输入会生成 bf16 scale，
+  因而触发上述 shape 减半；
+- 本版本的 `E8M0_RCEIL` 对 bf16 输入也会生成 bf16 scale，走同一错误路径；
+- 已经是 float32、或 NVFP4 使用 E4M3/float8 scale 的路径不应套用这个判断，需按
+  实际 scale dtype 和对应格式分别处理。
+
+## 11.4 修复建议
+
+在所有 E8M0 序列化路径中，先把 scale 显式提升到 float32，再做 bit reinterpret：
+
+```python
+blocked_scale = (
+    blocked_scale.to(torch.float32).view(torch.int32) >> 23
+).to(torch.uint8)
+```
+
+这样不会改变 E8M0 power-of-two scale 的数值，且保持“一块 32 个元素对应一个
+uint8 scale”的 `(512, 16)` 形状。也可以从 scale 生成阶段统一保证 E8M0 scale
+始终为 float32；关键是不能直接对 bf16 tensor 做 `view(torch.int32)`。
+
+最终结论：**对于 bf16 scale，当前这一行确实会丢失一半 scale，不符合 MXFP4 的
+`32 elements -> 1 E8M0 byte` 定义；对于该路径应先 `.to(torch.float32)` 再提取
+exponent。**

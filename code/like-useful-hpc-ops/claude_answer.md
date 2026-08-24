@@ -231,3 +231,108 @@ auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, w, take<0, 2>(SLayoutW{}));   // B�
 
 一句话：**这条指令叫 `mbarrier.arrive.expect_tx`，官方惯例是"先 arrive+expect_tx，后发 TMA copy"（tutorial 那样）；hpc-ops 的顺序也能跑，但 tutorial 的顺序更推荐**。
 
+
+---
+
+# TMA 版 `cute::copy`：`tBg` 里到底有没有 base address，Copy_Atom 与 gmem tensor 各自提供什么
+
+## 结论
+
+1. **`tBg(_, itile_n, itile_k, igroup)` 里没有 global base address，只有坐标。** `tBg` 来自 `gB = tma_b.get_tma_tensor(make_shape(n, k, num_group))`（`src/group_gemm/kernels.cuh:266`），而 `get_tma_tensor` 内部用 `make_coord_tensor` 生成（`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:151-153`）：`make_coord_tensor` 把一个 **counting iterator（坐标发生器，0 偏移）**绑定到 layout 上（`3rd/cutlass/include/cute/tensor_impl.hpp:484-486`），根本不含数据指针。所以 `tBg` 的 `data()` 是坐标迭代器，取出的 `src(Int<0>{})` 是一组坐标 `(itile_n, itile_k, igroup)` 经 `g_stride_` 映射后的 TMA 坐标 `crd0..crd4`。
+
+2. **`tBg` 的作用就是只生成 TMA coordinate，且这个 coordinate 甚至被忽略了它自己的 data 指针。** 看 `TMA_LOAD_Unpack::copy_unpack`（`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:71-89`）：`auto src_coord = src(Int<0>{});` 只读坐标，`void* dst_ptr = raw_pointer_cast(dst.data());` 读的是目标 smem 的地址——**源 gmem tensor 的 `data()`（指针）从头到尾没被使用**。
+
+3. 三个参数分别给 TMA 硬件提供的信息：
+
+| 参数 | 提供的硬件信息 |
+|------|----------------|
+| 第 1 个参数 `Copy_Atom`（`tma_b.with(...)` 的返回值） | ① TMA descriptor：gmem **base address + global shape + byte stride + smem box shape + swizzle**（这些在 `make_tma_copy_desc` 里经 `cuTensorMapEncodeTiled` 烤进描述符，`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:946/1050`）；② smem **mbarrier 指针**（`uint64_t*`，来自 `readable[ismem_write]`）；③ **cache hint**（L2 cache_hint，默认 `EVICT_NORMAL`） |
+| 第 2 个参数 gmem tensor `tBg(...)` | 只有 **TMA 坐标** `crd0..crd4`（对应汇编里的 `[desc, {crd0,crd1,...}]`） |
+| 第 3 个参数 smem tensor `tBs(...)` | 只有 **smem 目标地址** `smem_ptr`（汇编里的 `[%0]`，即 `dst_ptr`） |
+
+## 逐层证据
+
+### 1. `get_tma_tensor` 生成的是"坐标张量"，不是"数据张量"
+
+`tma_b` 是 `make_tma_copy(SM90_TMA_LOAD{}, w, take<0,2>(SLayoutW{}))` 的返回值（`src/group_gemm/config.h:93`），类型是 `TiledCopy<Copy_Atom<Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams>, ...>, ...>`。它的 `get_tma_tensor`（`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:149-154`）：
+
+```cuda
+template <class GShape>
+CUTE_HOST_DEVICE constexpr
+auto get_tma_tensor(GShape const& g_shape) const {
+  static_assert(is_congruent<decltype(g_shape), decltype(aux_params_.g_stride_)>::value);
+  return make_coord_tensor(make_layout(g_shape, aux_params_.g_stride_));
+}
+```
+
+`make_coord_tensor` 定义（`3rd/cutlass/include/cute/tensor_impl.hpp:481-487`）：
+
+```cuda
+template <class Layout, __CUTE_REQUIRES(is_layout<Layout>::value)>
+CUTE_HOST_DEVICE constexpr
+auto make_coord_tensor(Layout const& layout) {
+  return make_tensor(make_inttuple_iter(coprofile(layout)), layout);
+}
+```
+
+`make_inttuple_iter` 是坐标迭代器，`coprofile(layout)` 是 0 偏移 profile——即 **engine 是"坐标发生器"，layout 是 TMA 坐标空间的映射（`aux_params_.g_stride_`）**。所以 `gB` 的元素值就是坐标，不是地址。
+
+### 2. `copy_unpack` 只取源张量的坐标、丢弃其指针
+
+`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:71-89`：
+
+```cuda
+copy_unpack(Copy_Traits<CopyOp, Args...> const& traits,
+            Tensor<TS,SLayout>           const& src,   // <- tBg(...) 切片
+            Tensor<TD,DLayout>                & dst)   // <- tBs(...) 切片
+{
+  auto src_coord = src(Int<0>{});                        // 只取坐标
+  void* dst_ptr  = cute::raw_pointer_cast(dst.data());  // 只取 smem 地址
+  return detail::explode_tuple(detail::CallCOPY<CopyOp>{},
+                               traits.opargs_,          // (desc_ptr, mbar_ptr, cache_hint)
+                               ...,
+                               make_tuple(dst_ptr),     // smem_ptr
+                               ...,
+                               src_coord, ...);         // crd0..crd4
+}
+```
+
+`CallCOPY<SM90_TMA_LOAD>` 最终调用 `SM90_TMA_LOAD::copy(desc_ptr, mbar_ptr, cache_hint, smem_ptr, crd0, ...)`（`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:327-363`），它再 dispatch 到 `SM90_TMA_LOAD_Nd::copy`，例如 3D 版本（`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:159` 起的 `SM90_TMA_LOAD_3D`）里汇编是：
+
+```
+cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint
+  [smem_ptr], [desc_ptr, {crd0, crd1, crd2}], [mbar_ptr], cache_hint;
+```
+
+可以清楚看到：`smem_ptr`（第 3 参数）与 `desc_ptr`/`mbar_ptr`/`cache_hint`（第 1 参数）和 `crd0..crd2`（第 2 参数）各就各位，源 gmem 张量的 `data()` 指针没有出现。
+
+### 3. base address / shape / stride 在 descriptor 构造时就烤死了
+
+`make_tma_copy_desc`（`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:946`）里：
+
+```cuda
+void* gmem_address = (void*) raw_pointer_cast(gtensor_T.data());   // :946
+cute::array<uint64_t, 5> gmem_prob_shape  = {1,1,1,1,1};          // :949
+cute::array<uint64_t, 5> gmem_prob_stride = {0,0,0,0,0};          // :950
+fill_tma_gmem_shape_stride(gtensor_T, stride(tma_gbasis), gmem_prob_shape, gmem_prob_stride); // :952
+...
+CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+    &tma_desc, tma_format, tma_dim,
+    gmem_address,                         // :1050  ← 基地址进 descriptor
+    gmem_prob_shape.data(),               //         ← global shape
+    gmem_prob_stride.data() + 1,          //         ← byte stride
+    smem_box_shape.data(),                //         ← smem box
+    smem_box_stride.data(),
+    tma_interleave, smem_swizzle, tma_l2Promotion, tma_oobFill);  // :1058
+```
+
+即 `tma_b` 对应的 descriptor 在 host 端（`make_tma_copy` 时）就已经把 W 的 base address、`(n,k,num_group)` 的 shape 与 stride、smem box 全部编码进去了。之后 `tma_b.with(readable[ismem_write])` 只是把这个 descriptor 指针 + barrier 指针 + cache hint 塞进可执行的 `Copy_Traits<SM90_TMA_LOAD_OP,...>`（`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:127-133`）。
+
+## 一句话总结
+
+- **第 1 参数（Copy_Atom）**：TMA 需要知道"从哪块 gmem 搬、搬到 smem 的 box 长什么样、用哪个 mbarrier 同步、L2 怎么 cache"——这些全部来自 descriptor + mbarrier + cache_hint，其中 **base address / global shape / stride / smem box / swizzle 都在 descriptor 里**。
+- **第 2 参数（gmem tensor `tBg`）**：TMA 只需要知道"这一次要搬的是这个 tensor 里的第几个 tile"——即 **coordinate**，不含 base address；它的 `data()` 指针在 TMA 路径下被忽略。
+- **第 3 参数（smem tensor `tBs`）**：TMA 需要知道"搬到 smem 的哪个地址"——即 **smem_ptr**。
+
+这也是为什么 `tma_a` 需要 `.with(td_x, ...)` 换 descriptor（换 base address + shape），而 `tma_b` 只需 `.with(barrier)`：B 的所有 expert 共用一个 descriptor，第 `igroup` 维只是坐标 `crd` 的一部分，由 `tBg(_, itile_n, itile_k, igroup)` 在坐标里表达。
+

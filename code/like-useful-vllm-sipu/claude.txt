@@ -1,4 +1,7 @@
 {
+{
+修改 /softhome/like/asset/code/cpp_guard/kgp_wl.cpp, 发送 kill 信号前打印的信息中, 增加如下内容: process 的 start time . 修改完重新 cmake build
+}
 对以下命令的功能进行讲解:
 python3 examples/offline/offline_inference_recipe.py  --recipe  examples/recipes/deepseek/deepseek_v32_tiny.json
 答案追加到 like-useful/answer_codex.md
@@ -136,9 +139,6 @@ simo 代码以 editable 方式安装在 conda 环境
 }
 
 
-{
-修改 /softhome/like/asset/code/cpp_guard/kgp_wl.cpp, 发送 kill 信号前打印的信息中, 增加如下内容: process 的 start time . 修改完重新 cmake build
-}
 
 
 
