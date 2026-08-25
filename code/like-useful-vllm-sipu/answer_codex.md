@@ -2238,6 +2238,19 @@ augroup END
   .deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su
 ```
 
+如果不想现在改任何配置文件，可以用 `--cmd` 临时注册 autocmd；它会在首个
+buffer 读取前执行：
+
+```bash
+/data/like/vim-port-all/binary/vim-install-ubuntu22.04/bin/vim \
+  -u /data/like/vim-port-all/config/.vimrc \
+  --cmd 'autocmd BufNewFile,BufRead *.su setfiletype cuda' \
+  .deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su
+```
+
+这里用 `--cmd` 而不是把同一条命令放到文件名后的 `-c`：普通 `-c` 在首个
+文件已经读取后执行，初次 `BufRead` 事件可能已经错过。
+
 如果只是临时试用、暂时不改配置，可以在已经打开的 `.su` buffer 中执行：
 
 ```vim

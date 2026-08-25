@@ -390,3 +390,195 @@ return detail::explode_tuple(detail::CallCOPY<CopyOp>{},
 
 （注：`tAg(_, itile_m, itile_k)` 里那个 `_` 已经就是"整块 box"——`tAg` 的第 0 维是 TMA 分区 `(TMA_M,TMA_K)`，`run.log:162-163` 显示 `tAg = (((_128,_48),_1),12,56)`，切片后剩下的正是 box 本身，所以一次 `cute::copy` 就搬完一整块，无需循环。）
 
+
+---
+
+# math warpgroup 逐行讲解 + 三个问题（accumulate_、TMA store 无 barrier、wait/arrive 顺序）
+
+本次运行 shape：`m=576, n=4096, k=7168, num_group=8`，tile 配置 `kTileM=48, kTileN=128, kTileK=128, kStage=8, kWarpgroupM=2, kWarpgroupN=1`（`temp/run.log:6`）。
+
+## 0. 线程分工（进入 else 分支的前提）
+
+`kNumThreads = size(TiledMma{})`（`src/group_gemm/kernels.cuh:340`）。`run.log:30` 打印 `ThrLayoutVMNK: (_128,_2,_1,_1)`，故 `kNumThreads = 128×2 = 256`。整个 kernel `__launch_bounds__(384, 1)`（`src/group_gemm/kernels.cuh:222`）：
+
+- `idx < 256`（= math warpgroup）：256 个线程 = **2 个 warpgroup**（`iwarpgroup = idx/128` = 0 或 1），每个 warpgroup 128 线程算 M 方向的一半（`kWarpgroupM=2`）。
+- `idx >= 256`（= load warpgroup）：128 个线程 = 1 个 warpgroup，只负责 TMA 搬 A/B。
+
+## 1. math warpgroup 逐行讲解（`src/group_gemm/kernels.cuh:421-629`，跳过 printf/print）
+
+```cuda
+} else {
+  // math warpgroup
+  cutlass::arch::warpgroup_reg_alloc<168>();   // :423
+```
+请求 168 个寄存器/线程（`warpgroup_reg_alloc` 触发 `setmaxnreg` 动态寄存器重配置），math 侧需要大量寄存器存累加器/描述符，把多出的寄存器从 load 侧（`:343` 的 `warpgroup_reg_dealloc<24>`）拿过来。
+
+```cuda
+  int iwarpgroup = idx / 128;                  // :425
+  TiledMma tiled_mma;                          // :427
+  auto thr_mma = tiled_mma.get_slice(idx);     // :429
+  auto tBs4r = thr_mma.partition_A(sB);        // :430
+  auto tAs4r = thr_mma.partition_B(sA);        // :431
+```
+`TiledMma` 是 `make_tiled_mma(mma_selector<48>(), WarpgroupLayout{})`（`src/group_gemm/config.h:100`），`mma_selector<48>` 选的是 `SM90_64x48x32_F32E4M3E4M3_SS_TN`（`config.h:51`）。`get_slice(idx)` 取本线程在 MMA 里的切片；`partition_A/B` 把 smem 里的 B/A 张量按 GMMA 需要的 smem 描述符布局分片。注意 A/B 角色互换：B 进 `partition_A`、A 进 `partition_B`，因为这是 `_TN`（A 转置 N 方向）。
+
+```cuda
+  auto tBr = thr_mma.make_fragment_A(tBs4r);   // :433  (MMA, MMA_N, MMA_K, kStage)
+  auto tAr = thr_mma.make_fragment_B(tAs4r);   // :434  (MMA, MMA_M, MMA_K, kStage)
+```
+把 smem 分片变成 GMMA 描述符迭代器（`run.log:200-203`：`GMMA::DescriptorIterator o (_1,_1,_4,(_1,_8))`，第 3 维 `_4` = 每个 itile_k 内 4 个 K-atom，第 4 维 `(_1,_8)` = 8 级流水 stage）。
+
+```cuda
+  auto tCr = thr_mma.partition_fragment_C(gC); // :436
+```
+`tCr` 是本线程的 f32 累加器寄存器片段（`run.log:205`：`ptr[32b] o ((_2,_2,_6))` = 每线程 24 个 f32；128 线程 × 24 = 3072 = 64×48，即一个 warpgroup 的 M64×N48 累加器）。
+
+```cuda
+  int ismem_read = 0;                          // :438
+  int phase = 0;                               // :439
+  int iblock = blockIdx.x;                     // :441
+  int igroup = 0, sum_tile_m = 0, itile_m, itile_n, task, iwave = 0;  // :442-446
+  while (true) {                               // :447
+```
+`ismem_read/phase` 是读侧流水指针；`while(true)` 按 `kTaskLoopPolicy` 三种策略之一取下一个任务 `(igroup, itile_m, itile_n)`（`:448-468`），与 load warpgroup 用同一套 `get_next_tile_*` 逻辑，保证两边顺序一致。policy==2 走 `get_next_tile_vert`（`:464`），`itile_n >= num_tile_n` 时 break（`:465-467`）。
+
+```cuda
+  iblock += gridDim.x;                         // :470
+  auto tDr = make_tensor_like(tCr);            // :472
+  clear(tDr);                                  // :473
+```
+`tDr` 是"按 group scale 缩放后的最终累加器"，**每个 tile 只清一次**；`tCr` 是 raw MMA 累加器（每个 itile_k 用 ScaleOut::Zero 重置，见下）。
+
+```cuda
+  float scale = yscale_ptr[igroup];            // :475
+  int ntile_k = size<2>(tAg);                  // :477
+  for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {   // :479
+    wait_barrier(readable[ismem_read], phase);  // :480
+```
+`scale` 是 per-group 输出缩放（per-tensor fp8 反量化系数）。`ntile_k = 56`（k=7168/kTileK=128）。`wait_barrier` 等 load warpgroup 把这一 stage 的 A/B 通过 TMA 搬进 smem（mbarrier 相位翻转）。
+
+```cuda
+    tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;   // :482
+    warpgroup_fence_operand(tCr);                   // :484
+    warpgroup_arrive();                             // :485
+    for (int ik = 0; ik < size<2>(tAr); ++ik) {     // :487  （size<2>(tAr)=4）
+      cute::gemm(tiled_mma, tBr(_,_,ik,ismem_read), tAr(_,_,ik,ismem_read), tCr);
+      tiled_mma.accumulate_ = GMMA::ScaleOut::One;  // :489
+    }
+    warpgroup_commit_batch();                       // :492
+    warpgroup_wait<0>();                            // :493
+    warpgroup_fence_operand(tCr);                   // :494
+    arrive_barrier(writable[ismem_read]);           // :496
+```
+- 先 `accumulate_ = Zero`，再在循环体里 `= One`：第一个 K-atom（ik=0）**覆盖写**累加器，后续 3 个 atom **累加**（详见第 2 节）。
+- `warpgroup_fence_operand(tCr)`（`:484`）＝对累加器寄存器做 fence，保证 wgmma 异步写 `tCr` 之前对它的旧读写已可见。
+- `warpgroup_arrive()`（`:485`）＝`wgmma.fence.sync.aligned`，标记 wgmma 组的开始。
+- 内层 `for ik`（`:487-490`）发 4 次 `cute::gemm`，每次一个 64×48×32 的 GMMA atom，4×32=128 覆盖整个 kTileK。`tBr/tAr` 第 3 维 `ik` 选 K-atom，第 4 维 `ismem_read` 选 stage。
+- `warpgroup_commit_batch()`（`:492`）＝`wgmma.commit_group` 标记这 4 条 wgmma 为一批；`warpgroup_wait<0>()`（`:493`）＝`wgmma.wait_group 0` 等这批全部算完、`tCr` 可读；`warpgroup_fence_operand(tCr)`（`:494`）再 fence 使结果对后续读可见。
+- `arrive_barrier(writable[ismem_read])`（`:496`）告诉 load warpgroup"这块 smem 我已读完，可复用"。
+
+```cuda
+    for (int i = 0; i < size(tCr); ++i)          // :499
+      tDr(i) = tCr(i) * scale + tDr(i);          // :500
+    ++ismem_read;                                // :503
+    if (ismem_read == kStage) { phase ^= 1; ismem_read = 0; }  // :504-507
+```
+把本 itile_k 的 raw 累加 `tCr` 乘 scale 后累进 `tDr`（跨 56 个 itile_k 求和），并推进读流水。
+
+```cuda
+  auto tCrh = make_tensor_like<cute::bfloat16_t>(tCr);   // :511
+  for (int i = 0; i < size(tCr); ++i)
+    tCrh(i) = (Tout)(tDr(i));                            // :514-515
+```
+把 f32 累加器转成 bf16（`Tout`）。
+
+```cuda
+  auto sCT = make_tensor(make_smem_ptr(reinterpret_cast<Tout*>(shm_c)), SLayoutCT{});  // :519-520
+  using STSM_ATOM = std::conditional_t<kTileM==8, SM90_U16x4_STSM_T, SM90_U16x8_STSM_T>; // :521-522
+  using R2SCopyAtomC = Copy_Atom<STSM_ATOM, Tout>;        // :523
+  auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);  // :524
+  auto thr_copy_c = tiled_copy_c.get_slice(idx);          // :525
+  auto tCr4s = thr_copy_c.retile_S(tCrh);                 // :527
+  auto tCs4r = thr_copy_c.partition_D(sCT);               // :528
+```
+epilogue：`tiled_copy_c` 是 `SM90_U16x8_STSM_T`（smem store，把 bf16 寄存器写进 smem C）构成的 TiledCopy。`retile_S` 把累加器片段按 STSM 的源布局重新排列（`tCr4s`），`partition_D` 给出 smem C 目标分片（`tCs4r`）。
+
+```cuda
+  tma_store_wait<0>();                          // :530
+  syncwarpgroup(iwarpgroup);                    // :531
+  cute::copy(tiled_copy_c, tCr4s, tCs4r);       // :533
+  syncwarpgroup(iwarpgroup);                    // :534
+  cute::tma_store_fence();                      // :535
+```
+见第 4 节：`tma_store_wait<0>()` 先等上一轮的 TMA store 读 smem 完毕（保护 smem C 不被覆盖）；两个 `syncwarpgroup` 保证 warpgroup 内 128 线程的 STSM 完成；`tma_store_fence()`＝`fence.proxy.async.shared::cta`，让 smem 写对后续 TMA store 可见。
+
+```cuda
+  if (is_leader_in_warpgroup) {                 // :537
+    auto gD = tma_d.get_tma_tensor(make_shape(n, m));   // :538
+    auto btma_d = tma_d.get_slice(0);                   // :539
+    auto tDs = btma_d.partition_S(sCT);                 // :541  (TMA, _2, _1)
+    auto tDg = btma_d.partition_D(gD);                  // :542  (TMA, TMA_M, TMA_N)
+    auto *td_y = td_xy + igroup * 2 + 1;                // :544
+    cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
+               tDg(_, itile_n * 2 + iwarpgroup, itile_m));  // :545-546
+    tma_store_arrive();                                 // :547
+  }
+```
+只有每个 warpgroup 的 leader 线程发 TMA store。`tDs` 的 `_2` 维是 warpgroup 的 M 方向分半（`run.log:257` 的 `((_32,_8),(_2,_6)),_2,_1`），`tDs(_, iwarpgroup, Int<0>{})` 选本 warpgroup 的那一半；`tDg` 的 TMA_N 网格是 `64`（n=4096/64），因为每个 warpgroup 只存 64 列 = tile 的一半，所以全局 N-tile 号是 `itile_n*2 + iwarpgroup`（`run.log:259-260`）。`td_y = td_xy + igroup*2 + 1` 取本 group 的 store descriptor（`update_grouped_tma` 预生成，`+1` 是 Y/store 描述符，`+0` 是 X/load 描述符）。
+
+## 2. 为什么先 `accumulate_ = ScaleOut::Zero` 再 `= ScaleOut::One`
+
+GMMA 指令的语义是 `D = A*B + scale_D * C`（`3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:129` 注释 `C = (scaleA*A)*(scaleB*B) + (scaleD*C)`）。`accumulate_` 就是这个 `scale_D`，枚举值 `ScaleOut { Zero=0, One=1 }`（`mma_sm90_gmma.hpp:112-115`）。
+
+它**只影响输出侧 D 的累加行为，不影响 A/B 输入**：
+
+- `ScaleOut::Zero`（scale_D=0）→ `D = A*B`，旧的 C 被忽略/覆盖。
+- `ScaleOut::One`（scale_D=1）→ `D = A*B + C`，累加到旧 C 上。
+
+在 `cute::gemm` 里，`MMA_Traits` 的成员 `accumulate_`（默认 `One`，`3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:496`）通过 `&(traits.accumulate_)` 传给 `MMA_Op::fma`（`mma_traits_sm90_gmma.hpp:429`），最终变成 wgmma 指令里那条"是否累加"的谓词 `p`（例如 F16 版本的 `setp.ne.b32 p, %7, 0`，`mma_sm90_gmma.hpp:204-209`；fp8 版本同构）。
+
+**为什么这样写**：一个 `itile_k`（K=128）被拆成 4 个 K-atom（每个 K=32，`size<2>(tAr)=4`，`run.log:202`）。这 4 个 atom 共享同一个累加器 `tCr`：
+
+- 第 1 个 atom（ik=0）必须**覆盖**累加器，否则会把上一轮 `itile_k` 留下的旧值再加一遍 → 所以进内层循环前设 `Zero`。
+- 第 2~4 个 atom（ik=1,2,3）必须在同一 K 上**累加** → 循环体里设 `One`。
+
+这就是标准的"K 链上第一个 MMA 初始化累加器、其余 MMA 累加"惯用法，用硬件 scale_D 谓词实现，省掉一次显式清 `tCr` 寄存器。注意 `:489` 每次循环都赋 `One`，对 ik=1,2,3 冗余但无害。
+
+## 3. 为什么 `tma_d.with(td_y)` 不需要 barrier，而 `tma_a/tma_b` 需要
+
+因为 **TMA load 和 TMA store 的同步机制根本不同**：
+
+- **TMA load**（`SM90_TMA_LOAD`）的指令是 `cp.async.bulk.tensor.Nd.shared::cluster.global.mbarrier::complete_tx::bytes`（`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:69-74`），**必须带 mbarrier**。因为搬完数据后要靠 mbarrier 的 tx-count/arrive-count 相位翻转来通知**另一个 warpgroup**（consumer math）"数据到了"。所以 `tma_a/tma_b` 的 `.with` 里要传 `uint64_t& tma_mbar`（`readable[ismem_write]`），对应 `Copy_Traits<SM90_TMA_LOAD>::with` 的 barrier 形参（`copy_traits_sm90_tma.hpp:127/138`）。
+
+- **TMA store**（`SM90_TMA_STORE`）的指令是 `cp.async.bulk.tensor.Nd.global.shared::cta.bulk_group`（`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:969/992/1015`），**没有 mbarrier 操作数**，而是用 **bulk async group**（`bulk_group`）同步：`tma_store_arrive()`＝`cp.async.bulk.commit_group`，`tma_store_wait<N>()`＝`cp.async.bulk.wait_group.read N`（`copy_sm90_tma.hpp:1225-1258`）。
+
+所以 store 版的 `.with` 只有 1 个描述符指针参数，没有 barrier 参数：`Copy_Traits<SM90_TMA_STORE>::with(TmaDescriptor const* new_tma_desc)`（`copy_traits_sm90_tma.hpp:396`），返回 `SM90_TMA_STORE_PTR`，其 `opargs` 只含描述符指针（`copy_traits_sm90_tma.hpp:439`）。
+
+**为什么这样设计**：load 是"生产者→消费者"跨 warpgroup 的数据就绪通知，需要 mbarrier 做细粒度 phase 同步；store 是"写回 gmem"这一侧的 fire-and-forget，唯一需要保证的是"smem 源缓冲在 TMA 读完之前别被覆盖"，而这是**同一个 warpgroup 内部**的复用问题，用 bulk_group 的 commit/wait 计数就够了，不需要 mbarrier。
+
+## 4. 为什么先 `tma_store_wait<0>()` 后 `tma_store_arrive()`，不能交换
+
+两者是不同职责：
+
+- `tma_store_wait<0>()` = `cp.async.bulk.wait_group.read 0`：**等之前已 commit 的所有 TMA store 全部读完 smem 源**（0 个 pending）。
+- `tma_store_arrive()` = `cp.async.bulk.commit_group`：**把当前这条 TMA store 提交进一个新的 bulk_group**，标记边界，供下一轮的 wait 使用。
+
+正确顺序（`src/group_gemm/kernels.cuh:530-547`）构成一条"等上一轮 → 写 smem → 发本轮 → 提交本轮"的流水：
+
+```
+tma_store_wait<0>();                 // 等上一轮 store 读完 smem C
+syncwarpgroup(); cute::copy(STSM);   // 把本轮结果写进 smem C（此时安全）
+cute::tma_store_fence();             // smem 写对 TMA 可见
+cute::copy(tma_d.with(td_y), ...);   // 发本轮的 TMA store
+tma_store_arrive();                  // commit 本轮 store 为一个新 group
+```
+
+**为什么不能交换**：
+
+1. `wait<0>` 的目的是**保护 smem C 缓冲不被覆盖**——它必须发生在"写 smem C"（`cute::copy(tiled_copy_c,...)` STSM）**之前**。如果上一条 store 还在异步读这块 smem，就先写新结果，会读到被覆盖的数据。交换后 wait 就跑到写 smem 之后了，保护失效。
+
+2. `arrive`（commit_group）必须发生在**发完 store 之后**，才能把这条 store 纳入 group。若先 arrive，此刻还没有 store 可 commit（空提交/无意义），真正发 store 在 arrive 之后反而没被 commit，下一轮的 `wait<0>` 就管不住它。
+
+3. 更深一层：`wait<0>` 语义是"等 pending group 数归零"，若把它放到 store 发出之后（交换位置等效于"发完 store 立刻 wait<0>"），会把**刚发的这条 store 也一起等掉**，直接串行化、毁掉 store 与下一轮 MMA 的异步重叠。所以必须"wait 在前（清旧账）、arrive 在后（记新账）"。
+
+一句话：**wait 是"收账"（清上一轮），arrive 是"记账"（记本轮），先收旧账再记新账**，顺序不能反。
