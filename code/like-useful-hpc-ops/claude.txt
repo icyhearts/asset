@@ -222,3 +222,27 @@ src/group_gemm/kernels.cuh 440行，cute::copy 需要几次 cp.async.bulk指令�
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
 
 }
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+# 以本次运行的 shape和运行日志为例，对 src/group_gemm/kernels.cuh group_gemm_fp8_kernel 函数中 if (idx >= kNumThreads) 的 else分支，即对 math warpgroup 的代码进行讲解, 要尽量详细地逐行讲解. printf和 print代码不需要讲解,这是调试用的.
+# math warpgroup  中  先设置tiled_mma.accumulate_ = GMMA::ScaleOut::Zero; , 再设置 tiled_mma.accumulate_ = GMMA::ScaleOut::One; 为什么要这样做？ tiled_mma.accumulate_ 是如何影响 gemm 的输入或者输出的 ？
+ 
+ # 为什么 结果从  shared -> global 的  tma  copy ：
+ ```
+        cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
+                   tDg(_, itile_n * 2 + iwarpgroup, itile_m));
+                   ```
+tma_d.with不需要像 load warp group那样:tma_a.with, tma_b.with, 传入 shared memory barrier? tma store不需要 barrier吗?
+
+# math warpgroup分支 为什么先调用 tma_store_wait<0>(); 后 调用 tma_store_arrive(); 
+为什么不交换 tma_store_arrive 和  tma_store_wait 的 顺序?
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}

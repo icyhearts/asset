@@ -1987,3 +1987,315 @@ uint8 scale”的 `(512, 16)` 形状。也可以从 scale 生成阶段统一保�
 最终结论：**对于 bf16 scale，当前这一行确实会丢失一半 scale，不符合 MXFP4 的
 `32 elements -> 1 E8M0 byte` 定义；对于该路径应先 `.to(torch.float32)` 再提取
 exponent。**
+
+# 12. linear_to_tileformat 展平后 hp_to_mx 如何知道 tile geometry
+
+## 12.1 先看这个测试实际传入了什么
+
+测试 [test_mxint8_unpack_pytest.py](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_mxint8_unpack_pytest.py:61)
+中的 `test_quantize_to_mxint8` 使用默认参数 `m=7, k=96` 时，调用链是：
+
+```text
+x:                         (7, 96), bf16
+pad_to_mxint8_shape:       (32, 128)
+linear_to_tileformat:      (32, 128), bf16, contiguous
+C++ hp_to_mx 参数:         batch=1, dim0=32, dim1=128
+```
+
+原因是 [mxint8_utils.py](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:100)
+把行补到至少 32 且按 32 对齐、把列补到至少 128 且按 128 对齐。随后
+`linear_to_tileformat` 对 bf16 使用 32-byte 的列对齐，也就是每个输入 tile 为
+32 行 x 16 个 bf16 元素：
+
+```python
+x.reshape(tile_m, 32, tile_n, 16) \
+ .permute(0, 2, 1, 3) \
+ .contiguous() \
+ .reshape(32, 128)
+```
+
+所以用户观察到的现象是对的：最后的 PyTorch tensor metadata 只有 2D shape
+`(32, 128)` 和普通 contiguous stride `(128, 1)`，不会再携带
+`(tile_m, tile_n, row_in_tile, col_in_tile)` 四个维度。tile 信息已经转移到
+**元素的物理排列**中，而不是保存在 shape/stride 字段中。
+
+## 12.2 三个显式模板参数和两个默认参数
+
+[mxint8.cpp](/share/users/like/package/vllm-sipu/csrc/jit/quantization/mxint8.cpp:55)
+写的是：
+
+```cpp
+hp_to_mx<sifmt::mxint8, HPType, 0>(
+    input.data_ptr(), output.data_ptr(), 1,
+    input.size(0), input.size(1), stream);
+```
+
+SDK 的声明实际上有五个模板参数：
+
+```cpp
+template <
+    typename OUT_T,
+    typename HP_T,
+    int TNOCP,
+    sipu::TmapFormat INPUT_LAYOUT = sipu::TMAP_FORMAT_TILED,
+    bool ZERO_OUTPUT = false>
+void hp_to_mx(...);
+```
+
+因此这次调用等价于：
+
+```cpp
+hp_to_mx<
+    sifmt::mxint8,       // OUT_T：输出 MX 类型
+    HPType,              // HP_T：输入高精度类型
+    0,                   // TNOCP：量化模式
+    sipu::TMAP_FORMAT_TILED,
+    false>(...);         // ZERO_OUTPUT
+```
+
+`TNOCP=0` 不是 tile 尺寸；它是量化模式参数（主要对 MXFP6 的 OCP/SIPU 选择有
+意义）。`INPUT_LAYOUT=TILED` 表示输入指针必须已经是 SIPU 约定的 tiled physical
+layout；`ZERO_OUTPUT=false` 表示不额外把整个输出分配区清零。
+
+## 12.3 `Rows` 并没有丢失，而是在 `hp_to_mx` 内部重新选择
+
+`Rows` 不是 public `hp_to_mx` 调用处的第三个模板参数。当前 SiKernel
+实现 [hp_to_mx_kernel.su](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su:26)
+在函数内部根据传入的 `dim0` 选择 device kernel 的编译期 `Rows`：
+
+```cpp
+if (dim0 > 16)       launch.template operator()<32>();
+else if (dim0 > 8)   launch.template operator()<16>();
+else                 launch.template operator()<8>();
+```
+
+随后真正启动的是：
+
+```cpp
+hp_to_mx_kernel<MX_T, HP_T, Rows, TNOCP, INPUT_LAYOUT>
+```
+
+也就是说，调用点只显式给了 `OUT_T/HP_T/TNOCP`，但 `Rows` 在 wrapper 内部被选出，
+再作为 device kernel 的模板参数实例化。对本测试的 `(batch=1, dim0=32, dim1=128)`，
+实际是 `Rows=32`。
+
+## 12.4 tile 行数和每行字节从哪里来
+
+这些数由 `Rows + HP_T + OUT_T` 的编译期 traits 和固定的 1 KiB hardware tile
+约定计算，不需要从被展平的 4D PyTorch shape 读取：
+
+| `Rows` | bf16 输入 tile | 输入每行字节 | MXINT8 输出 box | 输出 data 每行字节 |
+| --- | --- | ---: | --- | ---: |
+| 8 | 8 x 64 | 128 | 8 x 128 | 128 |
+| 16 | 16 x 32 | 64 | 16 x 64 | 64 |
+| 32 | 32 x 16 | 32 | 32 x 32 | 32 |
+
+推导来自 [hp_to_mx_tensormap.hpp](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_tensormap.hpp:67)
+和 [hp_to_output_traits.hpp](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_output_traits.hpp:132)：
+
+```text
+input_tile_dim0 = 1024 / (Rows * sizeof(HP_T))
+input_lmul      = 2                 # MXINT8 traits, bf16 时
+output_tile_dim0 = input_lmul * input_tile_dim0
+```
+
+对 bf16（`sizeof=2`）且 `Rows=32`：
+
+- 一个输入 hardware tile 是 `1024 / 2 = 512` 个 bf16，即 `32 x 16`，每行 32
+  bytes；
+- MXINT8 traits 的 `input_lmul=2`，所以一个输出 conversion box 横向消费两个输入
+  tile，即 `32 x 32` 个 bf16；
+- 输出 MXINT8 tile 有 1024 bytes data（32 x 32 个 int8）和 64 bytes 的该 tile
+  metadata/header，总计 1088 bytes。四个 tile 组成一个 MX supertile 时，布局还会
+ 处理四个 tile 的 header/data 交错。
+
+当前 Python 路径的 `linear_to_tileformat` 正好产生 `32 x 16` bf16 输入 tile；对
+`dim1=128`，就是 8 个输入 tile，C++ geometry 将它们两两组合成 4 个 `32 x 32`
+输出 tile。`hp_to_mx` 只需用 `dim1 / input_tile_dim0` 和 traits 算出 tile 数量。
+
+## 12.5 Tensor map 如何恢复访问语义
+
+[hp_to_mx_tensormap.hpp](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_tensormap.hpp:168)
+用传入的逻辑尺寸和固定 geometry 编码 `SItensorMap`：
+
+```text
+global dimensions = {dim1, dim0, batch}
+box dimensions    = {output_tile_dim0, Rows, 1}
+```
+
+随后 device kernel 按 `[column-tile, row-tile, batch]` 计算坐标，并令
+`input_pos[0] = col * Output::input_lmul`、`input_pos[1] = row`，通过
+`tacp.vvr.tile.srctm` 从 tiled pointer 搬入共享 tile，再执行 `tcvt_mxi8`。
+因此 DTE 不是根据 PyTorch 的 2D stride 猜 tile，而是根据：
+
+```text
+TMAP_FORMAT_TILED + tensor map dtype(BF16) + global/box dimensions
+                     + MXINT8/HP traits + Rows
+```
+
+解释同一块已经按约定排列的 raw bytes。
+
+## 12.6 这个设计的边界
+
+所以“4D shape 信息丢了”本身不是当前测试的 bug；这里使用的是**非自描述的固定
+布局 ABI**：调用者和 kernel 预先约定 tile 形状，2D logical dimensions 只负责 tile
+计数、坐标和边界检查。
+
+但它不是任意 tile layout 的通用解码器。如果把另一种 `row_in_tile/col_in_tile`
+排列的 2D buffer 传入，或者手工传入 `dim0=8/16` 却仍使用 Python 固定的
+`32 x 16` bf16 排列，`hp_to_mx` 无法从 shape 恢复真实布局，可能得到错误数据。
+当前路径之所以匹配，是因为 Python 侧总把行 pad 到至少 32，且 C++ 默认
+`TMAP_FORMAT_TILED` 与 `linear_to_tileformat` 的物理排列一致。
+
+指定环境实测命令：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+source ./sipu_sdk_setup.sh
+python -u - <<'PY'
+import torch
+from tests.kernels.quantization.test_mxint8_unpack_pytest import test_quantize_to_mxint8
+test_quantize_to_mxint8(7, 96, torch.bfloat16, 0, "sipu:0")
+print("PASS")
+PY
+```
+
+输出为 `PASS`；SDK 日志显示该调用实际使用 padded `(32, 128)` 输入。
+
+最终结论：**`hp_to_mx` 不会从已经展平的 2D tensor 动态推断任意
+`row_in_tile/col_in_tile`。它通过默认 `TMAP_FORMAT_TILED`、`HPType/OUT_T` traits、
+内部按 `dim0` 选择的 `Rows`、以及 tensor-map 的固定格式契约知道 tile geometry。
+对本测试，`Rows=32`、bf16 输入 tile=`32x16`（1024B），MXINT8 输出 tile data=
+1024B、header=64B；Python 展平只改变 metadata 表示，不改变这些 bytes 的含义。**
+
+# 13. 让 Vim 将 `.su` 按 CUDA 代码处理
+
+## 13.1 结论
+
+不需要修改 Vim 自带的 `$VIMRUNTIME/syntax/cuda.vim`，也不需要把文件重命名为
+`.cu`。只要把 `.su` 的 `filetype` 设为 `cuda`，Vim 的现有
+filetype 机制就会自动加载 CUDA 的语法、缩进和 C++ ftplugin。
+
+这套 Vim 91 已经包含：
+
+- [syntax/cuda.vim](/data/like/vim-port-all/binary/vim-install-ubuntu22.04/share/vim/vim91/syntax/cuda.vim:12)：先加载 C++ syntax，再增加 `__device__`、`__global__`、CUDA 类型和内建变量等关键字；
+- [indent/cuda.vim](/data/like/vim-port-all/binary/vim-install-ubuntu22.04/share/vim/vim91/indent/cuda.vim:13)：直接执行 `setlocal cindent`；
+- [ftplugin/cuda.vim](/data/like/vim-port-all/binary/vim-install-ubuntu22.04/share/vim/vim91/ftplugin/cuda.vim:10)：复用 C++ ftplugin。
+
+Vim 默认只把 `*.cu` 和 `*.cuh` 识别为 CUDA（见默认
+`filetype.vim` 的 CUDA 规则），不会自动识别 `*.su`。当前配置中的
+[.vimrc](/data/like/vim-port-all/config/.vimrc:90) 已开启 `syntax on`，
+第 91 行已开启 `filetype plugin indent on`；因此只缺少后缀到 filetype 的映射。
+
+## 13.2 推荐的映射方式
+
+当前 runtimepath 的第一项是
+[/data/like/vim-port-all/config/.vim](/data/like/vim-port-all/config/.vim)，其中已经有
+[filetype.vim](/data/like/vim-port-all/config/.vim/filetype.vim:1)。最小改动方案是将下面
+一行追加到这个已有文件中：
+
+```vim
+" SiPU .su 使用 CUDA-like C++ 语法和缩进
+au BufNewFile,BufRead *.su setfiletype cuda
+```
+
+这里用 `setfiletype` 而不是无条件的 `set ft=cuda`，是为了在某个项目已有更具体
+filetype 检测时不强行覆盖它。Vim 的用户 `filetype.vim` 会在默认检测规则前加载，
+这条规则即可稳定生效。
+
+也可以选择下面两种等价方式，但通常只选一种，避免重复注册：
+
+1. 在用户 runtime 目录新建 `.vim/ftdetect/sipu.vim`：
+
+```vim
+au BufNewFile,BufRead *.su setfiletype cuda
+```
+
+`ftdetect/*.vim` 由 Vim 在 filetype 检测阶段加载，已经处于
+`filetypedetect` autocmd group 中，不需要再套一层 group。
+
+2. 直接在 [.vimrc](/data/like/vim-port-all/config/.vimrc) 中加入独立的 autocmd group
+（建议放在 `filetype plugin indent on` 之后或文件末尾）：
+
+```vim
+augroup sipu_su_filetype
+  autocmd!
+  autocmd BufNewFile,BufRead *.su setfiletype cuda
+augroup END
+```
+
+不要改 Vim 安装目录下的 `filetype.vim`、`syntax/cuda.vim` 或
+`indent/cuda.vim`；升级 Vim 时这些文件可能被覆盖。
+
+## 13.3 启动、当前 buffer 重载和验证
+
+题目给出的 Vim 配置不在默认的 `$HOME/.vimrc`，启动时应显式指定：
+
+```bash
+/data/like/vim-port-all/binary/vim-install-ubuntu22.04/bin/vim \
+  -u /data/like/vim-port-all/config/.vimrc \
+  .deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su
+```
+
+如果只是临时试用、暂时不改配置，可以在已经打开的 `.su` buffer 中执行：
+
+```vim
+:setfiletype cuda
+:syntax enable
+```
+
+`:setfiletype cuda` 同时设置 buffer 的 filetype，并让 `filetype plugin indent on`
+加载对应的 ftplugin 和 indent 脚本；只执行 `:set syntax=cuda` 只改变颜色语法，
+不会可靠地加载 CUDA 的 filetype/indent 设置。若配置规则刚刚加入，也可以关闭并
+重新打开 buffer，或者执行 `:edit` 重新触发 `BufRead`。
+
+可以用下面的命令确认结果：
+
+```vim
+:filetype
+:setlocal filetype? syntax? cindent? indentexpr? shiftwidth? expandtab?
+:verbose setlocal cindent?
+:verbose setlocal syntax?
+:scriptnames
+```
+
+在当前配置和目标文件上实际得到：
+
+```text
+filetype=cuda
+syntax=cuda
+cindent
+indentexpr=
+shiftwidth=2
+expandtab
+```
+
+`:verbose setlocal cindent?` 会指向安装目录的
+`indent/cuda.vim`（其中设置了 `setlocal cindent`）。`indentexpr` 为空是预期行为，
+因为这个 CUDA indent 脚本使用 Vim 的内建 C indent，而不是一个 `indentexpr` 表达式。
+`shiftwidth=2` 和 `expandtab` 则来自题目给出的用户 `.vimrc`。若使用
+`-Nu NONE` 做实验，看到 `shiftwidth=8` 或 `noexpandtab` 只是因为绕过了该
+`.vimrc`，不代表 filetype 映射失败。
+
+## 13.4 语法和缩进的实际范围
+
+```text
+filetype=cuda
+  ├─ syntax/cuda.vim   -> 先复用 syntax/cpp.vim，再增加 CUDA 关键字
+  ├─ ftplugin/cuda.vim -> 复用 ftplugin/cpp.vim
+  └─ indent/cuda.vim   -> setlocal cindent
+```
+
+因此 `.su` 中的 C++ 模板、namespace、预处理器、注释、字符串和花括号都会按
+C++/CUDA 规则处理；`__device__`、`__global__` 等 CUDA 关键字也会高亮。
+SiPU 自有名称（例如 `sipu::TmapFormat`、`tacp_commit_group`、
+`tcvt_mxi8`、`tst_blk_global_m1`）不在 Vim 内建 CUDA 词表中，会保持普通标识符
+颜色，这不影响 C++ 语法解析和 `cindent`。
+
+如果以后需要给这些 SiPU 专用 token 增加颜色，建议在用户 runtime 下建立
+`.vim/after/syntax/cuda.vim`，用 `syntax keyword` 或 `syntax match` 添加规则；
+不要直接改安装目录里的 `syntax/cuda.vim`。
+
+本次没有修改 Vim 配置、Vim runtime 文件或 `hp_to_mx_kernel.su`，只将说明追加到
+本答案文档。

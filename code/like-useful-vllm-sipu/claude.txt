@@ -1,7 +1,4 @@
 {
-{
-修改 /softhome/like/asset/code/cpp_guard/kgp_wl.cpp, 发送 kill 信号前打印的信息中, 增加如下内容: process 的 start time . 修改完重新 cmake build
-}
 对以下命令的功能进行讲解:
 python3 examples/offline/offline_inference_recipe.py  --recipe  examples/recipes/deepseek/deepseek_v32_tiny.json
 答案追加到 like-useful/answer_codex.md
@@ -152,4 +149,31 @@ simo 代码以 editable 方式安装在 conda 环境
 # 在 like-useful/demo_register_sipu.py 中演示一个简单的 direct_register_custom_op 注册 sipu 实现的例子, 并用指定环境运行
 # direct_register_custom_op 为什么需要一个 fake_impl, fake_impl会在什么情况下被调用 ？
 答案追加到 like-useful/answer_codex.md, 
+}
+
+
+
+
+{
+答案追加到 like-useful/answer_claude.md
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+
+simo 代码位于  /share/users/like/package/simo_conda_vllm_sipu
+simo 代码以 editable 方式安装在 conda 环境
+
+以  tests/kernels/quantization/test_mxint8_unpack_pytest.py 的 test_quantize_to_mxint8 为例，它在调用
+linear_to_tileformat 的时候，会把tensor [tile_m, row_in_tile, tile_n, col_in_tile] transpose 成  [tile_m, tile_n, row_in_tile, col_in_tile], 最终 reshape成 2D tensor, 2D 的 shape已经失去了 row_in_tile, col_in_tile 的信息, 
+最终 csrc/jit/quantization/mxint8.cpp launch_quantize_to_mxint8 传给  hp_to_mx 只有  input.size(0), input.size(1),  hp_to_mx 是如何知道一个小的 内部 tile 有多少行，tile每行有多少字节? 这部分信息已经丢失了
+hp_to_mx 本身的模板参数有很多，launch_quantize_to_mxint8 只传了3个模板参数: hp_to_mx<sifmt::mxint8, HPType, 0> ，又如何解释 ？
+
+答案追加到 like-useful/answer_codex.md
+}
+{
+vim 安装在 /data/like/vim-port-all/binary//vim-install-ubuntu22.04/
+vim 配置文件在 /data/like/vim-port-all/config
+.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su
+是 sipu 的 c++ 代码，语法类似 cuda语法，如何让 vim 把 su 文件当作 cuda 代码一样处理 ？ 比如语法高亮，缩进
+先不要改文件， 答案追加到 like-useful/answer_codex.md
 }
