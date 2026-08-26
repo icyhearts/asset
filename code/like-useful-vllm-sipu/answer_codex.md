@@ -2312,3 +2312,506 @@ SiPU 自有名称（例如 `sipu::TmapFormat`、`tacp_commit_group`、
 
 本次没有修改 Vim 配置、Vim runtime 文件或 `hp_to_mx_kernel.su`，只将说明追加到
 本答案文档。
+
+# 14. vllm_sipu 与 SiKernel 的 MXFP8 支持
+
+## 14.1 先区分“封装没有接入”和“底层不支持”
+
+结论是：`vllm_sipu` 当前的 SiKernel JIT 目录没有 MXFP8 的 Python/C++ 封装，
+但这**不能**推出 SiKernel 不支持 MXFP8。
+
+当前目录
+[`vllm_sipu/ops/backends/sikernel/jit`](/share/users/like/package/vllm-sipu/vllm_sipu/ops/backends/sikernel/jit)
+只有 `mxint8.py`、`mxfp6.py` 等文件，没有 `mxfp8.py`。对应的
+[op_list.yaml](/share/users/like/package/vllm-sipu/vllm_sipu/ops/op_list.yaml:654)
+只注册了：
+
+- `quantize_to_mxfp6` / `mxfp6_bf16_matmul`；
+- `quantize_to_mxint8` / `mxint8_bf16_matmul`。
+
+因此目前缺的是 vLLM-SiPU 的上层适配：没有 Python API、JIT module spec、
+导出算子注册，以及相应的 MXFP8 matmul/linear method 接线。另一个相关但不同的
+限制是
+[sipu_moe.py](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/sipu_moe.py:91)
+把 grouped MXFP8 expert GEMM 标成 unsupported，原因写的是
+`grouped MXFP8 expert GEMM is not wired up`，这也不是说 `hp_to_mx` 转换
+指令不存在。
+
+题目给出的 editable SIMO 包是另一条实现路径：它在
+[`simo/ops/kernels/mx_trition_api.py`](</share/users/like/package/simo_conda_vllm_sipu/simo/ops/kernels/mx_trition_api.py:86>)
+和
+[`simo/ops/kernels/downcast/_downcast_to_mxfmt.py`](</share/users/like/package/simo_conda_vllm_sipu/simo/ops/kernels/downcast/_downcast_to_mxfmt.py:8>)
+已有 MXFP8 的 Triton downcast/GEMM 逻辑；这些代码不会自动给
+`vllm_sipu/ops/backends/sikernel/jit/` 生成 SiKernel wrapper。
+
+## 14.2 hp_to_mx 明确包含 BF16 到 MXFP8
+
+公共 API
+[sikernel.h](/share/users/like/package/vllm-sipu/.deps/sikernel-src/include/sikernel.h:2323)
+的注释列出：
+
+```cpp
+OUT_T: mxint8, mxfloat6e3m2, mxfloat6e2m3,
+       mxfloat8e4m3, mxfloat8e5m2, mxfloat4e2m1, mxint4
+HP_T:  float16, float32, bfloat16
+```
+
+在
+[hp_to_output_traits.hpp](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_output_traits.hpp:105)
+中，`HpInputTraits` 明确注册了 `sifmt::bfloat16`（同时还有 fp16/fp32）。
+同文件第 171--176 行定义了两个 MXFP8 输出 trait：
+
+```cpp
+HpToOutputTraits<sifmt::mxfloat8e4m3, HP_T>
+    -> TMAP_DTYPE_MXFP8, tcvt_mxf8e4m3
+HpToOutputTraits<sifmt::mxfloat8e5m2, HP_T>
+    -> TMAP_DTYPE_MXFP8, tcvt_mxf8e5m2
+```
+
+这个宏对所有已支持的 `HP_T` 展开，所以其中包含：
+
+```text
+sifmt::bfloat16 -> sifmt::mxfloat8e4m3
+sifmt::bfloat16 -> sifmt::mxfloat8e5m2
+```
+
+具体的输出特性是 8-bit payload、64-byte tile header、每个输出 tile 消耗
+两个 1 KiB 的 16-bit 输入 tile（`input_lmul=2`）。这描述的是 MXFP8 的
+**转换存储格式**，不是普通 IEEE FP8 tensor 的无 scale 表示。
+
+## 14.3 hp_to_mx 的显式实例化证据
+
+[hp_to_mx_kernel.su](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su:93)
+的 `INSTANTIATE_HP_TYPES` 宏依次包含：
+
+```cpp
+sifmt::float32
+sifmt::float16
+sifmt::bfloat16
+```
+
+随后第 108--111 行显式生成了：
+
+```cpp
+INSTANTIATE_TILED(sifmt::mxfloat8e4m3, 0);
+INSTANTIATE_LINEAR(sifmt::mxfloat8e4m3, 0);
+INSTANTIATE_TILED(sifmt::mxfloat8e5m2, 0);
+INSTANTIATE_LINEAR(sifmt::mxfloat8e5m2, 0);
+```
+
+因此 BF16 的 tiled 和 linear 两种输入布局实例都被发射出来。这里的
+`TNOCP=0` 对 MXFP8 没有 mxfp6 的 OCP 选择含义；源码注释说明 TNOCP 的特殊
+取值只适用于 mxfp6。
+
+SiKernel 自己的测试也覆盖了这条组合：
+
+- [compile_contract.cpp](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/test/compile_contract.cpp:21)
+  检查 BF16→MXFP8 的函数指针类型、MXFP8 metadata、register 和 intrinsic
+  result，并在第 168--179 行列出 BF16/FP16/FP32 与 TILED/LINEAR 的实例；
+- [test_host.cpp](/share/users/like/package/vllm-sipu/.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/test/test_host.cpp:459)
+  的测试矩阵直接调用 `run_shapes<mxfloat8e4m3, bfloat16>` 和
+  `run_shapes<mxfloat8e5m2, bfloat16>`，另测 fp16/fp32 和 linear 路径。
+
+## 14.4 输入尺寸和布局的约束
+
+`hp_to_mx` 不是任意 shape 都能走 direct DTE path。
+[sikernel.h](/share/users/like/package/vllm-sipu/.deps/sikernel-src/include/sikernel.h:2345)
+规定：
+
+- `dim1` 必须是由所选 `Rows` 对应的输出 tile 宽度的整数倍；
+- `batch_size > 1` 时，`dim0` 还必须按 `Rows` 对齐；
+- MXFP8/BF16 下 `Rows=8/16/32` 时，输出 tile 宽度分别是
+  `128/64/32`。
+
+所以“底层支持 BF16→MXFP8”不等价于可以把任意普通二维 tensor 直接传入；
+调用者仍要按要求 padding，并按 `INPUT_LAYOUT` 约定准备物理内存。
+
+公共模板声明是：
+
+```cpp
+template <typename OUT_T, typename HP_T, int TNOCP,
+          sipu::TmapFormat INPUT_LAYOUT = sipu::TMAP_FORMAT_TILED,
+          bool ZERO_OUTPUT = false>
+void hp_to_mx(...);
+```
+
+因此调用：
+
+```cpp
+hp_to_mx<sifmt::mxfloat8e4m3, sifmt::bfloat16, 0>(...);
+```
+
+等价于使用 `INPUT_LAYOUT=TMAP_FORMAT_TILED`、`ZERO_OUTPUT=false`。如果输入
+是普通 linear 排列，必须显式传第四个模板参数
+`sipu::TMAP_FORMAT_LINEAR`，而当前 vllm_sipu 没有 MXFP8 wrapper 来替你完成
+这层布局和输出 storage size 管理。
+
+## 14.5 `sipu::TmapFormat` 定义位置
+
+`TmapFormat` 不定义在
+`hp_to_mx_kernel.su` 内；该文件第 27 行只是把它用作模板参数类型。include
+链是：
+
+```text
+hp_to_mx_kernel.su
+  -> sikernel.h / sipu.h
+  -> /share_data/sicx_sdk/release/2608121443/include/deprecated.h
+```
+
+精确定义在 SDK：
+[/share_data/sicx_sdk/release/2608121443/include/deprecated.h:779](/share_data/sicx_sdk/release/2608121443/include/deprecated.h:779)
+
+```cpp
+namespace sipu {
+// namespace starts at line 725
+enum TmapFormat
+{
+    TMAP_FORMAT_LINEAR = 0,  // line 781
+    TMAP_FORMAT_TILED = 1    // line 782
+};
+}
+```
+
+[/share_data/sicx_sdk/release/2608121443/include/sipu.h:57](/share_data/sicx_sdk/release/2608121443/include/sipu.h:57)
+包含了这个 `deprecated.h`，所以 `.su` 能看到该枚举。
+
+## 14.6 指定环境下的编译验证
+
+我在题目指定的 conda/SIPU SDK 环境中只读源码并构建到 `/tmp`：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+source ./sipu_sdk_setup.sh
+export SIKERNEL_ROOT_DIR="$PWD/.deps/sikernel-src"
+export SIPU_ARCH=150
+cmake -S "$SIKERNEL_ROOT_DIR/source/source_builtin/misc/hp_to_mx" \
+      -B /tmp/hp_to_mx_cmake -DTARGET_SIPU_ARCH=150
+cmake --build /tmp/hp_to_mx_cmake \
+      --target hp_to_mx_compile_contract -j2
+```
+
+结果为：
+
+```text
+[50%] Built target hp_to_mx
+[100%] Built target hp_to_mx_compile_contract
+```
+
+这证明当前 SDK/源码组合能编译出包含 MXFP8 实例的 `hp_to_mx`，并通过
+compile-contract 的类型和 geometry 检查。源码自带的 `test_host` 运行测试也
+覆盖 MXFP8，但其当前 CMake 文件把测试依赖写死为源码目录下的
+`build/libhp_to_mx.so`；本次没有为了运行它去修改源码目录或构建产物。已额外
+启动 compile-contract 可执行文件（设置 `LD_LIBRARY_PATH=/tmp/hp_to_mx_cmake`），
+退出码为 0，输出为：
+
+```text
+[SIRT] Library:0.4.1.970ac7d.Release @ /share_data/sicx_sdk/release/2608121443/lib/libsipu.so.0
+```
+
+最终结论：**SiKernel 的 `hp_to_mx` 明确支持 BF16→MXFP8 E4M3/E5M2；当前
+vllm_sipu 只是尚未提供 mxfp8 的 JIT/Python 封装和上层算子接线。**
+
+# 15. vllm_sipu FP8 linear 与 fused MoE
+
+本文针对当前工作树中的
+vllm_sipu/model_executor/layers/quantization/fp8.py 和
+vllm_sipu/model_executor/layers/quantization/fp8_linear.py。结论以代码实际
+执行路径为准，并用指定的 conda 环境和 SIPU SDK 做了聚焦测试。
+
+## 15.1 先给结论：权重和激活是两个时间维度
+
+“在线/离线量化”不能只给整个层贴一个标签，需要分别看 checkpoint 中的权重
+是否已经是 FP8，以及激活在 forward 时是否动态量化：
+
+| 路径 | checkpoint 中的权重 | 权重处理 | 激活处理 | 当前 SIPU 实际路径 |
+| --- | --- | --- | --- | --- |
+| SIPUFp8LinearMethod | FP8 权重和 scale（serialized） | 加载后只做 block scale/layout 处理 | 每次 apply 用 SiInfer 动态量化 | FP8 grouped GEMM |
+| SIPUFp8MoEMethod（serialized） | FP8 权重和 scale | 加载后整理；必要时选择 backend | DeepGemm 路径运行时量化输入和中间激活 | FP8 DeepGemm；不支持时退到 BF16/FP16 GEMM |
+| SIPUFp8PerTensorOnlineMoEMethod（非 serialized） | BF16/FP16 权重 | 按“online”命名本应在加载时转 FP8 | 当前实现没有建立 FP8 quant config | 保留原权重，使用未量化 Torch fallback |
+| SIPUCompressedTensorsW8A8Fp8MoEMethod | FP8 权重和 scale | 加载时整理 scale/必要时重定标 | 按 scheme 在运行时量化激活 | SIPU W8A8 FP8 Triton/相关 kernel |
+
+因此，对当前实现最准确的简答是：
+
+1. 线性层是“权重离线量化，激活在线量化”。
+2. serialized fused MoE 也是“权重离线量化，激活在线量化”；DeepGemm 不可用
+   时会先把权重解量化，计算本身变成未量化 fallback。
+3. 非 serialized 的 online MoE 类目前只是选择了 online 类名，代码明确保留
+   BF16/FP16 权重，还没有真正执行在线 FP8 权重量化。
+
+这里的“online FP8 权重量化”通常指：checkpoint 是 BF16/FP16，框架在模型加载
+完成时调用量化算子一次，把权重换成 FP8；并不表示每个 forward 都重新量化权重。
+激活的 dynamic quantization 则确实发生在 forward。
+
+## 15.2 fp8.py 的分派入口
+
+### 注册和选择 method
+
+SIPU 在 [fp8.py:197](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:197)
+把配置注册为 quantization name 'fp8'，并继承上游 Fp8Config。跳过列表中的层
+仍交给上游配置；其余层的选择在
+[fp8.py:199](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:199)
+到 [fp8.py:218](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:218)：
+
+- LinearBase 总是返回 SIPUFp8LinearMethod。
+- RoutedExperts 根据 is_checkpoint_fp8_serialized 分支：
+  - True 返回 SIPUFp8MoEMethod；
+  - False 返回 SIPUFp8PerTensorOnlineMoEMethod；
+- 其他层使用上游 Fp8Config 的选择逻辑。
+
+注意，LinearBase 这里没有像上游配置那样根据 serialized 标志切换到
+Fp8PerTensorOnlineLinearMethod；无论标志取值都返回 SIPUFp8LinearMethod。由于
+该 SIPU method 的非 block 路径未实现，BF16/FP16 checkpoint 不能据此推断会
+自动获得完整的 online linear FP8 支持。
+
+所以，不能把 fp8_linear.py 中注册的 kernel 和 SIPUFp8LinearMethod 混为同一个
+类：前者是上游 linear method 可以选用的 kernel 实现，后者是 SIPU 自己覆盖的
+quantization method。
+
+### SIPU 兼容性辅助函数
+
+这部分代码主要是给 SIPU 缺少的布局/算子补兼容路径，不负责把 BF16 权重转换为
+FP8：
+
+- [fp8.py:75](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:75)
+  的 _scaled_dequantize_sipu 检查输入是否在 sipu。若在 sipu，就把量化权重和
+  scale 拷到 CPU，调用上游 scaled_dequantize，再把结果搬回原 SIPU device。
+  这是 fallback 解量化，不是量化。
+- [fp8.py:116](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:116)
+  的 _transpose_for_grouped_mm 在 SIPU 上通过 CPU 完成 transpose 和 contiguous；
+  [fp8.py:124](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:124)
+  用 marker 使这个转换只做一次。
+- [fp8.py:135](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:135)
+  到 [fp8.py:194](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:194)
+  的函数按 block 或 tensor scale 把 FP8 MoE 权重恢复为原 dtype，供 Torch
+  fallback 使用。
+- [fp8.py:100](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:100)
+  安装一次性 monkey patch，使上游解量化函数遇到 SIPU tensor 时走上述 CPU
+  staging。
+
+## 15.3 SIPUFp8LinearMethod 的生命周期
+
+类定义和说明见
+[fp8.py:221](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:221)。
+类的 docstring 已明确写出它面向 offline/serialized、block-quantized checkpoint，
+GEMM 使用 torch._scaled_grouped_mm。
+
+### create_weights：分配运行时参数
+
+[fp8.py:226](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:226)
+到 [fp8.py:285](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:285)
+做以下事情：
+
+1. 保存 tensor-parallel 后的逻辑宽度、分片尺寸和 orig_dtype。
+2. block quant 时校验 block shape，并把 layer.weight_block_size 设为配置值
+   （当前 SIPU kernel 要求 128x128）。
+3. 创建 FP8 weight 参数，形状是 [output_partition, input_partition]。
+4. 非 block 创建 weight_scale；block 创建 weight_scale_inv。
+5. 只有静态 activation scheme 才创建 input_scale。
+
+这里的 create_weights 是“按 checkpoint 格式分配容器”，没有读取 BF16 权重并
+进行 FP8 量化。
+
+### process_weights_after_loading：只整理已量化权重
+
+[fp8.py:287](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:287)
+到 [fp8.py:308](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:308)
+只有 block_quant 分支调用上游 process_fp8_weight_block_strategy，然后替换
+weight 和 scale。它做的是 checkpoint block scale 的形状/布局规范化，不是
+BF16/FP16 到 FP8 的数值量化。因此该 method 的权重必须已经以 FP8 serialized
+形式提供。
+
+### apply：每个 forward 量化激活
+
+[fp8.py:310](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:310)
+到 [fp8.py:345](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:345)
+的实际顺序是：
+
+1. 输入 x（通常是 BF16 SIPU tensor）调用
+   per_token_group_quant_fp8.siinfer，group size 是
+   weight_block_size[1]，生成 x_fp8 和 x_scale。
+2. 第一次执行时把权重和 block scale 转成 grouped-MM 需要的布局，并在 layer
+   上缓存 marker。
+3. 调用 torch._scaled_grouped_mm(x_fp8, weight, x_scale, weight_scale_inv)，
+   输出 dtype 固定为 BF16，最后加 bias。
+
+所以激活是明确的 runtime/dynamic quantization；同一权重不会在每次 forward
+重新量化。当前非 block 分支在 [fp8.py:346](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:346)
+设计为 NotImplementedError。由于代码在抛出前先访问
+self.weight_block_size[1]，当配置确实没有 block size 时还可能先得到 None
+下标错误；这也说明当前实现的有效支持范围就是 block FP8。
+
+另外，create_weights 在 act_q_static=True 时虽然会创建 input_scale
+([fp8.py:281](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:281))，
+但 apply 的实现仍无条件调用动态 per_token_group_quant_fp8，并没有读取
+layer.input_scale。因此“分配了静态 scale 参数”不代表当前 SIPU override 已
+实现静态激活量化；实际执行仍按动态量化路径解释。
+
+## 15.4 fp8_linear.py：kernel 层，而不是新的量化策略
+
+### 注册关系
+
+文件末尾把 SIPU kernel 放进上游的 OOT dispatch 表：
+[fp8_linear.py:163](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8_linear.py:163)
+到 [fp8_linear.py:169](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8_linear.py:169)。
+因此上游的 Fp8LinearMethod 或 online linear method 在选择 scaled-MM kernel
+时可以看到这些实现；它本身不决定 checkpoint 是 offline 还是 online。
+
+### SIPUNonBlockFP8Kernel
+
+[fp8_linear.py:26](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8_linear.py:26)
+继承上游 CutlassFP8ScaledMMLinearKernel，只覆盖 is_supported，声明 SIPU
+out-of-tree platform 可用。注释中列出的 per-tensor/per-token activation scale
+和 per-tensor/per-channel weight scale 都由继承的上游路径处理；该类没有自己的
+权重量化步骤。
+
+### SIPUBlockFP8Kernel
+
+类定义见 [fp8_linear.py:44](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8_linear.py:44)。
+
+- [fp8_linear.py:58](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8_linear.py:58)
+  的 can_implement 限制 activation group 为 (1,128)、weight group 为
+  (128,128)，并要求 K/N 对齐 128，输入和输出均为 BF16。
+- [fp8_linear.py:99](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8_linear.py:99)
+  先调用父类处理，再把 E8M0 scale 转成 float32（若需要），并调用
+  pack_sideepgemm_block_fp8_weight。pack 是硬件布局打包，不等于把 BF16
+  数值量化成 FP8；进入该函数前权重已经是 FP8。
+- [fp8_linear.py:136](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8_linear.py:136)
+  的 apply_weights 调用 apply_w8a8_block_fp8_linear.torch；该算子内部对输入
+  做 per-token-group FP8 quant，然后执行 block FP8 GEMM。
+
+也就是说，fp8_linear.py 的 block kernel 是“已量化权重的执行/打包层”，运行时
+仍可在线量化激活。它与 fp8.py 中 SIPUFp8LinearMethod 直接调用
+_scaled_grouped_mm 的实现是两条接入路径。
+
+## 15.5 serialized fused MoE：SIPUFp8MoEMethod
+
+### 加载和 backend 选择
+
+[fp8.py:352](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:352)
+的 SIPUFp8MoEMethod 继承上游 Fp8MoEMethod，因此父类负责 serialized FP8
+权重/scale 的参数建立和加载。SIPU 在
+[fp8.py:368](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:368)
+到 [fp8.py:411](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:411)
+替换参数、构造 FusedMoEQuantConfig，并根据形状和 quant flags 选择：
+
+- DeepGemm：要求 FP8 E4M3、128x128 block、适合的 SiLU act-and-mul、无 bias，
+  且 hidden/intermediate 尺寸对齐。
+- Torch：DeepGemm 条件不满足时的兼容 fallback。
+
+这些条件的详细判定在
+[fused_moe/oracle/fp8.py:39](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/oracle/fp8.py:39)
+到 [fused_moe/oracle/fp8.py:94](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/oracle/fp8.py:94)。
+
+### DeepGemm 分支：权重离线、激活在线
+
+serialized checkpoint 的 w13/w2 已经是 FP8，DeepGemm 直接使用它们和对应
+scale 做两次 grouped GEMM。输入激活在 prepare 阶段调用
+moe_kernel_quantize_input；例如 no-EP 路径见
+[fused_moe/prepare_finalize/no_ep.py:28](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/prepare_finalize/no_ep.py:28)
+到 [no_ep.py:55](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/prepare_finalize/no_ep.py:55)。
+第一层 GEMM 后的 SiLU-and-mul 结果又在
+[fused_moe/experts/deep_gemm.py:239](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/experts/deep_gemm.py:239)
+到 [deep_gemm.py:259](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/experts/deep_gemm.py:259)
+调用 per_token_group_quant_fp8.siinfer，再做第二层 GEMM。因此两处激活量化
+都是 forward-time 行为。
+
+### Torch fallback：先解量化，计算不再是 FP8
+
+当 backend 为 TORCH 时，
+[fp8.py:389](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:389)
+到 [fp8.py:403](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:403)
+调用 _dequant_fp8_moe_weight，把 FP8 w13/w2 恢复成 layer.orig_dtype，再
+创建 SIPUTorchMoEKernel。该 kernel 的
+[experts/torch.py:94](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/experts/torch.py:94)
+到 [experts/torch.py:125](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/fused_moe/experts/torch.py:125)
+最终调用 unquantized_fused_moe_torch_impl。因此这是“FP8 checkpoint + 加载时
+解量化 + BF16/FP16 fallback”，不能把它算成 FP8 fused-MoE 计算。
+
+## 15.6 非 serialized 的 online MoE：当前是占位 fallback
+
+上游 online MoE 的语义是加载 BF16/FP16 后，在
+process_weights_after_loading 中调用 scaled_fp8_quant，把每个 expert 的权重
+转换成 FP8（上游实现示例见
+[/share/users/like/package/vllm-for-conda-vllm-sipu/vllm/model_executor/layers/quantization/online/fp8.py:494](/share/users/like/package/vllm-for-conda-vllm-sipu/vllm/model_executor/layers/quantization/online/fp8.py:494)）。
+
+但 SIPU 覆盖类
+[fp8.py:445](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:445)
+到 [fp8.py:520](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:520)
+没有调用父类的在线量化逻辑：
+
+- __init__ 直接放入 SIPUTorchMoEKernel。
+- process_weights_after_loading 明确保留加载时的 BF16/FP16 w13/w2，清空
+  input scales，并把 moe_quant_config 设为 None。
+- get_fused_moe_quant_config 永远返回 None，所以 _setup_kernel 不会选择
+  DeepGemm FP8 kernel。
+- apply 把原始权重交给 SIPUTorchMoEKernel，而该 kernel 调用未量化 Torch
+  implementation。
+
+因此，非 serialized 分支目前是“online method 名称 + 未量化 fallback”，不是
+真正的 BF16→FP8 在线权重量化。若未来实现 quant config 和 FP8 kernel setup，
+才会变成上游意义上的 online FP8 MoE。
+
+## 15.7 测试覆盖情况
+
+### 直接覆盖 linear method 的测试
+
+[tests/kernels/quantization/test_fp8_linear.py:215](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear.py:215)
+到 [test_fp8_linear.py:312](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear.py:312)
+的 test_fp8_linear_method 是直接的 SIPUFp8LinearMethod 集成/数值测试，流程是：
+
+1. 构造 serialized、dynamic、128x128 block Fp8Config。
+2. 创建并填充 FP8 weight 和 block scale。
+3. 调用 process_weights_after_loading。
+4. 在 SIPU 上 apply，检查输出与 CPU reference，并断言激活 quant 的 group
+   size=128、dtype=float8_e4m3fn。
+
+同一文件 [test_fp8_linear.py:89](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear.py:89)
+到 [test_fp8_linear.py:174](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear.py:174)
+还直接测试 SIPUBlockFP8Kernel 的 process/apply；这不是 LinearMethod 本身，
+但覆盖了它所用的另一套 kernel 接口。配置注册则由
+[tests/test_glm_index_cache_config.py:76](/share/users/like/package/vllm-sipu/tests/test_glm_index_cache_config.py:76)
+到 [test_glm_index_cache_config.py:89](/share/users/like/package/vllm-sipu/tests/test_glm_index_cache_config.py:89)
+间接验证。
+
+### fused MoE method 的测试边界
+
+在 tests/ 下没有找到直接实例化
+SIPUFp8MoEMethod 或 SIPUFp8PerTensorOnlineMoEMethod 的单元测试。现有
+[tests/kernels/moe/test_sipu_w8a8_fp8_moe.py:302](/share/users/like/package/vllm-sipu/tests/kernels/moe/test_sipu_w8a8_fp8_moe.py:302)
+到 [test_sipu_w8a8_fp8_moe.py:408](/share/users/like/package/vllm-sipu/tests/kernels/moe/test_sipu_w8a8_fp8_moe.py:408)
+以及 [test_sipu_w8a8_fp8_moe.py:421](/share/users/like/package/vllm-sipu/tests/kernels/moe/test_sipu_w8a8_fp8_moe.py:421)
+到 [test_sipu_w8a8_fp8_moe.py:522](/share/users/like/package/vllm-sipu/tests/kernels/moe/test_sipu_w8a8_fp8_moe.py:522)
+测试的是另一个类 SIPUCompressedTensorsW8A8Fp8MoEMethod，覆盖 compressed-
+tensors FP8 的 channel/tensor/block scheme、Triton experts 和数值 reference；
+不能算 fp8.py 中两个 SIPUFp8*MoE method 的直接单测。另有低层 quant op 和
+workspace 测试，但同样不覆盖这两个 method 的分派/online fallback 语义。
+
+### 本次实际验证
+
+在题目指定环境执行：
+
+~~~bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+source ./sipu_sdk_setup.sh
+python3 -m pytest -q \
+  tests/kernels/quantization/test_fp8_linear.py::test_fp8_linear_method
+python3 -m pytest -q \
+  tests/kernels/moe/test_sipu_w8a8_fp8_moe.py::test_sipu_deep_gemm_workspace_covers_qwen35_single_token
+~~~
+
+结果分别是 1 passed（约 20 秒）和 1 passed（约 15 秒）。两个文件完整收集
+结果分别是 4 个和 11 个测试；这里没有把“收集成功”误报成所有测试都已运行。
+
+## 15.8 最终回答
+
+- FP8 linear：当前 SIPU 支持的是 serialized FP8 block weight；权重是离线量化
+  结果，输入激活在每次 forward 在线动态量化。
+- serialized fused MoE：DeepGemm 路径同样是离线 FP8 权重 + 在线激活量化；
+  Torch 不支持路径会在加载时解量化，随后用未量化 BF16/FP16 MoE。
+- 非 serialized fused MoE：类名是 Online，但当前 SIPU 实现显式保留 BF16/FP16
+  权重并走 unquantized fallback，尚不能称为真正的在线 FP8 权重量化。
+- 单元测试：SIPUFp8LinearMethod 有直接测试；SIPUBlockFP8Kernel 也有直接
+  测试。SIPUFp8MoEMethod 和 SIPUFp8PerTensorOnlineMoEMethod 没有直接单元
+  测试；已有的 MoE FP8 测试属于 compressed-tensors method。

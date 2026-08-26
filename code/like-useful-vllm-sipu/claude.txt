@@ -177,3 +177,51 @@ vim 配置文件在 /data/like/vim-port-all/config
 是 sipu 的 c++ 代码，语法类似 cuda语法，如何让 vim 把 su 文件当作 cuda 代码一样处理 ？ 比如语法高亮，缩进
 先不要改文件， 答案追加到 like-useful/answer_codex.md
 }
+{
+}
+
+
+
+{
+答案追加到 like-useful/answer_claude.md
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+
+simo 代码位于  /share/users/like/package/simo_conda_vllm_sipu
+simo 代码以 editable 方式安装在 conda 环境
+
+vllm_sipu/ops/backends/sikernel/jit/ 里面没有mxfp8的封装，是 sikernel不支持吗？
+.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su hp_to_mx 支持 bf16->mxfp8的转换吗?
+
+.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su sipu::TmapFormat 枚举定义在哪一行代码?
+答案追加到 like-useful/answer_codex.md
+}
+
+
+{
+答案追加到 like-useful/answer_claude.md
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+
+simo 代码位于  /share/users/like/package/simo_conda_vllm_sipu
+simo 代码以 editable 方式安装在 conda 环境
+sikernel代码在 .deps/sikernel-src 
+
+sikernel 已经能通过 hp_to_mx 支持 bf16->mxfp8 的 转换，有 mxfp8 input, bf16 output的gemm算子吗 ？
+答案追加到 like-useful/answer_codex.md
+}
+
+
+{
+答案追加到 like-useful/answer_claude.md
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+simo 代码位于  /share/users/like/package/simo_conda_vllm_sipu
+simo 代码以 editable 方式安装在 conda 环境
+对 vllm_sipu/model_executor/layers/quantization/fp8.py 和 vllm_sipu/model_executor/layers/quantization/fp8_linear.py 代码进行讲解
+这里的 fp8 linear层和 fused moe层的量化，是在线量化还是离线量化? linear method和 moe method有没有单元测试?
+答案追加到 like-useful/answer_codex.md
+}
