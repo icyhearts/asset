@@ -582,3 +582,156 @@ tma_store_arrive();                  // commit 本轮 store 为一个新 group
 3. 更深一层：`wait<0>` 语义是"等 pending group 数归零"，若把它放到 store 发出之后（交换位置等效于"发完 store 立刻 wait<0>"），会把**刚发的这条 store 也一起等掉**，直接串行化、毁掉 store 与下一轮 MMA 的异步重叠。所以必须"wait 在前（清旧账）、arrive 在后（记新账）"。
 
 一句话：**wait 是"收账"（清上一轮），arrive 是"记账"（记本轮），先收旧账再记新账**，顺序不能反。
+
+---
+
+## scale 乘法放在 itile_k 循环内 vs 提出的"挪到循环外只乘一次"是否等价
+
+**问题**：`src/group_gemm/kernels.cuh` group_gemm_fp8_kernel 的 math warpgroup 分支里，499~501 行的 `tDr(i) = tCr(i) * scale + tDr(i);` 目前放在 `for (int itile_k = 0; itile_k < ntile_k; ++itile_k)` 循环内部，对整个 tile 总共执行 `size(tCr) * ntile_k` 次。若把 scale 乘法挪到循环结束后，改成 `for (int i = 0; i < size(tDr); ++i) { tDr(i) = tDr(i) * scale; }`（只循环 `size(tDr)` 次），结果还正确吗？
+
+**结论：正确，可以安全地把 scale 乘法挪出循环。** 数学上完全等价，且略有精度/性能好处。唯一差别是浮点舍入顺序，量级在几个 ULP 以内。
+
+### 1. 为什么数学上等价
+
+关键是 `scale` 是循环不变量：
+
+- `src/group_gemm/kernels.cuh:475` `float scale = yscale_ptr[igroup];` — scale 只依赖 `igroup`。
+- `igroup` 在每个 tile task 开始时由任务调度（`get_next_tile_vert` / task map，见 458~467 行区域）一次性确定，在同一个 tile 的整个 K 循环内固定不变，不随 `itile_k` 变化。因此 `scale` 在 `for (int itile_k ...)` 循环里对每次迭代都是同一个值。
+
+原始写法按 k 展开（tDr 初值为 0，见 :473 `clear(tDr)`）：
+
+```
+k=0 : tDr = tCr_0 * scale + 0       = tCr_0 * scale
+k=1 : tDr = tCr_1 * scale + tCr_0 * scale
+k=2 : tDr = tCr_2 * scale + tCr_1 * scale + tCr_0 * scale
+...
+k=ntile_k-1 : tDr = scale * Σ_k tCr_k
+```
+
+即 `tDr = scale * Σ_{k} tCr_k`。
+
+提出写法：先裸累加（不乘 scale），循环结束后再乘一次：
+
+```
+循环后 : tDr = Σ_k tCr_k
+再乘   : tDr = (Σ_k tCr_k) * scale
+```
+
+两者都是 `scale * Σ tCr_k`，数学恒等。整数/重数下结果一致。
+
+### 2. 关键正确性前提都成立
+
+- **`scale` 真正循环不变**（:475 只在 tile 开始时读一次，:479 的循环内不重读）。
+- **`tCr` 每个 K-tile 被重置为全新部分和**：`src/group_gemm/kernels.cuh:482` `tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;`，所以 `tCr` 只存放"当前 K-tile"这 32 个 K 值的部分积，而非跨 K 的累积；跨 K 的累积正是靠 `tDr`。这点很关键——挪出后 `Σ tCr_k` 由 `tDr` 完整保存，循环内不再有 scale 参与累积。
+- **`tDr` 只在循环结束后被消费**：`src/group_gemm/kernels.cuh:511-516` `tCrh(i) = (Tout)(tDr(i));` 在循环外面。所以把 scale 延后到循环后乘，不会影响任何读 tDr 的时序。
+
+### 3. 唯一的差别：浮点舍入（可忽略）
+
+- 原始：每个 K 步做一次 `scale * tCr_k`（乘法）再加进 `tDr`，共 `ntile_k` 次乘法 + `ntile_k` 次加法（编译器通常会融合为 FMA，但每个 FMA 仍是一次舍入）。
+- 提出：循环内只做 `ntile_k` 次加法，最后做 1 次乘法。
+
+两者最终结果的 fp32 低几位会略有不同（舍入顺序不同），但误差都是"标准累积求和 + 1 次缩放"量级，属于几个 ULP 的差异，不会改变数值正确性。实际上提出版本只做 1 次乘法而非 `ntile_k` 次，乘法舍入更少，通常**略微更精确或至少不更差**。
+
+### 4. 性能
+
+挪出后每个元素少做 `ntile_k - 1` 次乘法（fp32 寄存器运算），且能让 `#pragma unroll`（:486/:498）的 K 内层循环更轻。不过该循环大概率受 TMA / wgmma 等待（`warpgroup_commit_batch` + `warpgroup_wait<0>`，:492-493）约束而非受这几条 fp32 运算约束，所以实际收益可能很小，但无任何副作用。
+
+### 建议的等价改写
+
+```cuda
+// K 循环内改为纯累加
+for (int i = 0; i < size(tCr); ++i) {
+  tDr(i) += tCr(i);
+}
+// 循环结束后一次缩放
+for (int i = 0; i < size(tDr); ++i) {
+  tDr(i) = tDr(i) * scale;
+}
+```
+
+
+---
+
+## 进一步合并：直接让 gemm 累加到 tDr，去掉 tCr，并把 accumulate_ 提到循环外
+
+**问题**：在上一问（把 scale 乘法挪出 `for (int itile_k ...)`）的基础上，进一步：让 `cute::gemm` 直接输出到 `tDr` 而非 `tCr`：
+- 循环前 `clear(tDr)`（让 tDr 为 0），并只设置一次 `tiled_mma.accumulate_ = GMMA::ScaleOut::One;`
+- 内层 `for (int ik ...)` 不再反复设 `accumulate_`
+- 循环结束后 `for (int i = 0; i < size(tDr); ++i) tDr(i) = tDr(i) * scale;`
+
+结果还正确吗？
+
+**结论：正确。这是标准 CUTLASS Hopper mainloop（fp32 直接累加、最后统一缩放）的写法，且能省掉 `tCr` 这一整份片段寄存器。** 但有一个关键点必须跟着改：**`warpgroup_fence_operand` 必须从 `tCr` 改为 `tDr`**，否则编译器屏障落在已经不再被 wgmma 改写的 `tCr` 上，`tDr` 这个真正的累加器没有被强制物化到寄存器，是潜在的正确性隐患。
+
+### 1. 为什么数学上正确
+
+`accumulate_` 控制 GMMA 的 `scale_D`（`src/group_gemm/kernels.cuh:482` 附近），即 `D = (scaleA*A)*(scaleB*B) + (scaleD*D)`。原始写法每个 `itile_k` 先把 `tCr` 用 `ScaleOut::Zero` 重置为"本 K-tile 的部分和"，再用 `ScaleOut::One` 在 `ik` 内累加，最后 `tDr = tCr*scale + tDr`。逐项展开即：
+
+```cuda
+tDr = scale * ( Σ_{itile_k} Σ_{ik} A*B )
+// 括号里就是整个 K（7168）维的完整点积，因为循环一次把 tAg 的 K 维（size<2>=56，56*128=7168）全部走完
+```
+
+新写法 `clear(tDr)` 后全程 `ScaleOut::One`：
+
+- 第 1 次 gemm：`tDr = A_0*B_0 + 0 = A_0*B_0`（等价于 `Zero` 的起始效果）
+- 后续全部：`tDr += A*B`
+- 整个 K 循环后：`tDr = Σ_{全部 K} A*B`
+- 最后乘一次：`tDr = (Σ A*B) * scale`
+
+两者都等于 `scale * Σ_K (A*B)`，数学恒等。
+
+### 2. 为什么可以全程用 One / 只 clear 一次
+
+- `src/group_gemm/kernels.cuh:473` `clear(tDr);` 已经存在，且它位于每个 tile task 的 while 循环体内（`auto tDr = make_tensor_like(tCr);` 在 :472）。所以每个输出 tile 开始时 `tDr` 保证为 0，第一次 gemm 的 `A*B + 0` 就是干净的起始值，等价于只在"第一次"用一次 `Zero`。全程 `One` 是安全的。
+- `scale` 是循环不变量（`src/group_gemm/kernels.cuh:475` `float scale = yscale_ptr[igroup];`，只依赖 `igroup`，在单个 tile 的整个 K 循环内恒定）。一个 tile 的 `igroup` 固定，整个 K 维都属于同该 group，所以只乘一次即可。
+- `tDr` 目前只在 K 循环**结束后**被消费（`src/group_gemm/kernels.cuh:513-516` `tCrh(i) = (Tout)(tDr(i));`），循环内除了 `tCr` 没有任何地方读 `tDr` 的中间值，因此把缩放和消费都推迟到循环后不影响时序。
+- 每次 `itile_k` 结尾的 `warpgroup_commit_batch(); warpgroup_wait<0>();`（`src/group_gemm/kernels.cuh:492-493`）已保证每次批次的 wgmma 在进入下一次 `itile_k` 前完成，因此循环退出时最后一次 wgmma 也已 wait 完，`tDr` 是稳定可读的。
+
+### 3. 必须改的点（否则有隐患）
+
+1. **`warpgroup_fence_operand(tCr)` 改成 `warpgroup_fence_operand(tDr)`**：`src/group_gemm/kernels.cuh:484` 和 `:494`。`warpgroup_fence_operand` 的实现（`3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:88-103`）是 `asm volatile("" : "+f"(reg) :: "memory")`——一个以累加器寄存器作为读写约束的空汇编，作用是**强制编译器把该寄存器张量在 wgmma 前物化到寄存器、不跨这条屏障乱序**。它必须作用于实际被 wgmma 读写的那个累加器张量。现在累加器是 `tDr`，若屏障仍挂在 `tCr` 上，`tDr` 不被强制物化，是正确性风险。
+
+2. **只设一次 `tiled_mma.accumulate_ = GMMA::ScaleOut::One;`** 放在 `for (int itile_k ...)` 之前（`clear(tDr)` 之后）。其实 `GMMA::ScaleOut accumulate_` 的默认值就是 `One`（`3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:496`），所以不设也默认是 One；显式设一次更清晰。
+
+3. **`tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;`（`src/group_gemm/kernels.cuh:482`）删掉**，因为不再需要每个 `itile_k` 重置部分和。
+
+4. **内层 `ik` 循环里的 `tiled_mma.accumulate_ = GMMA::ScaleOut::One;`（`src/group_gemm/kernels.cuh:489`）删掉**，gemm 直接写 `tDr(_, _, _)`。
+
+5. 循环后的乘 scale 循环用 `size(tDr)`（而非 `size(tCr)`）作边界；顺带修正 `:513-516` epilogue 里 `for (int i = 0; i < size(tCr); ++i)` 的边界为 `size(tDr)`（二者当前相等，只是语义上更严谨）。
+
+### 4. 精度：不更差，通常略更好
+
+原始写法每个 `itile_k` 都要做一次 `scale * tCr`（有舍入）再 FMA 进 `tDr`；新写法把 7168 个 fp32 累加全部在 `tDr` 里做，最后只做**一次**乘法。两者总累积精度相当（都是 ~7168 元素 fp32 求和），新写法乘法舍入由 `ntile_k` 次降为 1 次，通常略更精确。不做 per-K-tile 的 scale 缩放，也避免了 scale 带来的逐段舍入。
+
+### 5. 性能 / 寄存器收益
+
+`tCr` 和 `tDr` 是两份独立的寄存器片段（`make_tensor_like(tCr)` 复制布局但分配新存储，见 run.log 中 `tCr`/`tDr`/`tCrh` 三个不同的 `ptr[...]`）。合并后 `tCr` 彻底不再需要，主循环内少一份累加器片段的寄存器压力（配合 `warpgroup_reg_alloc<168>()` 的动态寄存器分配更稳），内层循环也不再每条 gemm 后插入一次分支/赋值。这是实打实的收益。
+
+### 6. 一句话总结
+
+只要**把 `warpgroup_fence_operand` 一起切到 `tDr`**、删掉 per-`itile_k` 的 `Zero`/`One` 切换、保留 `clear(tDr)`，这套"直接累加 + 循环后一次缩放"的写法在数学和时序上都正确，且省寄存器、少舍入。合并后的结构大致为：
+
+```cuda
+auto tDr = make_tensor_like(tCr);
+clear(tDr);
+float scale = yscale_ptr[igroup];
+tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+  wait_barrier(readable[ismem_read], phase);
+  warpgroup_fence_operand(tDr);
+  warpgroup_arrive();
+  for (int ik = 0; ik < size<2>(tAr); ++ik) {
+    cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tDr(_, _, _));
+  }
+  warpgroup_commit_batch();
+  warpgroup_wait<0>();
+  arrive_barrier(writable[ismem_read]);
+  ++ismem_read;
+  if (ismem_read == kStage) { phase ^= 1; ismem_read = 0; }
+}
+for (int i = 0; i < size(tDr); ++i) {
+  tDr(i) = tDr(i) * scale;
+}
+```
+

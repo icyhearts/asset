@@ -1824,7 +1824,109 @@ arrive_barrier(writable[ismem_read]);
 - `cute::gemm` 发出的 WGMMA 是异步指令；调用返回不代表 FP32 结果已经写回 `tCr`。
 - `warpgroup_commit_batch()` 发出 `wgmma.commit_group.sync.aligned`，把此前由这个 warpgroup 发出的 WGMMA 放入一个可等待的 batch。实现见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:73-83`（函数 `warpgroup_commit_batch`）。
 - `warpgroup_wait<0>()` 发出 `wgmma.wait_group.sync.aligned 0`。模板参数 0 表示等待到已提交的 WGMMA pending group 数为 0，也就是当前 `tCr` 可以被普通 CUDA 指令读取。实现见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:59-71`（函数 `warpgroup_wait`）。
-- 第二个 `warpgroup_fence_operand(tCr)` 是编译器层面的 operand fence，使后续普通的寄存器读、类型转换和软件累加不会被编译器错误地移到异步 WGMMA 完成之前；相关 helper 见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:45-65`（函数 `warpgroup_fence_operand`）。
+- 第二个 `warpgroup_fence_operand(tCr)` 更准确地说，是 CUTLASS 用“空的 `volatile` inline asm + 每个 accumulator 的 read-write operand + `memory` clobber”实现的**编译器代码移动约束**。CUTLASS 的相关说明通常把它称为 **NVVM code-motion fence**，但它不是独立的 PTX/GPU 硬件原语，也不是等待 WGMMA 完成的指令。它只标记列出的 accumulator live range：约束编译器不要把会定义、覆盖、reload 或错误使用这些 accumulator 的普通指令放进 WGMMA in-flight 区间；完全不依赖这些 operand 的独立指令仍可能被调度到前后。实现见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:45-66`（函数 `warpgroup_fence_operand(Tensor<Engine, Layout>&)`）。
+
+#### `warpgroup_fence_operand(tCr)` 在本次实例中的展开
+
+`tCr` 是 `src/group_gemm/kernels.cuh:436`（函数 `group_gemm_fp8_kernel`）由 `partition_fragment_C` 创建的寄存器 tensor。运行日志显示每个线程的形状为 `((_2,_2,_6),_1,_1)`，即 `2*2*6=24` 个 FP32 accumulator，见 `temp/run.log:204-205`（函数 `group_gemm_fp8_kernel` 的调试输出）。这也与本次 atom 的输出规模吻合：一条 `m64n48` WGMMA 产生 `64*48=3072` 个 FP32 输出，由 128 个线程共同持有，所以每线程正好持有 `3072/128=24` 个逻辑 accumulator。
+
+调用点的重载解析也值得明确：`tCr` 是 `cute::Tensor<Engine, Layout>` 左值，所以 `src/group_gemm/kernels.cuh:484` 和 `src/group_gemm/kernels.cuh:494`（函数 `group_gemm_fp8_kernel`）匹配的是 `warpgroup_fence_operand(Tensor<Engine, Layout>&)` 模板，而不是 `float&` 标量 overload。模板内部对 `f32_frg(i)` 逐元素取出 `float&` 后，才继续分派到 `warpgroup_fence_operand(float&)`。两个层次的实现分别见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:45-66`（函数 `warpgroup_fence_operand(Tensor<Engine, Layout>&)`）和 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:97-103`（函数 `warpgroup_fence_operand(float&)）。
+tensor overload 的执行路径是：
+
+1. `CUTE_STATIC_ASSERT(is_static<Layout>::value)` 要求 fragment layout 在编译期已知。这里不是运行时检查，也不会访问 shared/global memory；目的是让下面的遍历可以静态展开。
+2. 当前 `Engine::value_type=float`，所以进入 `if constexpr` 的 float 分支，而不是整数分支。
+3. `recast<float>(frg)` 只改变 tensor view 的类型视图。因为原来的元素类型已经是 float，`recast` 的同类型路径直接复用原 data/layout，不做数值转换或内存 copy，见 `3rd/cutlass/include/cute/tensor_impl.hpp:756-780`（函数 `recast`）。
+4. `CUTE_UNROLL` 把 24 次循环展开；概念上等价于对本线程的每一个 `tCr(i)` 分别调用一次标量 overload。因此它不是对一个“抽象 tensor 对象”发一条 fence，而是给该线程持有的每个 accumulator register 建立约束。
+
+概念展开形式如下（这是语义等价的伪代码，不是额外的运行时循环）：
+
+```cpp
+for (int i = 0; i < 24; ++i) {
+  asm volatile("" : "+f"(tCr(i)) :: "memory");
+}
+```
+
+标量 overload 位于 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:86-103`（函数 `warpgroup_fence_operand(uint32_t&)` 和 `warpgroup_fence_operand(float&)`）。如果 accumulator 是整数类型，tensor overload 会走另一分支：先 `recast<uint32_t>`，再使用 `"+r"`；本次 FP8->FP32 kernel 走的是 `"+f"` 浮点分支。标量实现还受 `#if defined(__CUDA_ARCH__)` 保护：host 编译 pass 中函数体为空，只有 device 编译 pass 才建立这些 inline-asm 约束。每个线程只约束自己持有的 24 个 fragment 元素；它没有 arrival count、phase 或跨线程通信，因此本身不是 128-thread warpgroup barrier。相对地，`src/group_gemm/kernels.cuh:485`（函数 `group_gemm_fp8_kernel`）调用的 `warpgroup_arrive` 展开为带 `.sync.aligned` 的硬件指令，要求 warpgroup 按一致路径执行；这正是“operand fence 是 per-thread 编译器标记、`wgmma.fence` 是 warpgroup 硬件同步”的区别。
+
+#### 空 inline asm 的每个部分分别表示什么
+
+对本次 float overload：
+
+```cpp
+asm volatile("" : "+f"(reg) :: "memory");
+```
+
+- `""`：asm 模板为空，因此该 asm 本身不要求生成 `mov`、`membar`、`wgmma` 等显式硬件指令。编译器仍可能因为寄存器分配在附近生成普通 `mov`，但那不是这个 helper 发出的指令；真正有意义的是 operand/clobber 约束。
+- `volatile`：要求编译器保留这条 asm，不把它当成可删除的纯空语句。`volatile` 单独并不是“禁止所有代码移动”的完整屏障；本例的寄存器依赖来自 `+f`/`+r`，内存访问约束来自 `memory` clobber。这里的 volatile 修饰的是 asm 语句，不是对某个 shared/global 地址执行 volatile load/store。
+- `+`：operand 是 **read-write**。编译器必须把 `reg` 的旧定义作为 asm 输入，并把 asm 之后的值作为输出传给后续使用，于是形成 `旧值 -> fence -> 新值` 的数据流边界。它不表示 helper 真的改变了数值，也不表示硬件已经完成异步写回。
+- `f`：要求该 operand 使用浮点寄存器约束，正好对应 WGMMA wrapper 中的 `float d00...d23`。
+- `"memory"` clobber：告诉编译器这条 asm 可能观察或影响任意内存，从而约束编译器可见的普通内存访问不要跨过它任意重排。它不是 CUDA 的 `__threadfence()`，不刷新 cache，不建立 CTA/warpgroup 间可见性，也不等待异步单元完成；shared-memory 的 TMA readiness 由 `readable` mbarrier 路径另行保证。
+
+因此，`warpgroup_fence_operand` 的本质是“告诉编译器这些寄存器在这里形成一个异步 WGMMA 的边界”，而不是“在这里让 GPU 停下来”。可以把它理解成给特定寄存器 live range 加标签，而不是给整个线程或整个 warpgroup 加全局栅栏。
+
+#### 为什么这个 operand 正好是 `tCr`
+
+本次选择的 GMMA operation 是 `MMA_64x48x32_F32E4M3E4M3_SS_TN`，其 `CRegisters=float[24]`，见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28810-28815`（类型 `MMA_64x48x32_F32E4M3E4M3_SS_TN`）。其 `fma` 的 `d00...d23` 都以 `"+f"` 传给 `wgmma.mma_async`，见同文件 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28817-28850`（函数 `MMA_64x48x32_F32E4M3E4M3_SS_TN::fma`）。
+
+CuTe 的 `mma_unpack` 将 `D` 和 `C` 视为同一组寄存器：它把可写的 D tensor 重解释为 `rC`，再把每个寄存器传给 `fma`，见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:392-430`（函数 `SM90::GMMA::mma_unpack`）。三参数 `MMA_Atom::call(A,B,C)` 进一步明确执行 `call(C,A,B,C)`，即 D=C 原地更新，见 `3rd/cutlass/include/cute/atom/mma_atom.hpp:107-118`（函数 `MMA_Atom::call`）。所以需要被标记的正是 `tCr`，而不是 `tDr`、`tAr` 或 `tBr`。
+
+#### 第一条 WGMMA 使用 `ScaleOut::Zero`，为什么 fence 仍是 `+f`
+
+`src/group_gemm/kernels.cuh:482-490`（函数 `group_gemm_fp8_kernel`）中第一条 WGMMA 的 `ScaleOut::Zero` 只控制硬件公式里的旧 C 项是否参与：wrapper 通过谓词令第一条指令计算 `D=A*B`，后续三条才计算 `D=A*B+D`。它不把 `tCr` 清零，也不改变 C++/inline-asm 层面对这 24 个 destination operands 的描述。
+
+具体 wrapper 始终把 `d00...d23` 写成 `"+f"`，见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28817-28850`（函数 `MMA_64x48x32_F32E4M3E4M3_SS_TN::fma`）；是否使用旧值由同一函数中的 `scale_D` 谓词决定。于是 compiler helper 也统一使用 `+f` 来维持同一组 in-place accumulator 的 live range。这里的“read”是编译器数据流含义，不意味着 `ScaleOut::Zero` 时硬件把旧 `tCr` 加入结果，也不意味着 pre-fence 初始化了 `tCr`。
+
+#### 在当前代码中的两个边界
+
+当前 WGMMA 的顺序是 `src/group_gemm/kernels.cuh:482-496`（函数 `group_gemm_fp8_kernel`）：
+
+```text
+ScaleOut::Zero
+warpgroup_fence_operand(tCr)  // 编译器边界：开始
+warpgroup_arrive()            // 硬件 wgmma.fence.sync.aligned
+4 x cute::gemm(...)           // 异步 WGMMA，写同一组 tCr
+warpgroup_commit_batch()
+warpgroup_wait<0>()           // 硬件等待 batch 完成
+warpgroup_fence_operand(tCr)  // 编译器边界：结束
+读取 tCr，更新 tDr
+```
+
+- **前一个（`src/group_gemm/kernels.cuh:484`，函数 `group_gemm_fp8_kernel`）**：它标记在第一条 WGMMA 之前，`tCr` 可能存在的普通寄存器访问已经结束；随后 `src/group_gemm/kernels.cuh:485`（函数 `group_gemm_fp8_kernel`）的 `warpgroup_arrive()` 才是真正的 `wgmma.fence.sync.aligned`。这个硬件 fence 排序的是此前 accumulator（以及采用寄存器 A fragment 时的相关 A 寄存器）访问与后续 WGMMA；本例是 `SS_TN`，A/B 通过 shared-memory descriptor 提供，因此实际重点是 accumulator 寄存器。它不负责让 shared memory 变得可读；A/B stage 的 TMA readiness 已由 `src/group_gemm/kernels.cuh:480`（函数 `group_gemm_fp8_kernel`）的 `wait_barrier(readable[ismem_read], phase)` 保证。也就是说，operand fence、硬件 `wgmma.fence`、TMA mbarrier 分别服务于编译器寄存器数据流、WGMMA 寄存器顺序和 shared-memory 数据可用性，三者不能互相替代。
+- **后一个（`src/group_gemm/kernels.cuh:494`，即用户指出的文档 line 1827 所解释的调用）**：`src/group_gemm/kernels.cuh:493`（函数 `group_gemm_fp8_kernel`）的 `warpgroup_wait<0>()` 确认已提交的 4 条 WGMMA 完成后，这个 fence 把 accumulator 的“异步定义”与后续普通 C++ 使用连接起来。当前紧接着的依赖使用是 `src/group_gemm/kernels.cuh:499-500`（函数 `group_gemm_fp8_kernel`）的 `tCr(i)`，随后还会经过 BF16 转换和 STSM epilogue（`src/group_gemm/kernels.cuh:510-533`，函数 `group_gemm_fp8_kernel`）。特别是 `warpgroup_wait<0>()` 自身的 inline asm 没有 `tCr` operand；仅靠它的 memory clobber，编译器不一定能把“这 24 个异步产生的寄存器”与后续 C++ tensor 访问建立完整的寄存器级边界，因此 CUTLASS 再显式调用 operand fence。
+
+这里的“开始/结束”是编译器调度边界，不表示这条空 asm 在硬件上开启或关闭 WGMMA pipeline。真正发起运算的是 `src/group_gemm/kernels.cuh:488`（函数 `group_gemm_fp8_kernel`）的 `cute::gemm`，它最终展开为 `wgmma.mma_async`；`warpgroup_arrive` 只发出运算前的硬件寄存器排序 fence，`warpgroup_commit_batch` 定义异步 group 的提交边界，`warpgroup_wait` 等待已提交 group。三个 wrapper 的实现见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:47-84`（函数 `warpgroup_arrive`、`warpgroup_commit_batch`、`warpgroup_wait`）。
+
+四个内层 `cute::gemm` 使用同一个形状 `m64n48k32` 和同一组 `tCr` accumulator。对这种连续、同形状的 accumulator WGMMA，硬件允许连续更新同一 accumulator，不需要在每两条 WGMMA 之间再执行 `wgmma.fence`；同时，两条 WGMMA 之间没有普通 C++ 代码读写 `tCr`，所以也没有必要重复加入 compiler operand marker。这里必须区分两种边界：空的 `warpgroup_fence_operand` 不会直接切分硬件 pipeline，硬件 async batch 由 `warpgroup_commit_batch` 定义。当前 helper 放在 batch 开始和 `wait_group` 之后，覆盖“普通寄存器访问 -> 异步 WGMMA batch -> 普通寄存器访问”三个阶段。当前 operation 是 `SS_TN`，A/B 数据来自 shared-memory descriptor，`tCr` 是需要重点标记的寄存器 accumulator；这也是代码只对 `tCr` 调用该 helper 的原因。
+
+
+#### 用“寄存器使用权交接”理解两个调用
+
+这是一个帮助阅读代码的抽象模型，不是额外的 CUDA barrier：
+
+1. 在 `src/group_gemm/kernels.cuh:484`（函数 `group_gemm_fp8_kernel`）之前，普通 C++/编译器代码仍可能拥有 `tCr` 的 live range；前置 operand marker 把“最后一次普通访问”标在 WGMMA batch 之前。紧接的 `src/group_gemm/kernels.cuh:485`（函数 `group_gemm_fp8_kernel`）才发出硬件 `wgmma.fence.sync.aligned`，满足 WGMMA 对相关寄存器顺序的要求。
+2. 在 `src/group_gemm/kernels.cuh:488-490`（函数 `group_gemm_fp8_kernel`）期间，4 条 `wgmma.mma_async` 连续把同一组 24 个 accumulator 当作目的寄存器更新；这段区间没有普通 C++ 读取 `tCr`。`tiled_mma.accumulate_` 的赋值只改变下一条 WGMMA 的 `scale_D` 控制，不是对 `tCr` 做普通寄存器访问。
+3. `src/group_gemm/kernels.cuh:492-493`（函数 `group_gemm_fp8_kernel`）先提交 batch，再用 `warpgroup_wait<0>()` 等待异步结果完成。**硬件“结果可读”由 wait 提供，不能由 operand marker 提供。**
+4. `src/group_gemm/kernels.cuh:494`（函数 `group_gemm_fp8_kernel`）的 post marker 位于 wait 之后、`src/group_gemm/kernels.cuh:499-500`（函数 `group_gemm_fp8_kernel`）第一次普通读取 `tCr(i)` 之前；它把 compiler-visible 的 accumulator 定义与后续 C++ use 接起来。把这个调用提前到 wait 之前，不能替代当前顺序，因为 marker 就失去了“完成后再允许普通 use”的位置含义。
+5. `src/group_gemm/kernels.cuh:496`（函数 `group_gemm_fp8_kernel`）的 `arrive_barrier(writable[ismem_read])` 是 shared-memory stage 的生产者/消费者协议，和 `tCr` 寄存器 marker 是两条独立的同步链路；前者不读取或刷新 `tCr`。
+
+#### 如果删除 `src/group_gemm/kernels.cuh:494`（函数 `group_gemm_fp8_kernel`），会发生什么
+
+删除 operand fence **通常没有硬件同步或数学正确性含义**：`src/group_gemm/kernels.cuh:493`（函数 `group_gemm_fp8_kernel`）的硬件 `warpgroup_wait<0>()` 仍然等待全部已提交 group 完成，所以某些编译器版本下测试仍会通过。风险主要在编译器生成代码和性能：NVVM/ptxas 对“哪些寄存器属于 WGMMA in-flight batch、何时允许普通指令触碰这些 live range”的信息变得不完整，可能出现：
+
+- 为了满足隐含的寄存器依赖而插入额外等待，多个 WGMMA 被串行化；
+- ptxas 报告类似“non-WGMMA instructions defining accumulator registers between the start and end of the pipeline stage”的性能警告；
+- 寄存器压力较高时发生额外 register move/reload，削弱 4 条 WGMMA 的异步重叠。
+
+因此它主要是性能和编译器调度方面的标记，不是清零 `tCr`、不是 `ScaleOut::Zero`，也不是线程同步原语。对本次 kernel，最准确的职责分工是：
+
+| 原语 | 是否生成硬件指令 | 主要职责 |
+|---|---:|---|
+| `warpgroup_fence_operand(tCr)` | 否（空 asm） | 给 NVVM 标记 24 个 accumulator register 的代码移动边界 |
+| `warpgroup_arrive()` | 是，`wgmma.fence.sync.aligned` | 排序此前 accumulator（必要时的寄存器 A fragment）访问与后续 WGMMA；不负责 shared-memory 可见性 |
+| `warpgroup_commit_batch()` | 是，`wgmma.commit_group.sync.aligned` | 把已发出的 WGMMA 组成可等待 batch |
+| `warpgroup_wait<0>()` | 是，`wgmma.wait_group.sync.aligned 0` | 等待 batch 完成，之后才可读取 accumulator |
+
+
 
 ```cpp
 arrive_barrier(writable[ismem_read]);
@@ -2142,3 +2244,299 @@ math 分支结束后，循环回到下一项任务；本次 pertensor kernel 的
 - `tiled_mma.accumulate_` 不改变 FP8 A/B 输入；它对应 GMMA 公式中的 `scale_D*C`，控制本条 WGMMA 是否把旧的 C accumulator 加入结果。对本次 `kTileK=128`，4 条 `K=32` WGMMA 的模式必须是 `Zero, One, One, One`。
 - `tma_d.with(td_y)` 不是“没有同步”，而是没有 load 所用的 transaction mbarrier 参数。S2G 指令用 `bulk_group`，由 `tma_store_arrive` 提交、下一轮 `tma_store_wait<0>` 等待；STSM 前后还需要两个 `syncwarpgroup` 和一个 `tma_store_fence`。
 - `tma_store_wait<0>` 保护上一轮 `shm_c` source 的复用；`tma_store_arrive` 提交当前刚发出的 store。正确的流水线顺序是“上一轮 wait -> 当前轮写 shared/fence/copy/arrive”，不能把两者当成同一轮的可交换调用。
+
+### 13.17 能否把 `tDr(i) * scale` 移到 `itile_k` 循环之后
+
+先给直接结论：**可以提取这个公共 scale，但不能只删除循环内的整条更新语句。** 如果循环内不再把 `tCr` 加到 `tDr`，而循环结束后只执行
+
+```cpp
+for (int i = 0; i < size(tDr); ++i) {
+  tDr(i) = tDr(i) * scale;
+}
+```
+
+那么结果不正确。`tDr` 在每个 output task 开始时由 `make_tensor_like` 创建并在 `clear(tDr)` 清零，见 `src/group_gemm/kernels.cuh:472-475`（函数 `group_gemm_fp8_kernel`）；如果中间没有任何写入，最后乘法仍然只是 `0 * scale`。
+
+反过来，如果保留循环内原来的 `tCr(i) * scale`，又在循环结束后乘一次 `scale`，就会把同一个因子应用两遍，结果变成 `scale^2 * Σ_j p_j`，同样不正确。
+
+#### 必须采用的改写
+
+要提取 scale，`itile_k` 循环内仍须进行**未缩放的累加**，循环结束后再统一缩放：
+
+```cpp
+#pragma unroll 1
+for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+  // wait + WGMMA + wait_group，与原代码相同
+#pragma unroll
+  for (int i = 0; i < size(tDr); ++i) {
+    tDr(i) = tDr(i) + tCr(i);
+  }
+}
+
+#pragma unroll
+for (int i = 0; i < size(tDr); ++i) {
+  tDr(i) = tDr(i) * scale;
+}
+```
+
+原始的 K 循环、WGMMA 完成等待和 `tDr` 更新位于 `src/group_gemm/kernels.cuh:477-501`（函数 `group_gemm_fp8_kernel`）。实际改代码时，`tDr(i) + tCr(i)` 仍应放在每次 `warpgroup_wait<0>()` 和 `warpgroup_fence_operand(tCr)` 之后；统一乘法应放在外层循环结束、`tCrh` 的 BF16 转换之前，即 `src/group_gemm/kernels.cuh:508-515`（函数 `group_gemm_fp8_kernel`）之间。不能在 `warpgroup_wait<0>()` 之前读取 `tCr`，也不能等转换成 BF16 后才乘 scale。
+
+#### 为什么当前 per-tensor 路径可以提出公因子
+
+令第 `j` 个 K tile 的 `tCr(i)` 为 `p_j(i)`。当前代码的逻辑是：
+
+```text
+D_0(i) = 0
+D_{j+1}(i) = D_j(i) + p_j(i) * scale
+```
+
+`scale` 在进入 K 循环前只读取一次：`float scale = yscale_ptr[igroup]`，见 `src/group_gemm/kernels.cuh:472-479`（函数 `group_gemm_fp8_kernel`）。在一个 task 的整个 `itile_k` 循环中，`igroup` 不变，因此这个 scale 不依赖 `itile_k` 或元素下标 `i`。host 入口也把 `y_scale` 检查为 FP32，并把它作为 `yscale_ptr` 传入 kernel，见 `src/group_gemm/entry.cc:17-20`、`:33`、`:99-112`（函数 `group_gemm_fp8_entry`）。
+
+所以在**实数算术**下：
+
+```text
+Σ_j (p_j(i) * scale) = (Σ_j p_j(i)) * scale
+```
+
+这里还有一个必要条件：`tDr` 初值必须是零。若初值是 `D0 != 0`，原式是 `D0 + scale * Σp_j`，改写式却是 `scale * (D0 + Σp_j)`，除非 `scale == 1`，两者并不相等。当前 `clear(tDr)` 正好满足这个条件，而且 `tDr` 在 while 的每个 task 内重新创建，不会把上一个 task 的结果带进来，见 `src/group_gemm/kernels.cuh:447-475`（函数 `group_gemm_fp8_kernel`）。
+
+本次运行的日志显示 `tAg` 的 K 维 tile 数为 `56`，每线程的 `tCr` 和 `tDr` 都有 `24` 个 FP32 元素，见 `temp/run.log:162-207`（函数 `group_gemm_fp8_kernel` 的调试输出）。因此当前每线程执行 `56 * 24 = 1344` 次“缩放并累加”，改写后是 `1344` 次“只累加”加 `24` 次最终缩放。`size(tDr)` 与 `size(tCr)` 相同是 `make_tensor_like(tCr)` 的直接结果。
+
+测试也明确使用了 per-group 公共 scale：参考路径传 `scale_a=0.5`、`scale_b=0.5`，HPC 路径传每 group 的 `scale_hpc=0.5*0.5=0.25`，见 `tests/test_group_gemm_pertensor_like.py:39-40`、`:57-66`（函数 `naive_group_gemm_pertensor_fp8`、`test_group_gemm_pertensor_fp8`）。对这一数据接口，提出公因子的数学前提成立。
+
+#### “数学正确”不等于“逐位相同”
+
+两种写法的 FP32 舍入点不同。原写法每个 K tile 都先做乘法再累加：
+
+```text
+old_j = round(old_{j-1} + round(p_j * scale))
+```
+
+而改写后先累加未缩放值，最后只舍入一次乘法：
+
+```text
+sum_j = round(sum_{j-1} + p_j)
+new   = round(sum_last * scale)
+```
+
+在 CUDA 编译器允许乘加融合时，原表达式还可能生成一条 FP32 FMA（一次舍入）；改写后通常是多次 FP32 add 加一次 FP32 multiply。因而不能承诺 `torch.equal` 或 bitwise identical，即使 `scale=0.25` 是 2 的负幂也不能对所有 subnormal、边界值和舍入情形作此承诺。
+
+极端情况下两者还可能在以下方面不同：
+
+- **舍入和消去误差**：先缩放再相加与先相加再缩放，对正负 partial 的消去顺序不同；
+- **范围**：改写后的未缩放 `tDr` 可能先溢出，而最终乘以小 scale 后本来可以落回有限范围；反过来，原写法也可能把很小的 partial 先下溢为零；
+- **特殊值**：NaN、Inf 和 signed zero 的传播也不保证一致。
+
+结果在最后才从 FP32 `tDr` 转成 BF16，见 `src/group_gemm/kernels.cuh:510-515`（函数 `group_gemm_fp8_kernel`）。BF16 的较低精度通常会掩盖一部分 ULP 差异，但不能把两种 FP32 算法变成严格等价。
+
+#### 性能上不一定更快
+
+“scale 乘法只剩 `size(tDr)` 次”这个观察是对的，但它没有消除 K 循环中的累加。对于本次 `ntile_k=56`、`size(tCr)=24`：
+
+```text
+原写法：1344 次 multiply-add（常见情况下可融合为 1344 次 FFMA）
+改写后：1344 次 add + 24 次 multiply
+```
+
+所以在原表达式已经被融合为 FMA 时，改写反而可能多出最终的 24 条标量乘法，不能仅凭循环次数断定加速；`#pragma unroll` 也意味着 24 元素循环的控制开销通常已经被编译期展开。若编译选项或别名分析阻止 FMA，指令数才可能呈现“少很多 multiply”的另一种情况。最终应检查目标 `sm_90a` 的 SASS（`FFMA`、`FADD`、`FMUL`）并用 CUDA event/Nsight 做 A/B benchmark，而不是只看 C++ 循环文本。当前构建使用 Release/O3，编译选项见 `CMakeLists.txt:5`、`:105-115`（目标 `_C`）；这仍不保证每个版本的最终指令选择完全相同。
+
+此外，WGMMA/TMA 的等待和 shared-memory 流水通常比这 24 个标量运算更昂贵；改写后的收益若存在，必须用完整 kernel 的端到端测量确认。若必须保持现有数值行为，应保留 `src/group_gemm/kernels.cuh:499-501`（函数 `group_gemm_fp8_kernel`）的原有乘加形式（最终是否融合为 FMA 由编译器决定）。
+
+#### 哪些同步位置不能随改写移动
+
+- `src/group_gemm/kernels.cuh:480-494`（函数 `group_gemm_fp8_kernel`）中的 `wait_barrier`、`warpgroup_wait<0>` 和后置 `warpgroup_fence_operand(tCr)` 必须保持；统一缩放只操作已经完成的 `tDr`，不能用它替代 WGMMA 完成等待。
+- `src/group_gemm/kernels.cuh:496`（函数 `group_gemm_fp8_kernel`）的 `arrive_barrier(writable[ismem_read])` 仍在每个 K tile 内，负责释放 A/B shared-memory stage；把累加改成未缩放不会改变这条生产者/消费者协议。
+- 最终 `tDr *= scale` 必须在外层 K 循环结束后、`src/group_gemm/kernels.cuh:511-515`（函数 `group_gemm_fp8_kernel`）的 FP32->BF16 转换前；把它移到下一个 output task 或 TMA store 之后都会改变数据归属或精度。
+- `scale` 只能在当前 task 的 K 循环范围内视为常量；不能把一次读取提升到整个 while 循环之外，因为下一个 task 的 `igroup` 可能不同，见 `src/group_gemm/kernels.cuh:447-475`（函数 `group_gemm_fp8_kernel`）。
+
+#### 不要套用到 blockwise 分支
+
+这个结论仅针对 `group_gemm_fp8_kernel` 的 per-group scalar `yscale`。blockwise kernel 在每个 K tile 读取 `wscale = sBS(ismem_read, itile_k % 4)`，并在输出列循环中使用随列/当前 tile 变化的 `yscale`，见 `src/group_gemm/kernels.cuh:909-941`（函数 `group_gemm_blockwise_fp8_kernel`）。那里通常不存在一个可以提出到整个 K 循环外的单一 scale；照搬本节改写会把不同 K tile 的 scale 错误地合并。
+
+#### 最终判断
+
+| 改法 | 结果判断 |
+|---|---|
+| 删除循环内更新，只在末尾 `tDr *= scale` | **错误**：`tCr` partial 没有累加进 `tDr` |
+| 循环内 `tDr += tCr`，末尾 `tDr *= scale` | **实数算术正确**，但 FP32/BF16 输出不保证逐位相同；性能需实测 |
+| 保留 `tDr = tCr * scale + tDr` | 保持当前数值舍入和已验证行为 |
+
+对本次测试的 `scale=0.25` 和 `allclose(rtol=0.08, atol=0.01)`，第二种写法大概率仍能通过容差，测试断言见 `tests/test_group_gemm_pertensor_like.py:69-73`（函数 `test_group_gemm_pertensor_fp8`）；但如果验收要求 bitwise 一致或希望无风险地提升性能，不能只凭代数恒等式改动，应该先做两版本的正确性与性能 A/B 测试。
+
+### 13.18 让 WGMMA 直接把结果写进 `tDr`
+
+这个改法**原则上可以正确**，而且比“只把 scale 移到循环外”更有可能真正省掉指令；但它不是只把第 488 行的 `tCr` 改成 `tDr` 就结束了。`tDr` 一旦作为 `cute::gemm` 的第三个参数，就变成 WGMMA 的异步 C/D accumulator，必须同时调整 `ScaleOut`、`warpgroup_fence_operand` 和 accumulator 的生命周期。
+
+#### 先区分当前两个 tensor 的职责
+
+当前实现中，`tCr` 是**一个 K tile 内部**的 WGMMA accumulator：每次 `itile_k` 先设置 `ScaleOut::Zero`，4 条 `K=32` 的 WGMMA 在同一个 `tCr` 上累加；`tDr` 则是**跨所有 K tile**的 software accumulator，WGMMA 完成后再由普通 CUDA 指令更新。完整代码见 `src/group_gemm/kernels.cuh:472-501`（函数 `group_gemm_fp8_kernel`）。数据流可以写成：
+
+```text
+当前：每个 itile_k
+  tCr = WGMMA(partial_K_tile)
+  tDr = tDr + tCr
+
+改写：整个 output tile
+  tDr = WGMMA(partial_0)
+      + WGMMA(partial_1)
+      + ...
+      + WGMMA(partial_{ntile_k-1})
+```
+
+因此，直接累加时应删除 software `tDr += tCr` 循环，而不是删除“累加”这个动作本身。`tDr` 仍然必须由每条后续 WGMMA 作为 C 输入继续累加。
+
+#### 为什么 `tDr` 可以作为 WGMMA 的 C/D
+
+`make_tensor_like(tCr)` 会创建与 `tCr` 相同布局和元素类型的 owning register tensor，见 `3rd/cutlass/include/cute/tensor_impl.hpp:417-443`（函数 `make_tensor_like`）。在本次实例中，日志显示每个线程的 `tCr`/`tDr` 都是 24 个 FP32 元素，见 `temp/run.log:204-207`（函数 `group_gemm_fp8_kernel` 的调试输出）。
+
+CuTe 的 GMMA unpack 路径明确要求 D、C 都是 register tensor，并要求两者 value type 和 layout 相同；它把可写的 D 重解释为传给硬件的 `rC`，见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:398-430`（函数 `SM90::GMMA::mma_unpack`）。`cute::gemm(mma, A, B, C)` 的三参数重载明确转发为 `gemm(mma, C, A, B, C)`，见 `3rd/cutlass/include/cute/algorithm/gemm.hpp:77-89`（函数 `gemm`）；底层 `MMA_Atom::call` 也把三参数形式转发为 `call(C, A, B, C)`，见 `3rd/cutlass/include/cute/atom/mma_atom.hpp:107-118`（函数 `MMA_Atom::call`）。因此第三个参数同时充当 D 和 C，`tDr` 只要保持同一 C layout，下面的形式在类型/布局上就是合法的：
+
+```cpp
+cute::gemm(tiled_mma,
+           tBr(_, _, ik, ismem_read),
+           tAr(_, _, ik, ismem_read),
+           tDr(_, _, _));
+```
+
+当前选择的 atom 的 `CRegisters` 正好是 `float[24]`，且 24 个目的寄存器都以 `+f` 传给 `wgmma.mma_async`，见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28810-28850`（类型 `MMA_64x48x32_F32E4M3E4M3_SS_TN`、函数 `MMA_64x48x32_F32E4M3E4M3_SS_TN::fma`）。这说明 `tDr` 不是“写回 global 的 tensor”，而是每个线程持有的那组 FP32 accumulator registers。
+
+若追求最小寄存器占用，可以进一步让 `tDr` 直接由 `partition_fragment_C` 创建，并用它的 layout 生成 BF16 fragment：
+
+```cpp
+auto tDr = thr_mma.partition_fragment_C(gC);
+auto tCrh = make_tensor_like<cute::bfloat16_t>(tDr);
+```
+
+这样可以避免同时保留一个只用于提供 layout 的 `tCr`。是否真的减少物理寄存器，要以编译后的寄存器/ spill 报告为准。
+
+#### `ScaleOut` 必须是“整个 output tile 只初始化一次”
+
+用户提出的方案是：
+
+```cpp
+clear(tDr);
+tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+```
+
+然后所有 `itile_k`、所有 `ik` 都使用 `tDr`。这在 `clear` 确实发生且 `tDr` 是零的前提下是正确的：第一条 WGMMA 计算 `A*B + 0`，后续 WGMMA 计算 `A*B + tDr`。`clear` 对 register tensor 的实现是把元素填成 `T{}`，见 `3rd/cutlass/include/cute/algorithm/clear.hpp:54-62`（函数 `clear`）；`ScaleOut` 的硬件谓词和 C/D 操作数见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28826-28850`（函数 `MMA_64x48x32_F32E4M3E4M3_SS_TN::fma`）。
+
+更符合 CUTLASS 常见写法的方案是：不清零，**第一条** WGMMA 使用 `ScaleOut::Zero`，从第二条起永久使用 `ScaleOut::One`。这样第一条指令会忽略旧 C，且可以省掉 `clear(tDr)`；但必须保证 Zero 只出现在整个 output tile 的第一条 WGMMA 上。现有代码把 Zero 放在 `itile_k` 循环内的 `src/group_gemm/kernels.cuh:482`（函数 `group_gemm_fp8_kernel`），直接照搬会导致每个 K tile 都覆盖 `tDr`，最后只剩最后一个 K tile，结果错误。
+
+两种初始化方式的条件如下：
+
+| 初始化方式 | 第一条 WGMMA | 是否需要 `clear(tDr)` | 注意事项 |
+|---|---|---:|---|
+| 用户方案 | `ScaleOut::One`，C 已由 `clear` 置零 | 是 | `clear` 必须在第一条 WGMMA 前完成 |
+| 推荐 accumulator 方案 | `ScaleOut::Zero` | 否（`ntile_k>0` 时） | Zero 只能使用一次，随后一直 One |
+
+如果 `ntile_k==0` 也要返回确定的零结果，第二种方案仍需保留 clear 或单独处理空 K；用户方案因为显式 clear 自然覆盖这个边界。
+
+#### 一个可行的代码骨架
+
+下面是“保留现有 task/barrier 结构、采用 `clear + One`”的骨架。它展示必须改变的 operand；`wait_barrier`、stage 索引和 TMA load 逻辑保持不变：
+
+```cpp
+auto tDr = make_tensor_like(tCr);
+clear(tDr);
+float scale = yscale_ptr[igroup];
+tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+
+#pragma unroll 1
+for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+  wait_barrier(readable[ismem_read], phase);
+
+  // tDr 是异步 WGMMA 的目的/累加寄存器
+  warpgroup_fence_operand(tDr);
+  warpgroup_arrive();
+#pragma unroll
+  for (int ik = 0; ik < size<2>(tAr); ++ik) {
+    cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read),
+               tAr(_, _, ik, ismem_read), tDr(_, _, _));
+  }
+  warpgroup_commit_batch();
+  warpgroup_wait<0>();
+  warpgroup_fence_operand(tDr);
+
+  arrive_barrier(writable[ismem_read]);
+  // advance ismem_read/phase
+}
+
+#pragma unroll
+for (int i = 0; i < size(tDr); ++i) {
+  tDr(i) = tDr(i) * scale;
+}
+```
+
+对应原代码位置是 `src/group_gemm/kernels.cuh:472-508`（函数 `group_gemm_fp8_kernel`）。要点是：
+
+1. 删除每个 `itile_k` 的 `tiled_mma.accumulate_ = ScaleOut::Zero`；
+2. 删除 `ik` 循环中每次都执行的 `ScaleOut::One` 赋值；
+3. 把两处 `warpgroup_fence_operand(tCr)` 改成 `warpgroup_fence_operand(tDr)`，因为异步 destination 已经从 tCr 变为 tDr；
+4. 保留每个 K tile 的 `warpgroup_commit_batch()`/`warpgroup_wait<0>()`，以及之后的 `arrive_barrier(writable[ismem_read])`；
+5. 最后的 scale 必须在最后一次 wait 之后、`src/group_gemm/kernels.cuh:511-515`（函数 `group_gemm_fp8_kernel`）的 FP32->BF16 转换之前执行。
+
+如果采用“Zero 一次、One 永久”的方案，则第一个 `cute::gemm` 前设置 Zero，第一条发出后切换到 One；切换点必须跨越 `itile_k` 循环保留，不能在下一轮外层循环重新置 Zero。
+
+#### 为什么 fence 也必须从 `tCr` 改成 `tDr`
+
+`warpgroup_fence_operand` 不是数值清零，也不是等待 WGMMA 完成；它通过 tensor 重载逐元素调用 float/uint32 标量重载，而标量重载的空 inline asm `+f`/`+r` 约束和 `memory` clobber 只建立编译器的数据依赖。实现见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:45-66`（函数 `warpgroup_fence_operand(Tensor&)`）和 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:86-103`（函数 `warpgroup_fence_operand(float&)`、`warpgroup_fence_operand(uint32_t&)`）。当前代码在 `src/group_gemm/kernels.cuh:484-494`（函数 `group_gemm_fp8_kernel`）标记的是 tCr；直接把 WGMMA destination 换成 tDr 后，继续标记 tCr 会让 compiler 看不到 tDr 的异步 live range。
+
+- 前置 `warpgroup_fence_operand(tDr)`：把 `clear(tDr)` 及其它普通 tDr 定义放在第一条 WGMMA 之前；
+- `warpgroup_arrive()`：发出 `wgmma.fence.sync.aligned`，排序相关寄存器访问与后续 WGMMA；
+- 中间四条（本例）WGMMA：连续更新同一组 tDr registers；
+- `warpgroup_wait<0>()`：等待 batch 完成，硬件结果才可读；
+- 后置 `warpgroup_fence_operand(tDr)`：把异步写回后的 tDr 与后面的普通 scale、BF16 转换连接起来。
+
+这些 wrapper 的底层实现见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:47-84`（函数 `warpgroup_arrive`、`warpgroup_commit_batch`、`warpgroup_wait`）。即使中间没有普通代码读取 tDr，保留现有“每批前后各一个 operand fence”的写法最稳妥；想进一步只保留整个序列首尾的 fence，需要单独检查 ptxas 诊断和生成代码，不能仅凭 C++ 数据流删掉。
+
+#### wait 仍然不能删除
+
+把 software 累加改成 WGMMA 累加，并不会改变 shared-memory stage 的所有权协议。每个 `itile_k` 的 WGMMA 仍然读取 `sA/sB` 当前 stage；在 `warpgroup_wait<0>()` 完成前，不能让 load warpgroup 通过 `arrive_barrier(writable[ismem_read])` 复用/覆盖该 stage。相关顺序位于 `src/group_gemm/kernels.cuh:480-496`（函数 `group_gemm_fp8_kernel`）。
+
+因此不能因为 tDr 已经是跨 K 的 accumulator，就把每批的 `commit/wait` 改成只在最外层结束时调用。那会使后续 TMA load 可能覆盖仍被未完成 WGMMA 读取的 shared memory。若想减少 wait 次数，需要重新设计更深的 WGMMA/TMA pipeline 和 stage 数量，不是这次寄存器重定向的直接结果。
+
+#### 数值结果：实数上等价，浮点上不保证逐位一致
+
+对当前 per-tensor 路径，`scale` 在 task 开始时由 `yscale_ptr[igroup]` 读取一次，见 `src/group_gemm/kernels.cuh:472-479`（函数 `group_gemm_fp8_kernel`），所以直接 accumulator 的实数结果是：
+
+```text
+Σ_j partial_j * scale = (Σ_j partial_j) * scale
+```
+
+但它与现有实现仍有两个舍入差异：
+
+1. 现有实现每个 K tile 先得到独立的 tCr，再由普通 FP32 指令执行 `tDr = tCr * scale + tDr`；
+2. 直接方案让 WGMMA 在 tDr 中跨 K tile 累加，最后才做一次 scale。
+
+WGMMA 内部累加、software FP32 加法和最终乘法的舍入位置不同，因此不能承诺 bitwise identical。结果随后才转为 BF16，见 `src/group_gemm/kernels.cuh:510-515`（函数 `group_gemm_fp8_kernel`）；通常测试容差可以吸收小的 ULP 差异，但仍应实际比较 `max_abs_diff`、`max_rel_diff` 和 BF16 输出。
+
+此外，直接方案让未缩放的总和一直留在 FP32 accumulator 中：它可能先溢出，而最终乘以小 scale 后理论上本可有限；scale 很小时也可能避免“每个 partial 先下溢”。这属于算法数值范围变化，不是 barrier 问题。
+
+#### 性能与寄存器压力
+
+对本次日志的 `ntile_k=56`、每线程 24 个 accumulator，当前 software 累加大约执行 `56*24=1344` 次普通更新；直接 WGMMA 后，这 1344 次更新循环可以去掉，累加由 tensor core 的 C/D path 完成。相比之前仅移动 scale 的方案，这才是可能产生明显收益的地方。
+
+但要同时检查以下反效果：
+
+- `tDr` 必须作为 WGMMA 的 register operand；CuTe 在 `mma_unpack` 中对此有 `is_rmem` 静态要求，见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:398-401`（函数 `SM90::GMMA::mma_unpack`）；
+- 如果仍保留无用的 `tCr`，会让两个 24-float fragment 同时占用寄存器，抵消收益；
+- tDr 的 WGMMA live range 延长到整个 56-tile K 循环，可能触发 register move/reload 或 spill；
+- `clear(tDr)` 是额外的普通寄存器写入，采用“Zero 首条 WGMMA”才可能把它也去掉；
+- 生成指令和占用率必须看目标 `sm_90a` 的 ptxas 报告/SASS，仓库当前的 CUDA 编译选项（包括 `-Xptxas ... -v`）见 `CMakeLists.txt:105-115`（目标 `_C`）。
+
+所以建议用三个版本做 A/B：原实现、`tDr` 直接 WGMMA 且 `clear+One`、`Zero 一次+One` 且无 clear；同时检查数值和 kernel 时间，不能只按 C++ 循环次数判断。
+
+#### 适用范围
+
+这个直接 accumulator 改法适用于本节的 `group_gemm_fp8_kernel` per-group scalar scale，因为同一个 `igroup` 的所有 K tile 共用一个 `scale`，见 `src/group_gemm/kernels.cuh:475-479`（函数 `group_gemm_fp8_kernel`）。blockwise 分支在每个 K tile/输出列使用变化的 scale，见 `src/group_gemm/kernels.cuh:909-941`（函数 `group_gemm_blockwise_fp8_kernel`）；若仍需逐 K tile 乘不同 scale，就不能把所有结果无条件直接累加到同一个 tDr 后再统一乘一个 scale。
+
+#### 最终判断
+
+| 改法 | 数学结果 | 工程判断 |
+|---|---|---|
+| 只把 gemm 的输出从 tCr 改成 tDr，但每个 `itile_k` 仍置 `ScaleOut::Zero` | 错误，前面 K tile 会被覆盖 | 不能这样改 |
+| `clear(tDr)` + `ScaleOut::One` 一次 + 所有 WGMMA 写 tDr | 实数算术正确 | 可行；需把 fence 改为 tDr，并验证浮点差异/寄存器压力 |
+| 首条 WGMMA `ScaleOut::Zero`，之后永久 `One`，所有 WGMMA 写 tDr | 实数算术正确 | 更接近 CUTLASS accumulator 用法，可能省掉 clear；需处理 `ntile_k==0` |
+| 直接 WGMMA 写 tDr 后仍保留旧的 `tDr += tCr` 循环 | scale/partial 被重复累加 | 错误 |
+
+因此，对用户给出的具体方案，答案是：**在 `clear(tDr)`、`ScaleOut::One` 只设置一次、所有 WGMMA 都以 tDr 为 D/C、并把 operand fence 改为 tDr 的前提下，结果在实数意义上正确；但不是逐位等价，也不能保证一定加速。**

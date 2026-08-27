@@ -246,3 +246,60 @@ tma_d.with不需要像 load warp group那样:tma_a.with, tma_b.with, 传入 shar
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
 
 }
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+
+src/group_gemm/kernels.cuh 499~501行的 乘以scale: tDr(i) = tCr(i) * scale + tDr(i);
+现在是放在 for (int itile_k = 0; itile_k < ntile_k; ++itile_k) 循环内部
+对于一个tile task,总共会循环 size(tCr) * ntile_k次。
+如果把 scale 的乘法操作移动到 for (int itile_k = 0; itile_k < ntile_k; ++itile_k) 结束后.
+并改成
+        for (int i = 0; i < size(tDr); ++i) {
+          tDr(i) = tDr(i) * scale;
+        }
+        这样只循环 size(tDr)次，提高性能, 结果还正确吗?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+
+还能进一步把循环内的纯累加也去掉吗？现在 488行gemm的输出位于 tCR:
+```
+          cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tCr(_, _, _));
+```
+如果直接改成累加到tDR，反正tCr和tDr都是寄存器:
+          cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tDr(_, _, _));
+
+      for (int itile_k = 0; itile_k < ntile_k; ++itile_k) 前
+      clear(tDr);保证 tDR是0, 再
+          tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+          这样后面的 for (int ik = 0; ik < size<2>(tAr); ++ik) 内部不再反复设置tiled_mma.accumulate_
+          gemm循环变成:
+          ```
+        for (int ik = 0; ik < size<2>(tAr); ++ik) {
+          cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tDr(_, _, _));
+        }
+        ```
+然后在循环外部
+```
+        for (int i = 0; i < size(tDr); ++i) {
+          tDr(i) = tDr(i) * scale;
+        }
+        ```
+结果还正确吗?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}

@@ -2815,3 +2815,331 @@ python3 -m pytest -q \
 - 单元测试：SIPUFp8LinearMethod 有直接测试；SIPUBlockFP8Kernel 也有直接
   测试。SIPUFp8MoEMethod 和 SIPUFp8PerTensorOnlineMoEMethod 没有直接单元
   测试；已有的 MoE FP8 测试属于 compressed-tensors method。
+
+## 16.1 先给结论：这两个参数是 pytest fixture 注入的
+
+在
+[test_fp8_linear.py:215-216](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear.py:215)
+上方的 `@nativeOnly()` 只是一个 `pytest.mark.skipif` 标记，用来决定当前
+execution profile 是否跳过测试；它不负责构造函数参数。在当前默认的
+`sipu_native` profile 下条件为 false，测试会正常执行。
+
+因此下面的函数不是由测试代码写成
+`test_fp8_linear_method(config, patcher)` 后再调用的：
+
+```python
+def test_fp8_linear_method(default_vllm_config, monkeypatch):
+    ...
+```
+
+pytest 在收集测试时看到参数名 `default_vllm_config` 和 `monkeypatch`，把它们
+当作 fixture 名称去查找定义；在 setup 阶段先求出两个 fixture 的值，然后等价于
+执行：
+
+```python
+test_fp8_linear_method(
+    default_vllm_config=<一个 VllmConfig 实例>,
+    monkeypatch=<一个 pytest.MonkeyPatch 实例>,
+)
+```
+
+pytest 9.1.1 的调用路径是 `FixtureRequest._fillfixtures()` 填充
+`item.funcargs`，随后 `_pytest/python.py:165-167` 以
+`testfunction(**testargs)` 调用测试函数。普通的 Python 直接调用不会经过这套
+解析，所以只写 `test_fp8_linear_method()` 会缺少两个实参。
+
+## 16.2 `default_vllm_config` 是怎样构造的
+
+定义在
+[tests/conftest.py:175-188](/share/users/like/package/vllm-sipu/tests/conftest.py:175)，
+关键代码是：
+
+```python
+@pytest.fixture(scope="session")
+def default_vllm_config():
+    import torch
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.plugins import load_general_plugins
+
+    load_general_plugins()
+    vllm_config = VllmConfig(
+        device_config=DeviceConfig(device=torch.device("sipu"))
+    )
+    with set_current_vllm_config(vllm_config):
+        yield vllm_config
+```
+
+具体顺序如下：
+
+1. pytest 首次需要这个 fixture 时，调用其底层 generator function，执行
+   `load_general_plugins()`，确保 SIPU 等 general plugin 已注册。
+2. `torch.device("sipu")` 创建 SIPU device 对象；再由
+   `DeviceConfig(device=...)` 创建 device 配置；最后
+   `VllmConfig(device_config=...)` 创建完整的 vLLM 配置对象。传给测试的
+   `default_vllm_config` 就是这个 `VllmConfig` 实例，不是 fixture 函数本身。
+3. `set_current_vllm_config(vllm_config)` 进入上下文，使依赖
+   `get_current_vllm_config()` 的代码在测试期间能取得这份配置。
+4. `yield vllm_config` 把对象交给测试。因为作用域是 `session`，同一个 pytest
+   session 中请求它的测试通常共享这一实例；yield 后的上下文退出和恢复动作
+   延迟到 session teardown 执行。
+
+这是一个 **yield fixture**，不是普通 `return` fixture。pytest 会执行 generator
+到第一次 `yield` 获取值，并登记 finalizer；测试 session 结束时再推进一次
+generator，执行 `with` 块退出逻辑。
+
+## 16.3 `monkeypatch` 是怎样构造的
+
+`monkeypatch` 并不在本仓库的 `tests/conftest.py` 中定义，而是 pytest 自带的
+fixture，源码位于当前环境的
+[`monkeypatch.py:35`](/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/_pytest/monkeypatch.py:35)。
+其核心实现等价于：
+
+```python
+@pytest.fixture
+def monkeypatch():
+    mpatch = MonkeyPatch()
+    yield mpatch
+    mpatch.undo()
+```
+
+每次测试函数调用都会创建一个新的 `pytest.MonkeyPatch` 对象。构造函数在
+[`monkeypatch.py:127`](/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/_pytest/monkeypatch.py:127)
+初始化属性、字典、工作目录和 `sys.path` 的回滚记录栈。调用
+`setattr` 时先保存旧值，再替换目标；本测试使用了两次：
+
+- [test_fp8_linear.py:230](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear.py:230)
+  把 `default_vllm_config.model_config` 临时替换为
+  `SimpleNamespace(dtype=torch.bfloat16)`，因为 `SIPUFp8LinearMethod` 初始化时
+  要读取 `model_config.dtype`。
+- [test_fp8_linear.py:296](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear.py:296)
+  把 `sipu_fp8.per_token_group_quant_fp8.siinfer` 临时替换成跟踪包装函数，
+  用来记录并验证 `group_size` 和 `dtype` 参数。
+
+测试结束后 pytest 自动调用 `undo()`，按逆序恢复这两个旧属性；因此 patch 不会
+泄漏到其他测试。`monkeypatch` 本质上是可回滚的属性/字典/环境修改器，不是
+被替换函数的返回值，也不是一个模型配置对象。
+
+## 16.4 手工调用时如何构造两个参数
+
+若使用 pytest，推荐直接运行测试，让 pytest 管理作用域和 teardown。若确实要用
+普通 Python 调用，不能写 `default_vllm_config()`：`@pytest.fixture` 装饰后它
+是 `FixtureFunctionDefinition`，直接调用会触发
+`Fixture "default_vllm_config" called directly`。可以取出装饰器保存的底层
+generator，并手工推进其进入、退出阶段；`monkeypatch` 则用公开的
+`pytest.MonkeyPatch.context()` 管理：
+
+```python
+import pytest
+from tests.conftest import default_vllm_config
+from tests.kernels.quantization.test_fp8_linear import test_fp8_linear_method
+
+config_generator = default_vllm_config.__wrapped__()
+config = next(config_generator)       # 执行到 yield，得到 VllmConfig
+try:
+    with pytest.MonkeyPatch.context() as patcher:
+        test_fp8_linear_method(config, patcher)
+finally:
+    try:
+        next(config_generator)         # 执行 yield 后的 context teardown
+    except StopIteration:
+        pass
+```
+
+也可以不用 pytest fixture 的内部包装，直接复现 fixture 的主体：调用
+`load_general_plugins()`，构造 `DeviceConfig(device=torch.device("sipu"))`
+和 `VllmConfig`，再在 `set_current_vllm_config(config)` 与
+`pytest.MonkeyPatch.context()` 两个上下文中调用测试函数。关键是要显式执行
+两个 teardown；否则当前 vLLM 配置或 monkey patch 可能污染后续测试。
+
+## 16.5 调用关系总结
+
+```text
+pytest 收集 test_fp8_linear_method
+        |
+        +-- 按名称解析 default_vllm_config
+        |       +-- load_general_plugins()
+        |       +-- torch.device("sipu")
+        |       +-- DeviceConfig(...)
+        |       +-- VllmConfig(...)
+        |       +-- set_current_vllm_config(...)
+        |       +-- yield VllmConfig
+        |
+        +-- 按名称解析 monkeypatch
+        |       +-- MonkeyPatch()
+        |       +-- yield MonkeyPatch
+        |
+        +-- test_fp8_linear_method(config, monkeypatch)
+        |
+        +-- monkeypatch.undo()        # function teardown
+        +-- 恢复 current_vllm_config     # session teardown
+```
+
+所以，问题中的两个形参分别对应一个 SIPU 设备的 `VllmConfig` 实例和一个
+pytest 的临时修改器实例；它们由 pytest fixture 系统传入，而不是由
+`test_fp8_linear_method` 内部实例化。
+
+## 17.1 先给结论
+
+`83dbdd1bc048810ba6a5206cad2c250d18cc96d4` 修复的是 **E8M0 scale 的
+字节重解释**，不是量化数据本身。修复前：
+
+```python
+(blocked_scale.view(torch.int32) >> 23).to(torch.uint8)
+```
+
+修复后：
+
+```python
+(blocked_scale.to(torch.float32).view(torch.int32) >> 23).to(torch.uint8)
+```
+
+当 `blocked_scale` 已经是 `float32` 时，两种写法等价；当它是 `bfloat16`
+或 `float16` 时，前一种写法会把两个 2-byte 元素拼成一个 4-byte
+`int32` 元素，导致最后一维减半，且拼接后的 bit pattern 不是任何一个原始
+scale 的正确 E8M0 编码。若最后一维元素数为奇数，甚至不能执行 `view`。
+
+## 17.2 什么时候会进入这个分支
+
+`_downcast_to_mxfmt_torch` 中的分支位于
+[`quant.py:369-383`](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/quant.py:369)：
+
+```python
+blocked_scale = scale_bw.squeeze(-1)
+if dtype in _NVFP4_DTYPES and quant_scale_rounding_mode == ScaleModeEnum.E4M3:
+    blocked_scale = dequant_scale_fp8.squeeze(-1)
+elif quant_scale_rounding_mode in (
+    ScaleModeEnum.E8M0_FLOOR,
+    ScaleModeEnum.E8M0_CEIL,
+    ScaleModeEnum.E8M0_EVEN,
+    ScaleModeEnum.E8M0_RCEIL,
+    ScaleModeEnum.E8M0_SIPU,
+):
+    blocked_scale = (blocked_scale.to(torch.float32).view(torch.int32) >> 23).to(torch.uint8)
+```
+
+因此首先必须满足 `quant_scale_rounding_mode` 是上述 E8M0 模式之一。这里的
+`dtype` 是目标 MX 格式（例如 `mxfp4_e2m1`），不是输入 tensor 的
+`torch.dtype`；`torch.dtype` 决定 `blocked_scale` 在进入该分支时究竟是不是
+4-byte。
+
+`blocked_scale` 的 dtype 传递过程是：
+
+1. [quant.py:287-288](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/quant.py:287)
+   的 `transform_to_block_wise` 不改变 `src_tensor.dtype`。
+2. ABS_MAX observer 在 [quant.py:320-324](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/quant.py:320)
+   调用 `calculate_mx_scale`；该函数在
+   [scale.py:577-597](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/scale.py:577)
+   对 block 做 `torch.max(torch.abs(x))`，amax 通常仍保持输入 dtype。
+3. 随后由 `ScaleModeFactory` 选择具体的 scale 算法
+   ([scale.py:415-424](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/scale.py:415))。
+
+在当前 simo 实现中，实际会得到低精度 `blocked_scale` 的组合如下：
+
+| observer | scale mode | 输入 dtype | `blocked_scale` dtype | 是否触发问题 |
+| --- | --- | --- | --- | --- |
+| `ABS_MAX` | `E8M0_SIPU` | `torch.bfloat16` | `torch.bfloat16` | 是 |
+| `ABS_MAX` | `E8M0_SIPU` | `torch.float16` | `torch.float16` | 是 |
+| `ABS_MAX` | `E8M0_RCEIL` | `torch.bfloat16`/`torch.float16` | 与输入相同 | 是 |
+| `ABS_MAX` | `E8M0_FLOOR` | `torch.bfloat16`/`torch.float16` | `torch.float32` | 否 |
+| `ABS_MAX` | `E8M0_EVEN` | `torch.bfloat16`/`torch.float16` | `torch.float32` | 否 |
+
+原因在 scale mode 的实现：
+
+- `E8M0_SIPU` 对应 `SIPUScaleMode`。它在
+  [scale.py:220-242](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/scale.py:220)
+  保存 `ori_dtype = amax.dtype`，计算完成后显式 `.to(ori_dtype)`，所以
+  bf16/fp16 会被保留下来。
+- `E8M0_RCEIL` 对应 `NVScaleMode`。在
+  [scale.py:268-273](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/scale.py:268)
+  的运算对 half/bfloat16 amax 保持相应 dtype，所以也可能返回 fp16/bf16。
+- `E8M0_FLOOR` 对应 `OCPScaleMode`，在
+  [scale.py:199-207](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/scale.py:199)
+  使用 `exponent.float()`，结果为 float32。
+- `E8M0_EVEN` 对应 `TorchaoScaleMode`，在
+  [scale.py:286-299](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/scale.py:286)
+  一开始就把 amax 转为 float32。
+
+所以最精确的触发条件是：
+
+```text
+observer_mode == ABS_MAX
+and quant_scale_rounding_mode in {E8M0_SIPU, E8M0_RCEIL}
+and src_tensor.dtype in {torch.bfloat16, torch.float16}
+```
+
+如果将来给 `E8M0_CEIL` 补上 scale factory 映射，它也应遵循同样的检查；但
+当前代码的 `ScaleModeFactory` 没有 `E8M0_CEIL` 条目，因此直接走该模式会在
+计算 scale 时先抛 `KeyError`，还到不了最后的 `view` 分支。
+
+另外，`STD_DEV_OBSERVER_MODE` 和 `FOUR_OVER_SIX_OBSERVER_MODE` 在
+[quant.py:298-319](/share/users/like/package/simo_conda_vllm_sipu/simo/ops/formats/mx/quant.py:298)
+已经把统计量转成 float32，再交给 scale mode；即使输入是 bf16/fp16，当前
+路径也不会产生这里讨论的低精度 `blocked_scale`。NVFP4 的 `E4M3` 特殊路径
+也在 E8M0 分支之前单独处理。
+
+## 17.3 为什么旧 `view(int32)` 会改变 shape
+
+`view` 是 **按字节重新解释**，不是数值转换：
+
+```text
+float32:  每个元素 4 bytes -> view(int32) 仍是 1 个 int32
+bf16:     每个元素 2 bytes -> 两个元素合成 1 个 int32
+float16:  每个元素 2 bytes -> 两个元素合成 1 个 int32
+```
+
+例如 512x512 输入沿最后一维以 32 个元素为一个 block 时，scale 的正确形状
+是 `[512, 16]`，表示 512*16 个 block、每个 block 一个 E8M0 byte。旧代码
+对 bf16/fp16 的 `[512,16]` 做 `view(torch.int32)` 后变成 `[512,8]`，只剩
+4096 个元素；它还把相邻两个 scale 的 16-bit 表示拼在一起，再右移 23 位，
+因此编码值也可能错误。若 shape 是 `[512,1]` 这类最后一维奇数，PyTorch 会
+直接报 `self.size(-1) must be divisible by 2`。
+
+修复先执行数值 cast：每个 bf16/fp16 scale 都变成独立的 4-byte float32，
+再做 bit reinterpret，故元素个数、shape 和每个 block 的 E8M0 code 都能保留。
+
+## 17.4 实验脚本与运行结果
+
+实验脚本位于
+[like-useful/test_cast_before_view.py](/softhome/like/asset/code/like-useful-vllm-sipu/test_cast_before_view.py)。
+它直接调用 `_downcast_to_mxfmt_torch`（若某个 simo 版本给该函数加了
+`torch.compile`，只剥掉装饰器以执行同一个 Python 函数体），并用同样的
+`transform_to_block_wise + calculate_mx_scale` 重建进入序列化语句前的
+`blocked_scale`，同时计算旧表达式和新表达式。
+
+执行命令：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+source ./sipu_sdk_setup.sh
+python like-useful/test_cast_before_view.py
+```
+
+在题目指定环境中脚本退出码为 0，并输出 `All cast-before-view examples
+passed.`。关键 case 如下：
+
+| case | 进入分支前 scale | 修复后返回 scale | 旧表达式结果 |
+| --- | --- | --- | --- |
+| float32 + `E8M0_SIPU`，64x64 | dtype=float32, shape=[64,2] | uint8, [64,2] | [64,2]，值一致 |
+| bf16 + `E8M0_SIPU`，512x512 | dtype=bf16, shape=[512,16] | uint8, [512,16]，前 8 个 code 为 `[122,123,124,125,126,127,128,129]` | [512,8]，前 8 个为 `[123,125,127,129,123,125,127,129]` |
+| fp16 + `E8M0_RCEIL`，512x512 | dtype=fp16, shape=[512,16] | uint8, [512,16]，前 8 个 code 为 `[122,123,124,125,126,127,128,129]` | [512,8]，前 8 个为 `[88,104,120,136,88,104,120,136]` |
+| bf16 + `E8M0_FLOOR`，64x64 | dtype=float32, shape=[64,2] | uint8, [64,2] | [64,2]，值一致 |
+| bf16 + `E8M0_SIPU`，单 block [1,32] | dtype=bf16, shape=[1,1] | uint8, [1,1]，code `[122]` | `RuntimeError`，最后一维不能按 2-byte->4-byte reinterpret |
+
+脚本中的断言还验证了修复后 `_downcast_to_mxfmt_torch` 返回的 scale 与
+`(blocked_scale.to(torch.float32).view(torch.int32) >> 23).to(torch.uint8)`
+逐元素相同；因此该提交的价值是同时修复 shape、元素数量和 E8M0 编码值。
+
+## 17.5 最终回答
+
+- 会进入最后 E8M0 `view` 分支的首要条件是 `quant_scale_rounding_mode` 属于
+  E8M0 序列化模式；是否真正受 83dbdd1 影响，还取决于进入分支的
+  `blocked_scale.dtype`。
+- 在当前实现中，`ABS_MAX + E8M0_SIPU` 或 `ABS_MAX + E8M0_RCEIL`，配合
+  bf16/fp16 输入，会让 `blocked_scale` 保持 bf16/fp16，正是该提交修复的
+  场景。
+- `E8M0_FLOOR`、`E8M0_EVEN` 以及会先把统计量转 float32 的 observer 路径，
+  通常不会触发 dtype/shape bug；float32 输入本身也不会触发。
+- 对 512x512、block_size=32，正确 scale 数量是 512*16；旧代码会错误地产生
+  512*8 或在奇数 block 数时直接失败。先 cast float32 后再 view 才能保证
+  每个 block 对应一个 E8M0 uint8 scale。
