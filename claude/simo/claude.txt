@@ -3732,3 +3732,43 @@ bash tools/setup_vllm_dev_conda.sh --recreate --env-name vllm_dev > temp/setup_v
 
 }
 修改 /softhome/like/asset/code/cpp_guard/kgp_wl.cpp, kill 前，打印进程的信息更加详细，增加该进程的 pid,ppid,command, command args, work directory信息 .修改完成，重新 cmake build
+
+
+
+
+
+{ 
+nvcc 位于 /share_data/users/like/opt/cuda-13.0/bin//nvcc
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/.
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang.
+simo 以 editable 方式安装
+
+# 我的 work dir: /share/users/like/package/simo_conda_sglang
+使用 我描述的 conda 环境执行:
+ pytest tests/simo_quant/test_mx_ops.py::test_upcast_from_mxfmt_native_op_matches_api > temp/test_mx_ops.py.log.`nowstr.sh` 2>&1 &
+日志位于 work dir: temp/test_mx_ops.py.log.2026_08_27___16_56_0
+
+请修复这个问题。
+只允许改 simo 代码，不允许改 conda环境境中安装的trition等包的代码.
+
+把原因追加到 like-useful/answer_codex_v2.md
+
+}
+
+
+{ 
+nvcc 位于 /share_data/users/like/opt/cuda-13.0/bin//nvcc
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/.
+
+simo 代码位于  /share/users/like/package/simo_conda_sglang.
+simo 以 editable 方式安装
+
+# 我的 work dir: /share/users/like/package/simo_conda_sglang
+使用 我描述的 conda 环境执行:
+  python3 tests/separate.py > temp/sep.log.3 2>&1 &
+  日志位于  temp/sep.log.3,   torch._dynamo hit config.recompile_limit (8) 是什么原因 ?
+
+把原因追加到 like-useful/answer_codex_v2.md
+
+}

@@ -303,3 +303,77 @@ tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/pac
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
 
 }
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+tests/test_group_gemm_pertensor_like.py 运行日志位于 /share/users/like/package/hpc-ops/temp/run.log
+
+为什么 hpc-ops 需要设置 tiled_mma.accumulate_
+wgmma-like 不需要设置 tiled_mma.accumulate_
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}
+
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+
+请帮我落地刚才的 让 WGMMA 直接把结果写进 tDr + scale乘法外移的修改方案, 看下效果。
+# 修改完，  做一个git commit
+# 然后在指定 conda环境 bash temp//rebuild.sh
+# 然后在指定 conda环境 pip install dist/目录下的whl
+# 然后在指定 conda环境 python3 tests/test_group_gemm_pertensor_like.py > temp/run.modifiy.log 看下结果
+
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+由于 这种改动没有 让 WGMMA 直接把结果写进 tDr + scale乘法外移的修改方案无法通过测试，我已经把代码回退到 like 分支。
+
+# 以本次运行的 shape和运行日志为例，对 src/group_gemm/kernels.cuh group_gemm_fp8_kernel 函数中 if (idx >= kNumThreads) 的 else分支, 
+先 `tma_store_wait<0>()`，再 STSM、`tma_store_fence()`、TMA copy，最后 `tma_store_arrive()`。
+对于给定 warp group, 它的最后一个 tile, 只会 tma_store_wait 上一个  tile,  tma_store_arrive 本 tile, 直到 kernel 结束，退出，最后一个tile 没有机会执行  tma_store_wait ，这不会导致结果错误吗?
+
+# like 分支在 fix_kTaskLoopPolicy_type 基础上，加了很多 print + printf, 我期望这些 debug print+printf 只有在 #ifdef LIKE_DEBUG 的时候才生效.
+LIKE_DEBUG 在定义可以在 setup.py 控制，这样， 一旦 LIKE_DEBUG 没有定义，  like 分支和 fix_kTaskLoopPolicy_type 相比，没有多余的影响性能的代码。
+请你帮我检查， like 分支在 fix_kTaskLoopPolicy_type 基础上，加的 print + printf, 是不是全部被  LIKE_DEBUG 保护? 
+
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面
+
+}
+
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+
+# 以本次运行的 shape和运行日志为例，对 src/group_gemm/kernels.cuh group_gemm_fp8_kernel 函数，是如何保证 某个group的X matrix和  Y matrix 的一个维度小于 tma copy box维度，小于 mma atom 的维度的时候，保证读取X，不会读越界，不会读到其他 group的 X matrix, 不会写越界，不会写到其他 group 的Y matrix? 如果是通过padding做到，如何保证 padding出来的元素，不影响 mma数值正确性 ？
+
+比如 X matrix, group 0 shape=16 x 7168, Y matrix, group 0 shape=16x4096, tma copy box [64, 48], 明显，有越界读和越界写的风险.
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面, 并对 like-useful/codex_answer.md 整理章节编号,  多级标题，以 1.1,1.2, 2.1,2.2, 的形式编号
+
+}

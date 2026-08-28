@@ -748,9 +748,9 @@ C++ group_gemm_fp8_entry
 
 ---
 
-## 3. `src/group_gemm/entry.cc` 完善 tmas 调试打印 + dtype / device 是否为 enum 的说明
+# 3. `src/group_gemm/entry.cc` 完善 tmas 调试打印 + dtype / device 是否为 enum 的说明
 
-### 3.1 修改内容（函数 `hpc::group_gemm::group_gemm_fp8_entry`，`src/group_gemm/entry.cc:17`）
+## 3.1 修改内容（函数 `hpc::group_gemm::group_gemm_fp8_entry`，`src/group_gemm/entry.cc:17`）
 
 原 `LIKE_DEBUG` 块（`src/group_gemm/entry.cc:61-86`）有两处错误且没有真正打印，本次完善如下：
 
@@ -790,7 +790,7 @@ C++ group_gemm_fp8_entry
 CUDA_HOME=/share_data/users/like/opt/cuda-13.0 ENABLE_LIKE_DEBUG=1 make wheel > temp/make.log
 ```
 
-### 3.2 dtype 是 enum 类型吗？
+## 3.2 dtype 是 enum 类型吗？
 
 **dtype 的“值”本质上是 enum，但 `Tensor::dtype()` 返回的不是 enum 本身，而是一个封装结构体。**
 
@@ -802,7 +802,7 @@ CUDA_HOME=/share_data/users/like/opt/cuda-13.0 ENABLE_LIKE_DEBUG=1 make wheel > 
 
 > 小结：tensor dtype 的“语义类型”是 `c10::ScalarType` —— 它是 `enum class`；`Tensor::dtype()` 通过 `caffe2::TypeMeta` 这个 wrapper 返回，需 `.toScalarType()` 才拿到 enum。
 
-### 3.3 device 是 enum 类型吗？
+## 3.3 device 是 enum 类型吗？
 
 **device 本身不是 enum，它是一个结构体；结构体内部保存的“设备类型”才是 enum。**
 
@@ -813,7 +813,7 @@ CUDA_HOME=/share_data/users/like/opt/cuda-13.0 ENABLE_LIKE_DEBUG=1 make wheel > 
 
 > 小结：device 的“语义类型”里，`DeviceType` 是 enum class；但 `Tensor::device()` 返回的是 `c10::Device` 结构体（enum 成员 + 设备序号）。
 
-### 3.4 tensor dtype / device enum 定义位置汇总
+## 3.4 tensor dtype / device enum 定义位置汇总
 
 | 类型 | 定义位置 | 说明 |
 | --- | --- | --- |
@@ -825,7 +825,7 @@ CUDA_HOME=/share_data/users/like/opt/cuda-13.0 ENABLE_LIKE_DEBUG=1 make wheel > 
 | TypeMeta<->ScalarType 比较桥接 | `torch_include/c10/core/ScalarTypeToTypeMeta.h:42-56` | 使 `entry.cc:29` 的 `x.dtype() == torch::kFloat8_e4m3fn` 可编译 |
 | dtype 转字符串 | `torch_include/torch/headeronly/core/ScalarType.h:320`（`c10::toString`） | 打印用 |
 
-### 3.5 运行效果
+## 3.5 运行效果
 
 启用 `ENABLE_LIKE_DEBUG=1` 后，调用 `group_gemm_fp8` / `group_gemm_pertensor_fp8` 会输出类似：
 
@@ -841,11 +841,11 @@ CUDA_HOME=/share_data/users/like/opt/cuda-13.0 ENABLE_LIKE_DEBUG=1 make wheel > 
 
 ---
 
-## 5. 以本次运行为例详解 update_grouped_tma
+# 4. 以本次运行为例详解 update_grouped_tma
 
 本节以 temp/run.log 记录的 tests/test_group_gemm_pertensor_like.py 一次运行为例，追踪 update_grouped_tma 从 Python 到 CUDA kernel 的完整调用链。代码引用均使用相对代码库根目录的路径 + 行号 + 函数名。
 
-### 5.1 本次运行的数据与形状
+## 4.1 本次运行的数据与形状
 
 测试入口 tests/test_group_gemm_pertensor_like.py:46（函数 test_group_gemm_pertensor_fp8），实际参数在 tests/test_group_gemm_pertensor_like.py:75-80：
 
@@ -858,7 +858,7 @@ CUDA_HOME=/share_data/users/like/opt/cuda-13.0 ENABLE_LIKE_DEBUG=1 make wheel > 
 
 以上与 temp/run.log:1-4 一致；temp/run.log:13-17 是本仓库上一轮加的 [LIKE_DEBUG] 打印，说明 tma buffer dtype=Float8_e4m3fn、shape=[16,128]，与 entry.cc 的 torch::empty({num_group*2,128}, options) 对应。
 
-### 5.2 分派：num_seq_per_group_avg=72 选中哪一组模板
+## 4.2 分派：num_seq_per_group_avg=72 选中哪一组模板
 
 group_gemm_fp8_async（src/group_gemm/group_gemm_pertensor_fp8.cu:360，函数 group_gemm_fp8_async）按平均 seq 长度分派模板。72 落入 else if (num_seq_per_group_avg <= 96) 分支：
 
@@ -880,7 +880,7 @@ config.get_tma 在 src/group_gemm/config.h（GroupGEMMFp8Config::get_tma）用 C
 - tma_w：W 的 fetch，tile (_128,_128)（N x K），因 W 是 [num_group,n,k]，额外带第 3 维 num_group
 - tma_y：Y 的 store，tile (_64,_48)（N x M），用于结果写回
 
-### 5.3 td_xy 与 tma_xy 的来历
+## 4.3 td_xy 与 tma_xy 的来历
 
 src/group_gemm/group_gemm_pertensor_fp8.cu:176（launch_group_gemm_fp8）把 tmas_ptr 位转成 cute::TmaDescriptor 数组（每个 group 2 个：1 个 X + 1 个 Y）：
 
@@ -891,7 +891,7 @@ td_xy 是"干净模板"：X 的基址还指向 x_ptr 起点、Y 指向 y_ptr 起
 
 注意：vec_t 定义在 src/utils/utils.cuh:30（struct vec_t），是固定长度小数组包装。
 
-### 5.4 启动网格：cudaLaunchKernelEx 与 PDL
+## 4.4 启动网格：cudaLaunchKernelEx 与 PDL
 
 launch_group_gemm_fp8 用 cudaLaunchKernelEx 且启用程序化流串行化：
 
@@ -901,15 +901,15 @@ launch_group_gemm_fp8 用 cudaLaunchKernelEx 且启用程序化流串行化：
 
 说明：num_group+1=9 个 block，block 0..7 每个负责 1 个 group 的 2 个描述符（X、Y），block 8（=num_group）专门算 tiles/cu_tiles。若传 task_map，会走 kAssignTask=true 分支，gridDim=2*num_group+1（src/group_gemm/group_gemm_pertensor_fp8.cu:201），多出的 num_group 个 block 用来生成 task_map；本测试不走。
 
-### 5.5 kernel 内部分工
+## 4.5 kernel 内部分工
 
 进入 update_grouped_tma（src/group_gemm/kernels.cuh:65，函数 update_grouped_tma）：
 
 - int igroup = blockIdx.x（src/group_gemm/kernels.cuh:73）
 - 若 kUsePDL 先 cudaGridDependencySynchronize()（src/group_gemm/kernels.cuh:75-77），确保上一个 producer 完成
-- 聚合 block（igroup==num_group，即 block 8）走 if 分支（见 5.6 的 cu_tiles）；其余 8 个 block 走 else 分支（src/group_gemm/kernels.cuh:172）更新描述符
+- 聚合 block（igroup==num_group，即 block 8）走 if 分支（见 4.6 的 cu_tiles）；其余 8 个 block 走 else 分支（src/group_gemm/kernels.cuh:172，函数 `update_grouped_tma`）更新描述符
 
-#### 5.5.1 每 group 的 X/Y 描述符改写（src/group_gemm/kernels.cuh:172-207）
+### 4.5.1 每 group 的 X/Y 描述符改写（src/group_gemm/kernels.cuh:172-207）
 
     int num_seq = seqlens_ptr[igroup];            // 该 group 实际 seq 长度
     uint64_t cu_seqlen = cu_seqlens_ptr[igroup];  // 该 group 起始 seq 偏移
@@ -946,7 +946,7 @@ update_tma_gtensor（src/utils/tma.cuh:37，函数 update_tma_gtensor）：
 
 这里 tma_descriptor_cp_fence_release 是切散、带 release 语义的 cp 描述符到全局的操作，实现在 3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:425（函数 tma_descriptor_cp_fence_release）。
 
-#### 5.5.2 聚合 block 计算 cu_tiles（src/group_gemm/kernels.cuh:143-170）
+### 4.5.2 聚合 block 计算 cu_tiles（src/group_gemm/kernels.cuh:143-170）
 
 block 8（igroup==num_group）不做描述符更新，转而计算每个 group 的 M tile 数与前缀和：
 
@@ -1004,17 +1004,17 @@ for idx in range(kThreadPerBlock):
       cu_tiles_ptr[num_group] = block_aggregate
 print(f"cu_tiles_ptr:{cu_tiles_ptr}")
 ```
-### 5.6 主 GEMM 如何消费这些描述符
+## 4.6 主 GEMM 如何消费这些描述符
 
-描述符就绪：update_grouped_tma 结尾用 PDL 的 cudaTriggerProgrammaticLaunchCompletion()（src/group_gemm/kernels.cuh:210-212）发出完成信号；随后启动的 group_gemm_fp8_kernel（src/group_gemm/kernels.cuh:215，函数 group_gemm_fp8_kernel）在开头 cudaGridDependencySynchronize()（src/group_gemm/kernels.cuh:286-287）等描述符就绪。
+描述符就绪：`update_grouped_tma` 结尾用 PDL 的 `cudaTriggerProgrammaticLaunchCompletion()`（`src/group_gemm/kernels.cuh:215-217`，函数 `update_grouped_tma`）发出完成信号；随后启动的 `group_gemm_fp8_kernel`（`src/group_gemm/kernels.cuh:220-226`，函数 `group_gemm_fp8_kernel`）在开头 `cudaGridDependencySynchronize()`（`src/group_gemm/kernels.cuh:302-304`，函数 `group_gemm_fp8_kernel`）等描述符更新 kernel 到达 PDL 依赖点。
 
 kernel 内按 task loop 策略取每个 tile 的 (igroup, itile_m, itile_n)（本测试 kTaskLoopPolicy=2，见 src/group_gemm/kernels.cuh:314）：
 - load WG 用 td_x = td_xy + igroup*2 做 tma_a.with(td_x, ...)（src/group_gemm/kernels.cuh:372-380）
 - store 用 td_y = td_xy + igroup*2+1 写回（src/group_gemm/kernels.cuh:519 处 cute::copy(tma_d.with(td_y),...)）
 
-这些 td_xy（也就是 update_grouped_tma 写入的 tma_xy buffer）正是描述符数组。消费前用 tma_descriptor_fence_acquire 做 acquire（src/group_gemm/kernels.cuh:302-303），其底层实现在 3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:459（函数 tma_descriptor_fence_acquire）。
+这些 `td_xy`（也就是 `update_grouped_tma` 写入的 `tma_xy` buffer）正是描述符数组。当前只有 policy 0 在 `src/group_gemm/kernels.cuh:306-319`（函数 `group_gemm_fp8_kernel`）显式调用 `tma_descriptor_fence_acquire`；本次 policy 2 路径没有该调用，具体风险和建议见第 14.8 节。其底层实现位于 `3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:457-470`（函数 `tma_descriptor_fence_acquire`）。
 
-### 5.7 小结
+## 4.7 小结
 
 对本次 temp/run.log 的调用，update_grouped_tma（src/group_gemm/kernels.cuh:65）：
 1. 以 num_group+1=9 个 block 启动（PDL 程序化单响应器）；block 0..7 每个负责 1 个 group 的 X、Y 描述符，block 8 算 tiles/cu_tiles。
@@ -1025,11 +1025,11 @@ kernel 内按 task loop 策略取每个 tile 的 (igroup, itile_m, itile_n)（�
 
 ---
 
-## 6. 详解 elect_one_sync（cutlass 集群/warp 选举）
+# 5. 详解 elect_one_sync（cutlass 集群/warp 选举）
 
 本节讲解 3rd/cutlass/include/cute/arch/cluster_sm90.hpp 中的 elect_one_sync 函数。该函数在 hpc-ops 的 group_gemm 实现里被多处使用（例如更新 TMA 描述符后让"单个线程"提交 commit/wait，见 src/group_gemm/kernels.cuh:202），其作用是"在一个 warp 内选出一个代表线程"。
 
-### 6.1 函数签名与语义
+## 5.1 函数签名与语义
 
 函数定义在 3rd/cutlass/include/cute/arch/cluster_sm90.hpp:180（函数 elect_one_sync）：
 
@@ -1059,14 +1059,14 @@ kernel 内按 task loop 策略取每个 tile 的 (igroup, itile_m, itile_n)（�
 - 返回类型 uint32_t，返回值作为谓词（predicate）：被选中的那条线程得到 1，其余线程得到 0。
 - 因此调用方式通常是 if (cute::elect_one_sync()) { ... }，让 warp 内只有一条线程进入分支执行"一次即可"的工作。
 
-### 6.2 分支依赖：CUTE_ARCH_ELECT_ONE_SM90_ENABLED
+## 5.2 分支依赖：CUTE_ARCH_ELECT_ONE_SM90_ENABLED
 
 该宏在 3rd/cutlass/include/cute/arch/cluster_sm90.hpp:42-44 定义，要求：
 
 - __CUDA_ARCH__ >= 900（即 sm_90 / Hopper 及以上，使用该宏说明需要现代 TMA/集群指令）
 - __CUDACC_VER_MAJOR__ >= 12（CUDA 12.x 编译器，因为 elect.sync 及 elect semantics 需要新 ptxas）
 
-### 6.3 SM90 路径下的 PTX 内联汇编
+## 5.3 SM90 路径下的 PTX 内联汇编
 
 真实路径走 elect.sync 指令：
 
@@ -1082,7 +1082,7 @@ kernel 内按 task loop 策略取每个 tile 的 (igroup, itile_m, itile_n)（�
 2. 辅助汇编把"谓词结果"写进 pred，而把"被选的 lane id"写进 laneid；elect_one_sync 只返回 pred，elect_one_leader_sync（cluster_sm90.hpp:203-210）则把二者都返回。
 3. 兼容路径：当 CUTE_ARCH_ELECT_ONE_SM90_ENABLED 未定义但仍是 __CUDA_ARCH__（例如较旧编译器被禁用）时，退化为 return (threadIdx.x % 32) == 0，即固定选 lane 0。非设备环境返回 true（主机路径基本只在 CUTE_HOST_DEVICE 里做模拟验证）。
 
-### 6.4 在 hpc-ops 中的用法示例
+## 5.4 在 hpc-ops 中的用法示例
 
 以本项目的 group_gemm 主 kernel 为例（src/group_gemm/kernels.cuh:240-241）：
 
@@ -1105,20 +1105,20 @@ kernel 内按 task loop 策略取每个 tile 的 (igroup, itile_m, itile_n)（�
 
 这里所有 warp 都要负责 release（store 到全局），但 elect_one_sync 则只让一个 lane 做 TMA commit/wait，避免对"全局描述符队列"的并发。
 
-### 6.5 与"单纯看 threadIdx.x==0"的区别
+## 5.5 与"单纯看 threadIdx.x==0"的区别
 
 - elect.sync 是硬件指令，支持对任意"由并发执行到该点的 threads"做选举；而 (threadIdx.x%32)==0 只是"固定 lane 0 为 leader"。
 - 在带有分支发散、或某条 lane 提前退出（mask 中有 inactive lane）时，elect.sync 仍保证在参与 mask 线程里恰好选出一个。
 - 但 elect_one_sync 每次调用都重新选举，**不保证**每次都选同一条 lane；它只保证"恰恰选出一个代表"，适合用它的地方都是"只需一个线程来执行一次副作用"（arrive/commit/wait）。
 
-### 6.6 相关兄弟函数（cluster_sm90.hpp）
+## 5.6 相关兄弟函数（cluster_sm90.hpp）
 
 - cluster_arrive_relaxed / cluster_arrive / cluster_wait / cluster_sync（cluster_sm90.hpp:48-83）：基于 barrier.cluster 的集群同步。
 - cluster_grid_dims / cluster_id_in_grid / block_id_in_cluster / cluster_shape / block_rank_in_cluster（cluster_sm90.hpp:86-163）：读取 nclusterid/clusterid/cluster_ctaid/cluster_nctaid/cluster_ctarank 的内建寄存器，用于确定 cluster 的几何形状与当前 block 在 cluster 中的身份。
 - set_block_rank（cluster_sm90.hpp:166-177）：用 mapa.shared::cluster 把"本地共享地址+目标 block rank"映射成集群内可访问的远程共享地址，是集群间 SMEM 通信的基础。
 - store_shared_remote（cluster_sm90.hpp:234-244）：组合 set_block_rank + st.async.shared::cluster 做远程共享内存写（带 mbarrier 完成计数）。
 
-### 6.7 参考规范
+## 5.7 参考规范
 
 elect.sync 指令在 PTX ISA（sm_90 引入 elect 这一谓词选举指令）有明确定义：
 
@@ -1131,9 +1131,9 @@ CUTLASS/CuTe 的 elect_one_sync 即 (elect.sync 的 pred + laneid) 中只保留�
 
 ---
 
-## 7. `src/group_gemm/kernels.cuh:203-204` 的 `commit + wait`
+# 6. `src/group_gemm/kernels.cuh:203-204` 的 `commit + wait`
 
-### 7.1 结论
+## 6.1 结论
 
 在当前的 `update_grouped_tma` kernel 中，203--204 行之前**没有**发起 X/Y tensor 的 TMA copy。这里的
 
@@ -1146,7 +1146,7 @@ cute::tma_desc_wait_group();
 
 更精确地说，它也不能等待别的线程、别的 warp 或别的 kernel 的 TMA 请求：PTX 将 bulk async-group 定义为 *per-thread*，`commit_group` 只收集“执行该指令的线程”此前发起、尚未提交且采用 `bulk_group` completion 的请求。
 
-### 7.2 203--204 行实际发出的指令
+## 6.2 203--204 行实际发出的指令
 
 - `cute::tma_desc_commit_group()` 在 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:1235` 中直接发出 `cp.async.bulk.commit_group`。
 - `cute::tma_desc_wait_group()` 在同文件 `:1262` 中发出 `cp.async.bulk.wait_group.read 0`。
@@ -1155,7 +1155,7 @@ cute::tma_desc_wait_group();
 
 这也是为什么一般动态 descriptor 重用场景需要二者连用：先 `commit` 把未提交请求纳入可等待的 group，之后 `wait_group.read 0` 让 descriptor 的异步读取阶段结束。CUTLASS 在动态 tensormap 更新路径中使用了同一惯用法，并明确说明“没有未提交指令时会得到 empty bulk async-group”（例如 `3rd/cutlass/include/cutlass/epilogue/collective/sm100_epilogue_array_tma_warpspecialized.hpp:1564`）。
 
-### 7.3 本函数在 203 行之前实际做了什么
+## 6.3 本函数在 203 行之前实际做了什么
 
 执行顺序如下：
 
@@ -1180,9 +1180,9 @@ cute::tma_desc_wait_group();
 
 ---
 
-## 8. 为什么 host 看起来是 policy 2，而 kernel 打印 policy 1
+# 7. 为什么 host 看起来是 policy 2，而 kernel 打印 policy 1
 
-### 8.1 直接原因：`kTaskLoopPolicy` 被声明成了 `bool`
+## 7.1 直接原因：`kTaskLoopPolicy` 被声明成了 `bool`
 
 `group_gemm_fp8_kernel` 的模板参数明确是 `int`：`src/group_gemm/kernels.cuh:215-221`（函数 `group_gemm_fp8_kernel`）。但 host 端 `launch_group_gemm_fp8` 的六个 dispatch 分支都写成了 `constexpr bool kTaskLoopPolicy`：
 
@@ -1199,7 +1199,7 @@ constexpr bool kTaskLoopPolicy = 2;
 
 这不是 `printf` 的格式问题，也不是 host/device 变量不同步，而是 `constexpr bool` 的类型错误。策略 0 和策略 1 恰好不会暴露问题；只有策略 2 被压成了策略 1。
 
-### 8.2 为什么 `shm_seq:36` 仍然能打印
+## 7.2 为什么 `shm_seq:36` 仍然能打印
 
 host 的 `shm_seq` 打印位于第三个 `else` 分支的局部代码中。该分支的选择条件是运行时条件：`task_map_ptr == nullptr` 且 `k > 1024`、`n > 1024`，见 `src/group_gemm/group_gemm_pertensor_fp8.cu:136-176`（函数 `launch_group_gemm_fp8`）。进入这个分支只说明选择了“原本意图对应 policy 2 的代码块”，并不说明其中 `constexpr bool kTaskLoopPolicy` 的值是整数 2。
 
@@ -1211,7 +1211,7 @@ host 的 `shm_seq` 打印位于第三个 `else` 分支的局部代码中。该�
 
 另外，`src/group_gemm/entry.cc:61-68`（函数 `group_gemm_fp8_entry`）只有在 `num_seq_per_group_avg <= 8` 且提供 task-map workspace 时才设置 `task_map_ptr`。本次平均 sequence length 为 72（日志中的 `16,32,...,128`），因此 `task_map_ptr` 为 null 是预期行为。
 
-### 8.3 kernel 实际编译和执行的是 policy 1
+## 7.3 kernel 实际编译和执行的是 policy 1
 
 在 `group_gemm_fp8_kernel` 中，policy 1 和 policy 2 是 `if constexpr` 的不同编译路径：
 
@@ -1220,11 +1220,11 @@ host 的 `shm_seq` 打印位于第三个 `else` 分支的局部代码中。该�
 
 由于实际模板值是 1，policy 2 分支在编译期被丢弃，kernel 走的是 horizon 路径。日志中 device printf 的 `total_m:0` 也与此一致：只有 policy 2 的 `src/group_gemm/kernels.cuh:315`（函数 `group_gemm_fp8_kernel`）会给 `total_m` 赋值；policy 1 不会赋值，因此保留初始化值 0。
 
-### 8.4 还要注意 `use_pdl` 的覆盖
+## 7.4 还要注意 `use_pdl` 的覆盖
 
 `group_gemm_fp8_entry` 在 `src/group_gemm/entry.cc:84-86`（函数 `group_gemm_fp8_entry`）把 `use_pdl=false` 传给 `group_gemm_fp8_async`，但 `src/group_gemm/group_gemm_pertensor_fp8.cu:224-246`（函数 `group_gemm_fp8_async`）第 238 行又无条件执行 `use_pdl = true`。所以本次运行实际走 `launch_group_gemm_fp8` 的 PDL 分支，具体是 `src/group_gemm/group_gemm_pertensor_fp8.cu:121-176`（函数 `launch_group_gemm_fp8`）中的第三个 `else`。
 
-### 8.5 修复建议
+## 7.5 修复建议
 
 将 pertensor host dispatch 中的六处声明改成 `constexpr int kTaskLoopPolicy`：
 
@@ -1238,13 +1238,13 @@ src/group_gemm/group_gemm_pertensor_fp8.cu:137,152,165,182,196,208
 
 ---
 
-## 9. `get_next_tile_vert`：policy 2 如何把线性任务映射回 group tile
+# 8. `get_next_tile_vert`：policy 2 如何把线性任务映射回 group tile
 
-### 9.1 本次日志确实执行了 policy 2
+## 8.1 本次日志确实执行了 policy 2
 
 当前 `temp/run.log:94-570` 大量打印 `kTaskLoopPolicy:2`，`temp/run.log:648-651` 也再次打印 policy 2；因此这次运行确实进入了 `get_next_tile_vert`，不是只有 host 端进入了 policy-2 的 dispatch 分支。当前源码在 `src/group_gemm/group_gemm_pertensor_fp8.cu:309`（函数 `launch_group_gemm_fp8`）使用 `constexpr int kTaskLoopPolicy = 2`，并在 `src/group_gemm/group_gemm_pertensor_fp8.cu:320-327`（函数 `launch_group_gemm_fp8`）将它作为模板实参传给 `group_gemm_fp8_kernel`。此前第 8 节记录的是类型修复前的历史状态；本节以当前源码和当前日志为准。
 
-### 9.2 函数签名和业务对象
+## 8.2 函数签名和业务对象
 
 函数定义在 `src/group_gemm/kernels.cuh:42`（函数 `get_next_tile_vert`）：
 
@@ -1266,7 +1266,7 @@ __device__ __forceinline__ void get_next_tile_vert(
 - `itile_m`：该 group 内沿 M/sequence 方向的 tile 编号，从 0 开始；对应的 X tile 在 `src/group_gemm/kernels.cuh:426-427`（函数 `group_gemm_fp8_kernel`）使用 `tAg(_, itile_m, itile_k)`。它是 tile index，不是元素行号；实际行起点约为 `itile_m * kTileM`，最后一个 tile 可能是部分有效。
 - `itile_n`：沿 N/output-channel 方向的 tile 编号，从 0 开始；对应 W tile 在 `src/group_gemm/kernels.cuh:429-430`（函数 `group_gemm_fp8_kernel`）使用 `tBg(_, itile_n, itile_k, igroup)`。本例 `N=4096`、`kTileN=128`，共有 32 个 N tiles。
 
-### 9.3 输入参数和输出参数
+## 8.3 输入参数和输出参数
 
 `cu_tiles_ptr`、`iblock`、`num_group`、`total_m` 的含义如下：
 
@@ -1280,7 +1280,7 @@ __device__ __forceinline__ void get_next_tile_vert(
 
 5. `igroup`、`itile_m`、`itile_n` 是引用输出参数；函数不会依赖调用前的 `igroup` 值，而是在 `src/group_gemm/kernels.cuh:59-60`（函数 `get_next_tile_vert`）覆盖写入。返回后，`igroup` 是 group 下标，`itile_m` 是 group-local M tile 下标，`itile_n` 是 N tile 下标。
 
-### 9.4 第一阶段：把 `iblock` 拆成 N tile 和全局 M tile
+## 8.4 第一阶段：把 `iblock` 拆成 N tile 和全局 M tile
 
 函数前两行（`src/group_gemm/kernels.cuh:45-46`，函数 `get_next_tile_vert`）是：
 
@@ -1299,7 +1299,7 @@ iblock = itile_n * total_m + r
 
 对比之下，policy 1 的 `get_next_tile_horizon` 在 `src/group_gemm/kernels.cuh:28`（函数 `get_next_tile_horizon`）使用另一种除法/取模顺序，先按全局 M rank 再按 N tile 展开；两种 policy 访问的是同一批输出 tiles，只是线性调度顺序不同。
 
-### 9.5 第二阶段：用 prefix sum 二分反查 group 和局部 M tile
+## 8.5 第二阶段：用 prefix sum 二分反查 group 和局部 M tile
 
 假设 `r = itile_m_total`。group `g` 覆盖的全局 M rank 区间是：
 
@@ -1328,7 +1328,7 @@ igroup = right;
 
 也就是说，`cu_tiles_ptr[right]` 把全局 M rank 转回该 group 的起点，做差后得到 group-local `itile_m`。如果某些 group 的 sequence length 为 0，prefix 中可能有重复值；取最后一个不超过 `r` 的 prefix 会跳过空 group，仍落到真正包含该 tile 的 group。
 
-### 9.6 用本次数据走一遍
+## 8.6 用本次数据走一遍
 
 `temp/run.log:77-84` 给出的 sequence lengths 是 `[16,32,48,64,80,96,112,128]`；本次 `kTileM=48`，见 `temp/run.log:6`。因此 `update_grouped_tma` 在 `src/group_gemm/kernels.cuh:149`（函数 `update_grouped_tma`）计算出：
 
@@ -1352,7 +1352,7 @@ total_m               = 15
 
 这些结果与日志一致：`temp/run.log:94` 是 `iblock=0 -> (0,0,0)`，`temp/run.log:95` 是 `iblock=2 -> (2,0,0)`，`temp/run.log:99` 是 `iblock=4 -> (3,1,0)`，`temp/run.log:97` 是 `iblock=130 -> (6,1,8)`。例如 `iblock=130` 时，`130 % 15 = 10`、`130 / 15 = 8`，全局 M rank 10 落在 group 6 的区间 `[9,12)`，所以局部 M tile 是 1。
 
-### 9.7 它如何服务于 TMA load 和 WGMMA
+## 8.7 它如何服务于 TMA load 和 WGMMA
 
 policy 2 下，load warpgroup 和 math warpgroup 都执行相同的映射：load 侧在 `src/group_gemm/kernels.cuh:390-413`（函数 `group_gemm_fp8_kernel`），math 侧在 `src/group_gemm/kernels.cuh:469-490`（函数 `group_gemm_fp8_kernel`）。这样同一个 CTA 的 producer/consumer 对同一个 `iblock` 得到相同的 `(igroup,itile_m,itile_n)`，随后：
 
@@ -1363,9 +1363,9 @@ policy 2 下，load warpgroup 和 math warpgroup 都执行相同的映射：load
 
 因此，`get_next_tile_vert` 的业务本质是：在 ragged group GEMM 中，把 persistent grid 的线性 work index 映射成正确的 group、该 group 内的 M tile、以及 N tile；它利用 prefix sum 处理不同 group 的 sequence length，并用二分查找避免逐 group 线性扫描。
 
-## 10. `tma_a.with`/`tma_b.with` 重载与 barrier 顺序
+# 9. `tma_a.with`/`tma_b.with` 重载与 barrier 顺序
 
-### 10.1 两处调用分别命中了什么重载
+## 9.1 两处调用分别命中了什么重载
 
 先区分两层 `with`：源码中看到的成员函数是 `cute::Copy_Atom::with`，它只是一个可变参数转发器；真正决定参数含义的是 `Copy_Traits<SM90_TMA_LOAD, ...>::with`。
 
@@ -1406,7 +1406,7 @@ policy 2 下，load warpgroup 和 math warpgroup 都执行相同的映射：load
 
 `with` 本身不会搬运数据，只是返回一个已经绑定了 descriptor/barrier 的可执行 `Copy_Atom`。真正发出 TMA 指令的是后面的 `cute::copy`；`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:103-131`（函数 `SM90_TMA_LOAD_2D::copy`）最终生成 `cp.async.bulk.tensor.2d...mbarrier::complete_tx::bytes`。
 
-### 10.2 为什么 A 要替换 descriptor，而 B 不需要
+## 9.2 为什么 A 要替换 descriptor，而 B 不需要
 
 `src/group_gemm/config.h:90-95`（函数 `GroupGEMMFp8Config::get_tma`）为 X、W、Y 各创建一个 TMA atom；但 group GEMM kernel 的参数只显式传入了 W TMA，见 `src/group_gemm/group_gemm_pertensor_fp8.cu:286-327`（函数 `launch_group_gemm_fp8`）。X/Y 的每个 group descriptor 放在 `td_xy` 中，由更新 kernel 动态生成并发布。
 
@@ -1415,7 +1415,7 @@ policy 2 下，load warpgroup 和 math warpgroup 都执行相同的映射：load
 
 换句话说，A 的两个参数分别是“本 group 的动态 descriptor + 完成 barrier”，B 的一个参数是“完成 barrier”；不是 A/B 的 TMA 指令种类不同。
 
-### 10.3 `set_barrier_transaction_bytes` 做了什么
+## 9.3 `set_barrier_transaction_bytes` 做了什么
 
 在 `src/group_gemm/kernels.cuh:325-329`（函数 `group_gemm_fp8_kernel`）中，每个 `readable` barrier 以 arrival count 1 初始化；消费者在 `src/group_gemm/kernels.cuh:510-514`（函数 `group_gemm_fp8_kernel`）调用 `wait_barrier` 等待该阶段完成。
 
@@ -1429,7 +1429,7 @@ mbarrier.arrive.expect_tx.shared::cta.b64 _, [barrier], bytes
 
 本例中的 `src/group_gemm/kernels.cuh:377-378`（函数 `group_gemm_fp8_kernel`）把 `kTransactionBytes` 计算为 A tile 和 B tile 的总字节数，正好对应 `src/group_gemm/kernels.cuh:437-443`（函数 `group_gemm_fp8_kernel`）提交的两次 TMA load。也就是说，一个 barrier 跟踪两次 copy 的合计，而不是每次 copy 各自跟踪一个 barrier。
 
-### 10.4 为什么当前代码可以先 copy、再设置 expected bytes
+## 9.4 为什么当前代码可以先 copy、再设置 expected bytes
 
 当前代码的实际顺序是：
 
@@ -1453,7 +1453,7 @@ mbarrier.arrive.expect_tx(total_bytes)
 
 因此，当前顺序不能解释为“先把数据拷完再设置 barrier”；它是“先提交异步操作，再立即登记本 phase 的完成条件”。
 
-### 10.5 tutorial 的顺序与推荐选择
+## 9.5 tutorial 的顺序与推荐选择
 
 外部 CUTLASS tutorial `../cutlass/examples/cute/tutorial/hopper/wgmma_tma_sm90_like.cu:215-224`（函数 `gemm_device`）采用：
 
@@ -1481,9 +1481,9 @@ copy(tma_b.with(...), ...)
 
 最后再强调：`tma_a.with` 的第二个参数和 `tma_b.with` 的唯一参数都是同一个 `readable` barrier；A 多出来的第一个参数只是在 group GEMM 的 ragged X 场景下替换 per-group descriptor。`with` 不负责发起搬运，`cute::copy` 才发起 TMA，`set_barrier_transaction_bytes`/`arrive_and_expect_tx` 负责把这些异步搬运纳入 barrier 的完成条件。
 
-## 11. line 440：`tBg` 与 TMA descriptor 的分工
+# 10. line 440：`tBg` 与 TMA descriptor 的分工
 
-### 11.1 直接结论
+## 10.1 直接结论
 
 `tBg(_, itile_n, itile_k, igroup)` **不包含 W 的 global memory base address**。它是 TMA 专用的 coordinate tensor，主要负责产生本次 TMA load 的起始坐标；它的 Tensor 对象仍然有 shape/layout（因此有坐标步长和 tile 分区信息），但其 `data()` 是算术坐标迭代器，不是 `w_ptr` 对应的 `gmem_ptr`。
 
@@ -1491,7 +1491,7 @@ W 的物理地址在 host/device launch 侧先进入原始 GMEM Tensor：`src/gr
 
 需要更精确地说：原始 `tma_b` 的 atom 保存 `tma_desc_`；`tma_b.with(readable[ismem_write])` 并不是再复制一份 descriptor，而是 `3rd/cutlass/include/cute/atom/copy_atom.hpp:76-83`（函数 `Copy_Atom::with`）转调 `Copy_Traits::with`。对于本例，命中 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:124-133`（函数 `Copy_Traits<SM90_TMA_LOAD>::with`），返回的 executable atom 的运行时参数是 `&tma_desc_`、barrier 地址和 cache hint。
 
-### 11.2 `tBg` 是怎样生成坐标的
+## 10.2 `tBg` 是怎样生成坐标的
 
 `src/group_gemm/kernels.cuh:265-278`（函数 `group_gemm_fp8_kernel`）先执行：
 
@@ -1506,7 +1506,7 @@ auto tBg = btma_b.partition_S(gB);
 
 运行日志也印证了这一点：`temp/run.log:130-133`（函数 `group_gemm_fp8_kernel` 的 debug 输出）中 `gB` 打印为 `ArithTuple`，而不是 `gmem_ptr`；`temp/run.log:166-167`（同一函数）中 `tBg` 仍打印为 `ArithTuple`，并显示 `(TMA, TMA_N, TMA_K, num_group)` 的坐标分区。
 
-### 11.3 `cute::copy` 两个参数分别给什么
+## 10.3 `cute::copy` 两个参数分别给什么
 
 在 line 440，`tma_b` 实际是 `make_tma_copy` 返回的 `TiledCopy`；`3rd/cutlass/include/cute/atom/copy_atom.hpp:185-189`（函数/类型 `TiledCopy`）说明它继承 `Copy_Atom`。`cute::copy` 在 `3rd/cutlass/include/cute/algorithm/copy.hpp:184-196`（函数 `copy` 的 `Copy_Atom` overload）把这个 atom 调到 `Copy_Atom::call`，再进入 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:64-90`（函数 `TMA_LOAD_Unpack::copy_unpack`）。该函数的关键代码是：
 
@@ -1534,9 +1534,9 @@ cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes
 
 在本 kernel 中，`igroup` 只改变 B descriptor 下的第三维坐标；因此同一个 W descriptor 可以覆盖所有 group。相对地，A 的 per-group descriptor 在 `src/group_gemm/kernels.cuh:430-441`（函数 `group_gemm_fp8_kernel`）通过 `td_x` 显式替换，正是因为 A 的每个 group 可能有不同的起始地址/有效形状。
 
-## 12. line 437/440：一次 `cute::copy` 的 TMA 指令数
+# 11. line 437/440：一次 `cute::copy` 的 TMA 指令数
 
-### 12.1 当前运行的直接答案
+## 11.1 当前运行的直接答案
 
 以 `temp/run.log` 中这次运行的实例为准（`temp/run.log:6`，函数 `launch_group_gemm_fp8` 的 debug 输出）：
 
@@ -1549,7 +1549,7 @@ cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes
 
 这里统计的是 `cp.async.bulk.tensor` 数据搬运指令；`src/group_gemm/kernels.cuh:443`（函数 `group_gemm_fp8_kernel`）的 `set_barrier_transaction_bytes` 是另一个 mbarrier 记账指令，不应算作额外的 `cp.async.bulk.tensor`。
 
-### 12.2 TiledCopy 和 CopyAtom 的实际关系
+## 11.2 TiledCopy 和 CopyAtom 的实际关系
 
 用户问题中“`tma_a.with(...)` 本身是一个 TiledCopy”需要做一个类型上的修正：
 
@@ -1563,7 +1563,7 @@ cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes
 
 从日志布局还可以直接看到这个复制倍率：A 的 `TiledLayout_TV` 是 1 个逻辑线程、6144 个 value，而 atom 的 `ValLayout` 是 1 个线程、6144 个 value；B 对应为 1 个线程、16384 个 value（`temp/run.log:43-61`、`temp/run.log:93-113`）。因此 `TiledNumThr/AtomNumThr = 1` 且 `TiledNumVal/AtomNumVal = 1`，逻辑上的 CopyAtom invocation 数就是 1。
 
-### 12.3 为什么一次调用只有一条 `cp.async.bulk`
+## 11.3 为什么一次调用只有一条 `cp.async.bulk`
 
 当前日志给出的静态布局是：
 
@@ -1580,7 +1580,7 @@ cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes
 
 也就是说，一条 tensor TMA 指令的地址操作数是“descriptor + 起始坐标”，box shape 则在 descriptor/atom 中描述；它可以一次搬完整的 2D/3D box，不需要每个 FP8 元素一条指令。
 
-### 12.4 元素数、CopyAtom 数和外层循环数的区别
+## 11.4 元素数、CopyAtom 数和外层循环数的区别
 
 对当前 `GroupGEMMFp8Config`，SMEM tile 的定义见 `src/group_gemm/config.h:81-84`（类型 `GroupGEMMFp8Config`），TMA 创建见 `src/group_gemm/config.h:90-95`（函数 `GroupGEMMFp8Config::get_tma`）：
 
@@ -1597,11 +1597,11 @@ B：每次 atom copy 的元素数 = kTileN * kTileK * 1
 - **CopyAtom 数**：每个 `TiledCopy` 有一个 base `Copy_Atom`，这个已索引的 tile view 只调用它一次；
 - **循环次数**：`itile_k` 每增加一次，就再次发出一条 A 和一条 B 指令。当前 K=7168、`kTileK=128` 时是 56 次，见 `src/group_gemm/kernels.cuh:387-388`（函数 `group_gemm_fp8_kernel`）及 `temp/run.log:162-167`。
 
-## 13. math warpgroup 分支逐行说明
+# 12. math warpgroup 分支逐行说明
 
 下面的行号以当前 code base 工作树为准。用户问题中所说的 `if (idx >= kNumThreads)` 的 `else`，当前位于 `src/group_gemm/kernels.cuh:340-421`（函数 `group_gemm_fp8_kernel`）；调试 `printf`/`print` 代码不在说明范围内。
 
-### 13.1 本次运行的具体配置
+## 12.1 本次运行的具体配置
 
 本次日志给出的输入是 `m=576, n=4096, k=7168, num_group=8`，每个 group 的 sequence length 为 `16,32,48,64,80,96,112,128`，见 `temp/run.log:261-272`（函数 `group_gemm_fp8_kernel` 的运行时输出）。平均 sequence length 是 72，因此 host dispatch 选择 `kTileM=48` 分支；该分支及其 `kTileN=128,kTileK=128,kStage=8` 配置见 `src/group_gemm/group_gemm_pertensor_fp8.cu:437-443`（函数 `group_gemm_fp8_async`）。由于 `n>1024` 且 `k>1024`，任务策略选择 policy 2，见 `src/group_gemm/group_gemm_pertensor_fp8.cu:308-327`（函数 `launch_group_gemm_fp8`）。
 
@@ -1622,7 +1622,7 @@ ThrLayoutVMNK  = (128, 2, 1, 1)
 
 本项目的矩阵逻辑是 `Y[n,m] = W[n,k] * X[m,k]^T`。为了匹配 CuTe 的 GEMM 约定 `A(M,K) x B(N,K) -> C(M,N)`，代码故意把 W 当作 GMMA 的 A、把 X 当作 GMMA 的 B，最后得到逻辑 `C(128,48)`，正好对应输出 Y 的 `(n,m)` tile。W/X 的原始 shape 见 `src/group_gemm/group_gemm_pertensor_fp8.cu:37-42`（函数 `launch_group_gemm_fp8`）。
 
-### 13.2 进入 math warpgroup 和配置寄存器
+## 12.2 进入 math warpgroup 和配置寄存器
 
 ```cpp
 } else {
@@ -1638,7 +1638,7 @@ int iwarpgroup = idx / 128;
 
 位置：`src/group_gemm/kernels.cuh:425`（函数 `group_gemm_fp8_kernel`）。math 分支中的 `idx` 仍是原始 block thread index，因此 `idx=0..127` 时 `iwarpgroup=0`，`idx=128..255` 时 `iwarpgroup=1`。后面的 TMA store 会用这个值选择两个 `64x48` shared-memory/global-memory 子块。
 
-### 13.3 建立线程私有的 MMA 视图
+## 12.3 建立线程私有的 MMA 视图
 
 ```cpp
 TiledMma tiled_mma;
@@ -1668,7 +1668,7 @@ auto tCr = thr_mma.partition_fragment_C(gC);
 ```
 
 位置：`src/group_gemm/kernels.cuh:436`（函数 `group_gemm_fp8_kernel`）。`gC` 在 `src/group_gemm/kernels.cuh:267-269`（函数 `group_gemm_fp8_kernel`）只是用 `nullptr` 指针和 `(kTileN,kTileM)` shape 构造的布局模板，并不是实际 global-memory 输出。实现见 `3rd/cutlass/include/cute/atom/mma_atom.hpp:497-503`（函数 `ThrMMA::partition_fragment_C`）。本次日志 `temp/run.log:204-205` 显示每个线程持有 24 个 FP32 累加值。
-### 13.4 任务、stage 和 K tile 循环
+## 12.4 任务、stage 和 K tile 循环
 
 ```cpp
 int ismem_read = 0;
@@ -1718,7 +1718,7 @@ iblock += gridDim.x;
 
 位置：`src/group_gemm/kernels.cuh:470`（函数 `group_gemm_fp8_kernel`）。当前 CTA 处理完一个任务后，以 grid-stride 方式跳到下一个任务；这不是数学运算，而是让多个 CTA 分摊有效的 `(group,M,N)` tile。
 
-### 13.5 软件跨 K 累加器和 per-group scale
+## 12.5 软件跨 K 累加器和 per-group scale
 
 ```cpp
 auto tDr = make_tensor_like(tCr);
@@ -1745,7 +1745,7 @@ wait_barrier(readable[ismem_read], phase);
 
 本次每个 stage 的 transaction bytes 是 `sizeof(Tin) * (48+128) * 128 = 22528` 字节（`Tin` 为 1-byte FP8）：A TMA copy 搬 `48*128=6144` 字节，B TMA copy 搬 `128*128=16384` 字节，两者之和由 load leader 在 `src/group_gemm/kernels.cuh:345` 和 `src/group_gemm/kernels.cuh:410`（函数 `group_gemm_fp8_kernel`）设置到同一个 `readable` barrier。因而 math 侧等待的是两次 load 合计完成，而不是只等待其中一条 copy。
 
-### 13.6 `accumulate_ = Zero/One` 的含义
+## 12.6 `accumulate_ = Zero/One` 的含义
 
 核心代码是：
 
@@ -1809,7 +1809,7 @@ tDr(i) = tCr(i) * scale + tDr(i);
 
 位置：`src/group_gemm/kernels.cuh:498-501`（函数 `group_gemm_fp8_kernel`）。因此 `accumulate_` 的作用范围是“当前 128-K tile 内的 4 条 WGMMA”，而 `tDr` 的作用范围是“整个 7168-K GEMM 的 56 个 tile”。`yscale_ptr` 的 group scale 也在这里显式乘入，不能由 `ScaleOut` 完成。
 
-### 13.7 提交并等待异步 WGMMA，然后释放 shared-memory stage
+## 12.7 提交并等待异步 WGMMA，然后释放 shared-memory stage
 
 ```cpp
 warpgroup_commit_batch();
@@ -1826,7 +1826,7 @@ arrive_barrier(writable[ismem_read]);
 - `warpgroup_wait<0>()` 发出 `wgmma.wait_group.sync.aligned 0`。模板参数 0 表示等待到已提交的 WGMMA pending group 数为 0，也就是当前 `tCr` 可以被普通 CUDA 指令读取。实现见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:59-71`（函数 `warpgroup_wait`）。
 - 第二个 `warpgroup_fence_operand(tCr)` 更准确地说，是 CUTLASS 用“空的 `volatile` inline asm + 每个 accumulator 的 read-write operand + `memory` clobber”实现的**编译器代码移动约束**。CUTLASS 的相关说明通常把它称为 **NVVM code-motion fence**，但它不是独立的 PTX/GPU 硬件原语，也不是等待 WGMMA 完成的指令。它只标记列出的 accumulator live range：约束编译器不要把会定义、覆盖、reload 或错误使用这些 accumulator 的普通指令放进 WGMMA in-flight 区间；完全不依赖这些 operand 的独立指令仍可能被调度到前后。实现见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:45-66`（函数 `warpgroup_fence_operand(Tensor<Engine, Layout>&)`）。
 
-#### `warpgroup_fence_operand(tCr)` 在本次实例中的展开
+### 12.7.1 `warpgroup_fence_operand(tCr)` 在本次实例中的展开
 
 `tCr` 是 `src/group_gemm/kernels.cuh:436`（函数 `group_gemm_fp8_kernel`）由 `partition_fragment_C` 创建的寄存器 tensor。运行日志显示每个线程的形状为 `((_2,_2,_6),_1,_1)`，即 `2*2*6=24` 个 FP32 accumulator，见 `temp/run.log:204-205`（函数 `group_gemm_fp8_kernel` 的调试输出）。这也与本次 atom 的输出规模吻合：一条 `m64n48` WGMMA 产生 `64*48=3072` 个 FP32 输出，由 128 个线程共同持有，所以每线程正好持有 `3072/128=24` 个逻辑 accumulator。
 
@@ -1848,7 +1848,7 @@ for (int i = 0; i < 24; ++i) {
 
 标量 overload 位于 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:86-103`（函数 `warpgroup_fence_operand(uint32_t&)` 和 `warpgroup_fence_operand(float&)`）。如果 accumulator 是整数类型，tensor overload 会走另一分支：先 `recast<uint32_t>`，再使用 `"+r"`；本次 FP8->FP32 kernel 走的是 `"+f"` 浮点分支。标量实现还受 `#if defined(__CUDA_ARCH__)` 保护：host 编译 pass 中函数体为空，只有 device 编译 pass 才建立这些 inline-asm 约束。每个线程只约束自己持有的 24 个 fragment 元素；它没有 arrival count、phase 或跨线程通信，因此本身不是 128-thread warpgroup barrier。相对地，`src/group_gemm/kernels.cuh:485`（函数 `group_gemm_fp8_kernel`）调用的 `warpgroup_arrive` 展开为带 `.sync.aligned` 的硬件指令，要求 warpgroup 按一致路径执行；这正是“operand fence 是 per-thread 编译器标记、`wgmma.fence` 是 warpgroup 硬件同步”的区别。
 
-#### 空 inline asm 的每个部分分别表示什么
+### 12.7.2 空 inline asm 的每个部分分别表示什么
 
 对本次 float overload：
 
@@ -1864,19 +1864,19 @@ asm volatile("" : "+f"(reg) :: "memory");
 
 因此，`warpgroup_fence_operand` 的本质是“告诉编译器这些寄存器在这里形成一个异步 WGMMA 的边界”，而不是“在这里让 GPU 停下来”。可以把它理解成给特定寄存器 live range 加标签，而不是给整个线程或整个 warpgroup 加全局栅栏。
 
-#### 为什么这个 operand 正好是 `tCr`
+### 12.7.3 为什么这个 operand 正好是 `tCr`
 
 本次选择的 GMMA operation 是 `MMA_64x48x32_F32E4M3E4M3_SS_TN`，其 `CRegisters=float[24]`，见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28810-28815`（类型 `MMA_64x48x32_F32E4M3E4M3_SS_TN`）。其 `fma` 的 `d00...d23` 都以 `"+f"` 传给 `wgmma.mma_async`，见同文件 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28817-28850`（函数 `MMA_64x48x32_F32E4M3E4M3_SS_TN::fma`）。
 
 CuTe 的 `mma_unpack` 将 `D` 和 `C` 视为同一组寄存器：它把可写的 D tensor 重解释为 `rC`，再把每个寄存器传给 `fma`，见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:392-430`（函数 `SM90::GMMA::mma_unpack`）。三参数 `MMA_Atom::call(A,B,C)` 进一步明确执行 `call(C,A,B,C)`，即 D=C 原地更新，见 `3rd/cutlass/include/cute/atom/mma_atom.hpp:107-118`（函数 `MMA_Atom::call`）。所以需要被标记的正是 `tCr`，而不是 `tDr`、`tAr` 或 `tBr`。
 
-#### 第一条 WGMMA 使用 `ScaleOut::Zero`，为什么 fence 仍是 `+f`
+### 12.7.4 第一条 WGMMA 使用 `ScaleOut::Zero`，为什么 fence 仍是 `+f`
 
 `src/group_gemm/kernels.cuh:482-490`（函数 `group_gemm_fp8_kernel`）中第一条 WGMMA 的 `ScaleOut::Zero` 只控制硬件公式里的旧 C 项是否参与：wrapper 通过谓词令第一条指令计算 `D=A*B`，后续三条才计算 `D=A*B+D`。它不把 `tCr` 清零，也不改变 C++/inline-asm 层面对这 24 个 destination operands 的描述。
 
 具体 wrapper 始终把 `d00...d23` 写成 `"+f"`，见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma_ext.hpp:28817-28850`（函数 `MMA_64x48x32_F32E4M3E4M3_SS_TN::fma`）；是否使用旧值由同一函数中的 `scale_D` 谓词决定。于是 compiler helper 也统一使用 `+f` 来维持同一组 in-place accumulator 的 live range。这里的“read”是编译器数据流含义，不意味着 `ScaleOut::Zero` 时硬件把旧 `tCr` 加入结果，也不意味着 pre-fence 初始化了 `tCr`。
 
-#### 在当前代码中的两个边界
+### 12.7.5 在当前代码中的两个边界
 
 当前 WGMMA 的顺序是 `src/group_gemm/kernels.cuh:482-496`（函数 `group_gemm_fp8_kernel`）：
 
@@ -1899,7 +1899,7 @@ warpgroup_fence_operand(tCr)  // 编译器边界：结束
 四个内层 `cute::gemm` 使用同一个形状 `m64n48k32` 和同一组 `tCr` accumulator。对这种连续、同形状的 accumulator WGMMA，硬件允许连续更新同一 accumulator，不需要在每两条 WGMMA 之间再执行 `wgmma.fence`；同时，两条 WGMMA 之间没有普通 C++ 代码读写 `tCr`，所以也没有必要重复加入 compiler operand marker。这里必须区分两种边界：空的 `warpgroup_fence_operand` 不会直接切分硬件 pipeline，硬件 async batch 由 `warpgroup_commit_batch` 定义。当前 helper 放在 batch 开始和 `wait_group` 之后，覆盖“普通寄存器访问 -> 异步 WGMMA batch -> 普通寄存器访问”三个阶段。当前 operation 是 `SS_TN`，A/B 数据来自 shared-memory descriptor，`tCr` 是需要重点标记的寄存器 accumulator；这也是代码只对 `tCr` 调用该 helper 的原因。
 
 
-#### 用“寄存器使用权交接”理解两个调用
+### 12.7.6 用“寄存器使用权交接”理解两个调用
 
 这是一个帮助阅读代码的抽象模型，不是额外的 CUDA barrier：
 
@@ -1909,7 +1909,7 @@ warpgroup_fence_operand(tCr)  // 编译器边界：结束
 4. `src/group_gemm/kernels.cuh:494`（函数 `group_gemm_fp8_kernel`）的 post marker 位于 wait 之后、`src/group_gemm/kernels.cuh:499-500`（函数 `group_gemm_fp8_kernel`）第一次普通读取 `tCr(i)` 之前；它把 compiler-visible 的 accumulator 定义与后续 C++ use 接起来。把这个调用提前到 wait 之前，不能替代当前顺序，因为 marker 就失去了“完成后再允许普通 use”的位置含义。
 5. `src/group_gemm/kernels.cuh:496`（函数 `group_gemm_fp8_kernel`）的 `arrive_barrier(writable[ismem_read])` 是 shared-memory stage 的生产者/消费者协议，和 `tCr` 寄存器 marker 是两条独立的同步链路；前者不读取或刷新 `tCr`。
 
-#### 如果删除 `src/group_gemm/kernels.cuh:494`（函数 `group_gemm_fp8_kernel`），会发生什么
+### 12.7.7 如果删除 `src/group_gemm/kernels.cuh:494`（函数 `group_gemm_fp8_kernel`），会发生什么
 
 删除 operand fence **通常没有硬件同步或数学正确性含义**：`src/group_gemm/kernels.cuh:493`（函数 `group_gemm_fp8_kernel`）的硬件 `warpgroup_wait<0>()` 仍然等待全部已提交 group 完成，所以某些编译器版本下测试仍会通过。风险主要在编译器生成代码和性能：NVVM/ptxas 对“哪些寄存器属于 WGMMA in-flight batch、何时允许普通指令触碰这些 live range”的信息变得不完整，可能出现：
 
@@ -1939,7 +1939,7 @@ arrive_barrier(writable[ismem_read]);
 - `readable[stage]`：TMA global-to-shared transaction 完成，消费者可以开始 WGMMA；
 - `writable[stage]`：消费者 WGMMA 完成，生产者可以再次写入该 stage。
 
-### 13.8 跨 K tile 累加、stage 轮转
+## 12.8 跨 K tile 累加、stage 轮转
 
 ```cpp
 #pragma unroll
@@ -1973,7 +1973,7 @@ if (ismem_read == kStage) {
 
 位置：`src/group_gemm/kernels.cuh:503-507`（函数 `group_gemm_fp8_kernel`）。本次 `kStage=8`，所以 `readable[0..7]` 和 `writable[0..7]` 构成环形缓冲。索引绕回 0 时翻转 `phase`，用同一个 barrier 对象区分第 0、1、2... 轮 transaction；否则第 9 次使用 stage 0 时会误把第 1 次的完成状态当成第 9 次。
 
-### 13.9 FP32 结果转换为 BF16
+## 12.9 FP32 结果转换为 BF16
 
 ```cpp
 auto tCrh = make_tensor_like<cute::bfloat16_t>(tCr);
@@ -1986,7 +1986,7 @@ for (int i = 0; i < size(tCr); ++i) {
 
 位置：`src/group_gemm/kernels.cuh:510-515`（函数 `group_gemm_fp8_kernel`）。`tCrh` 与 `tCr` 具有相同的线程分片和布局，但元素类型从 FP32 变为 `cute::bfloat16_t`；`Tout` 在本次 pertensor kernel 中就是 BF16。转换放在所有 56 个 K tile 累加完成之后，因此不会在每个 K tile 都提前舍入，减少中间精度损失。此时 `tCrh` 仍然是寄存器 tensor，还没有写入 shared memory。
 
-### 13.10 寄存器到 shared memory 的 epilogue
+## 12.10 寄存器到 shared memory 的 epilogue
 
 ```cpp
 auto sCT =
@@ -2021,7 +2021,7 @@ auto tCs4r = thr_copy_c.partition_D(sCT);
 - `partition_D` 把 `sCT` 分割成当前线程应写的 shared-memory destination；
 - 两个操作都只是 tensor view/layout 变换，真正的寄存器到 shared 写入发生在后面的 `cute::copy(tiled_copy_c,...)`。
 
-### 13.11 TMA store 的流水线顺序
+## 12.11 TMA store 的流水线顺序
 
 ```cpp
 tma_store_wait<0>();
@@ -2034,7 +2034,7 @@ cute::tma_store_fence();
 
 位置：`src/group_gemm/kernels.cuh:530-535`（函数 `group_gemm_fp8_kernel`）。
 
-#### 13.11.1 `tma_store_wait<0>()`：等待上一轮释放 shared source
+### 12.11.1 `tma_store_wait<0>()`：等待上一轮释放 shared source
 
 `tma_store_wait<Count>` 的实现见 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:1245-1259`（函数 `tma_store_wait`），生成：
 
@@ -2048,7 +2048,7 @@ cp.async.bulk.wait_group.read 0
 
 `wait_group` 是每个发起 TMA 的线程自己的 bulk-group 状态，不是 `readable[]` 那种 shared-memory mbarrier。代码让所有 math 线程都执行 wait，再用下一行的 128-thread barrier 把它们汇合；只有 leader 实际有此前提交的 store，其他线程通常没有待等待的 S2G group。
 
-#### 13.11.2 第一个 `syncwarpgroup`：让整个 math warpgroup 一起复用 `shm_c`
+### 12.11.2 第一个 `syncwarpgroup`：让整个 math warpgroup 一起复用 `shm_c`
 
 `syncwarpgroup(iwarpgroup)` 的实现见 `src/utils/utils.cuh:605-607`（函数 `syncwarpgroup`），发出 `barrier.cta.sync <barrier_id>, 128`。它把 `iwarpgroup` 作为 0/1 两个独立 barrier id：
 
@@ -2057,7 +2057,7 @@ cp.async.bulk.wait_group.read 0
 
 由于上一行的 `wait_group` 不是 CTA-wide mbarrier，这个汇合点保证 leader 已经完成旧 TMA source-read wait 后，其他线程才开始写 `shm_c`。
 
-#### 13.11.3 STSM：register -> shared
+### 12.11.3 STSM：register -> shared
 
 ```cpp
 cute::copy(tiled_copy_c, tCr4s, tCs4r);
@@ -2077,7 +2077,7 @@ cute::tma_store_fence();
 
 位置：`src/group_gemm/kernels.cuh:535`（函数 `group_gemm_fp8_kernel`）。该 helper 在 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:1212-1221`（函数 `tma_store_fence`）生成 `fence.proxy.async.shared::cta`。STSM 使用普通 shared-memory proxy，而 TMA store 使用 async shared proxy；此 fence 建立两种 proxy 之间的可见性/顺序关系。它不是 `mbarrier.arrive.expect_tx`，也不负责等待 global write 完成。
 
-### 13.12 形成 TMA destination view，并由 leader 发起 store
+## 12.12 形成 TMA destination view，并由 leader 发起 store
 
 ```cpp
 if (is_leader_in_warpgroup) {
@@ -2096,11 +2096,11 @@ if (is_leader_in_warpgroup) {
 
 位置：`src/group_gemm/kernels.cuh:537-547`（函数 `group_gemm_fp8_kernel`）。
 
-#### 13.12.1 为什么只让 leader 发一条 TMA 指令
+### 12.12.1 为什么只让 leader 发一条 TMA 指令
 
 `is_leader_in_warpgroup` 在 `src/group_gemm/kernels.cuh:243-246`（函数 `group_gemm_fp8_kernel`）中由 `elect_one_sync()` 选出，并限制 `iwarp % 4 == 0`。因此每个 128-thread math warpgroup 只有一个线程进入本段；本次两个 math warpgroup 各发一条 TMA store，而不是 256 个线程各发一条。
 
-#### 13.12.2 `gD`、`btma_d`、`tDs`、`tDg` 各自是什么
+### 12.12.2 `gD`、`btma_d`、`tDs`、`tDg` 各自是什么
 
 ```cpp
 auto gD = tma_d.get_tma_tensor(make_shape(n, m));
@@ -2129,7 +2129,7 @@ auto tDg = btma_d.partition_D(gD);
 `td_xy` 每个 group 占两个 descriptor 槽位：`update_grouped_tma` 在 `src/group_gemm/kernels.cuh:180-211`（函数 `update_grouped_tma`）先把 X descriptor 放在 `td_xy + igroup*2`，再把 Y descriptor 放在 `td_xy + igroup*2 + 1`。所以 line 544 的 `+1` 不是 tile 坐标，而是在 descriptor 数组中选择当前 group 的 Y base address/shape/stride。
 
 
-### 13.13 为什么 TMA store 不需要传 shared-memory barrier
+## 12.13 为什么 TMA store 不需要传 shared-memory barrier
 
 load 侧的代码在 `src/group_gemm/kernels.cuh:404-410`（函数 `group_gemm_fp8_kernel`）是：
 
@@ -2174,7 +2174,7 @@ cp.async.bulk.tensor.2d.global.shared::cta.bulk_group
 
 也就是说，S2G store 仍然需要同步，只是没有使用 load 的 transaction-completion mbarrier。当前代码用 `tma_store_wait` 保护 `shm_c` 的复用，用 `syncwarpgroup` 保证 128 个线程完成 STSM，用 `tma_store_fence` 建立普通 shared proxy 到 TMA async proxy 的顺序，再用 `tma_store_arrive` 提交当前 store。
 
-### 13.14 为什么先 `wait`，后 `arrive`：按“上一轮/当前轮”理解
+## 12.14 为什么先 `wait`，后 `arrive`：按“上一轮/当前轮”理解
 
 把一个输出 tile 的 epilogue 和下一 tile 的开头串起来，实际时间线是：
 
@@ -2206,11 +2206,11 @@ cp.async.bulk.commit_group
 
 `commit_group` 只提交“当前线程此前已经发出、但尚未提交”的 bulk async copies。因此它必须位于当前 `cute::copy` 之后，才能把当前 tile 的 TMA store 放进下一轮 `wait_group.read 0` 所跟踪的队列。
 
-#### 如果把 `arrive` 放到当前 `copy` 前
+### 12.14.1 如果把 `arrive` 放到当前 `copy` 前
 
 在当前 tile 尚未发出 TMA copy 时先执行 `commit_group`，提交的 group 不包含当前 copy；随后发出的 copy 会留在未提交状态。下一轮的 `tma_store_wait<0>()` 只等待已提交 group，不能可靠地保护 `shm_c` 不被下一轮 STSM 覆盖，形成 source-read/write 竞争。除非再额外补一个正确位置的 `commit_group`，否则语义就是错误的。
 
-#### 如果在当前 copy 后立即交换成“arrive 再 wait”
+### 12.14.2 如果在当前 copy 后立即交换成“arrive 再 wait”
 
 若把当前 copy 后的 `arrive` 和下一轮开头的 `wait` 紧挨着执行，通常可以得到正确但更保守的代码：当前 store 会在同一轮立刻被等待，TMA global write 的延迟不能与下一轮计算重叠。当前实现把 `arrive` 留在本轮末、把 `wait` 放到下一轮开头，正好实现“一轮延迟”的流水线。
 
@@ -2222,7 +2222,7 @@ cp.async.bulk.commit_group
 
 仓库中相同的推荐顺序也出现在 `src/gemm/sm90/gemm_bf16xfp32.cu:335-363`（函数 `gemm_bf16xfp32_kernel`）：先 `tma_store_wait<0>()`，再 STSM、`tma_store_fence()`、TMA copy，最后 `tma_store_arrive()`。
 
-### 13.15 本次 shape 的一次完整迭代
+## 12.15 本次 shape 的一次完整迭代
 
 以一个 `(igroup,itile_m,itile_n)` 为例：
 
@@ -2239,13 +2239,13 @@ cp.async.bulk.commit_group
 
 math 分支结束后，循环回到下一项任务；本次 pertensor kernel 的 PDL 收尾位于 `src/group_gemm/kernels.cuh:633-635`（函数 `group_gemm_fp8_kernel`）。`cudaTriggerProgrammaticLaunchCompletion()` 是 programmatic dependency 的调度触发点，不是 `readable[]` transaction barrier，也不能替代需要时的显式 TMA wait；循环末尾不再复用 `shm_c`，所以代码没有为下一次 shared-buffer 写入再增加一个 wait。
 
-### 13.16 直接结论
+## 12.16 直接结论
 
 - `tiled_mma.accumulate_` 不改变 FP8 A/B 输入；它对应 GMMA 公式中的 `scale_D*C`，控制本条 WGMMA 是否把旧的 C accumulator 加入结果。对本次 `kTileK=128`，4 条 `K=32` WGMMA 的模式必须是 `Zero, One, One, One`。
 - `tma_d.with(td_y)` 不是“没有同步”，而是没有 load 所用的 transaction mbarrier 参数。S2G 指令用 `bulk_group`，由 `tma_store_arrive` 提交、下一轮 `tma_store_wait<0>` 等待；STSM 前后还需要两个 `syncwarpgroup` 和一个 `tma_store_fence`。
 - `tma_store_wait<0>` 保护上一轮 `shm_c` source 的复用；`tma_store_arrive` 提交当前刚发出的 store。正确的流水线顺序是“上一轮 wait -> 当前轮写 shared/fence/copy/arrive”，不能把两者当成同一轮的可交换调用。
 
-### 13.17 能否把 `tDr(i) * scale` 移到 `itile_k` 循环之后
+## 12.17 能否把 `tDr(i) * scale` 移到 `itile_k` 循环之后
 
 先给直接结论：**可以提取这个公共 scale，但不能只删除循环内的整条更新语句。** 如果循环内不再把 `tCr` 加到 `tDr`，而循环结束后只执行
 
@@ -2259,7 +2259,7 @@ for (int i = 0; i < size(tDr); ++i) {
 
 反过来，如果保留循环内原来的 `tCr(i) * scale`，又在循环结束后乘一次 `scale`，就会把同一个因子应用两遍，结果变成 `scale^2 * Σ_j p_j`，同样不正确。
 
-#### 必须采用的改写
+### 12.17.1 必须采用的改写
 
 要提取 scale，`itile_k` 循环内仍须进行**未缩放的累加**，循环结束后再统一缩放：
 
@@ -2281,7 +2281,7 @@ for (int i = 0; i < size(tDr); ++i) {
 
 原始的 K 循环、WGMMA 完成等待和 `tDr` 更新位于 `src/group_gemm/kernels.cuh:477-501`（函数 `group_gemm_fp8_kernel`）。实际改代码时，`tDr(i) + tCr(i)` 仍应放在每次 `warpgroup_wait<0>()` 和 `warpgroup_fence_operand(tCr)` 之后；统一乘法应放在外层循环结束、`tCrh` 的 BF16 转换之前，即 `src/group_gemm/kernels.cuh:508-515`（函数 `group_gemm_fp8_kernel`）之间。不能在 `warpgroup_wait<0>()` 之前读取 `tCr`，也不能等转换成 BF16 后才乘 scale。
 
-#### 为什么当前 per-tensor 路径可以提出公因子
+### 12.17.2 为什么当前 per-tensor 路径可以提出公因子
 
 令第 `j` 个 K tile 的 `tCr(i)` 为 `p_j(i)`。当前代码的逻辑是：
 
@@ -2304,7 +2304,7 @@ D_{j+1}(i) = D_j(i) + p_j(i) * scale
 
 测试也明确使用了 per-group 公共 scale：参考路径传 `scale_a=0.5`、`scale_b=0.5`，HPC 路径传每 group 的 `scale_hpc=0.5*0.5=0.25`，见 `tests/test_group_gemm_pertensor_like.py:39-40`、`:57-66`（函数 `naive_group_gemm_pertensor_fp8`、`test_group_gemm_pertensor_fp8`）。对这一数据接口，提出公因子的数学前提成立。
 
-#### “数学正确”不等于“逐位相同”
+### 12.17.3 “数学正确”不等于“逐位相同”
 
 两种写法的 FP32 舍入点不同。原写法每个 K tile 都先做乘法再累加：
 
@@ -2329,7 +2329,7 @@ new   = round(sum_last * scale)
 
 结果在最后才从 FP32 `tDr` 转成 BF16，见 `src/group_gemm/kernels.cuh:510-515`（函数 `group_gemm_fp8_kernel`）。BF16 的较低精度通常会掩盖一部分 ULP 差异，但不能把两种 FP32 算法变成严格等价。
 
-#### 性能上不一定更快
+### 12.17.4 性能上不一定更快
 
 “scale 乘法只剩 `size(tDr)` 次”这个观察是对的，但它没有消除 K 循环中的累加。对于本次 `ntile_k=56`、`size(tCr)=24`：
 
@@ -2342,18 +2342,18 @@ new   = round(sum_last * scale)
 
 此外，WGMMA/TMA 的等待和 shared-memory 流水通常比这 24 个标量运算更昂贵；改写后的收益若存在，必须用完整 kernel 的端到端测量确认。若必须保持现有数值行为，应保留 `src/group_gemm/kernels.cuh:499-501`（函数 `group_gemm_fp8_kernel`）的原有乘加形式（最终是否融合为 FMA 由编译器决定）。
 
-#### 哪些同步位置不能随改写移动
+### 12.17.5 哪些同步位置不能随改写移动
 
 - `src/group_gemm/kernels.cuh:480-494`（函数 `group_gemm_fp8_kernel`）中的 `wait_barrier`、`warpgroup_wait<0>` 和后置 `warpgroup_fence_operand(tCr)` 必须保持；统一缩放只操作已经完成的 `tDr`，不能用它替代 WGMMA 完成等待。
 - `src/group_gemm/kernels.cuh:496`（函数 `group_gemm_fp8_kernel`）的 `arrive_barrier(writable[ismem_read])` 仍在每个 K tile 内，负责释放 A/B shared-memory stage；把累加改成未缩放不会改变这条生产者/消费者协议。
 - 最终 `tDr *= scale` 必须在外层 K 循环结束后、`src/group_gemm/kernels.cuh:511-515`（函数 `group_gemm_fp8_kernel`）的 FP32->BF16 转换前；把它移到下一个 output task 或 TMA store 之后都会改变数据归属或精度。
 - `scale` 只能在当前 task 的 K 循环范围内视为常量；不能把一次读取提升到整个 while 循环之外，因为下一个 task 的 `igroup` 可能不同，见 `src/group_gemm/kernels.cuh:447-475`（函数 `group_gemm_fp8_kernel`）。
 
-#### 不要套用到 blockwise 分支
+### 12.17.6 不要套用到 blockwise 分支
 
 这个结论仅针对 `group_gemm_fp8_kernel` 的 per-group scalar `yscale`。blockwise kernel 在每个 K tile 读取 `wscale = sBS(ismem_read, itile_k % 4)`，并在输出列循环中使用随列/当前 tile 变化的 `yscale`，见 `src/group_gemm/kernels.cuh:909-941`（函数 `group_gemm_blockwise_fp8_kernel`）。那里通常不存在一个可以提出到整个 K 循环外的单一 scale；照搬本节改写会把不同 K tile 的 scale 错误地合并。
 
-#### 最终判断
+### 12.17.7 最终判断
 
 | 改法 | 结果判断 |
 |---|---|
@@ -2363,11 +2363,11 @@ new   = round(sum_last * scale)
 
 对本次测试的 `scale=0.25` 和 `allclose(rtol=0.08, atol=0.01)`，第二种写法大概率仍能通过容差，测试断言见 `tests/test_group_gemm_pertensor_like.py:69-73`（函数 `test_group_gemm_pertensor_fp8`）；但如果验收要求 bitwise 一致或希望无风险地提升性能，不能只凭代数恒等式改动，应该先做两版本的正确性与性能 A/B 测试。
 
-### 13.18 让 WGMMA 直接把结果写进 `tDr`
+## 12.18 让 WGMMA 直接把结果写进 `tDr`
 
 这个改法**原则上可以正确**，而且比“只把 scale 移到循环外”更有可能真正省掉指令；但它不是只把第 488 行的 `tCr` 改成 `tDr` 就结束了。`tDr` 一旦作为 `cute::gemm` 的第三个参数，就变成 WGMMA 的异步 C/D accumulator，必须同时调整 `ScaleOut`、`warpgroup_fence_operand` 和 accumulator 的生命周期。
 
-#### 先区分当前两个 tensor 的职责
+### 12.18.1 先区分当前两个 tensor 的职责
 
 当前实现中，`tCr` 是**一个 K tile 内部**的 WGMMA accumulator：每次 `itile_k` 先设置 `ScaleOut::Zero`，4 条 `K=32` 的 WGMMA 在同一个 `tCr` 上累加；`tDr` 则是**跨所有 K tile**的 software accumulator，WGMMA 完成后再由普通 CUDA 指令更新。完整代码见 `src/group_gemm/kernels.cuh:472-501`（函数 `group_gemm_fp8_kernel`）。数据流可以写成：
 
@@ -2385,7 +2385,7 @@ new   = round(sum_last * scale)
 
 因此，直接累加时应删除 software `tDr += tCr` 循环，而不是删除“累加”这个动作本身。`tDr` 仍然必须由每条后续 WGMMA 作为 C 输入继续累加。
 
-#### 为什么 `tDr` 可以作为 WGMMA 的 C/D
+### 12.18.2 为什么 `tDr` 可以作为 WGMMA 的 C/D
 
 `make_tensor_like(tCr)` 会创建与 `tCr` 相同布局和元素类型的 owning register tensor，见 `3rd/cutlass/include/cute/tensor_impl.hpp:417-443`（函数 `make_tensor_like`）。在本次实例中，日志显示每个线程的 `tCr`/`tDr` 都是 24 个 FP32 元素，见 `temp/run.log:204-207`（函数 `group_gemm_fp8_kernel` 的调试输出）。
 
@@ -2409,7 +2409,7 @@ auto tCrh = make_tensor_like<cute::bfloat16_t>(tDr);
 
 这样可以避免同时保留一个只用于提供 layout 的 `tCr`。是否真的减少物理寄存器，要以编译后的寄存器/ spill 报告为准。
 
-#### `ScaleOut` 必须是“整个 output tile 只初始化一次”
+### 12.18.3 `ScaleOut` 必须是“整个 output tile 只初始化一次”
 
 用户提出的方案是：
 
@@ -2431,7 +2431,7 @@ tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
 如果 `ntile_k==0` 也要返回确定的零结果，第二种方案仍需保留 clear 或单独处理空 K；用户方案因为显式 clear 自然覆盖这个边界。
 
-#### 一个可行的代码骨架
+### 12.18.4 一个可行的代码骨架
 
 下面是“保留现有 task/barrier 结构、采用 `clear + One`”的骨架。它展示必须改变的 operand；`wait_barrier`、stage 索引和 TMA load 逻辑保持不变：
 
@@ -2477,7 +2477,7 @@ for (int i = 0; i < size(tDr); ++i) {
 
 如果采用“Zero 一次、One 永久”的方案，则第一个 `cute::gemm` 前设置 Zero，第一条发出后切换到 One；切换点必须跨越 `itile_k` 循环保留，不能在下一轮外层循环重新置 Zero。
 
-#### 为什么 fence 也必须从 `tCr` 改成 `tDr`
+### 12.18.5 为什么 fence 也必须从 `tCr` 改成 `tDr`
 
 `warpgroup_fence_operand` 不是数值清零，也不是等待 WGMMA 完成；它通过 tensor 重载逐元素调用 float/uint32 标量重载，而标量重载的空 inline asm `+f`/`+r` 约束和 `memory` clobber 只建立编译器的数据依赖。实现见 `3rd/cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp:45-66`（函数 `warpgroup_fence_operand(Tensor&)`）和 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:86-103`（函数 `warpgroup_fence_operand(float&)`、`warpgroup_fence_operand(uint32_t&)`）。当前代码在 `src/group_gemm/kernels.cuh:484-494`（函数 `group_gemm_fp8_kernel`）标记的是 tCr；直接把 WGMMA destination 换成 tDr 后，继续标记 tCr 会让 compiler 看不到 tDr 的异步 live range。
 
@@ -2489,13 +2489,13 @@ for (int i = 0; i < size(tDr); ++i) {
 
 这些 wrapper 的底层实现见 `3rd/cutlass/include/cute/arch/mma_sm90_gmma.hpp:47-84`（函数 `warpgroup_arrive`、`warpgroup_commit_batch`、`warpgroup_wait`）。即使中间没有普通代码读取 tDr，保留现有“每批前后各一个 operand fence”的写法最稳妥；想进一步只保留整个序列首尾的 fence，需要单独检查 ptxas 诊断和生成代码，不能仅凭 C++ 数据流删掉。
 
-#### wait 仍然不能删除
+### 12.18.6 wait 仍然不能删除
 
 把 software 累加改成 WGMMA 累加，并不会改变 shared-memory stage 的所有权协议。每个 `itile_k` 的 WGMMA 仍然读取 `sA/sB` 当前 stage；在 `warpgroup_wait<0>()` 完成前，不能让 load warpgroup 通过 `arrive_barrier(writable[ismem_read])` 复用/覆盖该 stage。相关顺序位于 `src/group_gemm/kernels.cuh:480-496`（函数 `group_gemm_fp8_kernel`）。
 
 因此不能因为 tDr 已经是跨 K 的 accumulator，就把每批的 `commit/wait` 改成只在最外层结束时调用。那会使后续 TMA load 可能覆盖仍被未完成 WGMMA 读取的 shared memory。若想减少 wait 次数，需要重新设计更深的 WGMMA/TMA pipeline 和 stage 数量，不是这次寄存器重定向的直接结果。
 
-#### 数值结果：实数上等价，浮点上不保证逐位一致
+### 12.18.7 数值结果：实数上等价，浮点上不保证逐位一致
 
 对当前 per-tensor 路径，`scale` 在 task 开始时由 `yscale_ptr[igroup]` 读取一次，见 `src/group_gemm/kernels.cuh:472-479`（函数 `group_gemm_fp8_kernel`），所以直接 accumulator 的实数结果是：
 
@@ -2512,7 +2512,7 @@ WGMMA 内部累加、software FP32 加法和最终乘法的舍入位置不同，
 
 此外，直接方案让未缩放的总和一直留在 FP32 accumulator 中：它可能先溢出，而最终乘以小 scale 后理论上本可有限；scale 很小时也可能避免“每个 partial 先下溢”。这属于算法数值范围变化，不是 barrier 问题。
 
-#### 性能与寄存器压力
+### 12.18.8 性能与寄存器压力
 
 对本次日志的 `ntile_k=56`、每线程 24 个 accumulator，当前 software 累加大约执行 `56*24=1344` 次普通更新；直接 WGMMA 后，这 1344 次更新循环可以去掉，累加由 tensor core 的 C/D path 完成。相比之前仅移动 scale 的方案，这才是可能产生明显收益的地方。
 
@@ -2526,11 +2526,11 @@ WGMMA 内部累加、software FP32 加法和最终乘法的舍入位置不同，
 
 所以建议用三个版本做 A/B：原实现、`tDr` 直接 WGMMA 且 `clear+One`、`Zero 一次+One` 且无 clear；同时检查数值和 kernel 时间，不能只按 C++ 循环次数判断。
 
-#### 适用范围
+### 12.18.9 适用范围
 
 这个直接 accumulator 改法适用于本节的 `group_gemm_fp8_kernel` per-group scalar scale，因为同一个 `igroup` 的所有 K tile 共用一个 `scale`，见 `src/group_gemm/kernels.cuh:475-479`（函数 `group_gemm_fp8_kernel`）。blockwise 分支在每个 K tile/输出列使用变化的 scale，见 `src/group_gemm/kernels.cuh:909-941`（函数 `group_gemm_blockwise_fp8_kernel`）；若仍需逐 K tile 乘不同 scale，就不能把所有结果无条件直接累加到同一个 tDr 后再统一乘一个 scale。
 
-#### 最终判断
+### 12.18.10 最终判断
 
 | 改法 | 数学结果 | 工程判断 |
 |---|---|---|
@@ -2540,3 +2540,247 @@ WGMMA 内部累加、software FP32 加法和最终乘法的舍入位置不同，
 | 直接 WGMMA 写 tDr 后仍保留旧的 `tDr += tCr` 循环 | scale/partial 被重复累加 | 错误 |
 
 因此，对用户给出的具体方案，答案是：**在 `clear(tDr)`、`ScaleOut::One` 只设置一次、所有 WGMMA 都以 tDr 为 D/C、并把 operand fence 改为 tDr 的前提下，结果在实数意义上正确；但不是逐位等价，也不能保证一定加速。**
+
+## 12.19 上一次直接 accumulator 改动的验证结果
+
+- 在 `src/group_gemm/kernels.cuh:472-507`（函数 `group_gemm_fp8_kernel`）让 WGMMA 直接累加到 `tDr`，并将 scale 移到 K 循环之后执行。
+- 已提交：`fd6960e8a9ed821ee82bf10813df4b97d3e18753`。
+- `bash temp//rebuild.sh` 成功，安装了 `dist/hpc_ops-0.0.1.dev0+gfd6960e-cp39-abi3-linux_x86_64.whl`。
+
+### 12.19.1 测试结果
+
+- `tests/test_group_gemm_pertensor_like.py`（函数 `test_group_gemm_pertensor_fp8`）执行失败，退出码 1，失败位置为 `tests/test_group_gemm_pertensor_like.py:73`。
+- `temp/run.modifiy.log`：Mean Absolute Error 0.025967、Mean Relative Error 0.004456，最大绝对误差 1.0。
+- 原因是累加顺序改变：旧实现每个 K tile 先缩放再软件累加；新实现先由 WGMMA 累加未缩放结果，最后统一缩放，浮点舍入结果不再满足当前 allclose。
+- PTX 中每个 K tile 的软件 FMA 被移除，替换为循环末尾乘法；但相关 specialization 仍使用约 168 个寄存器，尚未证明有性能提升。
+
+---
+
+# 13. 最后一个 TMA store 与 LIKE_DEBUG 审计（2026-08-28）
+
+## 13.1 本次 shape 和 policy=2 的任务空间
+
+本次日志 `temp/run.log:261` 到 `:264` 给出：`m=576` 、`n=4096` 、`k=7168` 、`num_group=8`，每组长度为 `[16,32,48,64,80,96,112,128]`，`cu_seqlens=[0,16,48,96,160,240,336,448,576]`。日志 `temp/run.log:6` 显示这次实例的 `kTileM=48`，`kTileN=128`，`kTileK=128`，`temp/run.log:73` 显示 `gridDim.x=132` 。
+
+`src/group_gemm/group_gemm_pertensor_fp8.cu:437` 到 `:443`（函数 `group_gemm_fp8_async`）对平均长度 72 选择 `kTileM=48`。因此：
+
+- `ntile_k = 7168 / 128 = 56`；
+- `num_tile_n = ceil(4096 / 128) = 32`；
+- 各组 M tile 数为 `[1,1,1,2,2,2,3,3]`，累计 `cu_tiles=[0,1,2,3,5,7,9,12,15]`，所以 `total_m=15`；
+- `src/group_gemm/kernels.cuh:45` 到 `:46`（函数 `get_next_tile_vert`）把一维 task index `iblock` 解码为 `itile_m_total=iblock%15` 和 `itile_n=iblock/15`，有效 task 范围是 `0..479`。当 `itile_n=32` 时，`src/group_gemm/kernels.cuh:465`（函数 `group_gemm_fp8_kernel`）中的条件成立并退出。
+
+所以，对一个 warpgroup 来说，最后一个有效 task 会完成一次 store，然后下一次调用 `get_next_tile_vert` 只是得到结束条件，不会再进入 epilogue。
+
+## 13.2 每个 tile 的 store 同步序
+
+`src/group_gemm/kernels.cuh:530` 到 `:547`（函数 `group_gemm_fp8_kernel`）的序列不是“等待当前 store 再写”，而是一个针对复用 `sCT` 的生产者流程：
+
+| 代码位置 | 操作 | 业务/硬件含义 |
+|---|---|---|
+| `src/group_gemm/kernels.cuh:530` (`group_gemm_fp8_kernel`) | `tma_store_wait<0>()` | 等待本 issuing thread 之前提交的 bulk group 至少已经读完 `sCT`，以允许下一个 task 的 STSM 覆盖该共享缓冲区。 |
+| `src/group_gemm/kernels.cuh:531` (`group_gemm_fp8_kernel`) | `syncwarpgroup(iwarpgroup)` | 让该 128-thread warpgroup 的所有 lane 在重新写 `sCT` 前会合。 |
+| `src/group_gemm/kernels.cuh:533` (`group_gemm_fp8_kernel`) | `cute::copy(tiled_copy_c, ...)` | STSM 把寄存器中的 BF16 结果写入 `sCT`，这是 generic proxy 的 shared-memory 写入。 |
+| `src/group_gemm/kernels.cuh:534` (`group_gemm_fp8_kernel`) | 第二次 `syncwarpgroup` | 确保所有 lane 已写完自己那部分 `sCT`，领导线程才可发起 TMA store。 |
+| `src/group_gemm/kernels.cuh:535` (`group_gemm_fp8_kernel`) | `cute::tma_store_fence()` | 在 `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:1214` 的 `tma_store_fence` 中发出 `fence.proxy.async.shared::cta`，把 generic proxy 的 shared 写入排序到 async proxy 的 TMA 读取之前。 |
+| `src/group_gemm/kernels.cuh:545` (`group_gemm_fp8_kernel`) | `cute::copy(tma_d.with(...), ...)` | 只由 `is_leader_in_warpgroup` 的线程发起非阻塞 `cp.async.bulk.tensor...global.shared::cta.bulk_group`。 |
+| `src/group_gemm/kernels.cuh:547` (`group_gemm_fp8_kernel`) | `tma_store_arrive()` | `3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:1225` 的 `tma_store_arrive` 发出 `cp.async.bulk.commit_group`，只是提交本线程的待处理 store group，不是完成通知。 |
+
+`3rd/cutlass/include/cute/arch/copy_sm90_tma.hpp:1248` 的 `tma_store_wait` 实际发出 `cp.async.bulk.wait_group.read 0`（`:1251`）。PTX 规定 `.read` 只等到源地址读取完成；默认的无 `.read` 形式才会额外等待目的地写入并对执行线程可见。参见 [PTX `cp.async.bulk.wait_group`](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group)。只有 leader 发起 TMA 时，它的 per-thread bulk group 才非空；其他 lane 执行同一个 wait 时通常只观察到空 group。
+
+## 13.3 最后 tile 没有下一次 wait 是否会错
+
+**对普通 CUDA stream 和本次测试，不会因为缺少这一次 tail wait 而自动丢失最后一个 tile。** 原因是：
+
+1. `tma_store_wait<0>()` 在每轮开头的主要任务是保护下一次对 `sCT` 的覆盖；最后一个 task 后没有再次写 `sCT`，因而不需要为“重用源缓冲”而等。
+2. `tma_store_arrive` 已将当前操作提交给 TMA bulk-group；线程达到函数末尾不会取消该异步操作。普通 stream 的后续操作或 `cudaStreamSynchronize` 在需要输出时会遵守 kernel 的完成顺序。
+3. Colfax 的 TMA store 示例在 kernel 发起 store 后直接退出，明确说明如果没有同 kernel 内的源缓冲重用，`arrive/wait` 不是必须的。参见 [Colfax TMA store 说明](https://research.colfax-intl.com/tutorial-hopper-tma/)。
+CUDA Programming Guide 的 bulk-asynchronous 示例也采用“发起 shared→global TMA、commit、`wait_group.read 0`”后结束 kernel 的序列，见 [CUDA asynchronous copies 示例](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html)。
+仓库内的 `src/gemm/sm90/gemm_bf16xfp32.cu:367` 到 `:372`（函数 `gemm_bf16xfp32_kernel`）也只在 `kSplitK>1` 、后续逻辑会读取/标记 store 结果时补尾部 `tma_store_wait<0>()`；不需要后续依赖的路径不会因为“最后一个 tile”自动多出一次 wait。
+
+**但这不等于当前代码已经在 PDL 解释下保证了 global write 完成。** `src/group_gemm/group_gemm_pertensor_fp8.cu:389` 的 `group_gemm_fp8_async` 无条件将 `use_pdl` 设为 `true`，`src/group_gemm/group_gemm_pertensor_fp8.cu:268` 到 `:269`（函数 `launch_group_gemm_fp8`）为后续 kernel 开启 `cudaLaunchAttributeProgrammaticStreamSerialization`，而 `src/group_gemm/kernels.cuh:634`（函数 `group_gemm_fp8_kernel`）调用 `cudaTriggerProgrammaticLaunchCompletion()`。这个 trigger 是“依赖 kernel 可以开始启动”的释放点，不是 TMA destination 完成点。CUDA 指南明确要求 PDL 的 secondary kernel 在读取主 kernel 结果前调用 `cudaGridDependencySynchronize()`；当前 kernel 自身在 `src/group_gemm/kernels.cuh:303`（函数 `group_gemm_fp8_kernel`）有这个等待点。参见 [CUDA PDL 指南](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html)。
+
+因此需要区分两种情况：
+
+- 同一 stream 中的普通后续操作，或者 host 等待 stream 完成：最后一个 TMA store 可以没有下一次循环内 wait，这不是当前测试中的数值错误来源。
+- 后续 kernel 也使用 PDL 并在 `cudaGridDependencySynchronize` 之前就读 `y`：这是违反 PDL 合同的用法，可以产生读到旧数据的 race。
+
+如果需要在 `cudaTriggerProgrammaticLaunchCompletion` 之前明确保证 global destination 已完成，不应只加一个现有的 `tma_store_wait<0>()`，因为它发出的是 `.read` 版本；应使用无 `.read` 的 `cp.async.bulk.wait_group 0` 封装，或保持正确的 secondary-side `cudaGridDependencySynchronize()`。为了只保护同 kernel 内的 `sCT` 重用，在 task loop 退出后补一个 `.read` tail wait 即可，但它不是 global write completion wait。
+如果真要补这个 tail wait，必须让每个发起 TMA store 的 warpgroup leader 等待自己的 per-thread bulk group，并在 PDL trigger 前用 CTA/warpgroup 同步确保所有 issuing leader 都到达了尾部；单个 leader 的 wait 不代表整个 CTA 的 store 都已 drain。
+
+## 13.4 LIKE_DEBUG 新增 print/printf 审计
+
+以 `git diff fix_kTaskLoopPolicy_type..like` 为范围，只统计这个差异中新增的输出调用，不把仓库原有的 vendor/test 输出算进来。
+
+### 13.4.1 已被 `#ifdef LIKE_DEBUG` 保护的 C++/CUDA 输出
+
+- `src/group_gemm/entry.cc:63` 到 `:83`（函数 `group_gemm_fp8_entry`）：TMA descriptor 的 shape/stride/dtype/device 输出。
+- `src/group_gemm/group_gemm_pertensor_fp8.cu:130` 到 `:183`（函数 `launch_group_gemm_fp8`），以及 `:315` 到 `:317`（同函数）：host-side layout/TMA/shm 调试输出。
+- `src/group_gemm/kernels.cuh:386` 到 `:392`（函数 `group_gemm_fp8_kernel`）：任务映射调试 `printf`；`src/group_gemm/kernels.cuh:549` 到 `:627`（同函数）：大量 CuTe `print/printf`。
+- `src/utils/tma.cuh:45` 到 `:50`（函数 `update_tma_gtensor`）：设置 TMA shape/stride 后的 device `printf`。
+
+LIKE_DEBUG 未定义时，以上内容在预处理阶段被完全删除；剩下的空 `{}`、题外的 `<cstdio>` 和编译期类型声明不会产生 kernel 运行时的 `printf/print` 指令。
+
+### 13.4.2 不在 `#ifdef LIKE_DEBUG` 之内的新增输出
+
+- `setup.py:44` 和 `:47`（函数 `CMakeBuild.build_extension`）的 Python `print` 无条件执行，只增加构建日志，不进入 GPU kernel。
+- `tests/test_group_gemm_pertensor_like.py:32`、`:56`、`:62`（函数 `naive_group_gemm_pertensor_fp8` 和 `test_group_gemm_pertensor_fp8`）的 Python `print` 也无条件执行，只影响测试主机输出。
+- `CMakeLists.txt:20`（CMake 构建配置，无 CMake 函数）的 `message` 无条件输出；`src/group_gemm/group_gemm_pertensor_fp8.cu:13`（文件作用域）还无条件定义 `T_LIKE_DEBUG`。后者当前只包住 `TD/ITD` 前向声明和 `#if 0` 死代码，没有 runtime print，但它并未与 `LIKE_DEBUG` 绑定。
+
+所以，如果问题中的“全部 print/printf”包括 setup 和 test 脚本，答案是 **不是全部**；如果只指 C++/CUDA 运行时调试输出，则是 **全部已被 LIKE_DEBUG 保护**。
+
+## 13.5 构建 cache 的额外风险
+
+`CMakeLists.txt:19` 的 `ENABLE_LIKE_DEBUG` 默认值是 `OFF`；`setup.py:41` 到 `:43`（函数 `CMakeBuild.build_extension`）只在 `ENABLE_LIKE_DEBUG>0` 时传入 `-DENABLE_LIKE_DEBUG=ON`，并没有在环境变量为 0 或未设置时主动传入 `OFF`。因此旧 CMake cache 可能继续保留开启状态，`SKIP_CMAKE_GENERATE` 时更会直接跳过重配置。
+
+本工作区当前实际验证到 `build/temp.linux-x86_64-cpython-312/hpc/CMakeCache.txt:454` 是 `ENABLE_LIKE_DEBUG:BOOL=ON`，`build/temp.linux-x86_64-cpython-312/hpc/CMakeFiles/_C.dir/flags.make:6` 中也包含 `-DLIKE_DEBUG=1`。这意味着当前构建的 wheel 不能用“环境没设 `LIKE_DEBUG`”来推断调试代码已被去除。要确保关闭，应清理该 build 目录后重新配置，或直接使 CMake cache 变为 `-DENABLE_LIKE_DEBUG=OFF`；仅给现有 `setup.py` 设置 `ENABLE_LIKE_DEBUG=0` 并不一定能覆盖旧 cache。
+
+## 13.6 总结
+
+- 最后一个 tile 没有下一次循环内 `tma_store_wait<0>()`，对当前普通 stream 用法不会自动导致结果错误；这个 wait 的核心目的是保护 `sCT` 的下一次重用。
+- `tma_store_arrive()` 是 commit，不是完成通知；PDL 下必须由 secondary 在读结果前执行 `cudaGridDependencySynchronize()`，或在 producer 端使用真正包含 destination completion 的 wait。
+- 新增的 C++/CUDA debug 输出全部有 `#ifdef LIKE_DEBUG`；setup.py 和 test 中的 Python 输出不是，且旧 CMake cache 可能让 `LIKE_DEBUG` 实际仍然开启。
+
+---
+
+# 14. TMA/MMA 边界与 group 隔离（本次 shape）
+
+## 14.1 先校正 box、矩阵轴和本次输入
+
+这里的 `[64,48]` **不是 X 的 TMA box**，而是 Y store 每个 warpgroup 发出的 box。`GroupGEMMFp8Config::get_tma` 在 `src/group_gemm/config.h:81-95`（类型 `GroupGEMMFp8Config`、函数 `get_tma`）中定义了三种 tile：X load 的逻辑形状是 `(kTileM,kTileK)=(48,128)`，W load 是 `(kTileN,kTileK)=(128,128)`，Y store 的完整 output tile 是 `(128,48)`；由于 `kWarpgroupM=2`，Y 又被拆成两个 `[64,48]` store box。TMA 的 `boxDim` 是“本次请求遍历多少元素”，不要求小于 `globalDim`；tiled-mode 允许 bounding box 跨过 tensor 边界，并按 OOB 模式处理。
+
+本次测试在 `tests/test_group_gemm_pertensor_like.py:46-80`（函数 `test_group_gemm_pertensor_fp8`）中使用 `num_group=8`、`n=4096`、`k=7168`，每组 `seqlens=[16,32,48,64,80,96,112,128]`。运行日志 `temp/run.log:261-264`（测试输出）确认 `m=576`、`n=4096`、`k=7168` 和相同的 `cu_seqlens=[0,16,48,96,160,240,336,448,576]`；`temp/run.log:6`（测试输出）确认实例参数为 `kTileM=48,kTileN=128,kTileK=128`。因此本次运行中 N、K 都整除 tile，真正需要边界处理的是每个 group 的 M 尾 tile。
+
+数学上的 Y 是每组 `M x N`，但代码按 `[N,M]` 存储：`src/group_gemm/group_gemm_pertensor_fp8.cu:37-42`（函数 `launch_group_gemm_fp8`）给 X 使用 stride `(k,1)`，给 Y 使用 shape `(n,m)` 和 stride `(1,n)`。所以日志里 group 0 的“16 x 4096”在 Y descriptor 中显示为 `[4096,16]`，不是维度弄反了。
+
+## 14.2 每个 group 的 descriptor 把物理连续内存切成逻辑局部 tensor
+
+`update_grouped_tma` 对 group `g` 做两件关键的地址/边界设置，代码在 `src/group_gemm/kernels.cuh:180-202`（函数 `update_grouped_tma`）：
+
+1. `x_ibatch_ptr = x_ptr + cu_seqlen * k`，并以 `gX=(num_seq,k)`、stride `(k,1)` 更新 X descriptor；因此 descriptor 的 base 是本 group 的第一行，`globalDim` 的 M 维是本 group 的真实长度 `num_seq`。
+2. `y_ibatch_ptr = y_ptr + cu_seqlen * n`，并以 `gY=(n,num_seq)`、stride `(1,n)` 更新 Y descriptor；这里第二个逻辑维是 M，同样只允许本 group 的 `num_seq` 行。
+
+`update_tma_gtensor` 在 `src/utils/tma.cuh:36-66`（函数 `update_tma_gtensor`）先调用 `fill_tma_gmem_shape_stride`，再用 `tma_descriptor_replace_addr_in_shared_mem` 替换 base，用 `tma_descriptor_replace_shapes_in_shared_mem`（`src/utils/tma.cuh:10-31`，函数 `tma_descriptor_replace_shapes_in_shared_mem`）替换 global dimensions。TMA descriptor 的轴序会按硬件约定排列，因此 group 0 的日志 `temp/run.log:77-92`（测试输出）显示 X 为 `shape=[7168,16], stride=[1,7168]`，Y 为 `shape=[4096,16], stride=[1,4096]`；这正是 `(K,M)` 和 `(N,M)` 的 descriptor 表示。
+
+这意味着 `tAg`、`tBg`、`tDg` 本身不负责携带另一个 group 的 base pointer：
+
+- `src/group_gemm/kernels.cuh:271-278`（函数 `group_gemm_fp8_kernel`）创建的 `tAg/tBg` 是按照静态 TMA tensor/layout 分区出来的坐标视图。
+- 真正用于当前 copy 的 descriptor 指针分别由 `src/group_gemm/kernels.cuh:397-408`（函数 `group_gemm_fp8_kernel`）的 `td_x=td_xy+igroup*2` 和 `src/group_gemm/kernels.cuh:544-546`（函数 `group_gemm_fp8_kernel`）的 `td_y=td_xy+igroup*2+1` 提供。
+- 因而 `tAg(_,itile_m,itile_k)`、`tBg(_,itile_n,itile_k,igroup)`、`tDg(_,itile_n*2+iwarpgroup,itile_m)`提供的是坐标/布局；group-local base、global shape/stride 和 OOB 模式在 descriptor 中。
+
+特别是，代码没有把 `cu_seqlen` 再加到 `tAg` 或 `tDg` 的坐标里：偏移只写入 descriptor 的 global base，坐标在每个 group 的局部原点重新从 0 开始。这样不会出现“descriptor 已经偏移一次、coordinate 又偏移一次”的双重偏移。
+
+## 14.3 policy=2 不会生成完整 tile 之外的 M task
+
+边界安全的第一层不是依赖“碰巧遇到零内存”，而是 task 映射本身只为每个 group 生成必要的 tile 数。`src/group_gemm/kernels.cuh:148-175`（函数 `update_grouped_tma`）计算
+
+`tiles[g] = ceil(seqlens[g] / kTileM)`，随后用 block exclusive scan 写出 `cu_tiles_ptr`。本次输入得到：
+
+| group | 有效 M | `ceil(M/48)` | `cu_tiles` 区间 |
+|---:|---:|---:|---:|
+| 0 | 16 | 1 | `[0,1)` |
+| 1 | 32 | 1 | `[1,2)` |
+| 2 | 48 | 1 | `[2,3)` |
+| 3 | 64 | 2 | `[3,5)` |
+| 4 | 80 | 2 | `[5,7)` |
+| 5 | 96 | 2 | `[7,9)` |
+| 6 | 112 | 3 | `[9,12)` |
+| 7 | 128 | 3 | `[12,15)` |
+
+所以 `total_m=15`。`get_next_tile_vert` 在 `src/group_gemm/kernels.cuh:42-66`（函数 `get_next_tile_vert`）先把 `iblock` 解成 `itile_m_total=iblock%total_m`、`itile_n=iblock/total_m`，再用 `cu_tiles_ptr` 反查 group 和 group-local `itile_m`。主 loader 和 math warpgroup 都在 `src/group_gemm/kernels.cuh:363-384`、`src/group_gemm/kernels.cuh:447-468`（函数 `group_gemm_fp8_kernel`）使用同一映射；当 `itile_n>=num_tile_n` 时先退出。当前 `num_tile_n=4096/128=32`，因此有效 task 正好是 `15*32=480` 个，`iblock=480` 不会发起 copy 或 MMA。
+
+这一步保证了每一个有效 M tile 的起点都在本 group 内，最多只有 tile 的尾部元素超出本 group；不会生成“整块起点已经落到下一个 group”的任务。
+
+在主 kernel 中，`src/group_gemm/kernels.cuh:340-417`（函数 `group_gemm_fp8_kernel`）的 `idx>=kNumThreads` 分支是 TMA loader，`src/group_gemm/kernels.cuh:421-547`（函数 `group_gemm_fp8_kernel`）的 `else` 分支是 math warpgroup/epilogue；两边都按同一个 `(igroup,itile_m,itile_n)` 取 tile。也就是说，边界判断不是只存在于 loader：math 侧消费的正是 loader 为同一 local tile 写入的 zero-filled shared tile，store 侧再用同一个 group 的 Y descriptor 裁剪目的坐标。
+
+## 14.4 X load 的 `[48,128]` 为什么不会读到下一个 group
+
+以用户点名的 group 0 为例。X descriptor 的 base 是 `x_ptr`，global M=16、K=7168；`tAg(_,itile_m,itile_k)`在 `src/group_gemm/kernels.cuh:399-405`（函数 `group_gemm_fp8_kernel`）请求一个 48 x 128 tile。唯一的有效任务是 `itile_m=0`，所以请求的 local row 范围是 `[0,48)`：
+
+- local row `[0,16)` 映射到 group 0 的真实 X 行 `[0,16)`；
+- local row `[16,48)` 超出该 descriptor 的 global M=16。虽然物理数组中紧接着的地址确实是 group 1 的 X 行，但这些坐标被 TMA 判定为 OOB，不会把 group 1 的值送进 shared memory。
+
+一般地，group `g` 的有效 X 地址集合是
+
+`[x_ptr + cu_seqlens[g]*k, x_ptr + (cu_seqlens[g]+seqlens[g])*k)`。
+
+令 `L=seqlens[g]`、`T=kTileM`。因为 task 生成规则给出 `0 <= itile_m < ceil(L/T)`，tile 起点满足 `itile_m*T < L`；对 tile 内偏移 `u`，当 `itile_m*T+u < L` 时才落入上述有效区间，否则就是 descriptor OOB。由于 `cu_seqlens[g+1]=cu_seqlens[g]+L`，任何被判定为有效的地址都严格小于下一个 group 的起点。
+
+TMA 对每个 box 坐标先相对于 descriptor 的 `globalDim` 做边界判断；只有 local row `< seqlens[g]` 且 local K `< k` 的元素才按 stride 形成 global address。OOB load 使用零填充，而不是继续沿 stride 访问相邻内存。CUDA PTX 对 tensor memory OOB 的定义见 [PTX Tensor Memory Access 的 OOB 规则](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)，CUDA Driver API 对 `globalDim`、`boxDim` 和 `oobFill` 的定义见 [CUDA Tensor Memory API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html)。
+
+这里“不会读到”指架构可观察的 copy 结果：越界元素不会以 group 1 的值写入 shared memory，也不会参与 MMA。底层实现是否为对齐 cache line 做了内部取数，不是该 TMA API 对应用提供的隔离承诺；若要求物理内存事务也绝不触碰相邻 allocation，需要额外的分配/保护页设计。
+
+当前 CUTLASS descriptor 的默认 `DescriptorAuxParams::oobfill_` 是 `OOBFill::ZERO`，见 `3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:150-183`（类型 `OOBFill`、`DescriptorAuxParams`）；`to_CUtensorMapFloatOOBfill` 在 `3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:265-271`（函数 `to_CUtensorMapFloatOOBfill`）把它编码成 `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`。这里的 `NONE` 不是“关闭边界检查”，而是“不请求特殊 NaN 模式”，默认 OOB 值为零；特殊的 `NAN_REQUEST_ZERO_FMA` 才是另一种模式。
+
+X 的 shared 目标由 `src/group_gemm/kernels.cuh:251-275`（函数 `group_gemm_fp8_kernel`）按完整 `(48,128)` tile 分配，因此 32 个零填充行落在已经分配的 shared tile 内，不会造成 shared OOB。随后 `cute::gemm` 读取这块完整 tile，硬件只看到合法的 shared 地址。
+
+## 14.5 W load 和 MMA atom 维度较大时为什么仍然安全
+
+W descriptor 是固定的三维 tensor，不随 M group 改写。host 端在 `src/group_gemm/group_gemm_pertensor_fp8.cu:39-40`（函数 `launch_group_gemm_fp8`）定义 W shape `(n,k,num_group)`、stride `(k,1,n*k)`；`tBg(_,itile_n,itile_k,igroup)`在 `src/group_gemm/kernels.cuh:277-278` 和 `src/group_gemm/kernels.cuh:407-408`（函数 `group_gemm_fp8_kernel`）用第三维 `igroup` 选择对应的 W slice。当前 n=4096、k=7168 都整除 box，所以 W 本次没有尾部 OOB；若某个配置的 N/K tile 跨出 descriptor 的 globalDim，同样由 TMA load 的 OOB-zero 规则处理，而不会沿第三维跳到别的 group。
+
+日志 `temp/run.log:31-40`（测试输出）显示本次 `TiledMma` 的 MMA atom 为 `Shape_MNK=(64,48,32)`。在 `SS_TN` 映射下，`src/group_gemm/kernels.cuh:430-436`（函数 `group_gemm_fp8_kernel`）把 W 分到 A、X 分到 B，因此 atom 的 64 轴对应输出 N、48 轴对应输出 M；两个 warpgroup 的 64 轴合起来正好是 `kTileN=128`。这个 atom 是固定的硬件计算形状，不能因为 group 0 只有 16 行就缩成 16 行；代码让它照常执行完整 atom：
+
+1. X 的有效 16 行正常装入，其余 M 位置是 FP8 zero；
+2. 对这些位置，WGMMA 的每个 K 乘加都是 `0 * W`，所以对应输出 accumulator 为零（假设有效输入是有限值）；
+3. `src/group_gemm/kernels.cuh:472-501`（函数 `group_gemm_fp8_kernel`）每个 output tile 都先建立/清零 `tDr`，并用 `ScaleOut::Zero` 初始化该 K tile 的首条 WGMMA，因此不会把上一个 task 的寄存器值带入尾部位置。
+
+这就是“用零填充支持固定 MMA atom”的数值依据：矩阵乘法对缺失的行/列补零后，合法输出区域与未补零的原始矩阵乘法完全相同。零填充不是任意垃圾值；如果把 OOB load 配成非零值，确实会污染结果。
+
+TMA load 的 transaction bytes 也按完整 box 计算。`src/group_gemm/kernels.cuh:340-346`（函数 `group_gemm_fp8_kernel`）定义 `kTransactionBytes=sizeof(Tin)*(kTileM+kTileN)*kTileK`，并在 `src/group_gemm/kernels.cuh:399-410`（函数 `group_gemm_fp8_kernel`）两条 copy 后调用 `set_barrier_transaction_bytes`。本次每个 K tile 的 expected bytes 是 `(48+128)*128*1=22528`；其中包含写入 shared 的零填充部分，所以 consumer 等待的是完整 tile，而不是只等待 16 行。
+
+## 14.6 Y store 的 `[64,48]` 为什么不会写到下一个 group
+
+Y descriptor 的 group 0 base 是 `y_ptr`，global dimensions 是 N=4096、M=16；group 1 的 base 则是 `y_ptr + 16*4096`。epilogue 在 `src/group_gemm/kernels.cuh:538-546`（函数 `group_gemm_fp8_kernel`）取 `td_y=td_xy+igroup*2+1`，并以两个 `[64,48]` box 覆盖一个 N=128、M=48 output tile。group 0 的第一个 tile 具体是：
+
+- `iwarpgroup=0`：N `[0,64)`、local M `[0,48)`；
+- `iwarpgroup=1`：N `[64,128)`、local M `[0,48)`；
+- descriptor 只允许 local M `[0,16)` 写回；local M `[16,48)` 的 store 元素被 TMA 丢弃。
+
+因此 group 0 的 store 绝不会写到物理上紧邻的 group 1 输出区。一般 group `g` 的 Y 有效地址集合是
+
+`[y_ptr + cu_seqlens[g]*n, y_ptr + (cu_seqlens[g]+seqlens[g])*n)`，
+
+store 的 local M 坐标仍是 `itile_m*kTileM+u`；只有它小于 `seqlens[g]` 时才映射到上式。因为 Y 的 M stride 是 `n`，最后一个有效 local row 对应的最后一列地址仍小于 `y_ptr+(cu_seqlens[g]+seqlens[g])*n`，不会跨过 group 边界。
+
+而所有超出 descriptor global M 的 store 坐标被抑制。CUDA 编程指南对 TMA/异步 tile store 的边界行为说明见 [CUDA Tile Kernels：边界 tile store](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-tile-kernels.html)。这里没有“先写到下一个 group 再回滚”的过程；TMA 在形成目的地址前就按 descriptor 边界筛掉 OOB 元素。
+
+同样，完整的 `sCT` 由 `src/group_gemm/kernels.cuh:518-528`（函数 `group_gemm_fp8_kernel`）分配和分区，写满 `[128,48]` 的 shared tile 不会越过 shared allocation；只有最终 global store 的 OOB 部分被丢弃。即使寄存器 fragment 中保留了无效 M 位置，它们也没有对应的可写 global destination。
+
+## 14.7 “padding”到底是哪一种，以及它为什么不改变结果
+
+当前实现**没有给每个 group 额外分配物理 padding 行**。准确说是两层逻辑 padding：
+
+- load 侧：descriptor 的 box 大于 group 的 `globalDim` 时，TMA 把越界 operand 元素填成 zero；
+- store 侧：descriptor 的 box 大于 group 的 `globalDim` 时，TMA 直接丢弃越界 destination 元素。
+
+所以在 `group_gemm_fp8_kernel` 中看不到逐元素的 `if (row < seqlen[g])`：边界谓词由 TMA tensor-map 的 `globalDim` 在异步 copy 引擎内执行，而不是由每个 CUDA lane 手工分支。
+
+对 X 的 group 0，补出的 32 行在每个 K 位置都是零，所以对任一合法输出行 `r<16`，WGMMA 计算仍是
+
+`C[r,n] = Σ_k X[r,k] * W[n,k]`；补出的 `r>=16` 只产生零 accumulator，并且不会被写到 Y。若是 K 尾部，缺失的 K 项同样贡献 `0*W=0`，但 N/M 仍然有效的输出照常写回；只有 N 或 M 尾部的无效输出坐标会在 store 侧被丢弃。
+
+如果改成真正的**物理 padding**，必须同时满足：每组的 padded stride/分配互不重叠、padding 值初始化为 zero、descriptor 的 globalDim 仍然是逻辑长度而不是把下一个 group 当成 padding。仅仅在一块连续数组后面“预留一些字节”不能替代 descriptor 边界；否则尾部访问仍可能落入下一个 group。当前动态 descriptor 方案不依赖这种物理 padding。
+
+## 14.8 重要的实现前提：policy=2 的 descriptor acquire
+
+上面的地址证明以“consumer 看到的是已经更新好的 group descriptor”为前提。producer 在 `src/group_gemm/kernels.cuh:204-212`（函数 `update_grouped_tma`）把 shared 中改好的 descriptor 通过 `tma_descriptor_cp_fence_release` 发布到 `tma_xy`；其底层 release 指令在 `3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:423-435`（函数 `tma_descriptor_cp_fence_release`）。
+
+但当前 `group_gemm_fp8_kernel` 只有 policy 0 在 `src/group_gemm/kernels.cuh:306-319`（函数 `group_gemm_fp8_kernel`）显式调用 `tma_descriptor_fence_acquire`；policy 2 的分支 `src/group_gemm/kernels.cuh:330-338`（函数 `group_gemm_fp8_kernel`）只复制 `cu_tiles` 并做 CTA `__syncthreads()`，没有对 `td_x/td_y` 调 acquire。acquire 的实现位于 `3rd/cutlass/include/cute/arch/copy_sm90_desc.hpp:457-470`（函数 `tma_descriptor_fence_acquire`）。CUDA 文档明确指出，普通 stream/grid 同步不能替代 tensor-map proxy 的 release/acquire；参见 [CUDA Programming Guide：异步拷贝与 tensor map proxy](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html)。
+
+所以应区分两个结论：
+
+1. **边界算法本身**是正确的：动态 base + per-group globalDim + TMA OOB zero/discard + 只生成合法 local tile，足以阻止逻辑上的跨 group 读写；本次日志中的 group 0 `[16,7168]` / `[16,4096]` 尾 tile 正是这样处理的。
+2. **当前 policy=2 的形式化内存可见性**仍有缺口：在 descriptor 被 device 动态改写、尤其是 descriptor cache 被复用时，不能仅凭 `cudaGridDependencySynchronize` 和 `__syncthreads` 宣称 acquire 已完成。工程上应在 policy=2 第一次使用每个 `td_x/td_y` 前补相应的 `tma_descriptor_fence_acquire`，再按需要做 CTA 同步，并用实际构建/运行验证。
+
+这项 acquire 缺口不等于“必然会读到别的 group”；它说明的是 descriptor 更新的发布/消费顺序还没有按 CUDA tensor-map proxy 的严格规则闭合。当前测试能稳定通过只能说明该环境下 descriptor 可见性恰好满足，不能替代上述同步审计。
+
+## 14.9 结论
+
+对本次 `group 0: M=16,N=4096,K=7168`：
+
+- X 的真实 box 是 `[48,128]`，group 0 的第 16--47 行由 TMA zero-fill；不会读取 group 1 的 X；
+- Y 的每次 store box 是 `[64,48]`，group 0 的第 16--47 行由 TMA OOB store discard；不会写入 group 1 的 Y；
+- `[64,48]` 大于有效 M、`(64,48,32)` MMA atom 大于有效 M 都不是错误，因为 shared tile/寄存器 fragment 采用固定形状，OOB operand 为零，OOB destination 不写；
+- 本次 N、K 整除 tile，因此没有实际 N/K 尾部；若出现尾部，仍需保持相同 OOB 模式和正确的 tile 计数；
+- 这不是依靠物理 padding 保护连续数组，而是依靠每 group descriptor 的 base 和 `globalDim` 做隔离；同时应补审 policy=2 的 tensor-map acquire。
+
+以上还依赖输入元数据契约成立：`cu_seqlens` 必须是非降的合法前缀和、`cu_seqlens[num_group] == m`，且每个 group 的实际内存区间确实落在已分配的 X/Y tensor 内；各 descriptor 的 base/stride 还必须满足 TMA 的对齐约束。本次 `k=7168`、`n=4096` 使所有 group base 偏移满足 16-byte 对齐；当前 kernel 没有为损坏的 `seqlens/cu_seqlens` 或未对齐指针另加校验。

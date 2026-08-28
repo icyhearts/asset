@@ -15649,3 +15649,87 @@ Python、Torch、torch_sipu、Triton、vLLM 和 vllm_sipu 验证全部通过，�
 
 本节更正前文 104.3.3 中关于 sikernel 子模块过滤、setup 内置 distributed source，以及前文 105 中
 由 setup 脚本内部选择 GCC 的描述；那些内容保留作历史记录，但以本节的环境变量驱动方式为准。
+
+## 107. `test_upcast_from_mxfmt_native_op_matches_api` 的 `E8M0_RCEIL` 失败原因（2026-08-27）
+
+本节只记录原因，未修改 simo 源码、测试文件或 conda 环境。
+
+### 107.1 复现条件和实际结果
+
+使用用户指定的环境运行：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/simo_sglang
+source /share/users/like/package/vllm-sipu/sipu_sdk_setup.sh
+pytest tests/simo_quant/test_mx_ops.py::test_upcast_from_mxfmt_native_op_matches_api \
+  > temp/test_mx_ops.py.log.2026_08_27___16_56_03 2>&1
+```
+
+实际存在的日志文件是 `temp/test_mx_ops.py.log.2026_08_27___16_56_03`；用户给出的末尾为
+`16_56_0` 的文件名不存在。环境版本为 `torch 2.11.0+cu130`、`triton 3.6.0`，设备为 H100。
+测试结果为 `1 failed`。当前工作树中的测试把 scale mode 依次设为
+`FLOOR, CEIL, EVEN, RCEIL, SIPU`；`FLOOR`、`CEIL`、`EVEN` 和 `SIPU` 可以完成，首次进入
+`RCEIL` 时失败。
+
+### 107.2 调用链
+
+失败调用的路径是：
+
+```text
+test_mx_ops.py:355
+  -> simo.ops.mx_api.downcast_to_mxfmt
+  -> torch.ops.simo.downcast_to_mxfmt (CUDA dispatch)
+  -> downcast_to_mxfmt_cuda_impl
+  -> _downcast_to_mxfmt_triton
+  -> _downcast_to_mxfmt[...] (Triton JIT compile)
+  -> _compute_and_pack_mxfmt
+```
+
+`downcast_to_mxfmt_cuda_impl` 当前只把
+`E4M3_GLOBAL_AMAX`、`E5M3`、`E5M3_GLOBAL_AMAX` 和 `E8M0_GLOBAL_AMAX` 列入
+`unsupported_triton_scale_modes`。`E8M0_RCEIL` 没有列入该集合，所以没有走已有的 Torch 实现，
+而是直接请求 Triton kernel。
+
+### 107.3 直接原因：Triton kernel 的 RCEIL 分支是占位代码
+
+在 `simo/ops/kernels/downcast/_downcast_to_mxfmt.py:335-337`，RCEIL 分支是：
+
+```python
+elif QUANT_SCALE_ROUNDING_MODE == E8M0_RCEIL:
+    # TODO: Implement RCEIL
+    raise NotImplementedError("RCEIL is not implemented")
+```
+
+Triton 会先把 `@triton.jit` 函数转换成 Triton AST/IR，再生成 CUDA kernel。Triton 语言不支持
+Python AST 的 `Raise` 节点；因此编译器在 AST 转换阶段报：
+
+```text
+UnsupportedLanguageConstruct: ... unsupported AST node type: Raise
+```
+
+日志中的外层 `CompilationError` 位于 `_compute_and_pack_mxfmt` 调用处，并不表示 GPU kernel 已经
+启动。实际情况是还没有执行量化计算，也没有执行后面的 `upcast_from_mxfmt` 对比。即使
+`QUANT_SCALE_ROUNDING_MODE` 是编译期常量，当前 Triton 版本仍需先解析函数 AST；被常量分支包住的
+`raise` 也不能作为可接受的 Triton 语法存在。
+
+### 107.4 为什么这不是 scale mode 本身或 nvcc 的问题
+
+- `ScaleModeEnum.E8M0_RCEIL` 已在 `simo/ops/formats/mx/scale.py` 注册，配置层也接受
+  `e8m0_rceil`。
+- CPU/Torch 路径的 `NVScaleMode.calculate_scale`（`scale.py:258-273`）已经实现
+  `ceil(log2(amax / dtype.max))`，说明 RCEIL 的数学定义已有实现；缺口在 CUDA Triton 路径的
+  分流/内核实现。
+- `nvcc`、H100 和 CUDA 13 只提供了运行/编译环境；报错发生在 conda 中 Triton 3.6.0 的 Python
+  AST 编译器，错误类型明确是 `Raise` 语法不支持，不是 CUDA 编译器或设备算子错误。
+- 仓库 `HEAD` 的原始测试只使用默认的 `E8M0_FLOOR`。当前工作树测试新增了 `RCEIL`，因此暴露了
+  原先未覆盖的已知占位分支；这也解释了为什么默认测试此前不会触发该错误。
+
+### 107.5 后续可选处理方向（本轮未实施）
+
+1. 在 `downcast_to_mxfmt_cuda_impl` 中把 `E8M0_RCEIL` 路由到已有的
+   `_downcast_to_mxfmt_torch`，复用 `NVScaleMode` 的实现；这是最小的行为修复方向。
+2. 在 `_compute_and_pack_mxfmt` 中用 Triton 可表达的 `ceil(log2(max_val / max_quant_val))`
+   公式替换占位 `raise`，并补充 CUDA 与 Torch 参考结果的逐模式测试；这是保留 GPU 路径的实现方向。
+
+在用户要求“先不修复”的阶段，没有选择或应用上述任一修改。
