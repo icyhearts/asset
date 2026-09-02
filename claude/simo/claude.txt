@@ -3824,3 +3824,16 @@ simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py
 }
 
 
+
+{
+
+ sglang_sipu 代码位于 /share/users/like/package/sglang_sipu, 这是一个在开源 sglang 上做的 sipu 版本的 sglang.
+ sglang_sipu code base  docs-sipu/get-started.md 2a. Run CUDA 部分
+ bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml \
+  --launch-config deepep_deepgemm_text \
+  --test-case text-only \
+  --device cuda
+这个命令的功能是什么？
+把答案追加到 like-useful/answer_codex_v3.md
+}

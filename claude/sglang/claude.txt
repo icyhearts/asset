@@ -911,3 +911,10 @@ sglang  安装脚本 /share/users/like/package/sglang_kernel_src/like-useful/ins
 如何修复运行失败的问题?
 要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
 }
+
+
+{
+sglang_sipu 代码位于 /share/users/like/package/sglang_sipu
+
+要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
+}

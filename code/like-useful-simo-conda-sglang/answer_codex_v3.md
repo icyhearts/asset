@@ -381,3 +381,209 @@ readelf -S "$SIMO_ONNX_CUSTOM_OPS_LIBRARY" | grep -E '\.debug_(info|line)' \
 
 结论是：当前项目对 `simo_qdq_ops.cc` 的 Debug 构建对象是完整的 `libSimoOnnxCustomOps_sm90.so`，不是 `simo._C`。临时调试使用 `build_sm90_runtime()` + `CXX` wrapper 最直接；整个 editable 开发环境使用 `DEBUG=1` 时，也必须保留该 wrapper，才能覆盖 `build_runtime.py` 内部硬编码的 `-O3`。
 
+## 3. `sglang_sipu` 中 `2a. Run CUDA` 命令的功能
+
+### 3.1 一句话结论
+
+命令
+
+```bash
+bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml \
+  --launch-config deepep_deepgemm_text \
+  --test-case text-only \
+  --device cuda
+```
+
+不是在当前机器直接启动一个本地 CUDA 服务，也不是执行 CUDA 与 SIPU 的比较。它是
+SIPU 精度验证流程的 **CUDA 基线生成步骤**：读取 `ds_v32_2layer.yaml`，在远端
+CUDA 主机的 SGLang CUDA 容器中运行一次 `text-only` 离线推理，并把中间层张量和
+输出保存为 `.pt` dump，供后续 SIPU dump 与 `compare_cuda_sipu.py` 对比。
+
+该结论对应的源码调用链是：
+
+```text
+run_test.sh
+  -> run_cuda
+  -> ssh <user>@10.96.11.15
+  -> docker run lmsysorg/sglang:v0.5.18-cu130
+  -> test_utils/run_test_job.py --device cuda
+  -> sgl.Engine(**cuda_block).generate(...)
+  -> forward hooks 保存 CUDA 张量
+```
+
+### 3.2 正确的执行目录
+
+文档在执行命令前要求：
+
+```bash
+cd /share/users/like/package/sglang_sipu/test/srt/sipu
+```
+
+然后再执行上面的命令。用户当前的 shell 目录是
+`/share/users/like/package/simo_conda_sglang`；在该目录直接写
+`bash test_utils/run_test.sh` 会找不到脚本。也可以从 `sglang_sipu` 仓库根目录使用
+绝对脚本路径，例如：
+
+```bash
+cd /share/users/like/package/sglang_sipu
+bash test/srt/sipu/test_utils/run_test.sh \
+  --config-yaml test/srt/sipu/configs/deepseek/ds_v32_2layer.yaml \
+  --launch-config deepep_deepgemm_text \
+  --test-case text-only \
+  --device cuda
+```
+
+脚本会把相对 YAML 路径解析到
+`<sglang_sipu>/test/srt/sipu/` 下，因此从文档指定目录运行时，
+`configs/deepseek/ds_v32_2layer.yaml` 才是最直观的写法。
+
+### 3.3 四个参数分别选择什么
+
+| 参数 | 实际作用 |
+| --- | --- |
+| `--config-yaml configs/deepseek/ds_v32_2layer.yaml` | 读取模型路径、prompt、采样参数、各设备的 Engine 参数和允许的测试 case。 |
+| `--launch-config deepep_deepgemm_text` | 选择 YAML 的 `launch_configs.deepep_deepgemm_text` 块；不会执行其他 launch 配置。 |
+| `--test-case text-only` | 选择 `run_test_job.py` 的 `run_text_only`；只执行文本生成，不执行同一 YAML 中的 `prefix-caching`。 |
+| `--device cuda` | 选择 `run_test.sh` 的 `run_cuda` 分支，并把 `--device cuda` 传给 `run_test_job.py`；不会运行 SIPU 分支。 |
+
+`run_test_job.py` 会先校验：YAML 存在 `model_path` 和 `launch_configs`，所选 launch
+同时有 `cuda`/`sipu` 两个 block，且 `text-only` 出现在 `tests` 列表中。校验失败时
+不会创建 Engine。
+
+### 3.4 这个具体 YAML 会运行什么
+
+`configs/deepseek/ds_v32_2layer.yaml` 中与本命令相关的设置如下：
+
+* 模型 ID 是 `ds_v32_2layer`，模型目录是
+  `/share_data/inference-framework/tiny-models/DeepSeek-V3.2-2layer/safetensor_weights`。
+* 顶层只有一个长文本 prompt；`text-only` 会把它作为一个元素传给
+  `llm.generate`。
+* 采样参数是 `temperature: 0`、`top_p: 0.95`、`max_new_tokens: 2`。
+  这不是吞吐 benchmark，而是一个短的确定性 smoke/accuracy run。
+* `enable_tensor_dump: true` 会注入 `forward_hooks`。
+* CUDA Engine 参数包括：`attention_backend: dsa`、`kv_cache_dtype: fp8_e4m3`、
+  `moe_runner_backend: deep_gemm`、`moe_a2a_backend: deepep`、
+  `deepep_mode: low_latency`、`disable_shared_experts_fusion: true`、
+  `disable_cuda_graph: true`、`context_length: 256`、`max_total_tokens: 512`、
+  `page_size: 64`、`skip_server_warmup: true` 和 debug 日志。
+* `test_env.text-only` 会设置
+  `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=0`，影响 DSA prefill 的 dense
+  attention 选择；它不是一个额外的命令行参数。
+
+YAML 中的 `base_gpu_id: 2` 会作为 SGLang Engine 参数传入，并参与 scheduler 的
+GPU ordinal 计算。远端物理 GPU 可见性则由 `run_test.sh` 的
+`CUDA_GPUS`/`NVIDIA_VISIBLE_DEVICES` 环境控制（默认值为 `0`）。因此当前示例存在
+一个需要运行前确认的风险：如果容器实际上只看到 GPU `0`，SGLang 仍可能尝试选择
+`cuda:2`，从而报设备不存在或使用错误的卡。应让 `base_gpu_id`、可见 GPU 列表和
+并行度保持一致（单卡容器通常使用逻辑 ordinal `0`，或者显式暴露并使用对应的
+多卡编号）。当前脚本的实际 Docker 参数是 `--gpus all` 加
+`NVIDIA_VISIBLE_DEVICES`，不是注释中所说的字面 `--gpus device=N`，部署时应按脚本
+实际行为检查 GPU 映射。
+
+### 3.5 `--device cuda` 的实际执行位置和依赖
+
+`run_test.sh` 的 `run_cuda` 会：
+
+1. 默认通过 SSH 连接 `${USER}@10.96.11.15`；可用 `ACCURACY_CUDA_HOST` 覆盖。
+2. 在远端先删除同名的旧 CUDA 容器，再启动
+   `lmsysorg/sglang:v0.5.18-cu130`。
+3. 将当前 `sglang_sipu` checkout 挂载到容器内
+   `/sgl-workspace/sglang`，并以读写方式挂载 `/share_data/sglang_sipu`，以只读方式
+   挂载 tiny-models 目录。
+4. 设置 CUDA 运行所需的 `PYTHONPATH`、`PYTHONUNBUFFERED`、
+   `SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1`、DeepGEMM/NCCL/NVSHMEM 相关环境，
+   然后调用容器内的 `run_test_job.py`。
+5. 通过本地 `tee` 把远端 stdout/stderr 同时写入日志文件。
+
+因此 CUDA 主机必须满足：SSH 可达、Docker 可用、上述镜像可拉取或已存在、模型和
+共享目录在相同路径可见，且挂载后的 checkout 能导入 SGLang。执行 CUDA 分支不要求
+设置 `SIPU_TEST_CONTAINER`；该环境变量只在 `--device sipu` 或 `both` 时使用。
+
+### 3.6 推理期间保存的内容
+
+`run_test_job.py` 会执行近似如下逻辑：
+
+```python
+cfg = load_yaml(...)
+kwargs = deepcopy(cfg["launch_configs"]["deepep_deepgemm_text"]["cuda"])
+kwargs["model_path"] = cfg["model_path"]
+kwargs["device"] = "cuda"
+kwargs["forward_hooks"] = build_forward_hooks(dump_dir=...)
+llm = sgl.Engine(**kwargs)
+outputs = llm.generate(cfg["prompts"], cfg["sampling"])
+llm.shutdown()
+```
+
+文本 hook 通常会保存以下类别的 CPU `.pt` 文件（每次 forward 位于一个
+`pass_XXX/` 目录）：
+
+* `embedding.pt`；
+* 每个文本层的 `layer_<i>_attn.pt`、`layer_<i>_attn_plus_residual.pt`、
+  `layer_<i>_mlp.pt` 和 `layer_<i>_mlp_plus_residual.pt`；
+* `layer_last_mlp_plus_residual.pt` 和 `lm_head.pt`；
+* `manifest.json` 以及记录 prompt/生成结果的 `run_meta.json`。
+
+hook writer 在一次新运行开始时会清理目标目录中已有的 `pass_*`、`manifest.json`
+和 `run_meta.json`，因此重复执行同一命令会覆盖该 tuple 的旧 CUDA dump。
+
+### 3.7 输出位置
+
+使用默认参数时，CUDA 张量 dump 是：
+
+```text
+/share_data/sglang_sipu/accuracy_verify/<当前用户名>/
+  ds_v32_2layer/deepep_deepgemm_text/text-only/cuda/
+```
+
+日志默认写回当前 checkout：
+
+```text
+/share/users/like/package/sglang_sipu/test/srt/sipu/logs/deepseek/
+  ds_v32_2layer_deepep_deepgemm_text_text-only_cuda.log
+```
+
+实际目录可分别用 `--dump-base` 和 `--log-base` 覆盖。命令结束时打印 dump base 和
+log host 路径；生成文本也会打印到终端和日志中。
+
+### 3.8 它不做什么，以及下一步如何使用
+
+这个命令本身：
+
+* 不启动 SIPU 推理；
+* 不调用 `compare_cuda_sipu.py`；
+* 不运行 YAML 中列出的 `prefix-caching`，因为显式选择了 `text-only`；
+* 不代表多 rank、在线服务或性能回归已经通过。文档明确说明该 accuracy 测试是
+  one-rank/archmodel 范围。
+
+完整的 CUDA↔SIPU 验证顺序是：
+
+```text
+1. 本命令：生成 .../text-only/cuda/ 基线
+2. 同参数改为 --device sipu：生成 .../text-only/sipu/
+3. 在 SIPU 容器中运行 compare_cuda_sipu.py：比较两侧 pass_XXX/*.pt
+```
+
+比较脚本会按 checkpoint 计算 shape、余弦相似度、绝对误差等指标；当前文档的门槛
+是最后一个 `lm_head.pt` 满足 `cos_sim >= 0.999` 且 `mean_atol <= 0.05`。因此，
+`--device cuda` 的准确描述是“为 SIPU 精度测试准备可复现的 CUDA 参考结果”，而不是
+“验证 SIPU 已经正确”。
+
+### 3.9 最短可操作示例
+
+```bash
+cd /share/users/like/package/sglang_sipu/test/srt/sipu
+
+# 可选：指定远端 CUDA 主机和可见 GPU
+export ACCURACY_CUDA_HOST="${USER}@10.96.11.15"
+export CUDA_GPUS=0
+
+bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml \
+  --launch-config deepep_deepgemm_text \
+  --test-case text-only \
+  --device cuda
+```
+
+如果共享目录中已经有同一模型/launch/case 的 CUDA baseline，可以跳过本步骤，直接
+生成 SIPU dump，并把 `--dump-base` 指向包含该 baseline 的用户目录。
