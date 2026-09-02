@@ -3467,3 +3467,289 @@ group_gemm_blockwise_fp8_async(
 - 在非 sm90 模块中，同一表达式变成 `sizeof((expression,0))`：只做编译期类型检查，不执行、不产生该函数调用的链接依赖。
 - 宏的冗长部分来自可变参数 pair 计数、token 拼接、递归展开、错误字符串生成和语句安全包装；它服务的是一个 `.cc` 源文件对应多个架构 `.so` 的构建模型。
 - 对当前 API 调用，宏开销只在 host launch 路径上，主要是一次缓存架构查询和比较；不会增加 blockwise GPU kernel 的运行时指令。
+
+# 18. `btma_as.partition_D(sAS)` 中第三个 mode 的来源
+
+## 18.1 先给本次实例的结论
+
+本次 `temp/block.log:1-3` 的编译期参数是 `kTileM=48`、`kTileS=64`、`kStage=8`。因此：
+
+本仓库当前 checkout 将原先的 `src/group_gemm/kernels.cuh` 放在 `src/group_gemm/sm90/kernels.cuh`；下文按当前 code base 的实际相对路径引用。
+
+```text
+sAS 的逻辑 shape                 = (8, 64)
+TMA x-scale box 的 Tiler_MN      = (1, 48)
+tASs 的实际 shape                 = ((48, 1), 8, 2)
+```
+
+第三个顶层 mode 的 `_2` 在这个实例中确实来自：
+
+```text
+ceil_div(kTileS, kTileM) = ceil_div(64, 48) = 2
+```
+
+但要准确理解它，必须把它称为 **TMA tile 之外的 rest/tile-count mode**。它不是 TMA descriptor 的第三个硬件维度，不是 `kWarpgroupM=2`，也不是 double buffering；它也不会让一次 `cute::copy` 自动执行两次 TMA copy。当前调用把这个 mode 显式固定为 `0`。
+
+## 18.2 `sAS` 的 shape 和 stride 从哪里来
+
+### 18.2.1 配置类型定义的两个维度
+
+`src/group_gemm/sm90/config.h:136-137`（类型 `GroupGEMMBlockWiseFp8Config`）定义：
+
+```cpp
+using SLayoutXS = decltype(make_layout(
+    make_shape(Int<kStage>{}, Int<kTileS>{}),
+    make_stride(Int<kTileS>{}, Int<1>{})));
+```
+
+在本次实例中 `kStage=8`、`kTileS=64`，所以它是：
+
+```text
+SLayoutXS = Layout<Shape<_8,_64>, Stride<_64,_1>>
+```
+
+`src/group_gemm/sm90/kernels.cuh:679-682`（函数 `group_gemm_blockwise_fp8_kernel`）用该 layout 和 shared-memory 指针构造 `sAS`。日志 `temp/block.log:90-93` 打印为：
+
+```text
+smem_ptr[32b](...) o (_8,_64):(_64,_1)
+```
+
+这里：
+
+- 第 0 维 `_8` 是 8 个 pipeline stage；`ismem_read/ismem_write` 选择这一维。
+- 第 1 维 `_64` 是每个 stage 预留的 x-scale slot 容量（`kTileS`）。
+- `(64,1)` 是 row-major 的 shared-memory 地址映射，所以 `sAS(stage, slot)` 的线性 offset 是 `stage * 64 + slot`。
+
+`kTileS` 是 shared buffer 的容量参数，不等于本次 TMA 实际传输的第二维；本次传输宽度由 `kTileM=48` 决定。
+
+### 18.2.2 本次 `kTileM` 的来源
+
+`src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:403-417`（函数 `group_gemm_blockwise_fp8_async`）固定 `kTileS=64`；本次日志的平均长度为 72，因此命中 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:459-466`（函数 `group_gemm_blockwise_fp8_async` 的 `kTileM=48` 分支）调用模板 kernel。日志中的 `kTileM:48` 与此一致。
+
+## 18.3 TMA 的 `Tiler_MN` 为什么是 `(1,48)`
+
+### 18.3.1 `CopyBoxXS` 定义的是一个 TMA box
+
+`src/group_gemm/sm90/config.h:142-145`（类型 `GroupGEMMBlockWiseFp8Config`）定义：
+
+```cpp
+using CopyBoxXS = decltype(make_layout(
+    make_shape(Int<1>{}, Int<kTileM>{}),
+    make_stride(Int<kTileM>{}, Int<1>{})));
+```
+
+本次即 `shape=(1,48)`、`stride=(48,1)`。`src/group_gemm/sm90/config.h:147-154`（成员函数 `GroupGEMMBlockWiseFp8Config::get_tma`）把它传给：
+
+```cpp
+auto tma_xs = make_tma_copy(SM90_TMA_LOAD{}, xs, CopyBoxXS{});
+```
+
+### 18.3.2 三参数 `make_tma_copy` 的默认行为
+
+`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:1341-1352`（函数 `make_tma_copy`）把 `product_each(shape(slayout))` 作为 CTA tiler。因此 `CopyBoxXS` 的 shape 被用作 TMA 的 tile shape，得到：
+
+```text
+Tiler_MN = (1, 48)
+```
+
+日志 `temp/block.log:47-56` 的 `tma_xs` 也直接显示：
+
+```text
+Tiler_MN:       (_1,_48)
+ThrID:          _1:_0
+ValLayout...    (_1,_48):(_0,_1)
+ValueType:      32b
+```
+
+这表示一个非 multicast TMA atom 负责一个逻辑线程、48 个 `float` 值（1536 bit），而不是负责整个 `(8,64)` 的 shared tensor。
+
+## 18.4 `get_slice(0)` 和 `partition_D` 的调用链
+
+### 18.4.1 `get_slice(0)` 只选择逻辑 TMA thread
+
+`src/group_gemm/sm90/kernels.cuh:692-695`（函数 `group_gemm_blockwise_fp8_kernel`）执行：
+
+```cpp
+auto btma_as = tma_as.get_slice(0);
+```
+
+`3rd/cutlass/include/cute/atom/copy_atom.hpp:338-345`（函数 `TiledCopy::get_slice`）返回一个 `ThrCopy`，保存 `thr_idx_=0`。TMA load atom 的 `ThrID=Layout<_1>` 定义在 `3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:101-110`，所以这里的 `0` 只是在唯一逻辑 TMA thread 中选 thread 0；它没有选择 stage，也没有把 rest mode 变成 1。
+
+### 18.4.2 `partition_D` 的实际展开
+
+`btma_as.partition_D(sAS)`（`src/group_gemm/sm90/kernels.cuh:703-704`，函数 `group_gemm_blockwise_fp8_kernel`）调用 `3rd/cutlass/include/cute/atom/copy_atom.hpp:375-383`（函数 `ThrCopy::partition_D`）。该函数先构造 `tidfrg_D(sAS.layout())`，最后再以 `thr_idx_` 切出一个线程 slice。
+
+`tidfrg_D` 的核心在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:239-248`（函数 `TiledCopy::tidfrg_D`）：
+
+```cpp
+tile2thrfrg(
+    zipped_divide(dtensor, Tiler_MN{}),
+    right_inverse(AtomLayoutRef{}).compose(AtomLayoutDst{}));
+```
+
+这不是读写 shared memory 的运行时操作，而是构造一个带新 layout 的 Tensor view。
+
+## 18.5 `zipped_divide` 如何产生 `_8` 和 `_2`
+
+### 18.5.1 先看不做 atom 映射的中间结果
+
+对本次 `sAS` 和 `Tiler_MN`，可以把 `zipped_divide` 的中间结果写成：
+
+```text
+zipped_divide(sAS, (1,48))
+  shape  = ((1,48), (8,2))
+  stride = ((0, 1), (64,48))
+```
+
+第一组 `((1,48))` 是一个 TMA tile，第二组 `((8,2))` 是 tile 外的 rest modes。其含义是：
+
+```text
+stage rest = 8 / 1 = 8
+slot  rest = ceil_div(64, 48) = 2
+```
+
+`3rd/cutlass/include/cute/tensor_impl.hpp:930-942`（函数 `zipped_divide` 的 Tensor overload）先保留原 Tensor 的 data pointer，再把 layout 运算应用到它；`3rd/cutlass/include/cute/layout.hpp:1606-1614`（函数 `zipped_divide`）保留 tile/rest 的分组；`3rd/cutlass/include/cute/layout.hpp:1555-1578`（函数 `logical_divide`）建立逻辑除法；非整除时，`3rd/cutlass/include/cute/layout.hpp:1216-1223`（函数 `detail::complement`）通过 `ceil_div` 计算 rest shape。因此 `_2` 是静态 layout 运算的结果，不是 kernel 中执行的一条 `ceil` 指令。
+
+### 18.5.2 atom 的 TV 映射为什么让第一个 mode 变成 `(_48,_1)`
+
+TMA `TiledCopy` 的日志 layout 是：
+
+```text
+TiledLayout_TV: (_1,((_48,_1))):(_0,((_1,_0)))
+```
+
+`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:1193-1232`（函数 `detail::make_tma_copy_tiled`）构造这个 TV layout；`3rd/cutlass/include/cute/atom/copy_atom.hpp:229-237`（函数 `TiledCopy::tidfrg_D` 的布局约定）把 value 部分解释为 `(FrgV,FrgX)`；其中：
+
+- 最外层 `_1` 是唯一逻辑 TMA thread；
+- `((_48,_1))` 是 `(FrgV,FrgX)` 的嵌套 mode，乘积仍为 48；本例一个 TMA atom 有 `FrgV=48`、`FrgX=1`，所以内层 `_1` 是退化的 atom-replica mode，不是额外的值；
+- 对应 stride `((_1,_0))` 表示 value 方向每步加 1，退化 mode 的 stride 为 0。
+
+`ThrCopy::partition_D` 选择 thread 0 后，最外层 thread mode 被切掉，于是最终打印为：
+
+```text
+((_48,_1),_8,_2):((_1,_0),_64,_48)
+```
+
+换句话说，`tidfrg_D` 在切出逻辑 thread 之前可概念性地写成：
+
+```text
+(_1, (_48,_1), (_8,_2)) : (_0, (_1,_0), (_64,_48))
+```
+
+`ThrCopy::partition_D` 代入 `thr_idx_=0` 后去掉最外层 `_1`，正好得到日志中的 `((_48,_1),_8,_2)`。因此用户所说的“在 TMA 之外先得到 `(8,2)`，再加上 TMA mode”在这个实例中是正确的；只是 TMA mode 本身保留了 `(_48,_1)` 的嵌套结构。
+
+所以日志中的“外层三个 mode”应这样读：
+
+1. `(_48,_1)`：单次 TMA atom 的 48-value fragment（带一个退化子 mode）；
+2. `_8`：shared 的 stage rest mode；
+3. `_2`：沿每个 64-slot stage 按 48-value tile 分割得到的 rest tile 数。
+
+## 18.6 最终 `tASs` 的地址公式
+
+对最终 view，令第一个 nested mode 的有效 value 坐标为 `v=0..47`，stage 为 `s=0..7`，rest 为 `r=0..1`，由日志中的 shape/stride 可写成：
+
+```text
+tASs(v, s, r) -> shm_as[s * 64 + r * 48 + v]
+```
+
+即：
+
+```text
+tASs(_, 0, 0) -> offsets 0..47
+tASs(_, 0, 1) -> offsets 48..95
+tASs(_, 1, 0) -> offsets 64..111
+```
+
+这也说明了一个 CuTe layout 的重要性质：**view 的 shape 不等于每个坐标组合都已经经过边界检查**。当 tile 宽度 48 不能整除行宽 64 时，`rest=1` 的完整 48-value 视图会超出当前 64-slot 行，并在物理地址上进入后续 stage。`partition_D` 本身不会替调用者插入 shared-memory predicate。
+
+`src/group_gemm/sm90/kernels.cuh:670-672`（函数 `group_gemm_blockwise_fp8_kernel`）把 `shm_bs` 放在 `shm_as + cosize(SLayoutAS{})` 之后；本例 `SLayoutAS` 需要 `8*64=512` 个 float。因此对最后一个 stage 使用 `rest=1` 时，地址还会越过 `sAS` 的 512-float 区域，进入后面的 `sBS` 区域。这正是当前代码必须显式选择 `rest=0` 的原因之一。
+
+## 18.7 为什么实际 copy 只用第三索引 `0`
+
+### 18.7.1 当前调用显式固定 rest tile
+
+`src/group_gemm/sm90/kernels.cuh:880-883`（函数 `group_gemm_blockwise_fp8_kernel`）的 x-scale copy 是：
+
+```cpp
+cute::copy(tma_as.with(readable[ismem_write]),
+           tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m),
+           tASs(_, ismem_write, 0));
+```
+
+这里最后的 `0` 就是第三个顶层 mode `r`。因此每个 `(itile_k, stage)` 只选择第一块 48 个 slot；`r=1` 没有被传给 `cute::copy`。
+
+### 18.7.2 一次切片后的 `cute::copy` 不会因为 `_2` 自动循环
+
+切片后 source 和 destination 都只剩 TMA fragment mode。`3rd/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp:64-90`（函数 `TMA_LOAD_Unpack::copy_unpack`）取选定 source coordinate 和 destination shared pointer，调用一个 TMA copy atom。`_2` 只是原始 view 中可供调用者选择的 rest 坐标；只有调用者显式遍历/保留该 mode，才会有多次 copy 调用。
+
+### 18.7.3 `tASg` 的两个 rest mode 是另一回事
+
+日志 `temp/block.log:164-167` 中：
+
+```text
+tASg ... shape (((_48,_1),56,15))
+```
+
+这里 `56` 是 `num_block_k`，`15=ceil(720/48)` 是 global `m_pad` 被 48-wide TMA box 切成的 tile 数。调用中的 `itile_k` 和 `cu_tiles_ptr[igroup]+itile_m` 分别选择这两个 global rest 坐标；它们与 destination `sAS` 的 `_8,_2` 是不同 Tensor 上的不同坐标域。
+
+## 18.8 为什么 `_2` 不影响本次计算结果
+
+### 18.8.1 MMA tile 只需要 48 个 x-scale
+
+`src/group_gemm/sm90/kernels.cuh:686-688`（函数 `group_gemm_blockwise_fp8_kernel`）构造的 `gC` shape 是 `(kTileN,kTileM)=(128,48)`。随后 `src/group_gemm/sm90/kernels.cuh:916-918`（函数 `group_gemm_blockwise_fp8_kernel`）从它生成 identity/fragment 坐标；在 `src/group_gemm/sm90/kernels.cuh:962-968`（函数 `group_gemm_blockwise_fp8_kernel`）读取 x-scale 时：
+
+```cpp
+sAS(ismem_read, get<1>(tI_mn(0, in)))
+```
+
+第二坐标只覆盖 `0..kTileM-1 = 0..47`，所以不会读取 shared stage 中的 `slot=48..63`。这 16 个 slot 是 `kTileS=64` 为其它 `kTileM` 配置预留的容量。
+
+### 18.8.2 transaction bytes 也只计算 48 个 x-scale
+
+`src/group_gemm/sm90/kernels.cuh:813-814`（函数 `group_gemm_blockwise_fp8_kernel`）定义：
+
+```cpp
+(kTileM + 4) * sizeof(float)
+```
+
+其中 `kTileM=48`，即本次 barrier transaction 计入 48 个 x-scale float 和 4 个 w-scale float，而不是 64 个 x-scale float。这与 `tASs(_, ismem_write, 0)` 的实际使用完全一致。
+
+## 18.9 `_1` 注释为何与日志 `_2` 不一致
+
+`src/group_gemm/sm90/kernels.cuh:703-704`（函数 `group_gemm_blockwise_fp8_kernel`）的注释写的是：
+
+```cpp
+// (TMA, kStage, _1)
+```
+
+这应理解为“预期使用的主要 tile/rest 形态”或旧的简化注释，不是对所有模板实例的精确静态类型声明。当前真实类型由日志打印为：
+
+```text
+((_48,_1),_8,_2):((_1,_0),_64,_48)
+```
+
+在本实现支持的 `kTileM<=64` 范围内，第三 mode 的通式是：
+
+```text
+ceil_div(kTileS, kTileM) = ceil_div(64, kTileM)
+```
+
+例如：
+
+```text
+kTileM=8   -> 8
+kTileM=16  -> 4
+kTileM=32  -> 2
+kTileM=48  -> 2   (本次实例)
+kTileM=64  -> 1
+```
+
+因此只有当前 `kTileM=64` 的实例会打印 `_1`；`kTileM=48` 打印 `_2` 是正常且可由 layout algebra 直接推导的结果。
+
+## 18.10 对问题的直接回答
+
+1. 是的，在本次 `kTileS=64`、`Tiler_MN` 第二维为 `48` 的实例中，第三个 mode 的大小就是 `ceil(64/48)=2`；更准确地说，它是 `zipped_divide` 为 destination shared layout 生成的 rest tile 数。
+2. `sAS` 的 `_8` 不是由 TMA box 计算出来的，而是 `kStage=8` 除以 Tiler 第一维 `_1` 后保留的 stage rest mode。
+3. 最外层 `(_48,_1)` 是 TMA atom 的 48-value fragment 的嵌套表示；它不是第三个 rest mode。
+4. `tASs` 的完整静态 view 可以读成 `((TMA-value), stage, rest)`，即 `((_48,_1),_8,_2)`；但实际 x-scale copy 使用 `tASs(_, ismem_write, 0)`，每次只传第一块 48 个 float，不会自动传第二块。
+5. 第三个 mode 若被错误地选为 `1`，`partition_D` 不会替你做边界保护；当前代码固定为 `0`，并且 MMA/transaction bytes 也都只依赖这 48 个有效 x-scale。

@@ -451,3 +451,22 @@ group_gemm_blockwise_fp8_entry 调用:
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把问题的答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面, 对于多级标题，以 1.1,1.2, 2.1,2.2,..., 的形式编号
 
 }
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+tests/test_group_gemm_blockwise_like.py 的日志位于 temp/block.log
+
+auto tASs = btma_as.partition_D(sAS); 的结果是:auto tASs = btma_as.partition_D(sAS);
+ // (TMA, kStage, _1)
+smem_ptr[32b](0x7fef0002f480) o ((_48,_1),_8,_2):((_1,_0),_64,_48)
+shape 的外层有3个 mode: (48,1), 8, 2, 第3个 mode为什么是2? 是因为ceil(64/48)=2吗？
+sAS的shape:(_8,_64)
+auto btma_as = tma_as.get_slice(0)的Tiler_MN:       (_1,_48)
+所以tASs在 TMA 之外的shape= (8/1, ceil(64/48)) =(8,2), 加上TMA ，tASs整体shape就变成((_48,_1),_8,_2)?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把问题的答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面, 对于多级标题，以 1.1,1.2, 2.1,2.2,..., 的形式编号
+
+}

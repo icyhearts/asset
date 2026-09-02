@@ -3837,3 +3837,58 @@ simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py
 这个命令的功能是什么？
 把答案追加到 like-useful/answer_codex_v3.md
 }
+
+
+{
+
+ sglang_sipu 代码位于 /share/users/like/package/sglang_sipu, 这是一个在开源 sglang 上做的 sipu 版本的 sglang.
+ sglang_sipu code base  docs-sipu/get-started.md 2a. Run CUDA 部分
+ bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml \
+  --launch-config deepep_deepgemm_text \
+  --test-case text-only \
+  --device cuda
+
+test/srt/sipu/configs/deepseek/ds_v32_2layer.yaml base_gpu_id: 2 会影响 可见 gpu吗 ？  test_utils/run_test.sh cuda 容器内可见GPU到底如何控制 ？
+把答案追加到 like-useful/answer_codex_v3.md
+}
+
+
+{
+
+本次 sglang升级，从 main-local-dep 分支升级到  release/v0.5.18-local-dep 分支，有很多接口发生了变化，有些class被删除，有些文件被删除.
+
+/share/users/like/opt/nginx_install/html/bjh-html/sglangNotes/images/callGraph.dot 记录了 sglang 的一些调用关系,不过这是旧版本的 sglang.
+
+ MHATokenToKVPool::__init__ 的上层调用链已经发生变化:
+ 我从pudb中得知， 新的 MHATokenToKVPool 调用栈:
+__init__ [MHATokenToKVPool] memory_pool.py:1787
+_build_mha_kv_pool [KVCacheConfigurator] kv_cache_configurator.py:1586
+_build_token_to_kv_pool [KVCacheConfigurator] kv_cache_configurator.py:1056
+_init_pools [KVCacheConfigurator] kv_cache_configurator.py:504
+configure [KVCacheConfigurator] kv_cache_configurator.py:288
+alloc_memory_pool [ModelRunner] model_runner.py:805
+alloc_memory_pool [TpModelWorker] tp_worker.py:403
+init_target_memory_pool [Scheduler] scheduler.py:964
+init_memory_pools [Scheduler] scheduler.py:968
+init_model_worker [Scheduler] scheduler.py:1002
+__init__ [Scheduler] scheduler.py:518
+run_scheduler_process scheduler.py:5048
+run [Process] process.py:108
+_bootstrap [Process] process.py:314
+_main spawn.py:135
+spawn_main spawn.py:122
+<module> <string>:1
+根据这个调用栈和 release/v0.5.18-local-dep  分支的代码，对 /share/users/like/opt/nginx_install/html/bjh-html/sglangNotes/images/callGraph.dot 进行修改，让它和新的代码保持一致。
+dot 文件里面，node的 label风格 和 def ModelRunner::__init__ 这个节点保持一致:
+
+# 对于成员函数以 class_name::function_name的方式标注
+# 把函数原型 copy 到 node label
+# 如果一个 node 有下游 node, 在 label 里面把本node 函数 调用下游 node 的语句，从 代码库 copy到 label，比如原来的 ModelRunner::__init_ 调用了ModelRunner::initialize, ModelRunner::__init_ 的 label里面有一句self.initialize(min_per_gpu_memory)
+# label 里面标明本 node 代码位于 code base 的相对路径,比如 python/sglang/srt/model_executor/model_runner.py
+# label每行文本 通过在末尾加 \l\ 保持：1.左对齐，2. 换行
+修改结束，使用 /softhome/like/bash-bin//bin/rundot-sglang.sh 编译出 svg 文件
+
+
+
+}

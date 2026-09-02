@@ -587,3 +587,260 @@ bash test_utils/run_test.sh \
 
 如果共享目录中已经有同一模型/launch/case 的 CUDA baseline，可以跳过本步骤，直接
 生成 SIPU dump，并把 `--dump-base` 指向包含该 baseline 的用户目录。
+
+## 4. `base_gpu_id` 与 `run_test.sh` CUDA 容器可见 GPU 的关系
+
+### 4.1 直接结论
+
+`test/srt/sipu/configs/deepseek/ds_v32_2layer.yaml` 中的
+`base_gpu_id: 2` **不会控制 Docker 容器暴露哪些 GPU**。它是在容器已经启动后、
+SGLang 创建 scheduler 子进程的启动阶段使用的 GPU 起始编号，用来决定 SGLang 在
+“当前进程可见的 CUDA 设备编号空间”中绑定哪张卡。
+
+当前 `run_test.sh` 的 GPU 选择分成两层：
+
+```text
+远端物理 GPU 选择/注入：CUDA_GPUS -> NVIDIA_VISIBLE_DEVICES（Docker/NVIDIA runtime）
+应用内逻辑 GPU 选择：base_gpu_id、gpu_id_step、tp_size、pp_size（SGLang）
+进程内再次屏蔽/重排：CUDA_VISIBLE_DEVICES（如果被设置）
+```
+
+所以：
+
+* 改 `base_gpu_id` 不会把 GPU 2 注入容器，也不会改变 `nvidia-smi` 能看到的设备。
+* 选定“主机物理 GPU 2”应在 Docker 层设置 `CUDA_GPUS=2`，并使用明确的
+  `--gpus '"device=2"'`（或等价 CDI 请求）；不能只把 `base_gpu_id` 写成 2。
+* 如果运行时只注入主机 GPU 2，它在只有这一张卡的容器进程中通常会重新编号为
+  逻辑 `cuda:0`，这时 SGLang 应使用 `base_gpu_id: 0`。
+* `base_gpu_id: 2` 只有在 SGLang 进程最终确实看到了至少三个逻辑设备，并且确实
+  想绑定第三个逻辑设备时才合理。
+
+NVIDIA 官方文档把 `NVIDIA_VISIBLE_DEVICES` 定义为容器 GPU enumeration/access
+控制项；Docker 的 `--gpus` 也可以指定 GPU。另一个层面的 CUDA
+`CUDA_VISIBLE_DEVICES` 则控制应用看到的设备及其枚举顺序：[NVIDIA Container
+Toolkit GPU Enumeration](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html)、
+[CUDA `CUDA_VISIBLE_DEVICES` 文档](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html)。
+
+### 4.2 当前脚本到底怎样设置可见 GPU
+
+`run_test.sh` 的关键代码是：
+
+```bash
+CUDA_GPU="${CUDA_GPU:-0}"
+CUDA_GPUS="${CUDA_GPUS:-${CUDA_GPU}}"
+```
+
+以及远端 Docker 命令：
+
+```bash
+docker run --rm \
+  --gpus all \
+  -e NVIDIA_VISIBLE_DEVICES="${CUDA_GPUS}" \
+  ...
+```
+
+因此默认值为：
+
+```text
+CUDA_GPU=0
+CUDA_GPUS=0
+NVIDIA_VISIBLE_DEVICES=0
+```
+
+这意味着脚本**想要**只让远端主机的物理 GPU 0 进入 CUDA 容器。实际选择设备的
+变量是 `CUDA_GPUS`，不是始终是 `CUDA_GPU`：如果用户预先设置了
+`CUDA_GPUS=2,3`，脚本会使用 `2,3`；此时 `CUDA_GPU` 主要还影响默认容器名中的
+`gpu<编号>` 字样。
+
+脚本第 41 行的注释写着“`--gpus device=N`”，但当前实际第 228 行写的是
+`--gpus all`，第 230 行才通过 `NVIDIA_VISIBLE_DEVICES` 传入选择列表。这两套
+机制同时出现会产生歧义：按标准 NVIDIA Container Toolkit 语义，
+`NVIDIA_VISIBLE_DEVICES` 是设备 enumeration 选择器，而 `--gpus all` 是 Docker
+GPU resource request；当两者冲突时，最终结果取决于 Docker/NVIDIA runtime 的
+版本和 legacy/CDI 模式。不能只看 `--gpus all` 就断定容器一定只看到一张卡，也
+不能只看环境变量就跳过实测。
+
+若希望设备选择在 Docker 层完全明确，建议二选一：
+
+```bash
+# 方案 A：保留当前脚本的写法（只有在远端 runtime 已验证时才使用）
+docker run --rm --gpus all \
+  -e NVIDIA_VISIBLE_DEVICES=2,3 \
+  ...
+
+# 方案 B：使用 Docker device request（推荐；去掉 NVIDIA_VISIBLE_DEVICES）
+docker run --rm --gpus '"device=2,3"' \
+  ...
+```
+
+不要把 `--gpus all` 和另一个互相矛盾的 `--gpus '"device=..."'` 同时传入。若
+使用 UUID（例如 `GPU-...`）而不是主机 index，设备选择对主机 GPU 排序变化更稳定；
+无论使用 index 还是 UUID，SGLang 的 `base_gpu_id` 仍应按容器内的逻辑 ordinal
+设置。对于本仓库当前脚本，若需要可靠隔离，建议把 `run_cuda` 的 Docker 参数改为
+`--gpus '"device=${CUDA_GPUS}"'`，并删除（或保证完全一致地设置）
+`-e NVIDIA_VISIBLE_DEVICES=...`；这比同时使用 `--gpus all` 和环境变量更可预测。
+
+在当前工作节点的 Docker 29.6.2 + NVIDIA Container Toolkit 1.19.1 环境中，用同系列
+CUDA 13.0 SGLang runtime 镜像做过一次临时 probe：`--gpus all
+-e NVIDIA_VISIBLE_DEVICES=0` 仍列出了全部 8 张卡，而
+`--gpus '"device=0"'` 只列出 1 张卡。这个结果说明当前脚本的环境变量不能被当成
+跨 runtime 的唯一隔离机制；远端 `10.96.11.15` 仍应在实际运行前自行 probe，不能把
+本机 runtime 的结果直接假定为远端结果。
+
+### 4.3 `base_gpu_id` 在 SGLang 内部的实际路径
+
+这条命令中，`run_test_job.py` 会把所选 CUDA block 复制成 `sgl.Engine` 参数，
+所以 YAML 的 `base_gpu_id` 会进入 `ServerArgs`，但 `run_test.sh` 本身不会读取或
+改写它。
+
+在当前 SGLang source 中，普通 scheduler 路径大致是：
+
+```python
+gpu_id = (
+    server_args.base_gpu_id
+    + pp_offset
+    + tp_offset * server_args.gpu_id_step
+)
+with maybe_reindex_device_id(gpu_id) as gpu_id:
+    start_scheduler_process(..., gpu_id=gpu_id)
+```
+
+对应源码位置是 `python/sglang/srt/entrypoints/engine.py:892-924`。随后
+`ModelRunner` 保存这个 `gpu_id`，并在初始化时调用：
+
+```python
+torch.get_device_module(self.device).set_device(ps.gpu_id)
+```
+
+见 `python/sglang/srt/model_executor/model_runner.py:387-397`。因此
+`base_gpu_id` 本质上是 SGLang 传给 `torch.set_device` 的起始 **逻辑 ordinal**，
+不是 NVIDIA runtime 的 host-physical selector。
+
+默认情况下 `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` 在
+`python/sglang/srt/environ.py:627` 是 `false`，`maybe_reindex_device_id` 不会
+自动把这个编号转换成另一张物理卡；`ParallelState` 也会使用传入的 local rank
+（`python/sglang/srt/distributed/parallel_state.py:319-323`）。只有显式打开
+`SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=true` 时，SGLang 才会按已有的
+`CUDA_VISIBLE_DEVICES` 列表为子进程做额外重映射（`python/sglang/srt/utils/common.py:1207-1230`）。
+这不是当前 `run_test.sh` 的默认行为，不应拿它作为修复 `base_gpu_id` 配置的替代品。
+
+### 4.4 物理编号与逻辑编号的例子
+
+假设远端主机物理 GPU 编号为 `0,1,2,3`，且没有额外的应用级
+`CUDA_VISIBLE_DEVICES`：
+
+| `CUDA_GPUS` / `NVIDIA_VISIBLE_DEVICES` | 容器实际注入的主机卡 | 进程通常看到的逻辑序号 | 合适的 `base_gpu_id` |
+| --- | --- | --- | --- |
+| `0` | 物理卡 0 | `cuda:0` | `0` |
+| `2` | 物理卡 2 | `cuda:0`（单卡被重新枚举） | `0` |
+| `2,3` | 物理卡 2、3 | `cuda:0 -> 2`，`cuda:1 -> 3` | `0`；TP=2 时再设 `tp_size: 2` |
+| `0,1,2` | 物理卡 0、1、2 | `cuda:0`、`cuda:1`、`cuda:2` | `2` 表示第三张可见逻辑卡 |
+| `all` | 全部物理卡 | 通常为 `cuda:0 ... cuda:N-1` | 按实际并行布局决定 |
+
+表中的“通常”是因为 MIG、UUID、容器 runtime mode 和应用级
+`CUDA_VISIBLE_DEVICES` 都可能改变枚举细节；最终应以容器内
+`torch.cuda.device_count()` 和 UUID/PCI bus 检查为准。关键点不变：
+`NVIDIA_VISIBLE_DEVICES=2` 选择的是主机物理卡 2，而不等价于让应用拥有一个
+名为 `cuda:2` 的逻辑设备。
+
+### 4.5 当前 `ds_v32_2layer.yaml` 的风险与推荐配置
+
+当前 YAML 的 CUDA block 是：
+
+```yaml
+base_gpu_id: 2
+```
+
+而脚本默认是 `CUDA_GPUS=0`。在标准单卡可见场景中，进程只有逻辑 `cuda:0`，
+SGLang 可能执行 `set_device(2)` 并得到 `invalid device ordinal`；即使某个 runtime
+配置让所有 GPU 意外可见，也可能把测试跑到并非预期的第三张卡上。
+
+如果目标是只使用远端物理 GPU 2，推荐：
+
+```text
+CUDA_GPU=2
+CUDA_GPUS=2
+YAML base_gpu_id=0
+```
+
+例如先复制一份 CUDA 测试 YAML，将 CUDA block 的 `base_gpu_id` 改为 `0`，再运行：
+
+```bash
+cd /share/users/like/package/sglang_sipu/test/srt/sipu
+export CUDA_GPU=2
+export CUDA_GPUS=2
+export ACCURACY_CUDA_HOST="${USER}@10.96.11.15"
+
+bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer_cuda_gpu2.yaml \
+  --launch-config deepep_deepgemm_text \
+  --test-case text-only \
+  --device cuda
+```
+
+如果目标是让 TP=2 使用远端物理 GPU 2、3，则应使用：
+
+```text
+CUDA_GPUS=2,3
+YAML base_gpu_id=0
+YAML tp_size=2
+YAML gpu_id_step=1（默认值通常就是 1）
+```
+
+这里 `base_gpu_id=0` 表示第一张**容器逻辑卡**，不是主机物理卡 0。
+仅设置 `CUDA_GPUS=2,3` 而不设置 `tp_size=2`，只会让两张卡可见，不保证 SGLang
+真的启动两个 TP worker；“可见”与“被并行布局使用”是两个独立条件。
+
+### 4.6 如何在远端确认最终可见 GPU
+
+不要用 YAML 的 `base_gpu_id` 推测容器可见性，建议用与 `run_test.sh` 相同的镜像和
+环境做一次轻量 probe。下面命令只打印设备信息，不加载模型：
+
+```bash
+export ACCURACY_CUDA_HOST="${USER}@10.96.11.15"
+export CUDA_GPUS=2,3
+
+ssh "${ACCURACY_CUDA_HOST}" \
+  "docker run --rm --gpus all \
+     -e NVIDIA_VISIBLE_DEVICES='${CUDA_GPUS}' \
+     lmsysorg/sglang:v0.5.18-cu130 \
+     nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv,noheader"
+
+ssh "${ACCURACY_CUDA_HOST}" \
+  "docker run --rm --gpus all \
+     -e NVIDIA_VISIBLE_DEVICES='${CUDA_GPUS}' \
+     lmsysorg/sglang:v0.5.18-cu130 \
+     python3 -c 'import os,torch; \
+print(\"NVIDIA_VISIBLE_DEVICES=\", os.getenv(\"NVIDIA_VISIBLE_DEVICES\")); \
+print(\"CUDA_VISIBLE_DEVICES=\", os.getenv(\"CUDA_VISIBLE_DEVICES\")); \
+print(\"torch.cuda.device_count=\", torch.cuda.device_count()); \
+[print(i, torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())]'"
+```
+
+应同时检查：
+
+* `NVIDIA_VISIBLE_DEVICES` 的值是否是期望的 `CUDA_GPUS`；
+* `nvidia-smi` 输出的 UUID/PCI bus 是否对应主机目标卡（不要只比较容器内的 index）；
+* `torch.cuda.device_count()` 是否等于预期可见卡数；
+* 对 `CUDA_GPUS=2` 的单卡测试，`torch.cuda.device_count()` 是否为 1，此时
+  SGLang 的 `base_gpu_id` 应为 0。
+
+实际 SGLang 作业的日志也应搜索 `gpu_id`、`CUDA_VISIBLE_DEVICES`、`tp_rank` 和
+`tp_size`。如果 `device_count=1` 但配置仍是 `base_gpu_id=2`，应在启动前修正
+YAML，而不是继续调大 Docker 的 `--gpus` 参数。
+
+### 4.7 最终判定
+
+对本问题可以归纳为：
+
+```text
+base_gpu_id       = SGLang 进程选择哪个逻辑 ordinal
+CUDA_GPUS         = run_test.sh 传给 NVIDIA runtime 的选择列表
+NVIDIA_VISIBLE_DEVICES = 容器层允许/注入哪些主机 GPU
+CUDA_VISIBLE_DEVICES   = 应用层进一步屏蔽或重排逻辑 ordinal
+```
+
+因此，当前示例的 `base_gpu_id: 2` 不会影响“容器是否看得到 GPU”；它只会影响
+SGLang 在容器已经可见的逻辑设备中尝试绑定哪一个。脚本默认选择 `CUDA_GPUS=0`，
+所以最稳妥的单卡 CUDA baseline 配置是把 `base_gpu_id` 改成 `0`；若要选择主机
+物理 GPU 2，则设置 `CUDA_GPU/ CUDA_GPUS=2`，同时仍保持 `base_gpu_id=0`。
