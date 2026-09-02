@@ -9195,3 +9195,124 @@ NaN bits 0x7f800001 -> code 0x0c -> +1.5
 所以结论是：`inf` 在这段转换里饱和到最大有限值 `±7.5`；`nan` 没有稳定的语义保证，会由 NaN payload 经过 normal 分支变成某个有限 E2M3 数。并且因为 MXFP6 E2M3 本身没有 NaN/Inf 专用编码，后面的 upcast kernel 也只会把这些 6-bit pattern 解释成有限数。
 
 还有一个上下文 caveat：上面的 NaN/Inf 讨论是针对 439~488 行看到的 `quant_tensor` 元素而言。如果原始输入 tensor 里已经有 NaN/Inf，它还会先参与 263~378 行的 block `max_val` 和 scale 计算；NaN 可能让一个 block 的 scale 也变成 NaN，Inf 也可能通过 scale 计算改变后续 `quant_tensor` 的值。因此端到端行为还要看前面的 observer/scale 分支。但只看 439~488 行这个“fp32 quant_tensor 到 FP6 E2M3 code”的局部转换，规则就是上面这些。
+
+## 2026-08-31：si-infer `test_per_token_group_fp8_quant.py` 失败原因与成功运行方式
+
+### 1. 原始失败发生在 pytest collection
+
+用户提供的日志 `/share_data/users/like/package/si-infer/temp/unit-test.log` 显示：
+
+```text
+rootdir: /share_data/users/like/package/si-infer
+configfile: pyproject.toml
+collected 115 items
+...
+ModuleNotFoundError: No module named 'siinfer._C'
+RuntimeError: SiPU operator tests require torch_sipu, a built siinfer._C extension,
+and an available SiPU runtime
+no tests ran
+```
+
+这不是 conda 中没有安装 `siinfer` wheel。当前 wheel 实际包含：
+
+```text
+/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/siinfer/
+    _C.cpython-310-x86_64-linux-gnu.so
+    libs/libsiinfer_kernels.so
+```
+
+真正的问题是源码目录遮蔽了 wheel。源码 checkout 中的
+`/share_data/users/like/package/si-infer/siinfer/` 只有 Python 文件，没有 `_C.so`；而
+`pyproject.toml:21-23` 配置了：
+
+```toml
+[tool.pytest.ini_options]
+pythonpath = ["."]
+```
+
+pytest 识别该项目后会把源码根目录放到 `sys.path` 前面，因此 `import siinfer` 解析为源码目录，
+随后 `tests/common_test_utils.py:22` 执行 `importlib.import_module("siinfer._C")` 时找不到子模块。
+`tests/conftest.py:7-11` 的 collection hook 会在发现 `sipu` 标记后立即调用这个检查，所以虽然
+显示 `collected 115 items`，测试体一个都没有运行。
+
+### 2. 运行库还需要 SDK、cmodel 和 conda lib
+
+仅执行 `/share_data/sicx_sdk/release/2608121443/sipu_sdk_setup.sh` 还不够：
+
+- `torch_sipu` 需要 SIPU SDK 的 `libsipu.so`/`libsipurt.so`；
+- 测试调用 `torch.empty(1, device="sipu")`，需要 1.5 cmodel 的
+  `libarchmodel.so` 和 `SI_CMODEL_ROOT`；
+- `torch_sipu/lib/libtorch_sipu.so` 需要 conda 环境提供的 GCC 运行库。若没有把
+  `$CONDA_PREFIX/lib` 放在 `LD_LIBRARY_PATH` 前面，动态链接器可能先取系统
+  `/lib/x86_64-linux-gnu/libgcc_s.so.1`，实测会报：
+
+  ```text
+  version `GCC_13.0.0' not found
+  (required by .../site-packages/torch_sipu/lib/libtorch_sipu.so)
+  ```
+
+SDK 下的 `sipu1.5_cmodel` 是指向当前 cmodel 的链接（本机解析到
+`/share_data/arch_cmodel_release/sipu1.5/2608120400`）。`nvcc` 在这个测试中不是触发点：已安装
+wheel 已包含 `siinfer._C` 和 `libsiinfer_kernels.so`，测试使用的是 CPU PyTorch + SIPU backend/cmodel，
+不会重新编译 CUDA 源码。
+
+### 3. 可成功运行的命令
+
+下面的命令直接使用用户指定的 SDK setup 脚本，并显式加载 cmodel。关键是从
+`si-infer` 的父目录启动，且覆盖项目的 `pythonpath=["."]`：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+
+# nvcc 对本测试不是必需的；保留此行可使环境与用户的 CUDA 配置一致。
+export PATH=/share_data/users/like/opt/cuda-13.0/bin:$PATH
+
+source /share_data/sicx_sdk/release/2608121443/sipu_sdk_setup.sh
+source /share_data/sicx_sdk/release/2608121443/sipu1.5_cmodel/sipu_cmodel_setup.sh
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+
+# 不要在 si-infer 源码根目录启动；否则源码 siinfer/ 会遮蔽 wheel。
+cd /softhome/like/package
+python -m pytest -q --import-mode=importlib \
+  -o pythonpath=/softhome/like/package/si-infer/tests \
+  /softhome/like/package/si-infer/tests/test_per_token_group_fp8_quant.py
+```
+
+`/softhome/like/package` 与 `/share_data/users/like/package` 是同一份目录的链接。使用
+`-o pythonpath=.../tests` 是为了让 `tests.common_test_utils` 仍然可导入，同时不再把源码根目录
+作为 `siinfer` 的优先路径；`--import-mode=importlib` 避免 pytest 再把测试目录插到模块搜索路径前面。
+
+如果希望由仓库脚本处理 cmodel 和 conda 库路径，也可以把上面的两条 setup 命令替换为：
+
+```bash
+source /softhome/like/package/si-infer/scripts/sipu_sdk_env.sh \
+  /share_data/sicx_sdk/release/2608121443
+```
+
+该包装脚本内部会 source SDK setup、解析 1.5 cmodel，并把 `$CONDA_PREFIX/lib` 放到
+`LD_LIBRARY_PATH` 首位；pytest 命令仍需从父目录运行并保留 `-o pythonpath=.../tests`。
+
+### 4. 验证结果
+
+在上述环境和命令下，导入路径为：
+
+```text
+torch          2.10.0+cpu
+torch_sipu     0.7.0+sdk260801
+siinfer        .../envs/vllm_dev/lib/python3.10/site-packages/siinfer/__init__.py
+siinfer._C     .../envs/vllm_dev/lib/python3.10/site-packages/siinfer/_C.cpython-310-x86_64-linux-gnu.so
+torch.sipu.is_available() = True
+torch.empty(1, device="sipu").device = sipu:0
+```
+
+完整测试输出为：
+
+```text
+........................................................................ [ 62%]
+...........................................                              [100%]
+115 passed in 61.76s (0:01:01)
+```
+
+因此，成功运行的必要条件是“加载匹配的 SiPU runtime + 使用 conda 中的 native wheel + 避免
+源码 `siinfer/` 遮蔽 wheel”，不需要修改 si-infer 源码、simo 源码或 conda 中任何已安装包。

@@ -15733,3 +15733,852 @@ UnsupportedLanguageConstruct: ... unsupported AST node type: Raise
    公式替换占位 `raise`，并补充 CUDA 与 Torch 参考结果的逐模式测试；这是保留 GPU 路径的实现方向。
 
 在用户要求“先不修复”的阶段，没有选择或应用上述任一修改。
+
+## 108. `tests/separate.py` 中 `torch._dynamo hit config.recompile_limit (8)` 的原因（2026-08-28）
+
+本节只记录原因，未修改 simo 源码、测试文件或 conda 环境。
+
+### 108.1 实际执行链
+
+使用用户指定的 `simo_sglang` 环境运行 `python3 tests/separate.py`。环境中的版本为
+`torch 2.11.0+cu130`、`triton 3.6.0`，Dynamo 配置为：
+
+```text
+torch._dynamo.config.recompile_limit = 8
+torch._dynamo.config.cache_size_limit = 8   # 该字段是同一个配置的别名
+torch._dynamo.config.accumulated_recompile_limit = 256
+```
+
+`tests/separate.py:50-55` 固定 `MXFP8_E4M3`，先后使用 `torch.bfloat16` 和 `torch.float32` 两种
+输入 dtype；每种 dtype 又依次传入 9 个 `ScaleModeEnum`。每次调用
+`tests/separate.py:46` 的 `downcast_to_mxfmt_cpu_impl`，其内部在
+`simo/ops/mx_api.py:307-314` 调用 `simo/ops/formats/mx/quant.py:278` 的
+`_downcast_to_mxfmt_torch`。后者带有：
+
+```python
+@torch.compile(fullgraph=False)
+def _downcast_to_mxfmt_torch(...):
+```
+
+所以虽然量化输入是 CPU tensor，仍然会进入 TorchDynamo 的编译和 guard 检查；这条日志不是
+`nvcc` 或 GPU kernel 的报错。
+
+### 108.2 直接触发 guard 的代码
+
+`_downcast_to_mxfmt_torch` 在 `quant.py:292-296` 对 Python 枚举对象做分支：
+
+```python
+if quant_scale_rounding_mode in (
+    ScaleModeEnum.E8M0_GLOBAL_AMAX,
+    ScaleModeEnum.E4M3_GLOBAL_AMAX,
+    ScaleModeEnum.E5M3_GLOBAL_AMAX,
+):
+    global_amax_bw = torch.abs(x_bw).max()
+```
+
+`quant_scale_rounding_mode` 不是 Tensor，而是控制 Python 控制流的 `ScaleModeEnum` 对象。Dynamo
+为了保证已经生成的图仍对应同一条分支，会对它生成对象身份 guard，而不是把 9 个枚举值当成一个
+可动态变化的 Tensor 值。`TORCH_LOGS=recompiles` 的实际记录反复显示：
+
+```text
+___check_obj_id(quant_scale_rounding_mode, ...), type=<ScaleModeEnum....>
+... quant.py:292 in _downcast_to_mxfmt_torch
+```
+
+日志中的对象 id 分别对应 `FLOOR`、`SIPU`、`RCEIL`、`EVEN`、`GLOBAL_AMAX`、`E4M3`、
+`E4M3_GLOBAL_AMAX`、`E5M3` 等不同枚举成员。枚举成员虽然各自是稳定的 singleton，但不同成员的
+身份不同；每换一个成员，之前的图的 identity guard 就失败，Dynamo 为同一个 Python code object
+再生成一个缓存变体。
+
+该脚本的第一个 `FLOOR` 调用建立初始图，之后不同 mode 逐个增加变体。尝试最后一个
+`E5M3_GLOBAL_AMAX` 时，外层 frame 已有 8 个同组缓存条目，日志显示为 `[0/8]`，并把上一个
+`E5M3` guard 记作 `last reason`：
+
+```text
+torch._dynamo hit config.recompile_limit (8)
+function: '_downcast_to_mxfmt_torch' (.../quant.py:278)
+last reason: ... type=<ScaleModeEnum.E5M3: 9>
+```
+
+这里的 `last reason` 是导致“还想再编译一个变体”的最后一个失效 guard，不表示
+`E5M3_GLOBAL_AMAX` 被错误地识别成 `E5M3`。
+
+### 108.3 `recompile_limit (8)` 的含义和后果
+
+`recompile_limit` 是**同一个 code object、同一组 ID_MATCH 对象**允许保留的编译缓存变体上限，
+不是测试用例数量，也不是 CUDA kernel 数量。默认值 8 是 TorchDynamo 为避免 Python 参数不断变化
+导致无限重编译和编译开销失控设置的保护阈值。
+
+当前环境 `fail_on_recompile_limit_hit=False`，且函数使用 `fullgraph=False`。达到上限后，Dynamo
+记录 warning，并将该 frame 的执行策略切换为 `RUN_ONLY`，后续不再为新的 mode 缓存图，而是走
+eager Python 执行。因此日志仍能打印完 18 组 dtype/mode，命令本身可以正常结束；这条提示主要
+意味着该函数后续失去编译加速，不代表量化结果已经错误。若开启 `fullgraph=True` 或
+`fail_on_recompile_limit_hit=True`，同类情况才可能升级为硬失败。
+
+### 108.4 日志中另外两类信息不是主因
+
+1. 切换 `bfloat16` 到 `float32` 时，日志还出现
+   `tensor '___stack0' dtype mismatch. expected BFloat16, actual Float`。这是函数在
+   `quant.py:325` 之后的 Dynamo resume frame 对中间 scale tensor dtype 的 guard 失效，属于另一个
+   dtype 专用图；它不是 `[0/8]` 外层 frame 达到上限的直接原因。
+2. `scale.py:175` 的 warning 是 Dynamo 发现 `simo._get_native_ops`（`simo/__init__.py:7-12`
+   的 `@cache`，底层为 `lru_cache`）并绕过 cache wrapper 直接追踪。它是 tracing 兼容性提示，
+   不会导致 `recompile_limit`；主 warning 的 stack/guard 已明确指向 `quant.py:292` 的
+   `ScaleModeEnum` identity。
+
+### 108.5 结论
+
+本次 `hit config.recompile_limit (8)` 的根因是：测试在一个带 `@torch.compile` 的函数上连续传入
+9 个不同的 Python `ScaleModeEnum`，函数内部又用这些对象决定 Python 分支，Dynamo 为每个对象身份
+专门化并不断重编译，最终达到默认 8 个缓存变体上限。它与 `nvcc` 版本、SIPU SDK、Triton
+RCEIL kernel 是否实现无关；本次脚本明确调用的是 CPU Torch implementation。可选的后续方向包括
+按 mode 拆分稳定的编译入口、对该参考函数跳过 `torch.compile`，或在确认编译成本可接受后调整
+recompile 上限；本轮没有实施这些修改。
+
+## 109. deepseek-v4-flash 启动失败：FlashInfer 的 cubin 版本不一致（2026-09-01）
+
+本节针对用户给出的安装和启动日志，记录根因和可直接执行的修复方法。本轮只追加了本文档，
+没有直接修改 conda 环境或启动脚本。
+
+### 109.1 结论
+
+启动失败的首个致命原因是 `flashinfer-python` 与独立的 `flashinfer-cubin` 版本不一致：
+
+```text
+flashinfer-python  : 0.6.17
+flashinfer-cubin   : 0.6.12
+```
+
+运行日志 `temp/sgl.dsv4-flash.log.2026_09_01___15_40_59` 的两次 traceback 都在
+`flashinfer/jit/env.py:_get_cubin_dir()` 抛出同一个异常（日志第 37-39、107-109 行）：
+
+```text
+RuntimeError: flashinfer-cubin version (0.6.12) does not match
+flashinfer version (0.6.17). Please install the same version of both packages.
+```
+
+调用链是：
+
+```text
+sgl_kernel -> flashinfer.norm -> flashinfer.jit -> _get_cubin_dir()
+          -> RuntimeError (0.6.12 != 0.6.17)
+```
+
+因此进程在解析 `ModelConfig`、加载模型权重之前就退出了；这不是 DeepSeek-V4 权重、TP=4
+或 EAGLE 参数导致的错误。
+
+### 109.2 为什么 editable 安装后留下了错误版本
+
+安装日志的实际位置是源码仓库下的
+`/share/users/like/package/sglang_kernel_src/temp/pip-sglang-log.main-local-dep.txt.2026_09_01___15_15_16`，
+因为 `install-sglang.sh` 使用相对路径 `LOG=temp/...`。
+
+证据如下：
+
+1. `python/pyproject.toml:36` 只声明了
+   `flashinfer_python[cu13]==0.6.17`，没有把 `flashinfer-cubin` 声明为 pip 依赖。
+2. 安装日志末尾的 `Successfully installed`（约第 19905 行）包含
+   `flashinfer_python-0.6.17`，但不包含 `flashinfer-cubin`。
+3. 同一日志只卸载了旧的 `flashinfer-python 0.6.12`（约第 19874-19889 行）；旧的
+   `flashinfer-cubin 0.6.12` 因为是独立包而被保留下来。
+4. 当前环境的 `pip check` 仍会报告 `No broken requirements found`，这是预期的：pip 的依赖
+   图里没有“两个独立包必须同版本”的约束，版本一致性由 FlashInfer 在 import 时主动检查。
+
+`sglang` 本身仍是正确的 editable 安装（`direct_url.json` 指向
+`/share/users/like/package/sglang_kernel_src/python`），不需要改成非 editable 安装。
+
+### 109.3 最小且推荐的修复
+
+只需把 `flashinfer-cubin` 换成与源码 pin 一致的 0.6.17。使用环境内的 Python 绝对路径可以
+避免误用系统 pip：
+
+```bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang/bin/python
+
+"$PY" -m pip install \
+  --index-url https://flashinfer.ai/whl \
+  --no-deps --force-reinstall \
+  "flashinfer-cubin==0.6.17"
+```
+
+这里必须使用 FlashInfer 官方 wheel index；当前使用的清华 PyPI 镜像没有可用的 0.6.17 cubin
+候选（可能只列到更旧版本）。`flashinfer-cubin` 没有需要解析的 Python 依赖，`--no-deps` 可以
+避免这次修复顺带改动已经能工作的 Torch、CUDA 或 SGLang 依赖。该 wheel 当前约 1.06 GB，
+请预留足够磁盘空间和下载时间。
+
+安装后先只检查 metadata（不触发 CUDA import）：
+
+```bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang/bin/python
+
+"$PY" - <<'PY'
+from importlib.metadata import version
+
+for name in ("flashinfer-python", "flashinfer-cubin"):
+    print(f"{name}=={version(name)}")
+
+assert version("flashinfer-python").split("+", 1)[0] == "0.6.17"
+assert version("flashinfer-cubin").split("+", 1)[0] == "0.6.17"
+PY
+```
+
+然后在与启动脚本相同的 CUDA 环境变量下做 import smoke test：
+
+```bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang/bin/python
+source /share/users/like/package/sglang_kernel_src/like-useful/env-build-pip.sh
+"$PY" - <<'PY'
+import flashinfer
+import sgl_kernel
+
+print("flashinfer and sgl_kernel import: OK")
+PY
+```
+
+若这两步通过，再从工作目录重新启动：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/simo_sglang
+cd /share/users/like/package/simo_conda_sglang
+bash like-useful/dsv4-flash-run.sh
+```
+
+启动脚本把服务放到后台，需查看本次新生成的日志，而不是继续查看旧的失败日志：
+
+```bash
+LOG=$(ls -t temp/sgl.dsv4-flash.log.* | head -1)
+tail -f "$LOG"
+```
+
+正常启动应能看到类似 `The server is fired up and ready to roll!` 的 ready 记录；如果仍失败，
+应以新日志中第一个 `Traceback`/`RuntimeError` 为准重新定位。
+
+### 109.4 可选：安装 CUDA 13 的完整 FlashInfer 配套
+
+当前环境没有安装 `flashinfer-jit-cache`，这不是本次异常的原因；仅同步 cubin 已足以通过
+当前的版本检查。如果确实要使用预编译 JIT cache，可以按 CUDA 13.0 的官方 index 安装，并且
+只接受基版本 0.6.17（实际 metadata 可能显示为 `0.6.17+cu130`）：
+
+```bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang/bin/python
+"$PY" -m pip install \
+  --index-url https://flashinfer.ai/whl/cu130 \
+  --no-deps --force-reinstall \
+  "flashinfer-jit-cache==0.6.17+cu130"
+```
+
+源码仓库的 `scripts/ci/cuda/ci_install_dependency.sh:372-408,609-615` 以及
+`docker/kimi_k3/kimi_k3_cu13.Dockerfile` 采用的原则是：
+`flashinfer-python`、`flashinfer-cubin`、`flashinfer-jit-cache` 的基版本都保持 0.6.17，
+只有 jit-cache 带 CUDA 版本后缀。若选择完整三件套，应逐项检查：
+
+```bash
+"$PY" - <<'PY'
+from importlib.metadata import version
+
+for name in ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"):
+    try:
+        print(f"{name}=={version(name)}")
+    except Exception:
+        print(f"{name}: not installed")
+PY
+```
+
+不要为了“配平”而把当前的 `flashinfer-python` 降到 0.6.12；源码明确 pin 0.6.17，降级会把
+问题扩展成一组未知的 SGLang/FlashInfer API 兼容性问题。
+
+### 109.5 不推荐的绕过方式和日志中的非致命信息
+
+可以用下面的变量暂时跳过检查，但它不修复二进制兼容性：
+
+```bash
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+```
+
+只有在需要确认“其余启动链是否可用”时才适合短时诊断；0.6.12 cubin 可能与 0.6.17 Python
+代码使用不同的 kernel/API，正式服务不应依赖这个绕过变量。
+
+当前失败日志中以下信息不是根因：
+
+- `torch.utils._pytree` 的 `KernelPreference`/`ScaleCalculationMode` 是 warning。
+- `--cuda-graph-max-bs` 的弃用提示只是参数迁移提示；可在后续把它改为
+  `--cuda-graph-max-bs-decode 16`，不影响本次 import 失败的诊断。
+- 日志已经显示 H100 的 `compute_capability = 90`、SM90 `common_ops.abi3.so` 成功加载，以及
+  CUDA 13.0 runtime 成功预加载，说明 GPU、`sgl_kernel` 和 CUDA runtime 不是首个故障点。
+
+### 109.6 以后重新安装时的注意事项
+
+`/share/users/like/package/sglang_kernel_src/like-useful/install-sglang.sh:4` 在 pip 命令末尾使用
+`&`，所以脚本会立刻返回，不能把返回时刻当作安装已完成。重新安装后应等待日志出现
+`Successfully installed`，再执行第 109.3 节的 cubin 同步和 import smoke test。
+
+如果要把修复固定到自己的安装流程，应在 editable 安装成功后显式执行第 109.3 节的
+`flashinfer-cubin==0.6.17` 命令，或采用仓库 CI 中同样的“读取 pyproject 版本并同步 cubin”逻辑；
+仅重复 `pip install -e python` 仍可能把已存在的旧 cubin 留在环境中。
+
+## 110. SGLang release/v0.5.18-local-dep 对 Simo KV-cache 量化的迁移审计（2026-09-01）
+
+本节以当前 checkout 的
+/share/users/like/package/sglang_kernel_src（分支
+release/v0.5.18-local-dep）和
+/share/users/like/package/simo_conda_sglang 为准，范围只覆盖 Simo 的 KV-cache
+量化写入、读取、pool 和 attention backend。
+
+### 110.1 结论先行
+
+有四个彼此独立的问题，修复顺序不能混淆。
+
+| 优先级 | 现象/范围 | 结论 |
+| --- | --- | --- |
+| P0 | 15:40 日志最早的 traceback | 先把 flashinfer-python 与 flashinfer-cubin 对齐到 0.6.17；详见第 109 节。这一步与 Simo pool 无关。 |
+| P0 | 修好 FlashInfer 后导入 Simo 插件 | ModelRunnerKVCacheMixin 已被 release 分支删除，当前 init_memory_pool_patch.py:242 必然抛 ModuleNotFoundError。 |
+| P0 | dsv4-flash 脚本 | 该模型走 SGLang 原生 DeepSeekV4TokenToKVPool 和 DeepseekV4AttnBackend，不会走普通 SIMOMHATokenToKVPool/SIMOMLATokenToKVPool。不能用普通 Simo pool 替换 DSV4 pool。 |
+| P1 | 普通 DeepSeek-V2/GQA/MLA | 父类构造参数、量化方法语义、prefix-valid/move、KVWriteLoc 和 backend forward 参数都需要迁移。 |
+| P1 | Simo Triton 文件 | 写 kernel 本身没有引用旧 SGLang kernel，主体可以保留；但 decode 有一个已删除模块的 import，且所有 custom kernel 只支持扁平 3-D NHD。 |
+
+当前环境中做了一个不启动模型的导入检查（临时关闭 FlashInfer 版本检查）：
+
+~~~text
+SIMODeepseekV2AttentionMLA registered
+ModuleNotFoundError: No module named
+'sglang.srt.model_executor.model_runner_kv_cache_mixin'
+~~~
+
+所以第 109 节的版本修复之后，以上 import 是下一个确定的阻塞点。日志中的
+“Failed to execute general plugin”会被 SGLang plugin loader 捕获，主进程可能继续
+启动；这会造成“服务看起来 ready，但 Simo 量化根本没有注册”的静默降级，必须增加
+启动后 pool/backend 类型检查或让插件注册失败即退出。
+这里的“失败即退出”应只针对用户确实请求了 Simo KV quant 的模型（例如
+quantization=simo 且存在 kv_cache_quant_algo）；对没有 Simo 量化配置的
+dsv4-flash，插件应安全 no-op，让原生 DSV4 正常启动。
+
+### 110.2 新旧 KV pool 调用链，以及 DSV4 的边界
+
+main-local-dep 时，Simo patch 依赖的是：
+
+~~~text
+ModelRunnerKVCacheMixin.init_memory_pool()
+  -> 在 model_runner_kv_cache_mixin 模块中临时替换
+     MHATokenToKVPool / MLATokenToKVPool
+~~~
+
+release/v0.5.18-local-dep 的实际链路是：
+
+~~~text
+ModelRunner.alloc_memory_pool()
+  -> ModelRunner.init_kv_cache_configurator()
+  -> KVCacheConfigurator.configure()
+  -> KVCacheConfigurator._init_pools()
+  -> KVCacheConfigurator._build_token_to_kv_pool()
+~~~
+
+相关源码位置大约是 model_runner.py:575、799，kv_cache_configurator.py:276、
+376、948。旧文件已由 git diff 明确标记为删除：
+
+~~~text
+D python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+~~~
+
+新 builder 在 _build_token_to_kv_pool 中先判断 is_dsv4_model（约 969 行），
+直接调用 _build_dsv4_kv_pool（约 1063 行）；之后才是 out-of-tree、Ascend、
+DSA、MLA、hybrid 和普通 MHA。普通分支最终调用 _build_mha_kv_pool 或
+_build_mla_kv_pool。
+
+/data/like/hf-models/deepseek-v4-flash/config.json 的 architecture 是
+DeepseekV4ForCausalLM，compress_ratios 包含 0/4/128，运行日志也实际出现：
+
+~~~text
+Initialize DeepSeekV4TokenToKVPool ...
+Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).
+~~~
+
+该运行脚本本身没有传入 Simo KV quant 配置；ServerArgs 解析出的
+attention_backend 是 dsv4、kv_cache_dtype 是 fp8_e4m3。release 的 DSV4
+参数解析还会强制 dsv4/page_size=256，并对 backend 做 allowlist 检查，因此
+仅在命令行把 attention backend 改成 triton_simo 也不能把 DSV4 切到普通
+Simo pool。
+
+DeepseekV4AttnBackend 的构造函数和模型 forward 还会 assert pool 是
+DeepSeekV4TokenToKVPool。因而：
+
+1. 本次 dsv4-flash 脚本的正确短期目标是修好依赖和插件导入，然后让原生 DSV4
+   路径启动；Simo 普通 MHA/MLA 量化不会自动生效。
+2. 如果产品目标是把 DSV4 的 c0/c4/c128 KV 或 compressor state 也改成
+   mxfp8/mxfp4/mxfp6/mxint8/fp8_per_group/int8_per_group/nvfp4，必须另行移植
+   DeepSeekV4TokenToKVPool 的 SWA、c4、c128、state pool、压缩写入和
+   DeepseekV4AttnBackend 的读取逻辑。把它强行替换为 Simo MHA/MLA 会破坏
+   allocator 和 backend 的类型契约。
+3. patch 应在检测到 is_deepseek_v4(model_config.hf_config) 时明确 bypass（使用
+   upstream）或明确报“不支持”，不能看到某个 layer 有
+   kv_cache_quant_spec 就全局替换 pool。
+
+### 110.3 SIMOMHATokenToKVPool：父类接口和必须修改项
+
+release 的父类构造签名（memory_pool.py:1759）为：
+
+~~~python
+MHATokenToKVPool(
+    size, page_size, dtype, head_num, head_dim, layer_num, device,
+    enable_memory_saver, v_head_dim=None,
+    swa_head_num=None, swa_head_dim=None, swa_v_head_dim=None,
+    start_layer=None, end_layer=None,
+    enable_alt_stream=True, enable_kv_cache_copy=False,
+    kv_cache_layout=None, quant_method=None,
+    post_capture_active=False, allocation_label=None,
+)
+~~~
+
+当前 SIMOMHATokenToKVPool（memory_pool.py:68-92）没有 quant_method 和
+allocation_label；当前 adapter（init_memory_pool_patch.py:55-75）也没有这两个
+参数。因此只要新 configurator 把这些关键字传进来就会 TypeError。建议把
+Simo 自己的构造器和 adapter 都改成显式接收全部 release 参数，并按下面规则处理：
+
+* allocation_label 原样传给 KVCache，便于内存日志、PD 和多 pool 诊断。
+* enable_alt_stream 不能再无条件 del；如果 custom writer 不支持异步 stream，
+  就显式保存为 false 并在 builder 侧传 false。不要让调用者误以为开启成功。
+* enable_kv_cache_copy 在 EAGLE/speculative 路径中通常为 true。当前代码强制
+  false，而父类 move_kv_cache 在 3-D NHD 路径会 assert _kv_copy_config
+  非空（约 2837-2840 行）。必须实现“按字节复制 packed data+scale”的 Simo
+  move，或初始化父类 copy config，或在检测到 speculative 时直接拒绝；不能等到
+  第一次 cache move 才崩溃。
+* kv_cache_layout 只接受 nhd/None。Simo writer 和 reader 使用
+  [slot, head, byte]，不能接受 release 的 HND、vectorized_5d 或 PageMajor pool。
+  page_size 大于 1 只有在 allocator 仍提供扁平 slot id 时才有效，不能因为
+  page_size=256 就把 3-D buffer 当成原生 paged 4-D buffer。
+* post_capture_active、unified memory、DCP、hybrid SWA/Mamba 要在建 pool 前
+  显式拒绝，或者完整实现对应的 location/VA 生命周期。当前 custom kernel 没有
+  这些语义。
+
+release 的 KVCache 基类新增 allocation_label 和 get_kv_cache_quant_method()
+（约 1628-1755 行）；MHA 新增 quant_method、is_quantized_kv_cache、
+_create_quantized_buffers、dequant workspace、get_raw_kv_buffer、
+set_kv_buffer_prefix_valid 等行为。当前 Simo 覆盖 _create_buffers 并把
+store_dtype 设成 uint8，这是合理的存储选择，但还要补齐以下契约：
+
+1. 父类默认 quant_method 是 UnquantizedKVCacheMethod。当前 Simo 没有传
+   quant_method，所以 inherited is_quantized_kv_cache 会返回 false，
+   get_kv_cache_quant_method() 也会把 pool 当成 unquantized。FlashInfer 或
+   其他通用 backend 可能因此直接读取 uint8 作为 BF16/FP8。短期应在 Simo
+   pool 中提供一个明确的 Simo marker（实现 name、dequant/workspace 约定），
+   或覆盖这两个方法并让非 Simo backend 立即报错；长期应实现一个符合
+   KVCacheQuantMethodBase 的 Simo adapter。不能把 native FP4 的 quant_method
+   伪装成 Simo method。
+2. _kv_buffer_descs、data_ptrs、data_strides 必须按照实际的 uint8 K/V 行宽
+   重建。当前代码在 _create_buffers 中重建 descriptor，这一步要继续保留，
+   并用 get_kv_size_bytes()、PD contiguous info 和实际 tensor.nbytes 做一致性
+   断言。
+   如果保留父类的 get_raw_kv_buffer() 入口，应从每个 combined row 正确切出
+   packed view 和 scale view（四个返回 tensor）；否则就让该入口在 Simo pool
+   上明确抛出 unsupported，不能返回父类期待的空 scale buffer。
+3. 当前 get_v_head_dim() 返回 v_combined_head_size（packed+scale 的字节数）。
+   这是 custom backend 为了分配输出而做的 workaround，但 release 的公共语义
+   是逻辑 value head dim。建议拆成 logical_v_head_dim 与 storage_v_head_dim：
+   公共 getter 返回逻辑维度，Simo kernel/backend 明确使用 storage 字段。否则
+   hybrid、通用 attention 或 buffer shape 检查会把字节宽当成模型维度。
+4. 父类新 set_kv_buffer() 接受 k_scale、v_scale、layer_id_override、
+   dcp_kv_mask。Simo MHA 已经有这些形参并拒绝 dcp_kv_mask，这是正确方向；
+   还应检查 loc 的 dtype/range、token 数、K/V head 数和 K/V 各自的 packed/scale
+   宽度，并在不支持的 scale 语义下显式报错。adapter 不能默认用同一个
+   packed_head_size 同时代表 K 和 V，除非逐层验证二者确实相等。
+5. 父类新增 set_kv_buffer_prefix_valid() 会被 prefix cache/speculative
+   路径调用。Simo 没有覆盖它，继承实现会把 BF16/存储 dtype 行直接写入 uint8
+   packed buffer，结果不是合法量化数据。必须写一个按 commit_lens 过滤后调用
+   Simo quantizer 的实现，或在启动时禁用/拒绝该路径。
+
+Simo 的量化方法（quantization.py:1250）目前只是继承旧 BaseKVCacheMethod，
+并向 attention layer 挂 kv_cache_quant_spec、packed_head_size 等属性；release
+的 KVCacheQuantMethodBase（fp4_kv_cache_quant_method.py:110）要求
+create_buffers、quantize_and_store、dequantize_prev_kv、compute_cell_size 等
+完整方法。两者不是同一个接口。可选的迁移方案是：
+
+* 短期：只在 configurator 的普通 MHA/MLA 分支直接构造 Simo pool，传
+  quant_method=None，并由 Simo pool 覆盖 quant 状态、raw buffer 和所有不支持
+  的通用入口。
+* 长期：实现 SimoKVCacheMethodAdapter(KVCacheQuantMethodBase)，让父 pool
+  负责 buffer、copy、prefix-valid、FlashInfer workspace；custom Triton kernel
+  只作为 adapter 的 quantize/dequantize 实现。
+### 110.4 SIMOMLATokenToKVPool：构造器基本兼容，但写入契约变了
+
+release 的 MLATokenToKVPool 构造签名仍是
+size/page_size/dtype/kv_lora_rank/qk_rope_head_dim/layer_num/device/
+enable_memory_saver/start_layer/end_layer/use_dsa/override_kv_cache_dim，因而
+当前 SIMOMLATokenToKVPool 的位置参数大体兼容。真正的变化在方法实现：
+
+* upstream 把原来的写入主体改名为 _write_mla_kv_buffer()（约 4148 行），
+  public set_mla_kv_buffer()（约 4205 行）负责 OOB 检查、DCP 位置语义和
+  layer 选择后再调用它。
+* 当前 Simo 直接覆盖 public set_mla_kv_buffer()（memory_pool.py:376），
+  绕过了 release 的检查和位置处理。建议把 custom kernel body 移到
+  _write_mla_kv_buffer(self, dst_buffer, loc, cache_k_nope, cache_k_rope)，
+  让父类 public wrapper 保留；如果必须覆盖 public 方法，也要复制
+  maybe_detect_oob、start_layer、DCP 拒绝和 layer_id_override 语义。
+* 当前 set_kv_buffer() 通过 unwrap_write_loc() 取 full_loc，这对 unified
+  pool 只有在 full_loc 已预先翻译且 custom kernel 能读物理扁平 id 时才成立。
+  普通 Simo 路径应统一使用 KVWriteLoc；不支持 unified/DCP 时应在 builder 处
+  拒绝，而不是静默选错 loc。
+* 对 generic caller 可能传入的 layer_id_override、scale 或 dcp mask，要么在
+  Simo MLA 方法中保留兼容形参并验证为 unsupported，要么尽早抛出明确异常；
+  不要让 Python 的位置参数错位后落入 concat kernel。
+* 父类 get_mla_kv_buffer() 返回逻辑 dtype 的 nope/rope；Simo 当前只覆盖
+  get_key_buffer/get_value_buffer，返回 raw uint8 combined buffer，未覆盖
+  get_mla_kv_buffer。因此任何通用 MLA/FlashInfer 调用都可能把 packed bytes 当
+  成原始 latent。要么实现对应的 Simo dequant read，要么明确禁止这些 caller，
+  只允许 SIMOTritonAttnBackend。
+* Simo 用 meta tensor 估算 packed/scale bytes。release 的 quant spec 和 FP4
+  分支增多，必须验证 downcast kernel 对 meta tensor、tile/group 对齐和
+  kv_lora_rank/qk_rope_head_dim 的行为；不能只沿用旧的一个总字节数。
+
+MLA 还要审计 move_kv_cache、CPU offload、PD transfer：combined uint8 buffer 的
+复制可以按字节完成，但所有 size、item length、layer id 都必须以实际
+kv_cache_dim_in_bytes 和 start_layer 为准。
+
+### 110.5 init_memory_pool_patch.py 的替换方式
+
+不能再导入或重新创建 ModelRunnerKVCacheMixin。推荐把 patch 拆成三个小范围
+hook：
+
+1. 包装 sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_mha_kv_pool
+   和 _build_mla_kv_pool。这两个方法的 release 签名分别是
+   (*, max_total_num_tokens, mha_pool_class, quant_method=None) 和
+   (*, max_total_num_tokens)。只在普通、非 DSV4/DSA/hybrid 的 CUDA NHD
+   分支返回 Simo adapter，其余情况调用 original。
+2. 如果选择“临时替换 class”而不是包装 builder，必须替换
+   kv_cache_configurator 模块中已经 import 的
+   MHATokenToKVPool/MLATokenToKVPool 别名；只改
+   sglang.srt.mem_cache.memory_pool 的属性没有效果。需要同时处理
+   MHATokenToKVPoolMXFP8、PageMajor 和 native FP4 分支的绕过条件，避免
+   Simo class 被错误用于原生量化或 page-major。
+   另外，_build_mha_kv_pool 会先按 kv_cache_dtype_str 将 mxfp8 改成
+   MHATokenToKVPoolMXFP8；Simo 要支持自己的 mxfp8，必须在这个分支之前拦截，
+   或在 _build_token_to_kv_pool 层替换返回值，不能只改 quant_method。
+3. 包装 DefaultPoolConfigurator._compute_cell_size 时使用新签名：
+   def wrapper(original, self, kvc, num_layers)。kvc 是
+   KVCacheConfigurator，不是 ModelRunner。应使用
+   kvc.model_config、kvc.kv_cache_dtype、kvc.use_mla_backend、
+   kvc.layer_info.num_effective_layers 和
+   get_parallel().attn_tp_size；旧的
+   sglang.srt.layers.dp_attention.get_attention_tp_size 在 release 已删除。
+
+如果用 SIMOPatch.wrap_function，wrapper 的 original 是未绑定函数，调用时要
+传 self；同时加一个类/属性 sentinel，避免每个 worker 或重复 plugin load 时
+把同一个方法包多层。
+
+对应的注册目标应类似：
+
+~~~python
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+SIMOPatch.wrap_function(
+    KVCacheConfigurator, "_build_mha_kv_pool", build_mha_simo,
+    call_original=True, create_if_missing=False)
+SIMOPatch.wrap_function(
+    KVCacheConfigurator, "_build_mla_kv_pool", build_mla_simo,
+    call_original=True, create_if_missing=False)
+SIMOPatch.wrap_function(
+    DefaultPoolConfigurator, "_compute_cell_size", compute_cell_size,
+    call_original=True, create_if_missing=False)
+~~~
+
+也可以只包 KVCacheConfigurator.configure，并在包裹期间替换
+kv_cache_configurator.MHATokenToKVPool/MLATokenToKVPool；但必须覆盖整个
+configure 调用（包括 memory sizing 和 pool allocation），并在 finally 中恢复
+别名。直接恢复旧 mixin 文件或只 monkey-patch memory_pool 模块都不是 release
+兼容方案。
+
+下面的伪代码只表达 hook 结构；实际实现要把 quant 参数按 layer 收集，而不是
+取第一个 attention layer：
+
+~~~python
+def build_mha_simo(original, self, *, max_total_num_tokens,
+                    mha_pool_class, quant_method=None):
+    kvc = self
+    q = extract_simo_params(kvc.model)
+    if q is None or is_dsv4(kvc.model_config.hf_config):
+        return original(kvc, max_total_num_tokens=max_total_num_tokens,
+                        mha_pool_class=mha_pool_class,
+                        quant_method=quant_method)
+    validate_simo_runtime(kvc)       # NHD, dcp=1, no unified/post-capture/hybrid
+    if quant_method is not None:     # native FP4 method, not a Simo method
+        raise ValueError("Simo and native KV quant method cannot be mixed")
+    return SIMOMHATokenToKVPoolAdapter(
+        size=max_total_num_tokens,
+        page_size=kvc.pool_page_size,
+        dtype=kvc.kv_cache_dtype,
+        head_num=kvc.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size),
+        head_dim=kvc.model_config.head_dim,
+        v_head_dim=kvc.model_config.v_head_dim,
+        layer_num=kvc.layer_info.num_effective_layers,
+        device=kvc.device,
+        enable_memory_saver=get_exec().features.enable_memory_saver,
+        enable_alt_stream=not get_disagg().enable_pdmux,
+        enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
+        allocation_label="simo",
+        **q,
+    )
+
+def compute_cell_size(original, self, kvc, num_layers):
+    q = extract_simo_params(kvc.model)
+    if q is None or unsupported_native_family(kvc):
+        return original(kvc, num_layers)
+    effective_layers = kvc.layer_info.num_effective_layers
+    if kvc.use_mla_backend:
+        bytes_per_layer = q["packed_head_size"] + q["scale_head_size"]
+        bytes_per_layer += q.get("packed_head_size_rope", 0)
+        bytes_per_layer += q.get("scale_head_size_rope", 0)
+    else:
+        n = kvc.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        bytes_per_layer = n * (
+            q["k_packed_head_size"] + q["k_scale_head_size"] +
+            q["v_packed_head_size"] + q["v_scale_head_size"])
+    return bytes_per_layer * effective_layers
+~~~
+
+cell_size 必须和实际 tensor 分配完全一致。特别要核对 K/V 非对称宽度、
+pipeline-parallel 的 local layer 数、DCP shard、page padding、SWA 子 pool 和
+speculative draft pool；不能继续使用旧代码中“同一 packed/scale 宽度乘 2”
+的假设。对 DSV4、DSA、native FP4、hybrid 和无 Simo 属性的模型应保留
+upstream 公式。
+
+extract_simo_params() 应改成 duck-typed：接收 ModelRunner 或 KVC，分别取
+owner.model 或 owner 本身；检查所有有效 attention layer 的 quant spec/packed
+size 是否一致，并返回按 layer 的映射。当前实现只取第一个 module，在 mixed
+layer 或 PP slice 上会算错容量。
+
+### 110.6 set_kv_buffer.py、decode_attention.py、extend_attention.py
+
+这三个文件的兼容性不是同一种问题。
+
+| 文件 | release 影响 | 建议 |
+| --- | --- | --- |
+| set_kv_buffer.py | 完全是 Simo 自己的 Triton writer，没有引用被删除的 SGLang module | 主体可保留；把布局、slot、K/V 宽度和 quant spec 检查补强。 |
+| decode_attention.py | 第 6 行仍 import sglang.srt.layers.attention.triton_ops.decode_attention，该文件已删除 | 只把 import 改成 sglang.kernels.ops.attention.decode_attention，继续取 _fwd_kernel_stage2。 |
+| extend_attention.py | 没有旧 SGLang attention import，使用自己的 packed-byte reader | 不要直接替换成 release 的 native wrapper；保留 Simo 参数和解量化逻辑。 |
+
+decode_attention.py 第 6 行的最小改动就是：
+
+~~~python
+from sglang.kernels.ops.attention.decode_attention import _fwd_kernel_stage2
+~~~
+
+release 的 native decode_attention_fwd 在 sm_scale 后新增 k_scale、v_scale，
+并增加 score_mod、aux_tensors；native extend_attention_fwd 还新增
+extend_seq_lens_cpu、lse_extend、skip_prefix/skip_extend 等参数。Simo 自己的
+decode_attention_fwd/extend_attention_fwd 参数顺序不同，不能把 native 的
+k_scale/v_scale 插到 Simo 调用中，否则会把 logit_cap 等位置参数错位。
+当前 Simo decode 对 _fwd_kernel_stage2 的调用仍然兼容，因为 release 新增的
+FORCED_KV_SPLITS 是可选 constexpr；如需固定 split，再显式传该关键字。
+
+Simo writer 的隐含前提需要在 launch 前变成显式校验：
+
+* source K/V 是连续或 stride 可解释的 3-D NHD，head 数相同，最后一维分别
+  等于量化器计算的逻辑 head dim；
+* destination 是 [slot, head, byte] 的 uint8，K/V 的每头 packed/scale
+  区域不越界，loc 是 flat int64/int32 slot id，且 token 数与 loc.numel()
+  相等；
+* K/V 可以有不同 packed/scale 宽度；若 kernel 暂时只支持对称宽度，就在
+  Python 层 assert，而不是让 value 写入 key 的行宽；
+* page_size 只影响池容量时可以继续传入，但 kernel 地址计算仍是
+  stride(0) * flat_slot。若 allocator 改为真正的 page-major/HND/4-D view，
+  必须另写 page_id/tok_in_page 地址计算，不能复用当前 kernel。
+
+decode/extend custom reader 目前也明确拒绝非 3-D buffer。该限制是正确的
+安全边界；同时应拒绝 page-major、HND、vectorized_5d、unified virtual loc、
+DCP widened loc 和 deterministic unified path，避免读到错误地址。不要以
+“page_size=256”推断 custom kernel 已支持 paged layout。
+
+### 110.7 SIMOTritonAttnBackend 的迁移
+
+构造器的三个现有参数与 release TritonAttnBackend 基本一致，位置
+super 调用当前可以工作，但建议改用关键字调用并显式传递新增配置。真正的
+必改点是 forward 方法签名：
+
+~~~python
+def forward_extend(..., save_kv_cache=True, sinks=None,
+                   score_mod=None, aux_tensors=None):
+    if not simo_layer:
+        return super().forward_extend(
+            ..., save_kv_cache=save_kv_cache, sinks=sinks,
+            score_mod=score_mod, aux_tensors=aux_tensors)
+    if score_mod is not None or aux_tensors is not None:
+        raise NotImplementedError(
+            "Simo packed KV kernels do not implement score_mod/aux_tensors")
+    ...
+
+def forward_decode(..., save_kv_cache=True, sinks=None,
+                   score_mod=None, aux_tensors=None):
+    ...
+~~~
+
+AttentionBackend.forward 现在接受可变关键字参数 kwargs，并把它们转给 forward_decode/
+forward_extend。Simo 当前两个显式签名没有这两个关键字，RadixAttention 或
+Inkling/speculative 路径一旦传入就会 TypeError。量化路径不能静默丢掉
+score_mod；要么把 custom Triton kernel 扩展到同一 contract，要么清楚地
+拒绝。非量化 fallback 则必须把参数原样传给 parent。
+
+还要做以下调整：
+
+1. MHA 写入继续通过 parent 的 _set_kv_buffer，使用 KVWriteLoc 和可选
+   k_scale/v_scale；Simo pool 自己决定是否忽略 per-tensor scale。
+2. 当前 MLA decode 分支直接把 forward_batch.out_cache_loc 传给
+   set_kv_buffer。应改成 _make_kv_write_loc(forward_batch,
+   self.forward_metadata)，让 full_loc 在 unified/virtual allocator 场景下
+   不丢失；如果 Simo 不支持 unified，则在初始化时拒绝而不是走错误 loc。
+3. parent 现在从 get_parallel().attn_dcp_size、get_parallel().attn_tp_size、
+   allocator.translate_kv_loc_dense 和 token_to_kv_pool.start_layer 取状态，
+   不再依赖旧 ModelRunner 的 dcp 字段或旧 getter。Simo 已经拒绝 DCP 时，
+   应在 backend 构造前检查并给出单一错误信息。
+4. verify API 从旧的 getter 迁移到 verify_mask property。Simo 如果覆盖
+   verify 相关方法，按新 property/VerifyMask 类型适配。
+5. constructor 中把 self.v_head_dim 重置为逻辑维度的做法只能是临时兼容；
+   pool 的 public getter 与 backend 的 storage width 必须分开，否则
+   qk_head_dim != v_head_dim、MLA、PP 和 output buffer sizing 会互相影响。
+6. SIMO custom decode 目前对 kv_group_num == 1（纯 MHA）直接抛
+   NotImplementedError。普通 MHA 模型必须显式选择 native backend 或实现
+   MHA packed reader，不能让它运行到 Triton launch 才失败。
+7. release 的普通 Triton extend 允许 k 和 v 同时为 None（只读已经缓存的
+   prefix），并可通过 skip_prefix/skip_extend、lse_extend 等参数拆分计算。
+   Simo 当前在这种 cache-read path 直接抛 NotImplementedError；要么实现
+   packed buffer 的 gather/dequant，要么在配置阶段禁止 chunked-prefix/
+   speculative 组合，不能只补一个函数签名。
+
+### 110.8 还需要审计的 KV-cache 相关代码
+
+以下项目不是当前 15:40 traceback 的首个根因，但升级后会决定量化是否真的
+正确工作：
+
+* SIMOKVCacheMethod 与 release 的 KVCacheQuantMethodBase 不是同一抽象。若
+  继续采用 layer attribute + 自定义 pool 的短期方案，必须禁止
+  KVCacheConfigurator 把同一配置解析成 native nvfp4/fp4_mx_block16 method。
+  尤其要处理 Simo 的 nvfp4_e2m1 与 upstream 的 nvfp4 名称冲突。
+  Simo 示例通常用 quantization=simo 的 kv_cache_quant_algo，而让
+  server_args.kv_cache_dtype 保持 auto（这样 pool 的 compute dtype 仍是模型
+  dtype）。如果把命令行 kv_cache_dtype 直接设成 mxfp8/nvfp4，release 会先
+  把 dtype 解析成 native FP8/FP4，可能使 Simo writer 收到错误的 source dtype
+  或走到 native pool；adapter 必须明确支持或拒绝这种组合。
+* extract_simo_params 不能只找到一个 layer 就假定所有层的 head_dim、K/V
+  packed bytes、scale bytes、Hadamard size 相同。至少覆盖 DeepSeek-V2 的
+  attn_mqa/attn_mha、PP local layer 和 mixed attention。
+* simo/extensions/sglang_simo/models/deepseek_v2.py 中
+  SIMODeepseekV2AttentionMLA 的构造参数目前与 release parent 大体一致，
+  但要回归测试 dsa_enable_prefill_cp、mla_enable_prefill_cp、is_nextn 及
+  layer_id/start_layer；这些字段会影响 pool 的有效 layer 数和 location。
+* release 的 RadixAttention.forward 现在会把 score_mod、aux_tensors、rel_bias、
+  q_descale/k_descale/v_descale 等 kwargs 继续传到 backend，并在
+  unified/TC-piecewise 场景根据这些 kwargs 改走 eager extra-kwargs 路径。
+  Simo backend 必须接受这些参数并明确处理；否则普通的 layer forward 也可能在
+  到达 Triton kernel 之前因签名不匹配失败。
+* parent 新增的 get_kv_cache_quant_method、get_raw_kv_buffer、
+  get_dequant_workspace、get_flashinfer_* workspace、get_cpu_copy/load_cpu_copy、
+  move_kv_cache 和 set_kv_buffer_prefix_valid 都要逐项决定“实现”或“明确拒绝”。
+  只覆盖 get_key_buffer/get_value_buffer 不足以满足通用 backend contract。
+* release 大量把路径从 sglang.srt.layers.attention.triton_ops、
+  sglang.srt.mem_cache.triton_ops、sglang.jit_kernel 移到
+  sglang.kernels.ops.attention/kvcache。对 Simo 做一次全仓库 rg，当前已确认
+  decode_attention.py:6 是直接命中的旧 import；复制过来的其他旧 helper 也要
+  同步迁移。
+* plugin loader 会吞掉一般 plugin 异常。注册完成后应记录并断言：
+  使用 Simo 配置时 pool 是 SIMOMHA/SIMOMLA、backend 是
+  SIMOTritonAttnBackend；DSV4 时 pool/backend 是原生 DSV4。否则量化开关
+  失效却不会显式报错。
+
+### 110.9 推荐的实施顺序和验证
+
+建议按下面顺序改，便于把依赖问题与量化正确性问题分开：
+
+1. 先按第 109.3 节把环境中的 flashinfer-python、flashinfer-cubin（以及
+   可选 jit-cache）统一为 0.6.17，确认 sglang/simo 都是 editable source。
+2. 重写 init_memory_pool_patch.py：删除旧 mixin import，改 hook
+   KVCacheConfigurator builder；同步改 _compute_cell_size 签名和
+   get_parallel() 调用；对 DSV4 明确 bypass。
+3. 先只启用普通 DeepSeek-V2/GQA 的单卡、dcp=1、NHD、无 unified、无
+   post-capture、无 speculative 配置，确认 pool 和 backend 类型。
+4. 迁移 MHA/MLA 的 prefix-valid、move、KVWriteLoc、start_layer 和
+   quant marker，再逐个打开 EAGLE、PP、CPU offload/PD 等功能。
+5. 最后才考虑 page-major、DCP、unified 或 DSV4 专用量化；这些不是当前
+   custom kernel 的小参数适配，而是新的地址和状态协议。
+
+静态检查：
+
+~~~bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang/bin/python
+PYTHONPATH=/share/users/like/package/sglang_kernel_src/python:/share/users/like/package/simo_conda_sglang \
+  "$PY" -m py_compile \
+  simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py \
+  simo/extensions/sglang_simo/mem_cache/memory_pool.py \
+  simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py \
+  simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py \
+  simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py \
+  simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py
+~~~
+
+确认 release API 的 smoke test：
+
+~~~bash
+PY=/share_data/users/like/miniconda3/envs/simo_sglang/bin/python
+FLASHINFER_DISABLE_VERSION_CHECK=1 \
+PYTHONPATH=/share/users/like/package/sglang_kernel_src/python:/share/users/like/package/simo_conda_sglang \
+  "$PY" - <<'PY'
+import inspect
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+print(inspect.signature(MHATokenToKVPool.__init__))
+print(inspect.signature(MLATokenToKVPool.__init__))
+print(inspect.signature(DefaultPoolConfigurator._compute_cell_size))
+print(inspect.signature(TritonAttnBackend.forward_extend))
+print(inspect.signature(TritonAttnBackend.forward_decode))
+PY
+~~~
+
+预期应包含：
+
+~~~text
+MHA ... quant_method ... allocation_label ...
+cell ... (self, kvc, num_layers)
+triton extend ... score_mod ... aux_tensors
+triton decode ... score_mod ... aux_tensors
+~~~
+
+GPU 回归至少包含四组：
+
+* 每一种 Simo 格式分别用随机 K/V 做 write -> custom decode/prefill read，
+  与 Python/reference dequant 比较误差，并覆盖非整 tile、空 loc、padding slot；
+* 用 prefix-valid 的二维 loc/commit_lens 和 speculative move_kv_cache，确认
+  packed data 与 scale 一起搬移，且不会触发 parent 的 _kv_copy_config assert；
+* 用 PP local layer、GQA head 数、K/V 不同逻辑维度和 page_size=256 的 flat
+  allocator，核对 cell_size、tensor.nbytes、slot stride；
+* dsv4-flash 只验证原生日志包含 DeepSeekV4TokenToKVPool/
+  DeepseekV4AttnBackend，并确认没有误注入 SIMOTritonAttnBackend。当前审计
+  没有执行完整的四卡生成质量/性能回归，因此不能把“服务 ready”当成 Simo
+  量化已验证。
+
+### 110.10 最终兼容性判定
+
+| 组件 | 在 release 上能否原样使用 | 必要动作 |
+| --- | --- | --- |
+| SIMOMHATokenToKVPool | 否 | 补 quant_method/allocation_label/SWA 关键字，处理 quant 状态、prefix-valid、move、logical/storage dim，并限制布局。 |
+| SIMOMLATokenToKVPool | 构造器大体可以，方法不能原样 | 迁移到 _write_mla_kv_buffer 或复制 release wrapper；处理 KVWriteLoc、DCP、raw/dequant API。 |
+| set_kv_buffer.py | kernel 主体可以 | 保持 flat 3-D NHD；增加 stride、loc、K/V 宽度和格式映射检查。 |
+| decode_attention.py | 不能原样 import | 只更新 _fwd_kernel_stage2 的 SGLang import 路径；不要套用 native decode 参数顺序。 |
+| extend_attention.py | custom 主体可以 | backend 接受新 kwargs；量化路径对 score_mod/aux_tensors 明确拒绝或实现。 |
+| SIMOTritonAttnBackend | 不能原样使用 | 更新 forward 签名、MLA 写 loc、DCP/unified/layout guard、parent 字段和 backend/pool 一致性检查。 |
+| init_memory_pool_patch.py | 完全不能原样使用 | 删除 ModelRunnerKVCacheMixin 依赖，改 patch KVCacheConfigurator builder/configurator。 |
+| dsv4-flash | 不属于当前 Simo MHA/MLA 路径 | 先走原生 DSV4；要 Simo DSV4 量化需单独移植 c4/c128/state pool 和 backend。 |
+
+因此，针对“本次升级后如何修复运行失败”的最小闭环是：
+
+~~~text
+FlashInfer 0.6.17 配平
+  -> 删除旧 ModelRunnerKVCacheMixin patch
+  -> 改接 KVCacheConfigurator
+  -> 修正 decode import 和 backend 新 kwargs
+  -> 对 DSV4 明确走 upstream
+  -> 用普通 GQA/MLA 做量化读写回归
+~~~
+
+仅把 import 名字改到新文件、或仅让 dsv4-flash 服务再次 ready，都不能证明
+Simo KV-cache 量化已经适配完成；父类新增的 quant/copy/prefix/location 契约
+和 DSV4 专用 pool 边界必须同时处理。

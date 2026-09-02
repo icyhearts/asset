@@ -377,3 +377,77 @@ conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
 要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面, 并对 like-useful/codex_answer.md 整理章节编号,  多级标题，以 1.1,1.2, 2.1,2.2, 的形式编号
 
 }
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+
+
+# 以本次运行的 shape和运行日志为例， 
+src/group_gemm/kernels.cuh group_gemm_fp8_kernel 函数: 
+```
+      auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
+```
+对 tiled_copy_c 进行讲解:
+copy atom SM90_U16x8_STSM_T::copy 每个线程一次 copy 几个 bf16? 2个 math warpgroup 执行一次 SM90_U16x8_STSM_T::copy能 copy几个 bf16?
+  后面的cute::copy(tiled_copy_c, tCr4s, tCs4r);，对于这行代码, 这条 ptx指令会被循环调用吗? 会循环几次 SM90_U16x8_STSM_T::copy ?
+
+ 
+Tiler_MN:       (_128,_48) 是谁的 layout?
+TiledLayout_TV: ((_4,_8,_8),((_2,_2,_6),(_1,_1))): ((_256,_1,_16),((_128,_8,_1024),(_0,_0))) 是谁的 layout?
+Copy_Atom ThrID:        _32:_1 为什么是 32个线程 ？
+  ValLayoutSrc: ((_4,_8),(_1,_2,_4)):((_16,_1),(_1,_8,_64)) 这个是谁的 layout?
+  ValLayoutDst: (_32,_8):(_8,_1) 这个是谁的 layout?
+ValLayoutRef: ((_4,_8),(_1,_2,_4)):((_16,_1),(_1,_8,_64)) 是谁的 layout?
+  ValueType:    16b 是什么意思?
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面, 并对 like-useful/codex_answer.md 整理章节编号,  多级标题，以 1.1,1.2, 2.1,2.2, 的形式编号
+
+}
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+tests/test_group_gemm_blockwise_like.py 的日志位于 temp/block.log
+
+# test_group_gemm1会调用 hpc.group_gemm_blockwise_fp8, 按照 hpc.group_gemm_blockwise_fp8 的实现, total_seq_pad, 是所有 group的 seqlen加在一起要pad到某个数的整倍，还是每个 group的 seqlen都要 pad到整数倍 ？ hpc.group_gemm_blockwise_fp8 对 x_scale 的 shape求是 [hidden_size // 128, total_seq_pad], total_seq_pad 是什么样的pad规则？用例子说明
+# test_group_gemm1 设置 xscale的形状的时候，为什么 是 total_seq_pad， 不是 total_seq?
+
+# test_group_gemm1 目前每个 group 的 seqlen是相同的, 现实负载中没有这么巧合，请你仿照 tests/test_group_gemm_pertensor_like.py test_group_gemm_pertensor_fp8 seqlens = (1+torch.arange(num_group, dtype=torch.int32, device='cuda'))*16这种方式，把 tests/test_group_gemm_blockwise_like.py test_group_gemm1的 seqlen设置成每个group都不一样的,
+tests/test_group_gemm_blockwise_like.py naive_group_gemm 如果还不支持 每个group都不一样,把naive_group_gemm 改造成支持的。
+改造完成，在指定conda环境进行测试, 对比 naive和hpc.group_gemm_blockwise_fp8 的结果
+
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把问题的答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面, 对于多级标题，以 1.1,1.2, 2.1,2.2,..., 的形式编号
+
+}
+
+
+
+{
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/claude_answer.md 里面
+
+hpc-ops 代码位于 /share/users/like/package/hpc-ops, 工作目录位于 /share/users/like/package/hpc-ops
+conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang
+tests/test_group_gemm_blockwise_like.py 的日志位于 temp/block.log
+
+src/group_gemm/entry.cc  
+group_gemm_blockwise_fp8_entry 调用:
+```
+  HPC_ARCH_DISPATCH(
+      "group_gemm_blockwise_fp8", 90,
+      group_gemm_blockwise_fp8_async(
+          y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
+          tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+          num_block_k_pad4, num_seq_per_group_avg, update_tma, false, stream));
+```
+这里的宏展开后，是什么样子 ？
+为什么用这么啰嗦的宏?
+要求：引用代码的时候要使用 相对code base的相对路径 + 行号 + 函数名 ，把问题的答案追加在  /softhome/like/asset/code/like-useful-hpc-ops/codex_answer.md 里面, 对于多级标题，以 1.1,1.2, 2.1,2.2,..., 的形式编号
+
+}

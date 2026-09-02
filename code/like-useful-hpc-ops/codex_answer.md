@@ -2784,3 +2784,686 @@ store 的 local M 坐标仍是 `itile_m*kTileM+u`；只有它小于 `seqlens[g]`
 - 这不是依靠物理 padding 保护连续数组，而是依靠每 group descriptor 的 base 和 `globalDim` 做隔离；同时应补审 policy=2 的 tensor-map acquire。
 
 以上还依赖输入元数据契约成立：`cu_seqlens` 必须是非降的合法前缀和、`cu_seqlens[num_group] == m`，且每个 group 的实际内存区间确实落在已分配的 X/Y tensor 内；各 descriptor 的 base/stride 还必须满足 TMA 的对齐约束。本次 `k=7168`、`n=4096` 使所有 group base 偏移满足 16-byte 对齐；当前 kernel 没有为损坏的 `seqlens/cu_seqlens` 或未对齐指针另加校验。
+
+# 15. `tiled_copy_c` 与 STSM 输出搬运（本次 shape）
+
+> **路径说明**：当前 `like` 分支经过架构重构，原问题中的 `src/group_gemm/kernels.cuh` 已移动为 `src/group_gemm/sm90/kernels.cuh`。下面的源码引用和行号均以当前 code base 的实际路径为准；讨论的函数仍是 `group_gemm_fp8_kernel`。
+
+## 15.1 本次实例的编译期参数
+
+测试函数在 `tests/test_group_gemm_pertensor_like.py:46-66`（`test_group_gemm_pertensor_fp8`）生成 8 个 group，`seqlens=[16,32,48,64,80,96,112,128]`，所以日志中的总 M 是 576，N=4096，K=7168（`temp/run.log:261-264`，由 `test_group_gemm_pertensor_fp8` 打印）。平均 sequence length 是 72。
+
+`src/group_gemm/sm90/group_gemm_pertensor_fp8.cu:363-375`（`group_gemm_fp8_async`）固定 `kTileN=128`、`kTileK=128`、`kWarpgroupM=2`、`kWarpgroupN=1`。平均长度 72 命中 `src/group_gemm/sm90/group_gemm_pertensor_fp8.cu:425-431`（`group_gemm_fp8_async`）的 `kTileM=48` 分支；`src/group_gemm/sm90/config.h:43-52`（`mma_selector`）因此选择 `SM90_64x48x32_F32E4M3E4M3_SS_TN`。
+
+本次日志给出的关键对象是（`temp/run.log:31-40,214-223`，由 `group_gemm_fp8_kernel` 的 debug 输出产生）：
+
+| 对象 | 本次值 | 直接含义 |
+|---|---:|---|
+| MMA atom `Shape_MNK` | `(64,48,32)` | 一个 WGMMA atom 的逻辑 M/N/K 形状 |
+| `ThrLayoutVMNK` 的线程总数 | `128 x 2 = 256` | 两个 128-thread math warpgroup |
+| `Tiler_MN` | `(128,48)` | 一个 C 输出 tile 的坐标域 |
+| `TiledLayout_TV` 的线程数 | `4 x 8 x 8 = 256` | tiled copy 的逻辑线程数 |
+| `TiledLayout_TV` 的每线程值数 | `2 x 2 x 6 x 1 x 1 = 24` | 每个 math lane 的 BF16 输出片段大小 |
+
+因此本次一个 output tile 的元素总数是 `128 x 48 = 6144` 个 BF16，也等于 `256 x 24`。
+
+## 15.2 `make_tiled_copy_C` 实际构造了什么
+
+在 `src/group_gemm/sm90/kernels.cuh:500-506`（`group_gemm_fp8_kernel`）中，WGMMA 的 FP32 accumulator `tCr` 先转换为 BF16 tensor `tCrh`。随后 `src/group_gemm/sm90/kernels.cuh:511-518`（`group_gemm_fp8_kernel`）执行：
+
+```cpp
+using STSM_ATOM = std::conditional_t<kTileM == 8,
+                                    cute::SM90_U16x4_STSM_T,
+                                    cute::SM90_U16x8_STSM_T>;
+using R2SCopyAtomC = Copy_Atom<STSM_ATOM, Tout>;
+auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
+```
+
+本次 `kTileM=48`，所以实际类型是 `Copy_Atom<SM90_U16x8_STSM_T, cute::bfloat16_t>`。`Tout` 的定义见 `src/group_gemm/sm90/group_gemm_pertensor_fp8.cu:35-46`（`launch_group_gemm_fp8`）。
+
+`3rd/cutlass/include/cute/atom/copy_atom.hpp:439-446`（`make_tiled_copy_C`）做两件事：
+
+1. 取 `tiled_mma.get_layoutC_TV()` 作为 tiled-copy 的 `(thread,value) -> C-tile-coordinate` 映射；
+2. 取 `make_shape(tile_size<0>(tiled_mma), tile_size<1>(tiled_mma))` 作为 tile 的坐标范围。
+
+接着 `3rd/cutlass/include/cute/atom/copy_atom.hpp:405-415`（`make_tiled_copy_impl`）把这三个部分包装成一个 `TiledCopy<Copy_Atom, LayoutCopy_TV, ShapeTiler_MN>`。因此 `tiled_copy_c` 不是“一个能自动搬完整 tile 的单条指令”，而是：
+
+- 一个 STSM `Copy_Atom`；
+- 一份覆盖整个 C tile 的 TV layout；
+- 一个 `(128,48)` 的 tile shape。
+
+`3rd/cutlass/include/cute/atom/copy_atom.hpp:185-206`（`TiledCopy`）还明确显示 `TiledCopy` **继承一个** `Copy_Atom`，并用 `TiledLayout_TV` 复制它的线程和值模式；它内部没有存放 24 个独立的 `Copy_Atom` 对象。`TiledNumThr` 和 `TiledNumVal` 必须分别能被 atom 的线程数和值数整除（同文件 196-206 行的静态断言）。
+
+`src/group_gemm/sm90/kernels.cuh:515-518`（`group_gemm_fp8_kernel`）中的 `get_slice(idx)`、`retile_S(tCrh)` 和 `partition_D(sCT)`，把完整 tiled copy 变成当前 lane 要读的寄存器片段 `tCr4s` 和要写的 shared-memory 片段 `tCs4r`。对应实现见 `3rd/cutlass/include/cute/atom/copy_atom.hpp:338-392`（`TiledCopy::get_slice`、`ThrCopy::partition_D`、`ThrCopy::retile_S`）。
+
+## 15.3 `SM90_U16x8_STSM_T::copy` 一次搬多少 BF16
+
+### 15.3.1 每个 lane 的输入寄存器
+
+`3rd/cutlass/include/cute/arch/copy_sm90.hpp:140-157`（`SM90_U16x8_STSM_T::copy`）定义：
+
+```cpp
+using SRegisters = uint32_t[4];
+using DRegisters = uint128_t[1];
+```
+
+`ValueType` 是 BF16，1 个 BF16=16 bit。于是每个参与 lane 的源寄存器是 `4 x 32 bit = 128 bit = 8 BF16`；目的寄存器 `uint128_t` 也正好容纳 8 个 BF16。换句话说，**一次 atom 操作中，每个线程提供 8 个 BF16**。这里的“线程”是一个 STSM atom 的一个 lane，不是整个 CTA。
+
+### 15.3.2 一条 warp-level STSM 的搬运量
+
+同一个函数在 `3rd/cutlass/include/cute/arch/copy_sm90.hpp:151-153`（`SM90_U16x8_STSM_T::copy`）发出：
+
+```ptx
+stmatrix.sync.aligned.x4.trans.m8n8.shared.b16
+```
+
+这是 warp-collective 指令。32 个 lane 协同执行时，总搬运量是 `32 x 8 = 256 BF16`。`.x4` 表示四个 `8x8` 的 BF16 matrix（`4 x 8 x 8 = 256` 个元素），不是“每线程 4 个 BF16”；每线程的 4 是 4 个 `uint32` 寄存器，每个寄存器装 2 个 BF16。`.trans` 只改变寄存器到 shared 的矩阵排列，不改变元素总数。
+
+从 C++ 视角，每个 lane 都会执行内联的 `copy` 函数；从硬件计数视角，应把 32 个 lane 合并计为 **1 个 warp-level STSM operation**。因此不要把“函数被 32 个线程调用”误读成 32 条独立的矩阵 store。
+
+### 15.3.3 两个 math warpgroup 的数量
+
+`src/group_gemm/sm90/kernels.cuh:330-333`（`group_gemm_fp8_kernel`）用 `kNumThreads=size(TiledMma{})` 区分 256 个 math 线程和 128 个 loader 线程；`src/group_gemm/sm90/kernels.cuh:411-426`（`group_gemm_fp8_kernel`）的 math 分支用 `iwarpgroup=idx/128`，所以一个 math warpgroup 有 128 个线程，即 4 个 warp。
+
+下面把“执行一次”分成三个层次，避免歧义：
+
+| 范围 | 参与 warp/lane | atom 次数 | 搬运 BF16 |
+|---|---:|---:|---:|
+| 一个 lane 的一次 `SM90_U16x8_STSM_T::copy` | 1 lane | 1 | 提供 8（由 warp 合作写入） |
+| 一个 warp 的一次 atom operation | 1 warp=32 lanes | 1 | 256 |
+| 一个 128-thread math warpgroup 的一轮 atom operation | 4 warps | 4 | 1024 |
+| 两个 math warpgroup 的一轮 atom operation | 8 warps | 8 | 2048 |
+
+最后一行是“每个 warp 各执行一次 atom”的一轮；它还不是当前完整 C tile 的最终答案。完整次数见下一节。
+
+在本次完整 `cute::copy` 中，每个 warp 需要 3 个 value group，所以一个 128-thread math warpgroup 实际执行 `4 x 3 = 12` 个 atom，写 `12 x 256 = 3072 BF16`；两个 math warpgroup 合计 `24 x 256 = 6144 BF16`。如果把问题中的“一次 `SM90_U16x8_STSM_T::copy`”严格理解为一轮 atom，那么答案是上表的 2048 BF16；如果理解为这一行 `cute::copy` 完整覆盖一个 tile，则答案是 6144 BF16。
+
+## 15.4 `cute::copy(tiled_copy_c, tCr4s, tCs4r)` 的展开次数
+
+### 15.4.1 当前线程片段为什么是 24 个值
+
+日志中 `tCr4s` 和 `tCs4r` 的布局分别是 `((_8,_3),_1,_1)`（`temp/run.log:238-241`，由 `group_gemm_fp8_kernel` 打印）。其第一个模式有 `8 x 3 = 24` 个 BF16：每个 lane 总共要搬 24 个值，并按“每次 atom 8 个值”分成 3 组。
+
+完整 tiled layout 也给出同一结果：`TiledLayout_TV` 的线程模式是 `4 x 8 x 8 = 256`，值模式是 `2 x 2 x 6 x 1 x 1 = 24`。因此：
+
+```text
+TiledNumThr / AtomNumThr = 256 / 32 = 8  个 warp-level atom 位置
+TiledNumVal / AtomNumVal = 24  /  8 = 3  个值分组
+总 atom operation = 8 x 3 = 24
+```
+
+这也与 `128 x 48 = 6144` 个 tile 元素相符：`24 x 256 = 6144 BF16`。
+
+### 15.4.2 CUTE 的“循环”是怎样发生的
+
+`3rd/cutlass/include/cute/algorithm/copy.hpp:434-444`（`cute::copy(TiledCopy,...)`）先把 `TiledCopy` 向下转换为它继承的 `Copy_Atom`，所以第一参数不会触发一个神秘的单条“大拷贝”指令。随后 `3rd/cutlass/include/cute/algorithm/copy.hpp:189-235`（`cute::copy(Copy_Atom,...)`）对除 value 主模式之外的 rest modes 执行 `CUTE_UNROLL` 循环，并在每个分组调用 `copy_atom.call`。
+
+`3rd/cutlass/include/cute/atom/copy_atom.hpp:89-113`（`Copy_Atom::call`）在片段尺寸匹配时进入 `copy_unpack`；`3rd/cutlass/include/cute/atom/copy_traits.hpp:108-136`（`copy_unpack`）把 8 个 BF16 重解释为 4 个 `uint32_t` 源寄存器和 1 个 `uint128_t` 目的寄存器，然后通过 `3rd/cutlass/include/cute/arch/util.hpp:153-159`（`detail::CallCOPY::operator()`）调用 `SM90_U16x8_STSM_T::copy`。
+
+所以答案是：
+
+- 源码只有一行 `cute::copy`，但它**逻辑上会重复调用 atom**；
+- 对当前 tile，每个 lane 有 3 次 atom 调用，每个 warp 发出 3 条 warp-level `stmatrix.x4.trans` 语义操作；
+- 两个 math warpgroup 共 8 个 warp，因此一次完整 tiled copy 是 `8 x 3 = 24` 个 warp-level STSM operation，覆盖 `6144 BF16`；
+- 若按 C++ lane 的概念计数，是 `256 lanes x 3 = 768` 次内联 `SM90_U16x8_STSM_T::copy` 路径；这 768 次由硬件按 32 lane 一组体现为 24 个 warp-level 指令实例。
+
+这里的 `CUTE_UNROLL`（宏定义见 `3rd/cutlass/include/cute/config.hpp:49-59`，`CUTE_UNROLL`）是静态布局已知时的编译期展开提示，最终 SASS 中不一定保留一个可见的运行时 `for`。因此“会循环调用”在语义上是肯定的，但不应据此期待看到一个动态循环计数器。`stmatrix.sync` 的具体 SASS mnemonic 可能因 `ptxas` 版本而变化；上面的 24 是该 tile 的逻辑 STSM 操作数。
+
+### 15.4.3 和外层 task 循环的关系
+
+`src/group_gemm/sm90/kernels.cuh:438-498`（`group_gemm_fp8_kernel`）先在 `while` 中取得一个 `(igroup,itile_m,itile_n)` task，再遍历所有 K tile；`cute::copy` 位于 K 循环结束后的 epilogue（`src/group_gemm/sm90/kernels.cuh:469-523`，`group_gemm_fp8_kernel`）。因此：
+
+- 一个 task/output tile 执行一次完整的 `cute::copy`，即 24 个 warp-level STSM；
+- 它不是对每个 `itile_k` 都做一次 STSM；
+- 本次 N=4096、`kTileN=128`，每 group 有 32 个 N tiles；各 group 的 M tile 数为 `1,1,1,2,2,2,3,3`，逻辑上共 480 个 output tasks。若只按语义总量统计，全 kernel 约为 `480 x 24 = 11520` 个 warp-level STSM operation，由不同 CTA 分摊执行。
+
+## 15.5 `Tiler_MN: (_128,_48)` 是谁的 layout
+
+严格说它**不是 layout，而是 shape**。`TiledCopy` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:199-203`（`TiledCopy`）把第三个模板参数命名为 `ShapeTiler_MN`，并定义 `using Tiler_MN = ShapeTiler_MN`；`make_tiled_copy_C` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:442-445`（`make_tiled_copy_C`）传入 `make_shape(tile_size<0>(mma), tile_size<1>(mma))`。因此日志里没有冒号的 `(_128,_48)` 是 `Shape<_128,_48>`，不是 `Layout<Shape,Stride>`。
+
+它描述的是“本次 tiled copy 要覆盖的 C tile 坐标域”，元素数是 `128 x 48`。kernel 自己在 `src/group_gemm/sm90/kernels.cuh:268-270`（`group_gemm_fp8_kernel`）把 `gC` 建成 `(kTileN,kTileM)=(128,48)`，所以在这个 `SS_TN` 和输出张量约定下，第一坐标语义上是 N=128，第二坐标是 M=48。CuTe 的成员名仍沿用通用的 `Tiler_MN`，不要因为名字中的 MN 就把它当成独立的内存 stride layout。
+
+这个 shape 会被 `TiledCopy::tidfrg_S` 和 `tidfrg_D` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:218-247`（`TiledCopy::tidfrg_S`、`TiledCopy::tidfrg_D`）用于 `zipped_divide(..., Tiler_MN{})`，也就是把 `tCrh`/`sCT` 按一个 128×48 tile 切分。
+
+## 15.6 `TiledLayout_TV` 的来源和逐层含义
+
+### 15.6.1 来源
+
+`3rd/cutlass/include/cute/atom/mma_atom.hpp:397-410`（`TiledMMA::get_layoutC_TV`）根据 TiledMMA 的 C fragment ownership，构造 `(thr_idx,val_idx) -> (M,N)` 的 C layout。`make_tiled_copy_C` 把这份 layout 原样传给 `make_tiled_copy_impl`，所以日志中的 `TiledLayout_TV` 是 **TiledMMA 的 C ownership layout 被用作 copy 的 TV layout**，不是 `SLayoutY`、`sCT` 或 `tCr4s` 的 layout。
+
+### 15.6.2 形状部分
+
+日志打印的是：
+
+```text
+((_4,_8,_8), ((_2,_2,_6), (_1,_1)))
+```
+
+可以按外层 `(T,V)` 读：
+
+- `T=(_4,_8,_8)`：逻辑线程因子化为 4×8×8，乘积 256；这是两个 math warpgroup 的全部 256 个 math lane，而不是 256 个独立 CopyAtom；
+- `V=((_2,_2,_6),(_1,_1))`：值模式因子化为 2×2×6×1×1，乘积 24；每个逻辑线程有 24 个 BF16 值；
+- 两个 `_1` 模式是退化的 size-one 模式，不增加元素数。
+
+### 15.6.3 stride 部分
+
+冒号右侧：
+
+```text
+((_256,_1,_16), ((_128,_8,_1024), (_0,_0)))
+```
+
+是与上述各层 shape 一一对应的 stride 因子。它描述 CuTe 如何把 `(T,V)` 坐标组合成 C tile 坐标；这些 stride 是**逻辑 layout 坐标的 stride**，不是 global-memory 字节 stride，也不是 `stmatrix` 的寄存器编号表。`_0` 对应 size-one 模式，因其只有一个坐标值，对最终覆盖范围没有影响。
+
+因此这份 layout 的关键不在于把右侧数字直接当作线性地址，而在于它同时编码了：哪个 math lane 负责哪个 C 坐标、一个 lane 的 24 个值如何分组、以及不同 warp/warpgroup 之间如何覆盖 128×48 tile。`TiledCopy` 的 `tile2thrfrg` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:254-280`（`TiledCopy::tile2thrfrg`）利用这份映射产生每线程的 source/destination fragment。
+
+## 15.7 `Copy_Atom` 打印字段逐项解释
+
+`3rd/cutlass/include/cute/atom/copy_atom.hpp:620-642`（`cute::print(Copy_Atom)`、`cute::print(TiledCopy)`）正是日志字段的打印实现。下面区分 atom-local layout 和 full-tile layout。
+
+### 15.7.1 `ThrID: _32:_1`
+
+`3rd/cutlass/include/cute/atom/copy_traits_sm90.hpp:117-130`（`Copy_Traits<SM90_U16x8_STSM_T>`）定义 `using ThrID = Layout<_32>`。`Layout<_32>` 的 shape 是 32，stride 是 1，所以打印为 `_32:_1`：逻辑 thread id 为 0..31，连续对应一个硬件 warp 的 32 个 lane。
+
+这是 STSM 的硬件约束：`stmatrix.sync` 是 warp-collective，不能用一个 128-thread warpgroup 作为单个 atom 的 thread domain。TiledCopy 再把这个 32-thread atom 沿 `TiledLayout_TV` 复制到 `256/32=8` 个 warp。因而 `_32:_1` 不表示整个 kernel 只有 32 个线程，也不表示两 math warpgroup 只执行一次 atom。
+
+### 15.7.2 `ValLayoutSrc: ((_4,_8),(_1,_2,_4)):((_16,_1),(_1,_8,_64))`
+
+`3rd/cutlass/include/cute/atom/copy_atom.hpp:57-74`（`Copy_Atom`）先从 `Copy_Traits` 取得 bit-level `SrcLayout`，再用 `recast_layout<uint1_t, ValType>` 生成 `ValLayoutSrc`。STSM traits 在 `3rd/cutlass/include/cute/atom/copy_traits_sm90.hpp:123-126`（`Copy_Traits<SM90_U16x8_STSM_T>`）把 source layout 取为 `SM75_U16x8_LDSM_T::DstLayout`；其原始层次定义见 `3rd/cutlass/include/cute/atom/copy_traits_sm75.hpp:127-140`（`Copy_Traits<SM75_U16x8_LDSM_T>`）。
+
+读法如下：
+
+- 左半部 `((_4,_8),(_1,_2,_4))` 是 `(thread,value)` 的层次 shape；thread 因子 4×8=32，value 因子 1×2×4=8；
+- 右半部 `((_16,_1),(_1,_8,_64))` 是对应的层次 stride；由于已经 recast 到 16-bit `ValType`，这里应理解为 BF16/逻辑值单位的布局偏移，而不是直接的 byte address；
+- 它描述一个 STSM atom 从每个 lane 的寄存器片段中取哪些值，以及如何把这些值排列成该 atom 的输入矩阵；它不是完整 `tCrh` 的 layout，也不是 shared-memory 的 `SLayoutY`。
+
+形状的元素数是 `32 x 8 = 256 BF16`，与一条 warp-level `stmatrix.x4` 的搬运量一致。
+
+### 15.7.3 `ValLayoutDst: (_32,_8):(_8,_1)`
+
+STSM traits 在 `3rd/cutlass/include/cute/atom/copy_traits_sm90.hpp:123-129`（`Copy_Traits<SM90_U16x8_STSM_T>`）把 destination bit layout 取为 `SM75_U16x8_LDSM_T::SrcLayout`；原始 layout 是 `(_32,_128):(_128,_1)` bit mapping，经过 `Copy_Atom` 的 16-bit recast 后打印成 `(_32,_8):(_8,_1)`。
+
+- shape `(_32,_8)`：32 个 lane，每 lane 8 个 BF16；
+- stride `(_8,_1)`：描述 atom-local destination 坐标中 lane/value 的排列；
+- 它是单个 STSM atom 的 shared-side 逻辑 fragment，不是最终整个 shared tile 的 swizzled 地址表。真正的 shared tensor 是 `sCT`（`src/group_gemm/sm90/kernels.cuh:509-510`，`group_gemm_fp8_kernel`），`partition_D` 再把两者组合起来。
+
+### 15.7.4 `ValLayoutRef: ((_4,_8),(_1,_2,_4)):((_16,_1),(_1,_8,_64))`
+
+`3rd/cutlass/include/cute/atom/copy_traits_sm90.hpp:128-129`（`Copy_Traits<SM90_U16x8_STSM_T>`）明确设置 `RefLayout = SrcLayout`，所以 recast 后 `ValLayoutRef` 与 `ValLayoutSrc` 完全相同。
+
+`RefLayout` 是 source 和 destination 共用的 canonical `(thread,value)` 坐标系，不是第三个实际 buffer，也不会额外执行一次 copy。`TiledCopy::tidfrg_S/D` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:225-247`（`TiledCopy::tidfrg_S`、`TiledCopy::tidfrg_D`）分别计算：
+
+```text
+reference -> source layout
+reference -> destination layout
+```
+
+这样即使 STSM 是 transpose store，CuTe 仍能保证 `tCr4s` 中的第 i 个逻辑值对应 `tCs4r` 中正确的 shared 坐标。由于本例选择 source 作为 reference，打印结果看起来就和 `ValLayoutSrc` 一样。
+
+### 15.7.5 `ValueType: 16b`
+
+`cute::print(Copy_Atom)` 在 `3rd/cutlass/include/cute/atom/copy_atom.hpp:621-629`（`cute::print(Copy_Atom)`）打印 `sizeof_bits<typename Atom::ValType>::value`。本例的 `ValType` 是 `Tout=cute::bfloat16_t`，所以 `16b` 表示：**每个逻辑 copy value 是 16 bit，也就是 2 byte 的 BF16**。
+
+它不表示：
+
+- 每线程 16 个 BF16；
+- 每条指令 16 个 byte；
+- `uint128_t` 只有 16 bit。
+
+本例的宽度关系是：`ValueType=16 bit`，每个源寄存器 32 bit 装 2 个 BF16，4 个源寄存器装 8 个 BF16，目的寄存器 128 bit 装 8 个 BF16。
+
+## 15.8 从寄存器到 shared 的一次完整路径
+
+对一个 `(igroup,itile_m,itile_n)` task，代码执行顺序可以压缩成下面的映射链：
+
+1. WGMMA 在 `src/group_gemm/sm90/kernels.cuh:477-485`（`group_gemm_fp8_kernel`）把结果写入每 lane 的 24 个 FP32 `tCr` 值；
+2. `src/group_gemm/sm90/kernels.cuh:500-506`（`group_gemm_fp8_kernel`）把这 24 个值转换成 24 个 BF16 `tCrh` 值；
+3. `make_tiled_copy_C` 用 TiledMMA 的 C TV ownership 和 `(128,48)` tile shape 构造 `tiled_copy_c`；
+4. `retile_S` 把每 lane 的 24 值重排成 `8 x 3` 的 atom-local source fragment，`partition_D` 得到对应的 shared destinations；
+5. `cute::copy` 对 8 个 warp atom 位置和每个位置的 3 个 value group 做静态展开；每个 atom 调用发出一条 warp-level `stmatrix.x4.trans.m8n8.shared.b16` 语义操作；
+6. 两个 math warpgroup 最终共同把整个 `128 x 48 = 6144 BF16` C tile 写入 `sCT`，之后才由后续 TMA store 从 shared 写回 global（`src/group_gemm/sm90/kernels.cuh:520-537`，`group_gemm_fp8_kernel`）。
+
+## 15.9 直接结论
+
+- `SM90_U16x8_STSM_T::copy`：每 lane 一次提供 8 个 BF16；一个 32-lane warp 一次完成 256 个 BF16。
+- 两个 128-thread math warpgroup 若各 warp 做一轮 atom：8 个 warp、2048 个 BF16；对本次完整 `tiled_copy_c`，每 warp 有 3 组值，所以是 24 个 warp-level STSM、6144 个 BF16。
+- `cute::copy(tiled_copy_c,...)` 不是一条覆盖整个 tile 的 PTX；它通过静态 `CUTE_UNROLL`/布局递归重复调用 atom。每 lane 3 次、每 warp 3 次、两个 math warpgroup 合计 24 次 warp-level STSM。
+- `Tiler_MN` 是 `(128,48)` 的 tile shape；`TiledLayout_TV` 是从 `TiledMMA::get_layoutC_TV()` 得到的 full-tile `(thread,value)->tile-coordinate` layout；`ValLayoutSrc/Dst/Ref` 则是单个 CopyAtom 内部的三份 32-thread/8-value 映射。
+- `ThrID=_32:_1` 表示一个 atom 使用一个硬件 warp；`ValueType=16b` 表示逻辑元素是 16-bit BF16。
+
+# 16. Blockwise `total_seq_pad` 与不等长 group 测试
+
+## 16.1 先给结论
+
+对 `hpc.group_gemm_blockwise_fp8`，`total_seq_pad` 不是把所有 group 的真实长度相加后再统一向上取整。给定 kernel 选出的统一 `kTileM`，每个 group 单独计算：
+
+```text
+pad_i = ceil(seqlens[i] / kTileM) * kTileM
+total_seq_pad = sum_i(pad_i)
+```
+
+这是 `x_scale` 第二维的**最小所需长度**。允许调用方提供更大的末尾容量，但每个 group 的有效 scale 必须放在上述紧凑 padded segment 的起点，不能把所有真实 token 直接拼成 `total_seq` 列。
+
+`total_seq` 是 X/Y 的真实 token 行数；`total_seq_pad` 还包括每个 group 为固定 M 方向 TMA box 保留的尾部空槽。两者只有在特殊情况下才相等，例如所有 group 长度已经是 `kTileM` 的整数倍。
+
+## 16.2 `m_pad` 是怎样从 API 传进 kernel 的
+
+### 16.2.1 C++ 入口不计算 padding
+
+`src/group_gemm/entry.cc:145-150`（`group_gemm_blockwise_fp8_entry`）直接执行：
+
+```cpp
+int m = x.size(0);
+int m_pad = x_scale.size(1);
+```
+
+随后 `src/group_gemm/entry.cc:193-198`（`group_gemm_blockwise_fp8_entry`）把 `m_pad` 原样传给 `group_gemm_blockwise_fp8_async`。因此 `hpc.group_gemm_blockwise_fp8` 的调用者负责分配正确的 `x_scale` 第二维；入口目前没有根据 `seqlens` 重新计算或检查它。
+
+### 16.2.2 XS TMA tensor 需要 padded 列空间
+
+`src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:106-125`（`launch_group_gemm_blockwise_fp8`）把 XS 构造成：
+
+```cpp
+auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
+                      make_shape(num_block_k, m_pad),
+                      make_stride(m_pad, Int<1>{}));
+```
+
+这里 `num_block_k=(k+kTileK-1)/kTileK`，而 `m_pad` 是 x-scale 的 token-slot 维度。`src/group_gemm/sm90/config.h:140-153`（`GroupGEMMBlockWiseFp8Config::get_tma`）为 XS 使用 `CopyBoxXS=(1,kTileM)`，即一次按一个 M tile 读取一列 K-block 的 `kTileM` 个 token scale。即使最后一个 group 只有少量真实 token，TMA 仍会请求完整 box，剩余 slot 必须存在于 `x_scale` 中。
+
+### 16.2.3 每组 tile 前缀决定 scale segment 起点
+
+`src/group_gemm/sm90/kernels.cuh:149-176`（`update_grouped_tma`）先计算每组的 tile 数：
+
+```cpp
+tiles[i] = (seqlens_ptr[igroup] + kTileM - 1) / kTileM;
+```
+
+再用 `BlockScan(...).ExclusiveSum` 生成 `cu_tiles_ptr`。这个前缀保存的是 tile 数，不是 token 数。blockwise kernel 在 `src/group_gemm/sm90/kernels.cuh:703-704` 和 `src/group_gemm/sm90/kernels.cuh:820-823`（`group_gemm_blockwise_fp8_kernel`）使用：
+
+```cpp
+tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m)
+```
+
+`CopyBoxXS` 的 M 方向一个坐标对应 `kTileM` 个连续 scale 列，所以 group `i` 的 scale 起点实际是：
+
+```text
+offset_i = kTileM * sum_{j < i} ceil(seqlens[j] / kTileM)
+         = sum_{j < i} pad_j
+```
+
+这正是“每组独立 padding 后再拼接”的布局。若把 `x_scale` 只分配成 `ceil(total_seq/kTileM)*kTileM`，即使总长度恰好整除 tile，也可能没有空间容纳各 group 之间的 padding 间隔。
+
+## 16.3 用本次日志和具体数字说明
+
+### 16.3.1 原始等长用例
+
+原始 `temp/block.log:17-20` 显示 8 个 group、每组 `seqlen=30`，`total_seq=240`，xscale 形状为 `[32,256]`。平均长度 30 选择 `kTileM=32`，所以：
+
+```text
+每组 pad_i = ceil(30/32)*32 = 32
+total_seq_pad = 8*32 = 256
+```
+
+这里 `m_pad=256` 恰好等于旧测试中的 `m*num_group`，但它不等于 `total_seq=240`。旧代码看起来没有问题，是因为所有 group 恰好等长。
+
+### 16.3.2 改造后的 8-group smoke
+
+修改后的 `tests/test_group_gemm_blockwise_like.py:77-116`（`test_group_gemm1`）使用：
+
+```python
+seqlens = (1 + torch.arange(num_group, dtype=torch.int32, device="cuda")) * 16
+```
+
+脚本入口 `tests/test_group_gemm_blockwise_like.py:259-260`（模块主程序）用 8 个 group 时，长度为 `[16,32,48,64,80,96,112,128]`。平均值为 72，当前 dispatch 选择 `kTileM=48`，因此：
+
+```text
+pad_i = [48,48,48,96,96,96,144,144]
+total_seq = 576
+total_seq_pad = 720
+```
+
+如果错误地对总长度统一取整，会得到 `ceil(576/48)*48=576`，少了 144 个必须保留的 segment slot。实际运行日志 `temp/block.modify.log:17-22` 记录了 `tile_m=48`、`total_seq_pad=720`、`x_scale=[32,720]`。
+
+### 16.3.3 pytest 的 128-group 参数
+
+参数化测试 `tests/test_group_gemm_blockwise_like.py:77-80`（`test_group_gemm1`）使用 128 个 group，长度为 `[16,32,...,2048]`。平均值是 1032，dispatch 选择 `kTileM=64`。此时：
+
+```text
+total_seq = 16*(1+2+...+128) = 132096
+total_seq_pad = 64*(4*(1+2+...+32)) = 135168
+```
+
+注意这里 `total_seq` 本身恰好是 64 的整数倍，但仍不能用它作为 `m_pad`，因为每个 group 都要单独补齐到 64 的倍数。`temp/block.pytest.log:257-275` 输出了 `x_scale=[32,135168]` 及对应 `total_seq`。
+
+### 16.3.4 一个更小的反例
+
+若统一 `kTileM=48`，`seqlens=[17,33,65]`，则：
+
+```text
+pad_i = [48,48,96]
+total_seq = 115
+total_seq_pad = 192
+```
+
+整体取整只有 `ceil(115/48)*48=144`，不足以表示第二、第三 group 之间的 tile-aligned 起点。这说明问题不是本次测试数据的偶然现象。
+
+## 16.4 为什么 `x_scale` 不能用 `total_seq`
+
+### 16.4.1 X 的行是 compact，scale 的列是 padded
+
+入口在 `src/group_gemm/entry.cc:145-148`（`group_gemm_blockwise_fp8_entry`）把 `m=x.size(0)` 当作 X 的真实 M；X tensor 在 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:109-110`（`launch_group_gemm_blockwise_fp8`）按 `(m,k)` 构造，所以 X 只存实际 token，行索引由 `cu_seqlens` 的 compact prefix 给出。
+
+XS tensor 却在同一 launch 函数的 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:115-116`（`launch_group_gemm_blockwise_fp8`）按 `(num_block_k,m_pad)` 构造。它的第二维不是 X 的物理行号，而是按 group tile 前缀排列的 scale slot。group 的有效 token 只占其 segment 的前 `seqlens[i]` 列，后面的 `pad_i-seqlens[i]` 列是固定 TMA box 的空槽。
+
+### 16.4.2 错用 `total_seq` 会造成什么
+
+假设 8-group 不等长例子错误地把 xscale 分配成 `[32,576]`：
+
+1. group 0 的 `[0,16)` 可能还能读到正确 scale；
+2. group 1 的正确起点应是 48，而不是紧接在 group 0 的 16 后面；
+3. 后续 group 的 `cu_tiles_ptr[igroup] + itile_m` 会继续按 48/96/144 等 padded 起点寻址；
+4. 最终会出现 scale buffer 越界，或者把别的 group/别的 token 的 scale 当成当前 group 的 scale。
+
+因此 `total_seq` 不能替代 `total_seq_pad`，即使 X 本身是 compact 且总 token 数很小。
+
+## 16.5 `x_scale` 的形状、排列和 padding 值
+
+### 16.5.1 直接 blockwise API 的格式
+
+Python API 文档在 `hpc/group_gemm.py:164-169`（`group_gemm_blockwise_fp8`）规定：
+
+```text
+x_scale.shape = [hidden_size // 128, total_seq_pad]
+```
+
+第一维对应 K 方向的 128-element scale block；第二维对应按 group padded segment 拼接的 token-slot。对 group `i`：
+
+```text
+segment_start = sum_{j<i} pad_j
+valid columns  = [segment_start, segment_start + seqlens[i])
+padding columns = [segment_start + seqlens[i], segment_start + pad_i)
+```
+
+padding columns 不参与有效 token 的结果，通常应初始化为 0 以便调试和后续复用；kernel 的正确性依赖的是它们存在且不越过下一个 segment，而不是依赖 padding 列的随机值。
+
+### 16.5.2 Deepep 输入需要先 reformat
+
+如果输入 scale 原本是 `[total_seq_pad, hidden_size//128]` 的 per-token 格式，`hpc.reformat_x_scale` 会转置并按每组 padded 长度放入 compact output。其 CUDA 实现 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:20-23`（`reformat_x_scale_kernel`）用 `cu_seqlens` 定位源 group；`src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:42-47`（`reformat_x_scale_kernel`）累加此前各 group 的 `ceil(seqlen/tilem)*tilem`，得到目标 segment 起点；有效范围判断位于同函数 `:59-82`。
+
+这个 reformat 路径与直接调用 `group_gemm_blockwise_fp8` 要求的最终 `[k//128,total_seq_pad]` 格式不同。直接 API 不会自动替调用者插入 padding 或转置。
+
+## 16.6 测试改造内容
+
+### 16.6.1 `naive_group_gemm` 支持不等长
+
+原实现 `tests/test_group_gemm_blockwise_like.py:20-34`（`naive_group_gemm`）用 `m // num_group` reshape scale，因此只适用于等长 group。现在 `tests/test_group_gemm_blockwise_like.py:40-74`（`naive_group_gemm`）改为：
+
+1. 根据同一个 `tile_m` 为每个 group 计算 `padded_lengths`；
+2. 用 `scale_offset` 累加每个 padded segment 的起点；
+3. 只取当前 group 的 `xscale[:, scale_offset:scale_offset+seq_len]`，转置并扩展每个 K block 的 128 个值；
+4. 从 compact X 的 `cu_seqlens[i]` 行开始做当前 group 的矩阵乘；
+5. 即使有 zero-length group，也推进对应 padding offset，避免后续 group 错位。
+
+### 16.6.2 测试端 padding 计算
+
+`tests/test_group_gemm_blockwise_like.py:77-116`（`test_group_gemm1`）现在使用实际 `seqlens` 的总和作为 `total_seq`，用平均长度选择 `tile_m`，再按每组向上取整求 `total_seq_pad`，最后创建精确形状 `xscale=(k//128,total_seq_pad)`。`tests/test_group_gemm_blockwise_like.py:20-37`（`get_tile_m`）镜像 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:369-457`（`group_gemm_blockwise_fp8_async`）的 dispatch 表，包含 `64->48`、`96->32`、`144->48` 这些不能用“超过 32 一律 64”替代的分支。
+
+## 16.7 验证结果
+
+### 16.7.1 8-group 脚本入口
+
+在指定环境并使用空闲 GPU 7 执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 /share_data/users/like/miniconda3/envs/simo_sglang/bin/python \
+  tests/test_group_gemm_blockwise_like.py > temp/block.modify.log 2>&1
+```
+
+结果 `temp/block.modify.log:17-22`：
+
+```text
+mean_seq:72, tile_m:48, total_seq:576, total_seq_pad:720
+x.shape=[576,4096], xscale.shape=[32,720]
+max_abs_diff:0.03125, mean_abs_diff:0.0011507084
+```
+
+脚本正常退出，naive 与 `hpc.group_gemm_blockwise_fp8` 的断言通过。
+
+### 16.7.2 128-group pytest
+
+同一环境执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 /share_data/users/like/miniconda3/envs/simo_sglang/bin/python \
+  -m pytest tests/test_group_gemm_blockwise_like.py::test_group_gemm1 -q -s \
+  > temp/block.pytest.log 2>&1
+```
+
+结果 `temp/block.pytest.log:273-276` 为 `max_abs_diff=0.03125`、平均绝对误差约 `0.00115693`，并显示 `1 passed in 1.44s`。这次比较覆盖 128 个不等长 group，而不是只验证等长的旧布局。
+
+## 16.8 使用时的边界条件
+
+### 16.8.1 `num_seq_per_group_avg` 必须与 padding 计算一致
+
+`kTileM` 是由调用方传入的 `num_seq_per_group_avg` 选择的，不是 kernel 根据每个 group 动态选择。dispatch 表在 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:385-457`（`group_gemm_blockwise_fp8_async`）；如果调用者传入的平均值与测试端不同，就必须按实际选出的 `kTileM` 重新计算全部 `pad_i`。
+
+### 16.8.2 `m_pad` 是最小容量，不是 X 的真实 M
+
+`m_pad` 可以大于 `sum_i(pad_i)` 作为额外容量，但不能小于它；额外尾部不会被当前 group 前缀使用。最重要的是，group segment 的起点必须保持 `sum_{j<i} pad_j`，不能按 `cu_seqlens[i]` 或 `sum_{j<i} seqlens[j]` 直接定位。
+
+### 16.8.3 输入元数据仍需合法
+
+上述证明依赖 `cu_seqlens[0]=0`、`cu_seqlens[i+1]=cu_seqlens[i]+seqlens[i]`、各 group 区间不重叠，且 X/Y 与 scale buffer 已按这些尺寸分配。kernel 当前入口没有为损坏的 prefix、负长度或不足的 `m_pad` 增加完整运行时校验。
+
+## 16.9 最终回答
+
+- `total_seq_pad` 是每个 group 按统一 `kTileM` 独立向上取整后的长度之和，不是总 `total_seq` 一次向上取整。
+- `x_scale` 的直接 API 形状是 `[hidden_size//128, total_seq_pad]`；`total_seq` 只描述 compact X 的真实 token 行。
+- blockwise kernel 通过 `cu_tiles_ptr` 的 tile 前缀定位每组 scale segment，再由 `CopyBoxXS=(1,kTileM)` 读取固定 box，所以每组尾部 padding 是地址布局的一部分。
+- 测试已改为 `[16,32,...]` 不等长 seqlen，naive 基准按 padded offset 取 scale；8-group 脚本和 128-group 参数化测试均通过，结果误差在原断言阈值内。
+
+# 17. `HPC_ARCH_DISPATCH` 的宏展开与设计原因
+
+## 17.1 这次调用的上下文
+
+问题中的调用位于 `src/group_gemm/entry.cc:122-200`（函数 `group_gemm_blockwise_fp8_entry`），实际 dispatch 语句是 `src/group_gemm/entry.cc:193-198`（函数 `group_gemm_blockwise_fp8_entry`）：
+
+```cpp
+HPC_ARCH_DISPATCH(
+    "group_gemm_blockwise_fp8", 90,
+    group_gemm_blockwise_fp8_async(
+        y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
+        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+        num_block_k_pad4, num_seq_per_group_avg, update_tma, false, stream));
+```
+
+这里的参数格式不是 `(op, arch, function)`，而是：
+
+```text
+HPC_ARCH_DISPATCH(op, arch_0, expression_0, arch_1, expression_1, ...)
+```
+
+本例只有一个 `(90, expression)` pair。`group_gemm_blockwise_fp8_async` 的共享声明在 `src/group_gemm/group_gemm.h:21-27`（函数声明 `group_gemm_blockwise_fp8_async`），而实际实现位于 sm90 专用源文件；因此入口文件需要在不同架构模块中都能编译，但不能让每个模块都链接所有架构实现。
+
+构建系统在 `CMakeLists.txt:53-82`（架构源文件选择逻辑）按 `HPC_TARGET_ARCH` 只加入当前架构的源文件，并在 `CMakeLists.txt:162-171`（目标 `target_compile_definitions`）把 `HPC_TARGET_ARCH` 作为预处理宏传给编译器。`setup.py:34-69`（`CMakeBuild::build_extension`）会为每个目标架构分别生成 `_C_sm<arch>.abi3.so`。
+
+## 17.2 宏链逐层做了什么
+
+定义集中在 `src/utils/utils.h:34-97`（宏 `HPC_ARCH_UNEVAL`、`HPC_ARCH_EVAL_*`、`HPC_ARCH_DISPATCH`）：
+
+| 宏 | 位置 | 作用 |
+|---|---|---|
+| `HPC_ARCH_NARGS` | `src/utils/utils.h:65-66`（宏 `HPC_ARCH_NARGS`） | 统计 variadic 参数个数；本例 `90, expression` 共 2 个 |
+| `HPC_ARCH_CAT` | `src/utils/utils.h:62-63`（宏 `HPC_ARCH_CAT`） | 把 `HPC_ARCH_EVALS_` 和数字 2 拼成 `HPC_ARCH_EVALS_2` |
+| `HPC_ARCH_EVALS_2/4/6/8/10` | `src/utils/utils.h:68-80`（宏族） | 每次消费一个 `(arch, expression)` pair，并递归处理剩余 pair |
+| `HPC_ARCH_EVAL_90/100/103` | `src/utils/utils.h:44-60`（宏族） | 由编译时 `HPC_TARGET_ARCH` 决定该架构 pair 是 live 还是 unevaluated |
+| `HPC_ARCH_IMPL_STR_*` | `src/utils/utils.h:82-86`（宏族） | 只提取架构号，生成错误信息中的 `"90"` 或 `"90, 100"` |
+| `HPC_ARCH_DISPATCH__` | `src/utils/utils.h:90-97`（宏 `HPC_ARCH_DISPATCH__`） | 建立 dispatched 标志、执行匹配 pair、未命中时抛错 |
+
+所以它看起来啰嗦，主要是因为 C 预处理器没有“遍历任意数量 pair”的原生语法；这里用固定的 `2/4/6/8/10` 宏递归模拟了最多五个架构 pair。
+
+## 17.3 `HPC_TARGET_ARCH=90` 时的实际展开
+
+### 17.3.1 先展开参数个数和 token 拼接
+
+`HPC_ARCH_DISPATCH` 在 `src/utils/utils.h:88-89`（宏 `HPC_ARCH_DISPATCH`、`HPC_ARCH_DISPATCH_`）先变成：
+
+```cpp
+HPC_ARCH_DISPATCH__(
+    "group_gemm_blockwise_fp8", 2,
+    90,
+    group_gemm_blockwise_fp8_async(/* 22 个实参 */));
+```
+
+这里 `HPC_ARCH_NARGS` 数的是 variadic 参数，而不是函数实参：外层的 `group_gemm_blockwise_fp8_async(...)` 有很多逗号，但它们位于括号内，整体仍是一个宏参数。因此 `n=2`。
+
+随后 `HPC_ARCH_CAT(HPC_ARCH_EVALS_, 2)` 展开成 `HPC_ARCH_EVALS_2`，`HPC_ARCH_EVALS_2` 在 `src/utils/utils.h:68`（宏 `HPC_ARCH_EVALS_2`）变成 `HPC_ARCH_EVAL_90(expression)`。
+
+### 17.3.2 `HPC_TARGET_ARCH=90` 选择 live 分支
+
+因为 `HPC_TARGET_ARCH == 90`，`src/utils/utils.h:44-45`（宏 `HPC_ARCH_EVAL_90`）定义为 `HPC_ARCH_EVAL_LIVE(90, expression)`；`src/utils/utils.h:36-42`（宏 `HPC_ARCH_EVAL_LIVE`）再展开为运行时架构检查。
+
+把本例的完整表达式代回后，预处理结果等价于：
+
+```cpp
+do {
+  bool hpc_arch_dispatched_ = false;
+  do {
+    if (::hpc::get_sm_arch() == (90)) {
+      group_gemm_blockwise_fp8_async(
+          y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
+          tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+          num_block_k_pad4, num_seq_per_group_avg, update_tma, false, stream);
+      hpc_arch_dispatched_ = true;
+    }
+  } while (0);
+  if (!hpc_arch_dispatched_) {
+    ::hpc::throw_arch_not_supported("group_gemm_blockwise_fp8", "90");
+  }
+} while (0);
+```
+
+这里有两个 `do { ... } while (0)`：内层来自 `HPC_ARCH_EVAL_LIVE`，外层来自 `HPC_ARCH_DISPATCH__`。它们都只执行一次；用途是让整个宏在 `if (...) HPC_ARCH_DISPATCH(...); else ...` 等语境中表现为一个安全的单语句。
+
+## 17.4 `HPC_TARGET_ARCH=100/103` 时的展开
+
+如果同一份 `entry.cc` 被编译为 sm100 模块，`src/utils/utils.h:46-48`（宏 `HPC_ARCH_EVAL_90`）不会选择 live 分支，而是选择：
+
+```cpp
+#define HPC_ARCH_EVAL_90(expr) HPC_ARCH_UNEVAL(expr)
+```
+
+于是本例等价于：
+
+```cpp
+do {
+  bool hpc_arch_dispatched_ = false;
+  static_cast<void>(sizeof((
+      group_gemm_blockwise_fp8_async(
+          y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
+          tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+          num_block_k_pad4, num_seq_per_group_avg, update_tma, false, stream),
+      0)));
+  if (!hpc_arch_dispatched_) {
+    ::hpc::throw_arch_not_supported("group_gemm_blockwise_fp8", "90");
+  }
+} while (0);
+```
+
+`HPC_ARCH_UNEVAL` 在 `src/utils/utils.h:34`（宏 `HPC_ARCH_UNEVAL`）使用 `sizeof` 的未求值操作数：
+
+- `group_gemm_blockwise_fp8_async(...)` 会被解析和类型检查，因此声明/参数类型错误仍能在编译时发现；
+- 函数不会被执行，也不会生成这次调用的运行时代码；
+- 因而 sm100/103 模块不需要链接只存在于 sm90 源目录中的实现。
+
+这不是把调用“注释掉”：它保留了编译期接口检查，但去除了运行时求值。CMake 的未定义符号保护在 `CMakeLists.txt:200-204`（目标 `target_link_options`）启用 `-Wl,--no-undefined`；如果非目标架构分支是普通函数调用而不是 `sizeof`，链接阶段就可能直接因为缺少 sm90 实现失败。
+
+## 17.5 如果同时写多个架构 pair
+
+宏的通用形式可以写成：
+
+```cpp
+HPC_ARCH_DISPATCH("op", 90, expr90, 100, expr100);
+```
+
+`HPC_ARCH_NARGS` 得到 4，`src/utils/utils.h:69-71`（宏 `HPC_ARCH_EVALS_4`）展开为概念上的：
+
+```cpp
+HPC_ARCH_EVAL_90(expr90);
+HPC_ARCH_EVAL_100(expr100);
+```
+
+在 sm90 模块中，`expr90` 是 live、`expr100` 是 `sizeof`；在 sm100 模块中相反。错误字符串由 `src/utils/utils.h:83-86`（宏 `HPC_ARCH_IMPL_STR_4`）生成 `"90, 100"`。因此架构之间不仅可以调用不同的 `*_async` 函数，也可以传入不同的参数准备或 launch 表达式；这比强行要求所有架构共享一个函数指针更灵活。
+
+## 17.6 运行时到底检查哪一个架构
+
+### 17.6.1 编译期和运行时是两道不同的筛选
+
+这套宏有两个层次：
+
+1. **编译期筛选**：`HPC_TARGET_ARCH` 决定哪个 `HPC_ARCH_EVAL_<arch>` 是 live，其他 pair 进入 `sizeof`；
+2. **运行时筛选**：live pair 内部调用 `::hpc::get_sm_arch()`，只有实际 GPU 架构等于 pair 中的数字才执行表达式。
+
+`src/utils/utils.cc:47-58`（函数 `get_sm_arch`）通过 `cudaGetDeviceProperties` 计算 `major * 10 + minor`，并缓存结果。`src/utils/utils.cc:61-67`（函数 `throw_arch_not_supported`）在没有任何 live pair 成功时给出实际设备、支持列表和已加载模块架构。
+
+`hpc_arch_dispatched_` 只表示“某个架构条件命中并执行了 expression”，不表示 expression 自己返回成功。当前 `group_gemm_blockwise_fp8_async` 在 `src/group_gemm/group_gemm.h:21-27`（函数声明）返回 `void`，所以这个布尔值足以表示本次分支已被选中；若某个其它 operator 的 async 函数返回 `bool`，调用者仍需像 `src/gemm/entry.cc:142-148`（函数 `gemm_bf16xfp32_entry`）那样另行检查返回值。
+
+### 17.6.2 本例的几种情况
+
+| 编译模块 | 实际设备 | `group_gemm_blockwise_fp8_async` 是否执行 | 结果 |
+|---|---:|---:|---|
+| sm90 | sm90 | 是 | 设置 `hpc_arch_dispatched_=true`，正常返回 |
+| sm90 | sm100 | 否 | bool 保持 false，抛出不支持错误 |
+| sm100 | sm90 | 否（90 pair 在 `sizeof` 中） | 抛出不支持错误 |
+| sm100 | sm100 | 本调用没有 sm100 pair | 抛出不支持错误 |
+
+Python 层通常在 `hpc/__init__.py:58-95`（函数 `_load_module`）按 NVML/设备能力选择匹配的 `_C_sm<arch>.abi3.so`，但 C++ 宏的运行时检查仍是防御性保障：它覆盖 `HPC_SM_ARCH` 覆盖、手工加载错误模块或多设备环境不一致等情况。
+
+## 17.7 为什么要设计得这么“啰嗦”
+
+### 17.7.1 避免每个模块链接不属于自己的 kernel
+
+blockwise 实现当前在 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:369-458`（函数 `group_gemm_blockwise_fp8_async`）的 sm90 源目录中。CMake 为每个目标架构筛选源文件；如果入口直接写普通调用，sm100/103 编译单元仍可能产生对 sm90 符号的引用，最终与 `-Wl,--no-undefined` 冲突。`sizeof` 分支正是为解决这个链接边界而存在。
+
+### 17.7.2 允许各架构使用不同表达式
+
+宏参数是任意 C++ expression，而不是固定函数名。未来可以写成 `90, launch_sm90(...)`、`100, launch_sm100(...)`，甚至让不同架构使用不同模板实例、不同配置或不同返回值处理。`HPC_ARCH_EVALS_*` 负责遍历 pair，调用点仍保持一个统一入口。
+
+### 17.7.3 同时提供运行时安全检查和清晰错误
+
+仅靠编译期选择无法阻止用户加载错误的 `.so`；仅靠运行时 `switch` 又会让所有实现都进入链接依赖。当前组合让错误在调用点立即变成：`hpc::<op> does not run on sm<actual>: implemented for <list>, loaded module built for sm<target>`，而不是更晚的非法 kernel launch 或难以解释的 unresolved symbol。
+
+### 17.7.4 让所有架构专用入口遵循同一模式
+
+`src/utils/utils.h:5-7`（文件级架构 dispatch 说明）明确规定：架构专用 operator 使用 `HPC_ARCH_DISPATCH`，真正对所有架构都有共享实现的 operator 才直接调用 `*_async`。因此当前 blockwise 只有一个 `90` pair 时看起来有些过度封装，但它与整个仓库的多架构模块模型一致。
+
+## 17.8 这层宏带来的实际代价和限制
+
+### 17.8.1 只有 host launch 路径有少量开销
+
+sm90 模块的最终代码多出一次 `get_sm_arch()` 判断、一个 bool 赋值和一次失败检查；`get_sm_arch()` 首次调用才查询 CUDA 属性，之后走缓存原子变量（`src/utils/utils.cc:47-58`，函数 `get_sm_arch`）。这些操作发生在 host 的 Python/C++ API 调用路径，不会加入 GPU kernel 内部，也不会影响 WGMMA/TMA 的每元素性能。
+
+### 17.8.2 只支持固定数量的 pair
+
+`src/utils/utils.h:68-80`（宏 `HPC_ARCH_EVALS_*`）目前只定义了 2、4、6、8、10 个 variadic 参数，即最多五个 `(arch, expression)` pair；参数必须成对出现。表达式内的逗号必须处在括号、函数调用或其它宏参数保护结构中，否则 `HPC_ARCH_NARGS` 会误计数。
+
+### 17.8.3 单架构、共享实现时可以更简单
+
+如果某个 `*_async` 实现在所有已知架构都存在，仓库说明建议直接调用，而不是为了形式统一套一层 dispatch。对当前只有 sm90 实现的 blockwise operator，直接写：
+
+```cpp
+group_gemm_blockwise_fp8_async(
+    y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
+    tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+    num_block_k_pad4, num_seq_per_group_avg, update_tma, false, stream);
+```
+
+在“永远只构建并加载 sm90、且不需要错误架构诊断”的前提下可以工作；但它会放弃上述源文件隔离、运行时设备校验和统一扩展点，所以当前仓库选择保留宏。
+
+## 17.9 最终结论
+
+- 本次一个 pair 的 `HPC_ARCH_DISPATCH` 在 `HPC_TARGET_ARCH=90` 下最终就是“`get_sm_arch()==90` 时调用 `group_gemm_blockwise_fp8_async`，否则抛错”的嵌套 `do/while` 代码。
+- 在非 sm90 模块中，同一表达式变成 `sizeof((expression,0))`：只做编译期类型检查，不执行、不产生该函数调用的链接依赖。
+- 宏的冗长部分来自可变参数 pair 计数、token 拼接、递归展开、错误字符串生成和语句安全包装；它服务的是一个 `.cc` 源文件对应多个架构 `.so` 的构建模型。
+- 对当前 API 调用，宏开销只在 host launch 路径上，主要是一次缓存架构查询和比较；不会增加 blockwise GPU kernel 的运行时指令。

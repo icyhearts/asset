@@ -273,3 +273,65 @@ simo code base 83dbdd1bc048810ba6a5206cad2c250d18cc96d4 这个提交在view int3
 答案追加到 like-useful/answer_codex.md
 }
 
+
+
+{
+答案追加到 like-useful/answer_claude.md
+
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+simo 代码位于  /share/users/like/package/simo_conda_vllm_sipu
+simo 代码以 editable 方式安装在 conda 环境
+
+si-infer 代码位于 
+tests/kernels/quantization/test_fp8_linear.py
+```
+def test_fp8_linear_method(default_vllm_config, monkeypatch)
+```
+default_vllm_config 和 monkeypatch 参数是谁传给 test_fp8_linear_method的？如何构造
+default_vllm_config 和 monkeypatch 参数如何实例化构造出来的 ？
+答案追加到 like-useful/answer_codex.md
+}
+
+
+{
+答案追加到 like-useful/answer_claude.md
+
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+simo 代码位于  /share/users/like/package/simo_conda_vllm_sipu
+simo 代码以 editable 方式安装在 conda 环境
+
+si-infer 代码位于  /softhome/like/package/si-infer/, 这个 源码仅仅是为了有一份测试，真正的 siinfer安装是通过 pip 安装的wheel包，位于  conda 环境。
+我的工作目录: /softhome/like/package/si-infer
+pytest tests/test_per_token_group_fp8_quant.py
+日志位于
+/share_data/users/like/package/si-infer/temp/unit-test.log
+
+分析错误原因。
+告诉我：如何在 conda 环境中成功运行 pytest tests/test_per_token_group_fp8_quant.py?
+
+答案追加到 like-useful/answer_codex.md
+}
+
+
+
+{
+答案追加到 like-useful/answer_claude.md
+
+conda 环境位于 /share_data/users/like/miniconda3/envs/vllm_dev/
+sipu sdk 位于 /share_data/sicx_sdk/release/2608121443/
+source sdk 脚本位于 sipu_sdk_setup.sh
+simo 代码位于  /share/users/like/package/simo_conda_vllm_sipu
+simo 代码以 editable 方式安装在 conda 环境
+
+tests/kernels/quantization/test_fp8_linear_unpack_pytest.py
+会走到 SIPUFp8LinearMethod apply函数 -> output = torch._scaled_grouped_mm
+这个 torch._scaled_grouped_mm 是调用的 torch_sipu 的实现,  它的函数签名在哪里? 完成 的是 激活 per token, 权重 per block的 matmul吗？调用者没有传 激活量化的 block size，也没有传权重量化的 block size,  torch._scaled_grouped_mm 是如何推断出 block size的?
+
+torch_sipu本身是通过 wheel 包的方式安装，如果需要 c++代码代码， /softhome/like/package/torch_sipu 是 torch_sipu 的代码库 
+
+答案追加到 like-useful/answer_codex.md
+}

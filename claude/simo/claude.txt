@@ -3772,3 +3772,55 @@ simo 以 editable 方式安装
 把原因追加到 like-useful/answer_codex_v2.md
 
 }
+{
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
+sglang 源码位于 /share/users/like/package/sglang_kernel_src
+sglang 以  editable 方式安装
+sglang  安装脚本 /share/users/like/package/sglang_kernel_src/like-useful/install-sglang.sh
+安装日志  temp/pip-sglang-log.main-local-dep.txt.2026_09_01___15_15_16
+
+安装后，运行 deepseek-v4-flash 脚本 :
+
+/share/users/like/package/simo_conda_sglang/like-useful/dsv4-flash-run.sh
+运行失败日志 ： /share/users/like/package/simo_conda_sglang/temp/sgl.dsv4-flash.log.2026_09_01___15_40_59
+如何修复运行失败的问题?
+
+把原因追加到 like-useful/answer_codex_v2.md
+}
+
+
+
+{
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
+sglang 源码位于 /share/users/like/package/sglang_kernel_src
+sglang 以  editable 方式安装
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+simo 以 editable 方式安装
+
+本次 sglang升级，从 main-local-dep 分支升级到  release/v0.5.18-local-dep 分支，有很多接口发生了变化，有些class被删除，有些文件被删除，我只关注对 sglang_simo kv cache 量化的影响。
+
+simo/extensions/sglang_simo 当前的 kv cache 量化基于 sglang  code base main-local-dep 分支做的扩展。
+sglang_simo 针对 kv cache 提出的自定义量化的主要代码如下 ：
+
+
+simo/extensions/sglang_simo/mem_cache/memory_pool.py 实现了 SIMOMLATokenToKVPool SIMOMHATokenToKVPool, 对 sglang 的 kv pool 进行功能增强。
+SIMOMLATokenToKVPool 和 SIMOMHATokenToKVPool 依赖的 父类接口有没有变化? 需要做什么修改, 从而适应  sglang 本次升级吗?
+
+simo/extensions/sglang_simo/layers/attention/triton_ops/set_kv_buffer.py concat_and_cache_mla_kernel set_kv_buffer_kernel 实现 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group nvfp4 格式 kv cache 量化格式写入。
+
+simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py 对 sglang 的原本 decode attention kernel 进行扩展， 支持 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group nvfp4 格式 kv cache 量化格式读取。
+simo/extensions/sglang_simo/layers/attention/triton_ops/extend_attention.py 对 sglang 的原本 prefill attention kernel 进行扩展， 支持 mxfp8 mxfp4 mxfp6 mxint8 fp8_per_group int8_per_group nvfp4 格式 kv cache 量化格式读取。
+
+simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py 实现的 SIMOTritonAttnBackend, 继承自 sglang TritonAttnBackend,  SIMOTritonAttnBackend 需要做什么修改去适应 sglang的升级吗?
+
+simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py 
+  from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    ModelRunnerKVCacheMixin,
+  ) 这个类，在 sglang 升级后，没有了，sglang_simo应该如何 如何修改? 
+ 
+ 为了适应 sglang的升级, sglang_simo 还有其他 kv cache 量化相关的代码，需要修改吗？
+
+把答案追加到 like-useful/answer_codex_v2.md
+}
+
+

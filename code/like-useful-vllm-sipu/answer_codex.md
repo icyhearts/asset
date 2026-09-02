@@ -3143,3 +3143,350 @@ passed.`。关键 case 如下：
 - 对 512x512、block_size=32，正确 scale 数量是 512*16；旧代码会错误地产生
   512*8 或在奇数 block 数时直接失败。先 cast float32 后再 view 才能保证
   每个 block 对应一个 E8M0 uint8 scale。
+
+## 2026-08-31：si-infer `test_per_token_group_fp8_quant.py` 失败原因与成功运行方式
+
+### 1. 原始失败发生在 pytest collection
+
+用户提供的日志 `/share_data/users/like/package/si-infer/temp/unit-test.log` 显示：
+
+```text
+rootdir: /share_data/users/like/package/si-infer
+configfile: pyproject.toml
+collected 115 items
+...
+ModuleNotFoundError: No module named 'siinfer._C'
+RuntimeError: SiPU operator tests require torch_sipu, a built siinfer._C extension,
+and an available SiPU runtime
+no tests ran
+```
+
+这不是 conda 中没有安装 `siinfer` wheel。当前 wheel 实际包含：
+
+```text
+/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/siinfer/
+    _C.cpython-310-x86_64-linux-gnu.so
+    libs/libsiinfer_kernels.so
+```
+
+真正的问题是源码目录遮蔽了 wheel。源码 checkout 中的
+`/share_data/users/like/package/si-infer/siinfer/` 只有 Python 文件，没有 `_C.so`；而
+`pyproject.toml:21-23` 配置了：
+
+```toml
+[tool.pytest.ini_options]
+pythonpath = ["."]
+```
+
+pytest 识别该项目后会把源码根目录放到 `sys.path` 前面，因此 `import siinfer` 解析为源码目录，
+随后 `tests/common_test_utils.py:22` 执行 `importlib.import_module("siinfer._C")` 时找不到子模块。
+`tests/conftest.py:7-11` 的 collection hook 会在发现 `sipu` 标记后立即调用这个检查，所以虽然
+显示 `collected 115 items`，测试体一个都没有运行。
+
+### 2. 运行库还需要 SDK、cmodel 和 conda lib
+
+仅执行 `/share_data/sicx_sdk/release/2608121443/sipu_sdk_setup.sh` 还不够：
+
+- `torch_sipu` 需要 SIPU SDK 的 `libsipu.so`/`libsipurt.so`；
+- 测试调用 `torch.empty(1, device="sipu")`，需要 1.5 cmodel 的
+  `libarchmodel.so` 和 `SI_CMODEL_ROOT`；
+- `torch_sipu/lib/libtorch_sipu.so` 需要 conda 环境提供的 GCC 运行库。若没有把
+  `$CONDA_PREFIX/lib` 放在 `LD_LIBRARY_PATH` 前面，动态链接器可能先取系统
+  `/lib/x86_64-linux-gnu/libgcc_s.so.1`，实测会报：
+
+  ```text
+  version `GCC_13.0.0' not found
+  (required by .../site-packages/torch_sipu/lib/libtorch_sipu.so)
+  ```
+
+SDK 下的 `sipu1.5_cmodel` 是指向当前 cmodel 的链接（本机解析到
+`/share_data/arch_cmodel_release/sipu1.5/2608120400`）。`nvcc` 在这个测试中不是触发点：已安装
+wheel 已包含 `siinfer._C` 和 `libsiinfer_kernels.so`，测试使用的是 CPU PyTorch + SIPU backend/cmodel，
+不会重新编译 CUDA 源码。
+
+### 3. 可成功运行的命令
+
+下面的命令直接使用用户指定的 SDK setup 脚本，并显式加载 cmodel。关键是从
+`si-infer` 的父目录启动，且覆盖项目的 `pythonpath=["."]`：
+
+```bash
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate /share_data/users/like/miniconda3/envs/vllm_dev
+
+# nvcc 对本测试不是必需的；保留此行可使环境与用户的 CUDA 配置一致。
+export PATH=/share_data/users/like/opt/cuda-13.0/bin:$PATH
+
+source /share_data/sicx_sdk/release/2608121443/sipu_sdk_setup.sh
+source /share_data/sicx_sdk/release/2608121443/sipu1.5_cmodel/sipu_cmodel_setup.sh
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+
+# 不要在 si-infer 源码根目录启动；否则源码 siinfer/ 会遮蔽 wheel。
+cd /softhome/like/package
+python -m pytest -q --import-mode=importlib -o pythonpath=/softhome/like/package/si-infer/tests /softhome/like/package/si-infer/tests/test_per_token_group_fp8_quant.py
+```
+
+`/softhome/like/package` 与 `/share_data/users/like/package` 是同一份目录的链接。使用
+`-o pythonpath=.../tests` 是为了让 `tests.common_test_utils` 仍然可导入，同时不再把源码根目录
+作为 `siinfer` 的优先路径；`--import-mode=importlib` 避免 pytest 再把测试目录插到模块搜索路径前面。
+
+如果希望由仓库脚本处理 cmodel 和 conda 库路径，也可以把上面的两条 setup 命令替换为：
+
+```bash
+source /softhome/like/package/si-infer/scripts/sipu_sdk_env.sh \
+  /share_data/sicx_sdk/release/2608121443
+```
+
+该包装脚本内部会 source SDK setup、解析 1.5 cmodel，并把 `$CONDA_PREFIX/lib` 放到
+`LD_LIBRARY_PATH` 首位；pytest 命令仍需从父目录运行并保留 `-o pythonpath=.../tests`。
+
+### 4. 验证结果
+
+在上述环境和命令下，导入路径为：
+
+```text
+torch          2.10.0+cpu
+torch_sipu     0.7.0+sdk260801
+siinfer        .../envs/vllm_dev/lib/python3.10/site-packages/siinfer/__init__.py
+siinfer._C     .../envs/vllm_dev/lib/python3.10/site-packages/siinfer/_C.cpython-310-x86_64-linux-gnu.so
+torch.sipu.is_available() = True
+torch.empty(1, device="sipu").device = sipu:0
+```
+
+完整测试输出为：
+
+```text
+........................................................................ [ 62%]
+...........................................                              [100%]
+115 passed in 61.76s (0:01:01)
+```
+
+因此，成功运行的必要条件是“加载匹配的 SiPU runtime + 使用 conda 中的 native wheel + 避免
+源码 `siinfer/` 遮蔽 wheel”，不需要修改 si-infer 源码、simo 源码或 conda 中任何已安装包。
+
+## 2026-08-31：SIPU FP8 Linear 中 `torch._scaled_grouped_mm` 的签名、调用链与量化粒度
+
+### 1. 运行时到底调用了哪个函数
+
+在指定的 `vllm_dev` 环境中，`torch_sipu` 是以 wheel 安装的，所以实际运行时应以
+`site-packages` 中的文件为准。导入 `torch_sipu` 时，
+[`torch_sipu/__init__.py`](/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/__init__.py:51)
+调用 `init_contrib_ops()`；
+[`ops/contrib/__init__.py`](/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/ops/contrib/__init__.py:30)
+执行：
+
+```python
+torch._scaled_grouped_mm = _scaled_grouped_mm
+```
+
+因此这里的 `torch._scaled_grouped_mm` 不是直接指向一个 C++ 函数，而是 wheel 中
+[`ops/contrib/_scaled_mm.py`](/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/ops/contrib/_scaled_mm.py:83)
+定义的 Python wrapper。运行时 `inspect.signature(torch._scaled_grouped_mm)` 得到：
+
+```python
+(input: torch.Tensor,
+ mat2: torch.Tensor,
+ scale_a: torch.Tensor,
+ scale_b: torch.Tensor,
+ offs: Optional[torch.Tensor] = None,
+ bias: Optional[torch.Tensor] = None,
+ scale_result: Optional[torch.Tensor] = None,
+ out_dtype: Optional[torch.dtype] = None,
+ use_fast_accum: bool = False,
+ grouped_layout: Optional[torch.Tensor] = None,
+ gemm_type: str = "normal",
+ *, out: Optional[torch.Tensor] = None)
+```
+
+这里的 `offs`、`bias`、`scale_result` 和 `use_fast_accum` 是为了兼容 PyTorch
+scaled-MM 接口保留的参数。SIPU 分支目前要求它们分别为 `None`、`None`、`None` 和
+`False`；本测试只传四个张量参数（A、B、`scale_a`、`scale_b`）和 `out_dtype`。
+
+底层自定义算子的正式 schema 在 torch_sipu 源码的
+[`ext_native_functions.yaml`](/softhome/like/package/torch_sipu/torch_sipu/csrc/aten/native/ext_native_functions.yaml:1)：
+
+```text
+aten_ext::_scaled_grouped_mm(
+    Tensor self, Tensor mat2, Tensor scale_a, Tensor scale_b,
+    Tensor? grouped_layout=None, ScalarType? out_dtype=None,
+    str gemm_type="normal") -> Tensor
+```
+
+对应的 tile-to-tile 内部算子是 `_scaled_grouped_mm_t2t`；安装 wheel 生成的 C++ 声明可在
+[`SIPUExtNativeFunctions.h`](/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/include/torch_sipu/SIPUExtNativeFunctions.h:52)
+看到，源码实现位于
+[`_grouped_scaled_mm.cpp`](/softhome/like/package/torch_sipu/torch_sipu/csrc/contrib/native/sipu/_grouped_scaled_mm.cpp:197)。
+`/softhome/like/package/torch_sipu` 当前 checkout 可能比 conda 中的 wheel 更新；要确认正在执行的
+版本，应优先查看上面的 `site-packages/torch_sipu/...` 路径。
+
+### 2. 从 `SIPUFp8LinearMethod.apply` 到 SIPU kernel 的调用链
+
+测试的入口在
+[`test_fp8_linear_unpack_pytest.py`](/share/users/like/package/vllm-sipu/tests/kernels/quantization/test_fp8_linear_unpack_pytest.py:343)。
+`SIPUFp8LinearMethod.apply` 的实现见
+[`fp8.py`](/share/users/like/package/vllm-sipu/vllm_sipu/model_executor/layers/quantization/fp8.py:310)，关键路径是：
+
+```text
+SIPUFp8LinearMethod.apply
+  -> per_token_group_quant_fp8.siinfer(x, self.weight_block_size[1], ...)
+  -> torch._scaled_grouped_mm(x_fp8, weight, x_scale, weight_scale_inv,
+                              out_dtype=torch.bfloat16)
+  -> torch_sipu Python wrapper
+  -> aten_ext::_scaled_grouped_mm (PrivateUse1 implementation)
+  -> pad/prepare scales + linear_to_tile
+  -> aten_ext::_scaled_grouped_mm_t2t
+  -> SIPU C++/SI-Kernel FP8 GEMM
+```
+
+具体而言，`_scaled_mm.py` 的 SIPU 分支（约第 98--124 行）把调用转给
+`aten_ext._scaled_grouped_mm.default`；同一文件约第 142--186 行的实现会：
+
+1. 从输入矩阵的逻辑 shape 取得 `M`、`N`、`K`，要求 `K` 能被 128 整除；
+2. 必要时把 `M` 补到 32、把 `N` 补到 128，并同步补 scale；
+3. 把 A 和转置后的 B 转成 SIPU tile storage；
+4. 调用 `_scaled_grouped_mm_t2t`，再把结果转回 linear layout 并裁掉 padding。
+
+本例没有传 `grouped_layout`，`gemm_type` 使用默认值 `"normal"`，所以实际是普通二维
+`[M,K] x [K,N]` GEMM，不是 MoE 的多 expert grouped GEMM。函数名中的 `grouped` 是共用接口的
+命名；是否 grouped 由 `gemm_type` 和 `grouped_layout` 决定。
+
+### 3. 本测试中的实际量化形状
+
+测试设置为 `M=32`（batch）、`K=256`（输入 hidden size）、`N=512`（输出 size），权重
+`block_size=(128, 128)`，见测试文件约第 277--320 行。
+
+激活路径显式把权重 block 的 K 方向大小传给了 SiInfer：
+
+```python
+x_fp8, x_scale = per_token_group_quant_fp8.siinfer(
+    x, self.weight_block_size[1], dtype=torch.float8_e4m3fn
+)
+```
+
+所以 block size 并非完全没有传递，而是在量化阶段传给了 `siinfer`；它没有再作为参数重复
+传给 GEMM。SiInfer 的 wheel 实现
+[`siinfer/quantization.py`](/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/siinfer/quantization.py:122)
+为每个 token 的每个 K-group 分配一个 scale，
+`x.shape=[32,256]`、`group_size=128` 时得到：
+
+```text
+x_fp8  : [32, 256]  (float8_e4m3fn)
+x_scale: [32, 2]    (每个 token 有 256/128=2 个 scale)
+```
+
+该测试构造的原始权重采用 PyTorch Linear 的 `[N,K]=[512,256]` 布局，权重 scale 是
+`[N/128,K/128]=[4,2]`。`_prepare_grouped_mm_layout` 将它们都转置，以符合 GEMM 的
+`[M,K] x [K,N]` 约定：
+
+```text
+weight       [512,256] -> [256,512]  (= [K,N])
+weight scale [4,2]     -> [2,4]      (= [K/128,N/128])
+```
+
+因此，这个线性层的有效量化粒度是：
+
+```text
+A（激活）: 每个 token 沿 K 每 128 个元素一个 scale，即 1x128。
+B（权重）: 每个 128x128 权重块一个 scale。
+```
+
+可把计算理解为（scale 的具体数值是量化 API 定义的 scale/inverse-scale）：
+
+```text
+C[m,n] = sum_k A_fp8[m,k] * scale_a[m, k//128]
+                       * B_fp8[k,n] * scale_b[k//128, n//128]
+```
+
+所以问题中“激活 per token、权重 per block”的判断基本正确，但更精确的说法是
+“激活 per-token-group（每 token、每 128 个 K 元素一组），权重 per-128x128-block”；
+它不是每个 token 在整个 K 维只用一个 scale 的 per-token 量化。
+
+### 4. 没有显式 block-size 参数时，后端如何得到它
+
+在 Python wrapper 中，`_prepare_deepgemm_block_wise_scales` 依据矩阵的 shape 预期 scale
+shape：
+
+```text
+scale_a: (..., M,       K//128)
+scale_b: (..., K//128,  max(1, N//128))
+```
+
+必要时只做 padding/列主序转换，并没有把一个整数 `block_size` 传给 kernel。随后 C++ 的
+normal 分支在
+[`_grouped_scaled_mm.cpp`](/softhome/like/package/torch_sipu/torch_sipu/csrc/contrib/native/sipu/_grouped_scaled_mm.cpp:227)
+直接从逻辑矩阵尺寸和 scale 尺寸计算：
+
+```cpp
+block_size_a_m = m / scale_a.size(0);
+block_size_a_k = k / scale_a.size(1);
+block_size_b_k = k / scale_b.size(0);
+block_size_b_n = std::max(n / scale_b.size(1), 128);
+```
+
+接着强制检查：
+
+```text
+block_size_a_m == 1
+block_size_a_k == 128
+block_size_b_k == 128
+block_size_b_n == 128
+```
+
+代入本例：
+
+```text
+m=32, n=512, k=256
+A: 32/32=1,  256/2=128
+B: 256/2=128, 512/4=128
+```
+
+这说明它不是从 scale 的数值、dtype 或某个隐藏 metadata 猜测 block size，而是把
+“scale 的数量 + 矩阵 shape”当作布局契约，再验证该契约是否正好对应 SIPU 当前支持的
+`1x128`/`128x128`。`K`、`M`、`N` 不满足对齐时，Python 层先尝试 padding；padding 后的 shape
+和 scale shape 才是 C++ 校验对象。若传入 64x64 等其他语义的 scale，原生路径会报：
+
+```text
+BlockWise scaling is only supported for block size 1x128 for mat a and 128x128 for mat b!
+```
+
+因此这是固定支持格式，不是任意 block size 的通用推断。只要调用者伪造了一个形状恰好通过
+整数除法的 scale，后端也没有额外信息判断其真实语义；正确性依赖调用者遵守 shape/layout
+契约。
+
+### 5. `linear_to_tile` 是否让 block 信息丢失
+
+不会。`linear_to_tile` 改变的是底层物理存储顺序，以便 SIPU kernel 读取；
+`TileTensor.__new__` 仍用 `tensor_impl.size()` 和 stride 保留逻辑 shape，且 scale tensor
+是单独传入的。C++ 一方面通过 `size(0/1)` 读取 `[M,K]`、`[K,N]` 等逻辑尺寸，另一方面用
+`is_sipu_compatible_tileformat` 校验物理 tile layout。执行 tile 的行/列对齐（例如 M32、32-byte
+块）是硬件存储/launch 约束，不等于量化 block size 128；后者由 scale shape 和上述固定检查
+决定。这也是为什么 tile 化后不需要把 `row_in_tile`、`col_in_tile` 作为额外参数传给
+`_scaled_grouped_mm_t2t`。
+
+如果启用了 `torch.backends.sipu_triton_kernels`，Triton 备用实现也采用同一契约：其 kernel
+按 `K/128` 索引激活 scale，并按 `K/128`、`N/128` 索引权重 scale。因此切换实现后量化粒度
+不会改变，只是执行后端不同。
+
+### 6. 可复现的运行时确认命令
+
+在题目给定的 SDK、cmodel 和 conda 环境中，可用下面命令确认当前 wheel 的实际绑定：
+
+```bash
+python - <<'PY'
+import inspect
+import torch
+import torch_sipu
+
+print(torch.__file__)
+print(torch._scaled_grouped_mm.__module__)
+print(inspect.getsourcefile(torch._scaled_grouped_mm))
+print(inspect.signature(torch._scaled_grouped_mm))
+print(torch._C._dispatch_find_schema_or_throw(
+    "aten_ext::_scaled_grouped_mm", "").schema())
+print(torch._C._dispatch_dump_table("aten_ext::_scaled_grouped_mm_t2t"))
+PY
+```
+
+典型结果是 Python wrapper 位于 conda 的 `site-packages/torch_sipu/ops/contrib/_scaled_mm.py`，
+`aten_ext::_scaled_grouped_mm` 的 `PrivateUse1` 实现落到同一文件中的
+`_scaled_grouped_mm_op`，而
+`_scaled_grouped_mm_t2t` 的 `PrivateUse1` 实现进入 torch_sipu 的 SIPU C++ 扩展。

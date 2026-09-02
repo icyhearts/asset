@@ -897,3 +897,17 @@ sglang 代码位于 /softhome/like/package/h100/package/sglang_kernel_src
 sglang conda环境位/share_data/users/like/miniconda3/envs/simo_sglang.
 sglang代码的 python/sglang/srt/mem_cache/memory_pool.py, MLATokenToKVPool.get_key_buffer 和get_value_buffer 为什么都都从 self.kv_buffer 同一个内存池里面取数据？取的时候为什么取出来的shape不一样？get_key_buffer取完整tensor, get_value_buffer 只取前self.kv_lora_rank的维度，这是为什么？
 要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
+{
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
+sglang 源码位于 /share/users/like/package/sglang_kernel_src
+sglang 以  editable 方式安装
+sglang  安装脚本 /share/users/like/package/sglang_kernel_src/like-useful/install-sglang.sh
+安装日志  temp/pip-sglang-log.main-local-dep.txt.2026_09_01___15_15_16
+
+安装后，运行 deepseek-v4-flash 脚本 :
+
+/share/users/like/package/simo_conda_sglang/like-useful/dsv4-flash-run.sh
+运行失败日志 ： /share/users/like/package/simo_conda_sglang/temp/sgl.dsv4-flash.log.2026_09_01___15_40_59
+如何修复运行失败的问题?
+要求：把答案追加在 /softhome/like/asset/claude/sglang/answer_sgl.md 里面
+}
