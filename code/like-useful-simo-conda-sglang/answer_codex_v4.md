@@ -898,3 +898,382 @@ release 的 EP 数据流和当前 SIMO 代码是相互对应的：
 先执行每个模型的无量化基线，再执行全部权重量化配置；KV 量化仍由
 `:157-168，run_model_evaluations_kv_cache_quant`
 单独执行，并继续只在该分支使用 `triton_simo` 和 `disable_chunked_prefix_cache=true`。因此脚本现在会运行两个模型的无量化、完整权重量化和完整 KV cache 量化测试。
+
+# 5. v0.5.18 适配 commit 逐处说明
+
+## 5.1 commit 范围与结果
+
+本次代码 commit 为 `4da2709396207c241003db49085e516093a62df1`，提交信息是
+`fix(sglang-simo): adapt quantization hooks to v0.5.18`。提交基于 SIMO 当前分支
+`like-debug-log`，目标 SGLang 是 `/share/users/like/package/sglang_kernel_src` 的
+`release/v0.5.18-local-dep`（源码提交 `982d8495b7`）。commit 只包含 7 个已经跟踪的
+适配文件，共 `236 insertions(+), 60 deletions(-)`：
+
+1. `simo/extensions/sglang_simo/__init__.py`
+2. `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh`
+3. `simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py`
+4. `simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py`
+5. `simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py`
+6. `simo/extensions/sglang_simo/mem_cache/memory_pool.py`
+7. `simo/extensions/sglang_simo/quantization/quantization.py`
+
+工作树中原有的编辑器文件、`temp/`、`results/`、实验脚本和 `like-useful` 符号链接
+没有被加入 commit。`QUANT_CONFIGS` 与 `KV_CACHE_QUANT_CONFIGS` 在 commit 的父版本中
+已经恢复，因此它们不是本 commit 的新增 diff；本 commit 只继续修正这些数组调用时的
+Engine 参数和 backend 分流。`SIMOFusedMoEMethod` 的主体也没有在本 commit 中改写；
+此前已经完成的 EP 映射修改保留在父版本中，本次 commit 只修改线性权重 loader 的
+release 签名兼容层。
+
+## 5.2 插件注册入口
+
+### 5.2.1 `register_simo_extensions`
+
+文件：`simo/extensions/sglang_simo/__init__.py:22-27，register_simo_extensions`
+
+旧代码从已经删除的 `ModelRunnerKVCacheMixin` 路径导入并调用
+`apply_init_memory_pool_patch()`。v0.5.18 把 KV pool 的构造职责移到
+`KVCacheConfigurator._build_token_to_kv_pool`，旧模块导入会在插件注册阶段直接触发
+`ModuleNotFoundError`。因此这里改为导入并调用
+`apply__build_token_to_kv_pool_patch()`，让 SIMO 的 KV 量化 patch 在新 configurator
+入口执行。其余 loader、quantization registry、attention backend 和 DeepSeek 模型
+注册顺序不变，非 KV 量化模型不会额外创建 SIMO pool。
+
+## 5.3 在线评测脚本
+
+### 5.3.1 管道失败状态
+
+文件：`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:3，脚本顶层`
+
+`run_eval`（`:57-75，run_eval`）把 `lm-eval` 输出通过 `tee` 写入日志。只有
+`set -e` 时，某些 shell 配置可能只观察到 `tee` 的成功退出码，掩盖上游评测失败。
+加入 `set -o pipefail` 后，管道任一环节失败都会使该测试返回失败，便于完整矩阵脚本
+在第一处错误停止并保留正确的失败状态。
+
+### 5.3.2 `run_simo_config_list` 的通用 Engine 参数
+
+文件：`.../llm_eval_online_quant.sh:103-114，run_simo_config_list`
+
+这里把原先分成两套、且包含临时 `disable_cuda_graph` 的字符串拼接统一为一套
+`model_args`。v0.5.18 的 `lm-eval` SGLang adapter 最终以 Python kwargs 构造
+`ServerArgs`；`cuda_graph_max_bs` 只是 CLI 兼容别名，不是可直接传给 dataclass
+构造函数的字段，所以改用当前字段 `cuda_graph_max_bs_decode`。这样设置 decode
+graph 的最大 batch size，同时不把 graph 本身关闭，也避免 Engine 因未知 key 报错。
+
+### 5.3.3 只对需要的分支设置 attention backend
+
+文件：`.../llm_eval_online_quant.sh:107-108，run_simo_config_list`
+
+当 `attention_backend` 参数非空时才写入 JSON。调用方
+`run_model_evaluations`（`:141-154，run_model_evaluations`）为普通权重量化传空值，
+所以 `SIMOLinearMethod`/`SIMOFusedMoEMethod` 测试继续使用 SGLang 的默认 attention
+选择；调用方 `run_model_evaluations_kv_cache_quant`（`:157-167，
+run_model_evaluations_kv_cache_quant`）才传 `triton_simo`，从而让打包的 SIMO KV
+buffer 由自定义读 kernel 消费。这个条件分流避免权重-only 测试无故承担自定义 KV
+backend 的限制。
+
+### 5.3.4 仅 KV 量化关闭 chunked-prefix 路径
+
+文件：`.../llm_eval_online_quant.sh:109-113，run_simo_config_list`
+
+只有 `attention_backend == "triton_simo"` 时才追加
+`disable_chunked_prefix_cache=true`。SIMO 的量化 attention kernel 返回 attention
+output，但没有 SGLang chunked-prefix 合并所需的 LSE；MLA pool 也不是上游 raw
+latent/rope buffer。将开关限制在 KV 量化分支可以绕过这条不兼容路径，同时保留普通
+prefix cache 和权重量化的默认行为。
+
+### 5.3.5 无量化基线的 graph 字段
+
+文件：`.../llm_eval_online_quant.sh:123-137，run_no_quant_eval`
+
+无量化 baseline 的 `model_args` 同样把旧的 `cuda_graph_max_bs` 替换为
+`cuda_graph_max_bs_decode`（`:131`）。这样 baseline 与量化测试使用同一 release
+字段，比较结果不会因为参数名过时而在启动阶段失败；此处没有加入
+`disable_cuda_graph`，基础 CUDA graph 仍由 SGLang 自己决定。
+
+### 5.3.6 完整矩阵注释
+
+文件：`.../llm_eval_online_quant.sh:147-149，run_model_evaluations`
+
+这处 diff 更新了注释并明确 `run_no_quant_eval` 先运行 baseline、再运行整个
+`QUANT_CONFIGS`。函数调用本身在父版本已经存在，所以该 hunk 的运行时行为没有另行
+改变；它是对当前完整测试矩阵意图的准确标注。数组内容和 KV 调用仍位于父版本的
+`:25-50` 与 `:157-167`，不应把它们误记为本 commit 新增。
+
+## 5.4 decode kernel 导入路径
+
+### 5.4.1 `_fwd_kernel_stage2` 导入
+
+文件：`simo/extensions/sglang_simo/layers/attention/triton_ops/decode_attention.py:6-8，模块导入`
+
+v0.5.18 删除/移动了旧的
+`sglang.srt.layers.attention.triton_ops.decode_attention` 模块，公共 Triton decode
+stage-2 kernel 现在位于 `sglang.kernels.ops.attention.decode_attention`。只改导入路径，
+不改 SIMO 自己的量化解包和 attention 计算逻辑，因此仍复用同一个上游 stage-2 kernel
+实现而不会在插件导入时失败。
+
+## 5.5 SIMO Triton attention backend
+
+### 5.5.1 `SIMOTritonAttnBackend::forward_extend` 新参数
+
+文件：`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:124-135，
+SIMOTritonAttnBackend::forward_extend`
+
+release 基类 `TritonAttnBackend::forward_extend` 新增 `score_mod` 和 `aux_tensors`。
+子类若仍使用旧签名，RadixAttention 以关键字调用时会得到 `TypeError`。因此在
+`:133-134` 补齐两个参数；普通（非 SIMO KV）层在 `:136-147` 将它们原样转发给
+`super()`，不改变 SGLang 原有功能。
+
+### 5.5.2 量化 extend 的能力边界
+
+文件：`.../triton_simo_backend.py:149-164，SIMOTritonAttnBackend::forward_extend`
+
+SIMO 自定义 extend kernel 没有实现 `score_mod`/`aux_tensors`，所以在量化层收到这类
+输入时显式抛出 `NotImplementedError`，避免静默忽略相对位置 bias 等张量而得到错误
+结果。`:154-164` 对 `forward_batch.mha_return_lse` 也做显式拒绝：chunked-prefix
+路径会期待 `(output, LSE)`，而当前 SIMO kernel 只产生 output；明确报错比把单个 tensor
+误当成二元返回值更安全，调用方应设置 `disable_chunked_prefix_cache=True`。
+
+### 5.5.3 `SIMOTritonAttnBackend::forward_decode` 签名与转发
+
+文件：`.../triton_simo_backend.py:246-274，SIMOTritonAttnBackend::forward_decode`
+
+decode 入口同样补上 `score_mod`/`aux_tensors`（`:255-256`）。非量化层通过
+`:258-269` 转发到 release 基类；量化层在 `:271-274` 显式拒绝尚未实现的扩展参数。
+这样同一个 `triton_simo` backend 在普通层和量化层之间都遵守 release 的调用协议，
+且不伪装支持未实现的 score modification。
+
+### 5.5.4 MLA decode 的位置包装
+
+文件：`.../triton_simo_backend.py:288-297，SIMOTritonAttnBackend::forward_decode`
+
+旧代码在 SIMO MLA 分支直接传 `forward_batch.out_cache_loc`。release 的写入接口接受
+`KVWriteLoc`，其中可能同时携带 SWA location 和统一内存下的 physical `full_loc`。
+`:291` 使用已有的 `_make_kv_write_loc`，`:292-296` 把包装对象交给 pool，使统一内存
+的 physical 地址在写入前保持正确。`:288` 的嵌套 `getattr` 也让旧/新 backend 对象在
+缺少 `is_simo_mla_quantized` 属性时安全落到 `False`，避免默认参数表达式提前访问
+不存在的属性。
+
+## 5.6 KV pool configurator patch
+
+### 5.6.1 模块说明和量化参数提取
+
+文件：`simo/extensions/sglang_simo/mem_cache/init_memory_pool_patch.py:1-6，模块文档`
+
+文档字符串从旧的 `init_memory_pool` 改为 `_build_token_to_kv_pool`，准确描述 patch
+所在的 release 生命周期；否则维护者会误以为仍在 patch 已删除的 ModelRunner mixin。
+
+文件：`.../init_memory_pool_patch.py:13，模块导入`。
+
+新增 `get_parallel`，供新的 configurator 计算 attention TP size。
+
+文件：`.../init_memory_pool_patch.py:18-40，_extract_quant_params_from_model`
+
+新入口的 `self` 是 `KVCacheConfigurator`，在某些初始化阶段可能尚未挂载 `model`。
+`:20-22` 用 `getattr(..., None)` 并在缺失时返回 `None`，让 wrapper 回退到 SGLang
+标准 pool，而不是在探测阶段因 `AttributeError` 阻断整个服务。找到带有
+`kv_cache_quant_spec` 的 attention layer 后，`:26-38` 仍提取 SIMO kernel、packed/scale
+尺寸及 MLA rope 尺寸，保持原有量化布局计算。
+
+### 5.6.2 临时替换目标模块
+
+文件：`.../init_memory_pool_patch.py:43-53，_temporarily_replace_simo_kv_pool_cls`
+
+旧目标 `sglang.srt.model_executor.model_runner_kv_cache_mixin` 在 v0.5.18 已不存在。
+`:46` 改为导入 `sglang.srt.mem_cache.kv_cache_configurator`，并在 `:52-53` 保存新模块
+中的 `MHATokenToKVPool`/`MLATokenToKVPool`。`:134` 与 `:171` 只在调用原始
+configurator 期间替换类，`:173-177` 的 `finally` 恢复原类，避免 patch 泄漏到后续
+非量化 pool 或其它线程。
+
+### 5.6.3 MHA adapter 的新构造参数
+
+文件：`.../init_memory_pool_patch.py:55-131，SIMOMHATokenToKVPoolAdapter::__init__`
+
+release 的 MHA 构造函数新增 `quant_method` 和 `allocation_label` 参数，分别位于
+`:77`、`:79`。SIMO 的 packed byte pool 不兼容 SGLang 的 FP4 `quant_method` 或其它
+带标签的独立 allocation，因此 `:82-90` 对非空值显式报错，而不是忽略参数后分配错误
+布局。`:91-97` 继续限制 NHD layout 和 post-capture；`:99-106` 保留上游 SWA 参数的
+维度优先级；`:108-131` 将 release 传入的尺寸和 SIMO 量化元数据组合后调用父类，
+使新入口仍能创建正确的 MHA pool。
+
+### 5.6.4 MLA adapter
+
+文件：`.../init_memory_pool_patch.py:135-169，SIMOMLATokenToKVPoolAdapter::__init__`
+
+MLA pool 的符号也从新 configurator 模块替换（`:171`）。adapter 保持 v0.5.18 的
+`start_layer`、`end_layer`、`use_dsa`、`override_kv_cache_dim` 参数（`:138-152`），
+并在 `:153-169` 追加 SIMO 的量化 spec/downcast kernel。这样 DeepSeek-V2 Lite 的
+新 `_build_mla_kv_pool` 调用可以匹配，同时仍由 SIMO 类计算 byte buffer 大小。
+
+### 5.6.5 新的 `_build_token_to_kv_pool` wrapper 和 fallback
+
+文件：`.../init_memory_pool_patch.py:180-188，_patched__build_token_to_kv_pool`
+
+函数名和 docstring 改为 release 实际调用的
+`KVCacheConfigurator::_build_token_to_kv_pool`。若 `:182-183` 找不到量化 attention
+层，`:188` 将所有参数原样传给 original function，保证普通模型继续使用标准 pool。
+
+### 5.6.6 不支持的 pool/layout 保护
+
+文件：`.../init_memory_pool_patch.py:190-217，_patched__build_token_to_kv_pool`
+
+这些检查把本次明确不支持的 release feature 变成启动时的可读错误：
+
+- `:193-196` 拒绝 DSA 和 DeepSeek-V4 的专用 pool layout；
+- `:198-205` 拒绝 hybrid SWA 与 Mamba/linear pool，避免 SIMO flat NHD reader 读取非
+  SIMO buffer；
+- `:207-213` 拒绝 DCP size 大于 1，因为当前写 kernel 没有 decode context parallel
+  的 location/mask 处理；
+- `:214-217` 拒绝 page-major 和 unified memory，这两者会改变物理地址或 page 组织，
+  而 SIMO kernel 只按普通 NHD byte rows 索引；
+- `:240-241` 拒绝 post-capture KV sizing，SIMO pool 的固定 packed buffer 不能在
+  capture 后再动态 backing。
+
+显式 `NotImplementedError`/`ValueError` 是有意的：目标只覆盖 Llama3.1 GQA 与
+DeepSeek-V2 Lite MLA，不能让其它 layout 静默落入错误的量化解释。
+
+### 5.6.7 attention backend 约束
+
+文件：`.../init_memory_pool_patch.py:219-239，_patched__build_token_to_kv_pool`
+
+`:222-229` 收集普通、prefill、decode 三个 backend 字段，并尝试读取 release 已解析
+的 backend pair；`:230-239` 只允许 `triton` 和 `triton_simo`。FA/FlashInfer 等
+backend 不认识 SIMO 的 uint8+scale buffer，若继续创建 pool 会在后续 kernel 中把字节
+当作普通 dtype。提前拒绝能把配置错误定位在 pool 构造阶段，而不是产生难以诊断的
+CUDA 结果。`:243-245` 在所有检查通过后才临时替换类并调用原始构造函数。
+
+### 5.6.8 `DefaultPoolConfigurator::_compute_cell_size`
+
+文件：`.../init_memory_pool_patch.py:248-279，_compute_cell_size`
+
+v0.5.18 的基类签名是 `DefaultPoolConfigurator::_compute_cell_size(self, kvc,
+num_layers)`，其中第二个对象是 `KVCacheConfigurator` 而不是旧版 ModelRunner。
+因此 `:248-256` 全部改用 `kvc`，无量化或无法提取量化参数时也把同一个 `kvc` 透传
+给 original。`:260` 用 `get_parallel().attn_tp_size` 替代旧的
+`get_attention_tp_size()`，适配 release 的 runtime context API。`:261-279` 对 MLA/MHA
+分别按照 packed data、scale bytes、KV head 数和 layer 数计算每 token 成本；FP4 或
+DSA 仍回退到上游计算，避免覆盖 release 已有的专用公式。
+
+### 5.6.9 安装函数与兼容别名
+
+文件：`.../init_memory_pool_patch.py:282-302，apply__build_token_to_kv_pool_patch`
+
+`:284-291` 将 patch 安装在 `KVCacheConfigurator::_build_token_to_kv_pool`，
+`:295-301` 将 cell-size patch 安装在 `DefaultPoolConfigurator::_compute_cell_size`，
+并保留 `call_original=True`，使 wrapper 只负责 SIMO 情况、其它情况继续走 SGLang。
+
+文件：`.../init_memory_pool_patch.py:305-307，模块级兼容别名`
+
+`_patched_init_memory_pool` 和 `apply_init_memory_pool_patch` 指向新实现，兼容仍引用
+旧函数名的外部脚本；真正注册入口已在 `sglang_simo/__init__.py:22-27，
+register_simo_extensions` 切换到新名称。
+
+## 5.7 SIMO memory pool
+
+### 5.7.1 MHA `set_kv_buffer` 的 `KVWriteLoc`
+
+文件：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:249-279，
+SIMOMHATokenToKVPool::set_kv_buffer`
+
+release 调用方现在可能传入 `KVWriteLoc` 而非裸 location。`:265` 使用
+`unwrap_write_loc` 解出 generic、SWA 和 unified `full_loc`；`:266-267` 对只有 SWA
+子池地址的情况显式拒绝，因为 SIMO 没有 SWA 专用 buffer；`:268-269` 在 unified
+memory 情况使用预先解析好的 physical `full_loc`。其余量化写入仍在 `:274-278`
+调用 `simo_set_kv_buffer`，因此只改变地址协议，不改变 mxfp/mxint/per-group 的量化
+格式。
+
+### 5.7.2 MLA packed buffer 的 storage dtype
+
+文件：`.../memory_pool.py:327-350，SIMOMLATokenToKVPool::_create_buffers`
+
+父类 `MLATokenToKVPool::__init__` 会动态调用子类 `_create_buffers`，并通常按计算
+dtype（例如 BF16）设置 `store_dtype`。SIMO buffer 的真实布局是 packed payload 加
+scale bytes，必须逐字节存储；`:329-331` 在分配前强制 `self.store_dtype = torch.uint8`，
+`:343-349` 随后分配 uint8 buffer，避免父类的 BF16 view 造成容量和 stride 错误。
+
+### 5.7.3 禁止 raw MLA prefix reader
+
+文件：`.../memory_pool.py:358-378，SIMOMLATokenToKVPool::get_mla_kv_buffer`
+
+release 的 chunked-prefix helper 会调用这个方法并期待未量化的 latent/rope 张量。
+SIMO 保存的是 packed uint8 与 tile scales，直接复用父类读取会把字节误解释成 BF16。
+因此新方法在 `:374-378` 直接抛出 `NotImplementedError`，并提示关闭
+`disable_chunked_prefix_cache`；正常 `triton_simo` attention 仍直接从 packed buffer
+解量化，不会经过这个 raw reader。
+
+### 5.7.4 MLA `set_kv_buffer` 的位置解包
+
+文件：`.../memory_pool.py:380-403，SIMOMLATokenToKVPool::set_kv_buffer`
+
+与 MHA 相同，`:393-397` 支持 release `KVWriteLoc` 和 unified physical `full_loc`，
+拒绝 SIMO 不实现的 SWA-only location；`:400-402` 再把 combined K 拆成 nope/rope，
+调用 SIMO 自己的 `set_mla_kv_buffer`。这使 v0.5.18 的普通 MLA 写入调用和旧的裸
+tensor 调用都能进入同一量化 kernel。
+
+### 5.7.5 MLA 专用写入位置解包
+
+文件：`.../memory_pool.py:405-419，SIMOMLATokenToKVPool::set_mla_kv_buffer`
+
+release 也可能直接以 `KVWriteLoc` 调用 MLA 专用入口。`:415-419` 再次解包并检查
+SWA/full location，保证该入口无论由 `set_kv_buffer` 还是 attention backend 直接调用，
+都不会把 dataclass 当作 tensor 索引；随后原有 `concat_and_cache_mla_kernel` 从 `:421`
+之后继续使用解析后的 `loc` 写入 packed buffer。
+
+## 5.8 线性权重 loader 兼容层
+
+### 5.8.1 `_call_weight_loader`
+
+文件：`simo/extensions/sglang_simo/quantization/quantization.py:3，模块导入`
+
+新增 `inspect`，用于在运行时判断 release loader 是否声明
+`loaded_shard_id`，而不依赖类名猜测签名。
+
+文件：`.../quantization.py:143-171，_call_weight_loader`
+
+v0.5.18 普通 Column/Row 的 `weight_loader_v2` 通常是两参数
+`(param, loaded_weight)`，而 merged/QKV loader 仍可能接受 `loaded_shard_id`。SIMO
+包装器同时服务这两类原始 loader，因此：
+
+- `:156-157` 没有 shard id 时保持最短的两参数调用；
+- `:159-162` 对无法反射的扩展 callable 安全回退；
+- `:164-167` 只有签名明确声明该参数或接受 `**kwargs` 时才转发 shard id；
+- `:169-171` 对普通 v2 loader 不传多余关键字，让其自行完成 TP slicing。
+
+这样既保留 merged/QKV 的分片语义，又避免普通 release loader 因意外收到
+`loaded_shard_id` 而报 `TypeError`。
+
+### 5.8.2 `SIMOLinearMethod::get_weight_loader`
+
+文件：`.../quantization.py:973-1043，SIMOLinearMethod::get_weight_loader` 内部的
+`online_weight_loader`
+
+`:974-979` 保持同时接受显式 `loaded_shard_id` 和旧调用方的 `**kwargs`；`:980-981`
+从 `kwargs` 兼容读取 `loaded_shard_id`/`shard_id`。随后三类原始参数写入全部改走
+`:991`、`:1019`、`:1030-1033`、`:1035-1041` 的 `_call_weight_loader`：
+
+1. prequantized packed 权重直接加载时，按 loader 签名决定是否传 shard id；
+2. float-source 权重经过 `weight_downcast_kernel` 后，packed weight 使用同一规则；
+3. `weight_scale` 和 NVFP4 `weight_global_scale` 也使用同一规则，避免只修权重而在
+   scale 参数上再次触发签名错误。
+
+这处修改不改变 SIMO 的量化数值、global scale 或 checkpoint format 判定，只修正
+release v0.5.18 weight-loader-v2 接口变化。
+
+## 5.9 验证与边界
+
+本次 commit 前后执行了以下检查：
+
+- pre-commit 的 Python AST、冲突、ruff、ruff-format、末尾换行检查全部通过；
+- `git diff --cached --check` 通过；
+- 修改的 SIMO Python 文件 `python -m compileall` 通过；
+- `bash -n simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh`
+  通过；
+- 在真实 v0.5.18 模块环境设置 `SIMO_TEST_USE_REAL_SGLANG=1` 后，
+  `tests/sglang_simo/test_prequantized_checkpoint_loading.py` 的 8 个测试全部通过；
+- 此前的真实 Llama3.1-8B weight-only 与 `kvquant_mxfp8` 单请求 smoke 均完成 decode
+  CUDA graph capture/replay，日志显示 `cuda graph: True`。
+
+默认 fake-SGLang 测试收集器仍引用旧的模拟模块布局，因此不带
+`SIMO_TEST_USE_REAL_SGLANG=1` 的该测试文件会在收集阶段找不到
+`sglang.srt.layers.quantization.kv_cache`；这属于测试夹具与当前 release 布局不一致，
+不是本 commit 的运行时失败。此次没有运行完整 42 项 lm-eval 矩阵，完整精度矩阵仍需
+在目标 GPU 和模型权重环境中执行。
