@@ -318,7 +318,7 @@ SIMO 的 MLA pool 用 `uint8` 保存打包后的量化 payload 和 scale bytes�
 
 ## 5. 为什么评测脚本要显式写 `true`
 
-当前脚本在指定 attention backend 时统一传入该选项，见 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:85-90，run_simo_config_list`：
+当前脚本在指定 attention backend 时统一传入该选项，见 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:103-114，run_simo_config_list`：
 
 ```json
 "disable_chunked_prefix_cache": true
@@ -521,7 +521,7 @@ SGLANG_JIT_CACHE_DEBUG=1
 
 按 `release/v0.5.18-local-dep` 当前源码，`ServerArgs.disable_chunked_prefix_cache` 的字段默认值是 `False`，因此**配置语义是默认允许 chunked prefix cache**，见 `python/sglang/srt/server_args.py:958-962，ServerArgs.disable_chunked_prefix_cache`。这不是“每个模型都实际开启”：`python/sglang/srt/model_executor/model_runner.py:369-372，ModelRunner.__init__` 会调用 `python/sglang/srt/model_executor/model_runner_components/misc_utils.py:25-48，maybe_disable_chunked_prefix_cache`，对非 MLA 模型或不在 `python/sglang/srt/server_args.py:211-224，CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS` 中的 prefill backend 自动覆写为 `True`（禁用）。
 
-此前版本的评测曾把 Llama3.1 权重量化也指定为 `triton`，而 DeepSeek KV 量化使用 `triton_simo`。本次修正后，权重量化不再指定 attention backend，只有 KV 量化保留 `triton_simo`；KV 分支在 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:89-95，run_simo_config_list` 显式传入 `"disable_chunked_prefix_cache": true`，是为了把 packed-KV 的兼容性限制固定下来，而不是依赖隐式门控。
+此前版本的评测曾把 Llama3.1 权重量化也指定为 `triton`，而 DeepSeek KV 量化使用 `triton_simo`。本次修正后，权重量化不再指定 attention backend，只有 KV 量化保留 `triton_simo`；KV 分支在 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:107-114，run_simo_config_list` 显式传入 `"disable_chunked_prefix_cache": true`，是为了把 packed-KV 的兼容性限制固定下来，而不是依赖隐式门控。
 
 关闭的直接原因是 SIMO 尚未实现上游 chunked 路径的两个契约：`simo/extensions/sglang_simo/mem_cache/memory_pool.py:360-380，SIMOMLATokenToKVPool.get_mla_kv_buffer` 不能把 packed `uint8` + scale 当作 raw MLA BF16 buffer 读取；`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:124-164，SIMOTritonAttnBackend.forward_extend` 不产生上游分块合并所需的 LSE。上游分块 caller 在 `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:286-320，DeepseekMHAForwardMixin.forward_normal_chunked_kv_core` 会读取每个 prefix chunk 并解包/合并 `(output, lse)`。
 
@@ -733,7 +733,7 @@ PY
 ### 13.1 为什么之前加了 `disable_cuda_graph`
 
 此前工作树中的
-`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:85-90，run_simo_config_list`
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:103-114，run_simo_config_list`
 把下面三个选项放在同一个分支中：
 
 ```json
@@ -790,9 +790,9 @@ release 的 dataclass 字段是
 ```
 
 具体位置是
-`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:85-88，run_simo_config_list`
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:103-106，run_simo_config_list`
 和
-`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:105-114，run_no_quant_eval`。
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:123-137，run_no_quant_eval`。
 
 这个参数只设置 decode graph 的最大捕获 batch size，不会关闭 graph。没有显式传 `cuda_graph_backend_decode` 时，
 `python/sglang/srt/server_args.py:4519-4527，ServerArgs::_parse_cuda_graph_config`
@@ -807,7 +807,7 @@ release 的 dataclass 字段是
 `SIMOLinearMethod` 和 `SIMOFusedMoEMethod` 只替换权重加载/专家计算，不读取 SIMO 打包 KV cache。把 `triton` 强行传给所有权重量化评测，会改变原脚本的 backend 选择范围，也会让不涉及 KV 的测试承担额外的 Triton attention 约束。
 
 当前
-`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:123-135，run_model_evaluations`
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:141-154，run_model_evaluations`
 传入空字符串：
 
 ```bash
@@ -815,14 +815,14 @@ run_simo_config_list ... "online_quantization" "QUANT_CONFIGS" "" ""
 ```
 
 `run_simo_config_list` 在
-`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:89-90，run_simo_config_list`
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:107-108，run_simo_config_list`
 只有在 backend 非空时才把 `attention_backend` 加进 model args，因此权重量化测试完全交给 SGLang 默认解析。默认选择逻辑在
 `python/sglang/srt/server_args.py:5870-5942，ServerArgs::_get_default_attn_backend`：MHA/MLA 会根据 GPU、模型结构和可用实现选择 `fa3`、`flashinfer` 或 `triton`，而不是由 SIMO 评测脚本硬编码。
 
 KV 量化则必须走 SIMO backend。当前
-`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:138-147，run_model_evaluations_kv_cache_quant`
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:157-168，run_model_evaluations_kv_cache_quant`
 仍传入 `triton_simo`；对应的条件分支在
-`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:89-95，run_simo_config_list`：
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:107-114，run_simo_config_list`：
 
 ```text
 attention_backend == "triton_simo"
@@ -867,8 +867,8 @@ release 的 EP 数据流和当前 SIMO 代码是相互对应的：
 
 已完成的代码修改：
 
-- `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:85-95，run_simo_config_list` 删除 `skip_server_warmup` 和 `disable_cuda_graph`，加入 `cuda_graph_max_bs_decode`，并只对 `triton_simo` 加 `disable_chunked_prefix_cache`；
-- `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:123-147，run_model_evaluations/run_model_evaluations_kv_cache_quant` 让权重量化使用默认 attention，KV 量化继续使用 `triton_simo`；
+- `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:103-114，run_simo_config_list` 删除 `skip_server_warmup` 和 `disable_cuda_graph`，加入 `cuda_graph_max_bs_decode`，并只对 `triton_simo` 加 `disable_chunked_prefix_cache`；
+- `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:141-168，run_model_evaluations/run_model_evaluations_kv_cache_quant` 让权重量化使用默认 attention，KV 量化继续使用 `triton_simo`；
 - `simo/extensions/sglang_simo/quantization/quantization.py:1413，SIMOFusedMoEMethod::get_moe_weight_loader` 删除 EP=1 硬限制。
 
 检查结果：
@@ -884,3 +884,17 @@ release 的 EP 数据流和当前 SIMO 代码是相互对应的：
 补充做了一次真实 Engine smoke：使用 Llama3.1-8B、`w8a8_mxfp`、单 GPU、`cuda_graph_max_bs_decode=2` 和 `gsm8k --limit 1` 启动。日志实际显示 `attention_backend='fa3'`、`disable_cuda_graph=False`、`cuda_graph_config.decode.backend='full'`，随后出现 `Capture target decode CUDA graph begin/end`，请求阶段显示 `cuda graph: True`，因此恢复后的参数链路已在真实模型上验证。第一次尝试因 shell `PATH` 未包含 conda 环境中的 `ninja` 而失败，补充 `PATH=/share_data/users/like/miniconda3/envs/simo_sglang/bin:$PATH` 后成功；这属于构建工具环境问题，不是 graph 或 SIMO kernel 错误。
 
 随后用 Llama3.1-8B 的 `kvquant_mxfp8` 配置、`attention_backend=triton_simo`、`disable_chunked_prefix_cache=true` 做了同样的单请求 smoke。`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:47-106，SIMOTritonAttnBackend::__init__` 成功创建量化 KV pool/backend，日志完成 `Capture target decode CUDA graph`，请求阶段同样显示 `cuda graph: True`。这验证的是当前 release 下 SIMO 自定义 KV read/write 路径可以参与普通 decode graph；它不表示 chunked-prefix 的 LSE 路径已实现，后者仍由前述显式开关关闭。
+
+### 13.6 恢复完整评测矩阵
+
+应用户要求，当前
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:25-39，QUANT_CONFIGS`
+和
+`:42-50，KV_CACHE_QUANT_CONFIGS`
+已恢复为完整配置数组，不再只筛选 `w8a8_mxfp` 与 `kvquant_mxfp8`。同时
+`:141-154，run_model_evaluations`
+重新调用
+`:123-137，run_no_quant_eval`
+先执行每个模型的无量化基线，再执行全部权重量化配置；KV 量化仍由
+`:157-168，run_model_evaluations_kv_cache_quant`
+单独执行，并继续只在该分支使用 `triton_simo` 和 `disable_chunked_prefix_cache=true`。因此脚本现在会运行两个模型的无量化、完整权重量化和完整 KV cache 量化测试。
