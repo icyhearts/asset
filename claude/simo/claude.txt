@@ -3970,7 +3970,7 @@ simo 以 editable 方式安装.
 
 
 {
-/share/users/like/package/sikernel/setup.sh 是如何设置 SI_CMODEL_ROOT 变量的？
+/share/users/like/package/sikernel/setup.sh 是如何设置 SI_CMODEL_ROOT 变量的？假设不传任何命令行参数
 讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。
-把答案追加到 like-useful/answer_codex_v4.md
+把答案追加到 like-useful/answer_codex_v5.md
 }
