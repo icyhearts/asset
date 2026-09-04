@@ -3974,3 +3974,11 @@ simo 以 editable 方式安装.
 讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。
 把答案追加到 like-useful/answer_codex_v5.md
 }
+{
+DEEP_SEEK_MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ LLAMA_MODEL_PATH=/data/like/hf-models/Llama3.1-8B-Instruct/ MAX_RUNNING_REQUESTS=128 CUDA_GRAPH_MAX_BS=128 ADD_BOS_TOKEN=true TASKS=gsm8k CUDA_VISIBLE_DEVICES=7 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh > temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.`nowstr.sh` 2>&1
+日志位于 temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_04___15_44_03
+日志中有没有 core dump或者抛异常？ 不同 量化配置的json文件，都生成了对应的 gsm8k flexible-extract  得分了吗?
+ 你帮我从 temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_04___15_44_03 中提取每个 gsm8k flexible-extract  得分，参考 tests/sglang_simo/references_accuracy/gsm8k.yaml，结果写入 tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.yaml, 字段顺序 保持和 tests/sglang_simo/references_accuracy/gsm8k.yaml 的顺序一致。
+ 并分析 这次升级至 sglang v0.5.18之后， simo 量化的 不同数据类型的 gsm8k flexible-extract 和  tests/sglang_simo/references_accuracy/gsm8k.yaml 对比，有没有明显精度上的变化
+把答案追加到 like-useful/answer_codex_v5.md
+}
