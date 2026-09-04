@@ -3960,9 +3960,10 @@ conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
 sglang 源码位于 /share/users/like/package/sglang_kernel_src
 sglang 以  editable 方式安装
 simo 代码位于 /share/users/like/package/simo_conda_sglang
-# simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh 你为什么加上 \"disable_cuda_graph\": true? 现在 simo 适配 sglang  release 分支后，连 基础的 cuda graph 都不支持了吗? 如果可以，把 cuda graph 命令行参数恢复
-# simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh run_model_evaluations 函数跑的测试都是 linear method + fused moe method 的配置，不涉及 kv cache, 不会用到 simo  自定义 attention backend, simo 适配 sglang  release 分支前, 脚本本身没有传 attention, 您为什么run_model_evaluations 里面加上 triton backend? 没有kv cache 量化的时候保持默认可以吗？ 只有 kv cache 量化的配置才使用 trition_simo attention backend
-# 原来的脚本 没有限制  expert parallel = 1, 为什么 simo 这次适配 release 分支，要 明确限制 SIMOFusedMoEMethod 为 EP size =1?
+simo 以 editable 方式安装.
+
+# 把 simo 当前适配 sglang  release/v0.5.18-local-dep 分支所做的修改，做一个 commit
+# commit 完成后，对 simo 本次 commit 中每个文件的 每处修改的原因进行解释，
 讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。
 把答案追加到 like-useful/answer_codex_v4.md
 }
