@@ -171,3 +171,212 @@ SI_CMODEL_ROOT=/share_data/arch_cmodel_release/sipu1.5/2609040400
 ```
 
 结论因此是：**无命令行参数时，`setup.sh` 先保留或默认决定 `SIPU_ARCH`；在干净环境中默认选择 1.5，然后 source 对应的 CModel setup，由 `sipu_cmodel_get_loc` 将 `SI_CMODEL_ROOT` 设置为 `readlink -f` 后的 `sipu1.5_cmodel` 目录，并由 `sipu_cmodel_setup_env` 导出。**
+
+## 7. 让 Vim 高亮 SiPU 的 `clusterDim` 和 `clusterIdx`
+
+### 7.1 当前配置和现象
+
+本节的配置 code base 是 `/data/like/vim-port-all/config`，Vim runtime code base 是
+`/data/like/vim-port-all/binary/vim-install-ubuntu22.04/share/vim/vim91`，SiRT
+code base 是 `/share/users/like/package/sirt`。
+
+当前 Vim 是 Vim 9.1（patch 1-1357）。配置文件有两个重要行为：
+
+- `.vimrc:5-10（<top-level>）` 计算配置目录，并把
+  `/data/like/vim-port-all/config/.vim` 放到 `runtimepath` 首位，把
+  `/data/like/vim-port-all/config/.vim/after` 放到末位；
+- `.vimrc:90-91（<top-level>）` 开启 syntax 和 filetype plugin/indent。
+
+当前用户 filetype 规则 `.vim/filetype.vim:1（BufNewFile/BufRead 顶层 autocmd）` 只
+处理 `*.cl`。Vim 内置规则 `filetype.vim:560-561（CUDA 顶层 autocmd）` 只把
+`*.cu,*.cuh` 识别为 `cuda`，没有 `*.su` 规则。因此打开
+`test/cuda/rt/04_execution/kernels.su:25-35（<top-level>）` 时，当前实测：
+
+```text
+:set filetype?  -> filetype=
+:set syntax?    -> syntax=
+```
+
+目标词出现在 `kernels.su:27（<top-level>）`。所以需要先解决文件类型识别，再增加
+语法词表。
+
+### 7.2 Vim 的加载链为什么需要两步
+
+`syntax/syntax.vim:19-35（<top-level>）` 加载 syntax 支持，并建立
+`FileType` 到 `syntax` 的自动设置；`syntax/syntax.vim:42-44（<top-level>）` 还会
+对已有 buffer 重新触发 filetype 检测。
+
+当文件类型变成 `cuda` 后，`syntax/synload.vim:34-63（s:SynSet）` 在第 59 行执行
+`runtime! syntax/cuda.vim`。CUDA 语法文件
+`syntax/cuda.vim:7-13（<top-level>）` 先加载 C++ 语法，
+`syntax/cuda.vim:39（<top-level>）` 定义：
+
+```vim
+syn keyword cudaVariable gridDim blockIdx blockDim threadIdx warpSize
+```
+
+`syntax/cuda.vim:46-51（<top-level>）` 把 `cudaVariable` 链接到通用的
+`Identifier` 高亮组。因此 `clusterDim` 和 `clusterIdx` 最适合加入同一个
+`cudaVariable` 组，视觉效果会和 `blockDim`、`threadIdx` 一致。
+
+### 7.3 推荐的最小持久化方案：复用 `cuda` filetype
+
+如果项目约定所有相关的 `.su` 文件都是 SiPU CUDA-like C++，建议增加两个用户 runtime
+文件（本次没有创建）：
+
+**文件类型检测：** `/data/like/vim-port-all/config/.vim/ftdetect/sipu.vim`
+
+```vim
+" SiPU kernels use CUDA-like C++ syntax.
+au BufRead,BufNewFile *.su setfiletype cuda
+```
+
+Vim 内置 `filetype.vim:3357-3359（<top-level>）` 会在默认检测规则之后执行
+`runtime! ftdetect/*.vim`，所以该文件会被自动加载。`setfiletype` 的含义是：只有在
+尚未确定 filetype 时才设置，避免无意覆盖别的检测器。按照 Vim 的 ftdetect 约定，文件
+中不需要再包一层 `augroup`；该文件是在 `filetypedetect` 组中加载的。
+
+**增加两个 CUDA 变量：** `/data/like/vim-port-all/config/.vim/after/syntax/cuda.vim`
+
+```vim
+" SiPU-specific CUDA-like built-in variables.
+syntax keyword cudaVariable clusterDim clusterIdx
+```
+
+`.vimrc:10（<top-level>）` 已经把 `.vim/after` 放进 `runtimepath`，因此这个文件会
+在发行版的 `syntax/cuda.vim` 之后执行。这样：
+
+```text
+打开 *.su
+  -> ftdetect/sipu.vim 设置 filetype=cuda
+  -> syntax/syntax.vim 设置 syntax=cuda
+  -> syntax/cuda.vim 加载 C++/CUDA 规则
+  -> after/syntax/cuda.vim 增加 clusterDim、clusterIdx
+```
+
+该方案的优点是改动最少、保留 `cuda` filetype 对 C++/CUDA 插件（例如 YCM）的兼容性。
+代价是两个词也会对所有 `*.cu`/`*.cuh` buffer 成为合法的 `cudaVariable`。如果希望
+只对 `.su` 生效，可以把 after 文件写成：
+
+```vim
+if &filetype ==# 'cuda' && expand('%:e') ==# 'su'
+  syntax keyword cudaVariable clusterDim clusterIdx
+endif
+```
+
+如果不想新建 `ftdetect` 文件，也可以把同一条检测规则追加到现有
+`.vim/filetype.vim:1（<top-level autocmd）` 的下一行；但独立的 `ftdetect/sipu.vim`
+更容易维护，也不会把不同用途的规则混在一起。
+
+### 7.4 不污染 CUDA 的专用 filetype 方案
+
+如果不希望普通 CUDA 文件认识 SiPU 关键字，可以使用专用 `sipu` filetype。需要选择
+这一方案时，不再使用上一节的 `after/syntax/cuda.vim`，而是新建：
+
+`/data/like/vim-port-all/config/.vim/ftdetect/sipu.vim`：
+
+```vim
+au BufRead,BufNewFile *.su setfiletype sipu
+```
+
+`/data/like/vim-port-all/config/.vim/syntax/sipu.vim`：
+
+```vim
+if exists('b:current_syntax')
+  finish
+endif
+
+" Reuse all C++/CUDA rules first.
+runtime! syntax/cuda.vim
+unlet! b:current_syntax
+
+syntax keyword sipuVariable clusterDim clusterIdx
+highlight default link sipuVariable Identifier
+
+let b:current_syntax = 'sipu'
+```
+
+这里先 `runtime! syntax/cuda.vim`，再清掉它留下的 `b:current_syntax`，是为了让
+`sipu.vim` 继续追加自己的规则；最后把当前 syntax 标记为 `sipu`，避免重复加载。
+`sipuVariable` 使用 `Identifier`，所以默认颜色仍与普通变量相同，也可以单独改成
+`Special` 或自定义颜色。
+
+这个方案的代价是 `&filetype` 变成 `sipu`。只支持 `c/cpp/cuda` 的插件可能不会自动
+把它当作 C++ 处理；若需要 YCM、clangd 或 ftplugin 的 CUDA 行为，上一节的“复用
+`cuda`”方案更合适。若确实要用专用 filetype，也可以在插件配置中把 `sipu` 加入对应
+的 filetype 白名单，并自行设置编译器参数。
+
+如果同一棵目录树中还存在 GCC `-fstack-usage` 生成的其他 `.su` 文件，不能只靠
+`sipu` 这个名字解决误判：上面的 `*.su` 规则仍会匹配它们。此时应把两个方案中的检测
+模式收窄到 SiPU 目录，例如：
+
+```vim
+au BufRead,BufNewFile */sirt/test/cuda/rt/*.su setfiletype cuda
+" 专用 filetype 方案把上面的 cuda 改为 sipu。
+```
+
+也可以按文件内容在用户 `scripts.vim` 中判断 `__global__`、`#include <sipu.h>` 等
+特征后再 `setfiletype`。路径模式应按实际工程布局调整；关键是让“文件类型检测”本身
+区分 SiPU `.su` 与其他 `.su`，专用 syntax 只负责隔离高亮规则。
+
+### 7.5 为什么使用 `syntax keyword`
+
+`syntax keyword cudaVariable clusterDim clusterIdx`（或专用组的
+`syntax keyword sipuVariable ...`）按完整单词匹配，不会把
+`my_clusterDim_value` 的中间片段误判为关键字；这正符合它们像 `blockDim`、`threadIdx`
+一样作为内建变量使用的场景。它只改变 Vim 的语法组和颜色，不会：
+
+- 修改 SiPU/C++ 编译器的关键字集合；
+- 改变语义检查、补全或 clangd 的解析结果；
+- 自动为编辑器提供声明、类型或跳转信息。
+
+如果还需要补全，应另行在 YCM/clangd 的编译参数或头文件中声明这些符号；语法高亮和
+语义补全是两条独立链路。
+
+### 7.6 立即试用而不修改任何文件
+
+在持久化配置前，可以只对当前 buffer 执行：
+
+```vim
+:setfiletype cuda
+:syntax keyword cudaVariable clusterDim clusterIdx
+```
+
+随后把光标放在 `clusterDim` 或 `clusterIdx` 上执行：
+
+```vim
+:set filetype? syntax?
+:syntax list cudaVariable
+:echo synIDattr(synID(line('.'), col('.'), 1), 'name')
+```
+
+预期分别看到 `filetype=cuda`、`syntax=cuda`，以及最后一条返回
+`cudaVariable`。当前未扩展时，实测 `blockDim` 的 syntax ID 是 `cudaVariable`，而
+`clusterDim`/`clusterIdx` 的 syntax ID 为 0；这可以直接验证规则是否生效。
+
+如果选择专用方案，则把第一条改为 `:setfiletype sipu`，并使用
+`:syntax list sipuVariable` 检查。
+
+### 7.7 持久化后如何确认加载了正确文件
+
+重新启动 Vim（文件类型检测文件是在启动时加载的），打开目标文件后检查：
+
+```vim
+:set runtimepath?
+:set filetype? syntax?
+:scriptnames
+:syntax list cudaVariable
+```
+
+`:scriptnames` 应能看到用户 runtime 下的 `ftdetect/sipu.vim` 和
+`after/syntax/cuda.vim`（专用方案则应看到 `syntax/sipu.vim`）。若 `filetype` 仍为空，
+先检查启动时是否真正使用了 `/data/like/vim-port-all/config/.vimrc`；当前配置的
+`.vimrc:5-10（<top-level>）` 只有在该 vimrc 被加载时才会把这些目录加入
+`runtimepath`。
+
+不要直接修改
+`/data/like/vim-port-all/binary/vim-install-ubuntu22.04/share/vim/vim91/syntax/cuda.vim`
+或 `.../vim91/filetype.vim`：它们属于 Vim 安装目录，升级 Vim 时容易被覆盖。Vim 官方
+文档 `doc/filetype.txt:195-263（<documentation>）` 推荐用用户 `ftdetect`/`filetype.vim`
+扩展文件类型，`doc/syntax.txt:174-193（<documentation>）` 推荐用
+`after/syntax/<name>.vim` 扩展现有语法。
