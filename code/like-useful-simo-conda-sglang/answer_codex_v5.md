@@ -380,3 +380,147 @@ au BufRead,BufNewFile */sirt/test/cuda/rt/*.su setfiletype cuda
 文档 `doc/filetype.txt:195-263（<documentation>）` 推荐用用户 `ftdetect`/`filetype.vim`
 扩展文件类型，`doc/syntax.txt:174-193（<documentation>）` 推荐用
 `after/syntax/<name>.vim` 扩展现有语法。
+
+## 8. sglang v0.5.18 GSM8K 评测日志审计（2026-09-04）
+
+### 8.1 评测范围和完整性
+
+本节分析的日志是
+`temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_04___15_44_03`。
+脚本在 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:25-39（<top-level>）`
+定义了 13 个权重量化 JSON，在 `:42-50（<top-level>）` 定义了 7 个 KV-cache 量化
+JSON。`run_no_quant_eval:122-136` 运行未量化基线，
+`run_model_evaluations:140-154` 运行基线和 13 个权重量化，
+`run_model_evaluations_kv_cache_quant:157-167` 运行 7 个 KV-cache 配置；Llama 和
+DeepSeek 的调用位于 `:176-204（<top-level>）`。
+
+日志中的计数如下：
+
+| 项目 | 数量 |
+| --- | ---: |
+| `Running evaluation for` | 42 |
+| `Running generate_until requests: ... 100%` | 42 |
+| `gsm8k` 结果表 | 42 |
+| `flexible-extract` 结果行 | 42 |
+| `strict-match` 结果行 | 42 |
+
+因此实际完成的是 `2 个模型 x (1 个基线 + 13 个权重量化 + 7 个 KV-cache 量化) = 42`
+项。20 个 JSON 配置各被两个模型加载一次（`Loaded config from` 共 40 次；基线不加载
+JSON），每个 KV 配置的日志都出现了 `Applying KV cache quantization`。没有发现某个 JSON
+启动后静默退回未量化或缺少得分的情况。
+
+### 8.2 core dump 和异常判断
+
+对该日志检索 `core dump`、`core dumped`、`SIGSEGV`、`SIGABRT`、`Segmentation fault`、
+`CUDA error`、`OutOfMemoryError`、`illegal memory access`、`FATAL` 和
+`RuntimeError`，均为 0 次。因此日志没有记录 GPU 推理 core dump、CUDA 致命错误或因
+OOM 中止。
+
+日志确实打印了异常堆栈，但都是评测进程结束后的 loky/multiprocessing 清理异常，共
+42 次同样的 traceback。第一次位于 `temp/...log:739-745`，最后一次位于
+`:38873-38879`，模式是：
+
+```text
+kill_process_tree called
+resource_tracker: process died unexpectedly, relaunching
+Traceback (most recent call last):
+  .../multiprocessing/resource_tracker.py:264, in main
+    cache[rtype].remove(name)
+KeyError: '/loky-...'
+```
+
+`resource_tracker` 的 warning 文本在日志中每次占两行（包含 `warnings.warn` 的续行），
+所以文本行数为 84，但 traceback 和 `KeyError` 事件各为 42。每次 traceback 都出现在
+该配置的结果表之后，随后马上进入下一个 `run_eval`，最后一个配置也正常输出分数；这说明
+它是 teardown 阶段的资源清理竞态/泄漏风险，不是模型加载、请求生成或 GSM8K 计分失败。
+严格说日志中“有 Python 异常堆栈”，但没有导致本次 42 项评测失败的异常。建议后续单独
+修复 `kill_process_tree` 与 loky resource tracker 的退出顺序，避免清理阶段泄漏。
+
+另外，`:78` 有被显式捕获的 `sarashina2_vision` 可选模型导入 warning，及多处 torch
+`register_constant()` 弃用 warning、instruct/chat template 提示；它们与本次两个目标
+模型和量化结果无关。
+
+### 8.3 提取规则和结果文件
+
+每项分数取日志中形如
+`|gsm8k| ... |flexible-extract| ... |0.xxxx|` 的 `exact_match` 值，再乘以 100
+转换为百分比并保留两位小数（例如 `0.699` -> `69.90`）。字段顺序逐项复制
+`tests/sglang_simo/references_accuracy/gsm8k.yaml:1-84`；日志名称
+`kvquant_fp8_per_group` 和 `kvquant_int8_per_group` 对应参考字段
+`fp8_per_group_64` 和 `int8_per_group_64`。完整结果已写入
+`tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.yaml`。
+
+### 8.4 Llama-3.1-8B-Instruct 结果和对比
+
+下表的“旧基准”来自 `tests/sglang_simo/references_accuracy/gsm8k.yaml`，差值为
+`v0.5.18 - 旧基准`，单位是百分点（pp）；日志行是对应的 flexible-extract 行。
+
+| 配置 | 日志行 | v0.5.18 (%) | 旧基准 (%) | 差值 (pp) |
+| --- | ---: | ---: | ---: | ---: |
+| no-quant | 736 | 77.63 | 77.63 | +0.00 |
+| w8a8_fp8_per_block | 7661 | 77.26 | 76.95 | +0.31 |
+| w4a16_int4_per_group | 1601 | 73.39 | 72.93 | +0.46 |
+| w8a8_int8_per_block | 9395 | 77.94 | 77.26 | +0.68 |
+| w8a8_fp8_per_channel | 8524 | 76.88 | 77.71 | -0.83 |
+| w8a8_int8_per_channel | 10247 | 77.03 | 75.59 | +1.44 |
+| w8a8_mxint | 11974 | 77.48 | 77.48 | +0.00 |
+| w8a8_mxfp | 11122 | 77.03 | 77.03 | +0.00 |
+| w6a6_mxfp | 6792 | 76.35 | 76.35 | +0.00 |
+| w4a4_mxfp | 4213 | 47.61 | 47.61 | +0.00 |
+| w4a16_nvfp4_per_group | 3327 | 73.24 | 73.46 | -0.22 |
+| w4a16_nvfp4_per_group_4_over_6 | 2461 | 75.51 | 74.00 | +1.51 |
+| w4a4_nvfp | 5923 | 69.07 | 69.07 | +0.00 |
+| w4a4_nvfp_4_over_6 | 5077 | 70.13 | 70.13 | +0.00 |
+| mxfp8 | 12802 | 76.72 | 76.72 | +0.00 |
+| mxfp4 | 13627 | 69.90 | 69.90 | +0.00 |
+| mxfp6 | 14443 | 77.79 | 77.79 | +0.00 |
+| mxint8 | 15251 | 77.94 | 77.94 | +0.00 |
+| fp8_per_group_64 | 16048 | 78.47 | 76.95 | +1.52 |
+| int8_per_group_64 | 16860 | 77.33 | 77.10 | +0.23 |
+| nvfp4 | 17667 | 76.57 | 76.57 | +0.00 |
+
+### 8.5 DeepSeek-V2-Lite-Chat-16B_A2.4B 结果和对比
+
+| 配置 | 日志行 | v0.5.18 (%) | 旧基准 (%) | 差值 (pp) |
+| --- | ---: | ---: | ---: | ---: |
+| no-quant | 18549 | 66.03 | 66.03 | +0.00 |
+| w8a8_fp8_per_block | 26652 | 65.96 | 64.97 | +0.99 |
+| w4a16_int4_per_group | 19570 | 56.86 | 58.68 | -1.82 |
+| w8a8_int8_per_block | 28761 | 65.88 | 66.64 | -0.76 |
+| w8a8_fp8_per_channel | 27724 | 65.58 | 65.50 | +0.08 |
+| w8a8_int8_per_channel | 29784 | 63.31 | 64.06 | -0.75 |
+| w8a8_mxint | 31848 | 65.28 | 65.28 | +0.00 |
+| w8a8_mxfp | 30822 | 64.90 | 64.90 | +0.00 |
+| w6a6_mxfp | 25598 | 64.37 | 64.37 | +0.00 |
+| w4a4_mxfp | 22583 | 38.51 | 38.51 | +0.00 |
+| w4a16_nvfp4_per_group | 21568 | 63.08 | 63.84 | -0.76 |
+| w4a16_nvfp4_per_group_4_over_6 | 20570 | 63.91 | 61.71 | +2.20 |
+| w4a4_nvfp | 24565 | 56.79 | 56.18 | +0.61 |
+| w4a4_nvfp_4_over_6 | 23573 | 57.77 | 60.20 | -2.43 |
+| mxfp8 | 32874 | 66.03 | 66.03 | +0.00 |
+| mxfp4 | 33859 | 31.39 | 31.39 | +0.00 |
+| mxfp6 | 34863 | 64.37 | 64.37 | +0.00 |
+| mxint8 | 35878 | 66.03 | 66.03 | +0.00 |
+| fp8_per_group_64 | 36886 | 66.34 | 66.03 | +0.31 |
+| int8_per_group_64 | 37870 | 66.34 | 66.26 | +0.08 |
+| nvfp4 | 38870 | 47.08 | 47.08 | +0.00 |
+
+### 8.6 精度变化结论
+
+1. 两个模型的未量化基线分别为 77.63% 和 66.03%，与旧基准完全一致，说明这次
+   对比的任务、数据和基本推理路径没有出现整体偏移。
+2. KV-cache 量化没有明显升级回归：两模型的 `mxfp8`、`mxfp4`、`mxfp6`、`mxint8`
+   和 `nvfp4` 都与旧基准（四舍五入到 0.01 pp）一致；per-group 配置的最大差值是
+   Llama `fp8_per_group_64` 的 +1.52 pp，DeepSeek 为 +0.31 pp（`int8_per_group_64`
+   为 +0.23/+0.08 pp）。这更像单次评测波动，不能据此判定 KV kernel 发生回归。
+3. 权重量化多数变化不超过约 1 pp。Llama 中较大的变化是
+   `w4a16_nvfp4_per_group_4_over_6` +1.51 pp、`w8a8_int8_per_channel` +1.44 pp；
+   `w8a8_fp8_per_channel` 为 -0.83 pp。DeepSeek 中最值得复测的是
+   `w4a4_nvfp_4_over_6` -2.43 pp、`w4a16_nvfp4_per_group_4_over_6` +2.20 pp 和
+   `w4a16_int4_per_group` -1.82 pp。
+4. 当前日志每项 stderr 约为 1.1--1.4 个百分点（1319 个 GSM8K 样本）；因此上述
+   0.5--1.5 pp 的变化不能单凭一次运行解释为版本回归，DeepSeek 的约 2 pp 变化应使用
+   相同随机种子重复运行或比较逐样本预测后再归因。
+5. `Llama w4a4_mxfp=47.61%`、`DeepSeek w4a4_mxfp=38.51%`、`DeepSeek KV mxfp4=31.39%`
+   和 `DeepSeek KV nvfp4=47.08%` 的绝对精度确实较低，但它们与旧基准完全相同，属于
+   量化配置本身的精度特征，而不是 v0.5.18 适配新引入的退化。
