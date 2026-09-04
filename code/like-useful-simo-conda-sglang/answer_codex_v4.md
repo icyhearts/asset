@@ -1,4 +1,4 @@
-# SGLang v0.5.18-local-dep 启动耗时分析
+# 1. SGLang v0.5.18-local-dep 启动耗时分析
 
 分析对象：
 
@@ -7,7 +7,7 @@
 - 启动参数：like-useful/dsv4-flash-run.sh，TP=4，Marlin，EAGLE，speculative-num-steps=3，speculative-num-draft-tokens=4，cuda-graph-max-bs=16
 - 环境：/share_data/users/like/miniconda3/envs/simo_sglang/；源码以 editable 方式安装在 /share/users/like/package/sglang_kernel_src
 
-## 结论
+## 1.1 结论
 
 启动时间增加的主因已经定位到：
 
@@ -19,7 +19,7 @@
 
 MHC/DeepGEMM 的懒编译、分布式初始化变慢以及环境混用会增加几十秒到约 1 分钟，或造成少量波动，但不能解释 10～13 分钟的主要差值。
 
-## 1. 启动总时间和阶段对比
+## 1.2 启动总时间和阶段对比
 
 以日志文件名时间作为开始时间，以 “The server is fired up and ready to roll!” 作为结束时间；阶段时间取各 rank 中的最长值。
 
@@ -38,7 +38,7 @@ MHC/DeepGEMM 的懒编译、分布式初始化变慢以及环境混用会增加�
 - 新版本启动汇总：2026-09-01 日志约 2324 行和 273 行；2026-09-03 日志约 2275 行。
 - ready 行：旧日志均为 256 行；新日志分别为 2402、286、2290 行附近。
 
-### 1.1 主要差值
+### 1.2.1 主要差值
 
 旧版本 generic graph 为 367.4～463.5 s，新版本对应的 target_verify 为 1106.0～1156.3 s：
 
@@ -53,9 +53,9 @@ MHC/DeepGEMM 的懒编译、分布式初始化变慢以及环境混用会增加�
 
 首个 bs=16 完成后，bs=14、12、10 等剩余桶大多在秒级或几十秒内完成。因此主耗时是首个桶中的 kernel/JIT 初始化，而不是 12 个桶平均变慢。
 
-## 2. 主要根因：新 JIT cache 没有命中，Marlin 被 4 个 rank 串行重编译
+## 1.3 主要根因：新 JIT cache 没有命中，Marlin 被 4 个 rank 串行重编译
 
-### 2.1 新旧 loader/cache 行为不同
+### 1.3.1 新旧 loader/cache 行为不同
 
 旧分支的 python/sglang/jit_kernel/utils.py:276-291：
 
@@ -80,7 +80,7 @@ MHC/DeepGEMM 的懒编译、分布式初始化变慢以及环境混用会增加�
 
 没有设置 SGLANG_JIT_CACHE_DIR。因此 release/v0.5.18-local-dep 不会使用旧版 TVM FFI 的直接 .so 作为新 loader 的缓存；实际使用的是 /softhome/like/.cache/sglang/jit（该路径最终指向 /share_data/users/like/.cache/sglang/jit）。
 
-### 2.2 缓存 manifest 中记录了已删除的 staging 文件
+### 1.3.2 缓存 manifest 中记录了已删除的 staging 文件
 
 新版本 python/sglang/kernels/jit/utils/compile/cache.py:463-486 在扫描依赖时会调用 candidate.resolve()，然后用 path.is_relative_to(build_dir) 判断是否应排除构建目录内部文件。
 
@@ -107,7 +107,7 @@ MHC/DeepGEMM 的懒编译、分布式初始化变慢以及环境混用会增加�
 
 修复方向是让比较双方使用同一 canonical path，例如在 _to_entries 进入 is_relative_to 前先执行 build_dir = build_dir.resolve()。现有坏 manifest 需要重新生成；为避免误删共享缓存，优先使用新的、canonical 的 SGLANG_JIT_CACHE_DIR 做验证。
 
-### 2.3 每次启动出现四次连续 Marlin 编译
+### 1.3.3 每次启动出现四次连续 Marlin 编译
 
 当前缓存目录中，模块 sgl_kernel_jit_moe_wna16_marlin_bf16_t_false_false 的 .so 时间戳如下：
 
@@ -121,9 +121,9 @@ MHC/DeepGEMM 的懒编译、分布式初始化变慢以及环境混用会增加�
 
 python/sglang/kernels/ops/moe/moe_wna16_marlin.py:18-33 会调用新 load_jit；在当前参数（bf16、is_ep=false、has_bias=false）下对应上述模块名。旧版本使用的 loader 和模块命名不同，所以旧版已有的 TVM FFI .so 不能直接证明新 loader 能命中。
 
-## 3. 次要增量和其它差异
+## 1.4 次要增量和其它差异
 
-### 3.1 MHC fused post/pre 与 TileLang 懒编译
+### 1.4.1 MHC fused post/pre 与 TileLang 懒编译
 
 当前 environ.py:1264-1268：
 
@@ -142,17 +142,17 @@ python/sglang/kernels/ops/moe/moe_wna16_marlin.py:18-33 会调用新 load_jit；
 
 所以 MHC 是真实的次要冷启动成本，并可能在 target_verify 中触发形状特化 kernel；但 2026-09-03 MHC 已基本 warm，而 target_verify 仍需 18.4 分钟，说明 MHC 不是本次 10～13 分钟增长的主因。
 
-### 3.2 DeepGEMM 预编译被显式关闭，缓存根目录也迁移
+### 1.4.2 DeepGEMM 预编译被显式关闭，缓存根目录也迁移
 
 脚本设置 SGLANG_JIT_DEEPGEMM_PRECOMPILE=0。新版本 compile_utils.py:31-40 会把 DG_JIT_CACHE_DIR 重定向到 SGLANG_DG_CACHE_DIR；同时 release 分支把默认 DeepGEMM cache 从旧的 ~/.cache/deep_gemm 迁移到 ~/.cache/sglang/deep_gemm。日志中可见 MHC prewarm 和 target_verify 期间产生 DeepGEMM 产物。
 
 这会造成额外 JIT 和缓存冷启动，但从时间量级看属于次要项。开启 precompile 可能只是把成本前移，必须用相同 cache 和相同环境做 A/B，不能直接当作根因修复。
 
-### 3.3 分布式初始化变慢
+### 1.4.3 分布式初始化变慢
 
 旧版分布式初始化约 10.6～13.4 s，新版约 62.7～68.1 s，增加约 50～57 s。新版日志使用 NCCL 2.29.7，旧版为 NCCL 2.28.9；两者存在时间相关性，但仅凭现有日志不能证明 NCCL 版本是唯一原因。它明显小于 target_verify 的十几分钟差值。
 
-### 3.4 环境不完全可比
+### 1.4.4 环境不完全可比
 
 2026-09-01 18:04:02 这次日志引用了 simo_sglang_pip 的 site-packages；2026-09-01 17:32:27 和 2026-09-03 使用的是 editable source。当前 Marlin 的 cuda.cu 依赖中同时出现：
 
@@ -161,16 +161,16 @@ python/sglang/kernels/ops/moe/moe_wna16_marlin.py:18-33 会调用新 load_jit；
 
 这会造成 build key 和缓存碎片化，因此 18:04:02 不应作为严格的同环境 A/B 样本。后续应固定使用 simo_sglang 的 python 和 sglang 可执行文件。
 
-### 3.5 不能归因的告警/阶段
+### 1.4.5 不能归因的告警/阶段
 
 - 新日志明确提示 prefill CUDA graph disabled；因此启动慢不是 prefill graph 捕获。
 - FlashInfer 的 libcudart_stub.so: undefined symbol: cudaDeviceReset 会禁用 allreduce fusion。这是 CUDA/TileLang 动态库不匹配，应修复后复测，但现有证据不能把它归因到 18 分钟的 target_verify。
 - SIMO plugin 报告找不到 model_runner_kv_cache_mixin，服务仍继续启动；目前没有分钟级耗时证据。
 - 2026-09-01 18:04:02 在权重/内存池结束到 target_verify 开始之间还有约 202 s 未被细分，startup timing 的 scheduler_e2e 包含该间隔，需要增加更细日志；这属于额外待查项，不改变 Marlin JIT 是主要热点的判断。
 
-## 4. 建议的验证和修复顺序
+## 1.5 建议的验证和修复顺序
 
-### 4.1 先固定环境和新的 canonical cache
+### 1.5.1 先固定环境和新的 canonical cache
 
 在启动进程导入 sglang 之前设置，并确认所有 rank 继承：
 
@@ -186,7 +186,7 @@ python -c 'import sglang; print(sglang.__file__)'
 
 SGLANG_JIT_CACHE_DIR 也可以使用 /share_data/users/like/.cache/sglang/jit，但不要再通过 /softhome 的 symlink 路径作为一侧路径。旧 TVM FFI 目录中的直接 .so 不要直接复制成新 loader 的 manifest；新 loader 的模块名、build key 和依赖布局不同，应在新根目录重新编译一次。
 
-### 4.2 修复 cache.py 的 canonical path 比较
+### 1.5.2 修复 cache.py 的 canonical path 比较
 
 在 python/sglang/kernels/jit/utils/compile/cache.py 的 _to_entries 中，让 build_dir 与 candidate 使用同一个 resolve 结果，再执行 is_relative_to。重新生成缓存后，检查 sgl_deps.json 不再包含已删除的 .staging-*/cuda.cu。
 
@@ -197,7 +197,7 @@ SGLANG_JIT_CACHE_DIR 也可以使用 /share_data/users/like/.cache/sglang/jit，
 - 第二次启动不再出现新的 .staging-UUID 依赖；
 - target_verify 的首个 bs=16 时间显著下降。
 
-### 4.3 再做隔离 A/B
+### 1.5.3 再做隔离 A/B
 
 固定同一个 editable 环境、同一个 canonical cache 后，分别比较：
 
@@ -207,11 +207,11 @@ SGLANG_OPT_FUSE_MHC_POST_PRE=0
 
 以及当前值；必要时临时降低 cuda-graph-max-bs 或使用 disable-cuda-graph 仅作诊断。若关闭 fused MHC 只减少几十秒，而修复 JIT cache 能减少十几分钟，就能进一步确认归因。
 
-### 4.4 最后处理环境告警
+### 1.5.4 最后处理环境告警
 
 修正 FlashInfer/TileLang 与 CUDA 13.0 的动态库匹配，清理或更新 stale SIMO plugin import；同时记录 NCCL 版本和启动阶段的更细时间点。它们是稳定性和次要启动时间问题，不应替代 JIT cache 修复。
 
-## 5. 最终判断
+## 1.6 最终判断
 
 按当前证据对启动时间增长做排序：
 
@@ -225,13 +225,13 @@ SGLANG_OPT_FUSE_MHC_POST_PRE=0
 
 ---
 
-# 为什么 SIMO 要关闭 chunked prefix cache
+# 2. 为什么 SIMO 要关闭 chunked prefix cache
 
 本节针对 `sglang` 的 `release/v0.5.18-local-dep`（当前源码提交 `982d8495b7`）和本仓库的 SIMO 量化路径。下面的行号以本次检查的工作树为准，后续提交若插入代码，行号可能变化。所有路径均为各自 code base 的相对路径：SGLang 的根目录是 `/share/users/like/package/sglang_kernel_src`，SIMO 的根目录是 `/share/users/like/package/simo_conda_sglang`。
 
 代码引用采用“相对路径:行号，类::函数”的形式；对于字段、常量和模块级注册，则直接写出对应符号名。
 
-## 结论
+## 2.1 结论
 
 `chunked prefix cache` 有两个容易混淆的“默认值”:
 
@@ -242,17 +242,17 @@ SGLANG_OPT_FUSE_MHC_POST_PRE=0
 
 字段帮助文本还说明，关闭它可以为短序列节省额外调度/路径开销，见 `python/sglang/srt/server_args.py:958-962，ServerArgs.disable_chunked_prefix_cache`。这只是原生 SGLang 的通用性能取舍；对 SIMO 来说，首要原因是量化 pool 和 kernel 尚未实现该路径所需的接口，不能把本次关闭理解成单纯的性能调参。
 
-## 1. “chunked prefix cache”不是普通 prefix cache
+## 2.2 “chunked prefix cache”不是普通 prefix cache
 
 普通的 Radix/prefix cache 由 `disable_radix_cache` 控制，该选项在 `python/sglang/srt/server_args.py:937-939，ServerArgs.disable_radix_cache` 中默认也是 `False`。`disable_chunked_prefix_cache` 只控制 DeepSeek MLA 在长前缀场景下采用的“分块 MHA 前缀读取”路径，不能把两个开关等同起来。关闭 chunked prefix cache **不会自动关闭所有 Radix prefix cache**。
 
-## 2. SGLang 默认值如何变成实际生效值
+## 2.3 SGLang 默认值如何变成实际生效值
 
-### 2.1 参数本身
+### 2.3.1 参数本身
 
 `disable_chunked_prefix_cache=False` 位于 `schedule` 配置组，含义是“不要禁用”。因此命令行不写该选项时，配置初值是允许功能的，而不是明确关闭功能。见 `python/sglang/srt/server_args.py:958-962，ServerArgs.disable_chunked_prefix_cache`。
 
-### 2.2 加载时能力门控
+### 2.3.2 加载时能力门控
 
 `ModelRunner.__init__` 在初始化过程中调用 `maybe_disable_chunked_prefix_cache`，见 `python/sglang/srt/model_executor/model_runner.py:369-372，ModelRunner.__init__`。该函数的判断逻辑见 `python/sglang/srt/model_executor/model_runner_components/misc_utils.py:25-48，maybe_disable_chunked_prefix_cache`：
 
@@ -278,7 +278,7 @@ SGLANG_OPT_FUSE_MHC_POST_PRE=0
 
 另外，DeepSeek 的 forward-method registry 对未知 backend 会回退到 `triton` handler，见 `python/sglang/srt/models/deepseek_common/attention_backend_handler.py:37-46，AttentionBackendRegistry.get_handler`。`handle_attention_triton` 对有前缀的 extend 直接走 MLA，只有前缀长度为零时才走 MHA，见 `python/sglang/srt/models/deepseek_common/attention_backend_handler.py:212-226，handle_attention_triton`。这解释了为什么当前 SIMO eager 路径通常不会主动选择 chunked MHA，但不能据此把 SIMO 标成“支持”该特性。
 
-## 3. SGLang 的 chunked 路径具体做了什么
+## 2.4 SGLang 的 chunked 路径具体做了什么
 
 DeepSeek MLA 初始化时把 schedule 中的开关和阈值复制到 attention 对象，见 `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:132-139，DeepseekMHAForwardMixin.init_mha_forward`。阈值注释说明，前缀总长度默认达到 8192 才考虑该路径；较短的非空前缀继续使用吸收式 MLA，见 `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:90-100，DeepseekMHAForwardMixin 的 chunk 配置说明`；默认值实际定义在 `python/sglang/srt/environ.py:586，RuntimeEnvs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD`。
 
@@ -296,15 +296,15 @@ DeepSeek MLA 初始化时把 schedule 中的开关和阈值复制到 attention �
 
 此外，完整 prefill CUDA graph 也读取这个开关：`python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py:410-425，PrefillCudaGraphRunner.__init__` 用 `not get_schedule().disable_chunked_prefix_cache` 决定是否建立 chunked-prefix graph 拓扑。它不是单纯的“是否启用 CUDA Graph”开关；`disable_cuda_graph` 与它是两个独立选项。
 
-## 4. SIMO 为什么不能沿用这条路径
+## 2.5 SIMO 为什么不能沿用这条路径
 
-### 4.1 SIMO pool 不是上游 raw MLA buffer
+### 2.5.1 SIMO pool 不是上游 raw MLA buffer
 
 SIMO 的 MLA pool 用 `uint8` 保存打包后的量化 payload 和 scale bytes，见 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:329-349，SIMOMLATokenToKVPool._create_buffers`。这与上游 `MLATokenToKVPool.get_mla_kv_buffer` 所要求的未量化 latent/rope dtype 不同。
 
 因此 SIMO 明确拒绝上游 chunked helper 调用 raw reader，见 `simo/extensions/sglang_simo/mem_cache/memory_pool.py:360-380，SIMOMLATokenToKVPool.get_mla_kv_buffer`。如果把打包字节直接当 BF16 latent 读取，结果不是精度下降这么简单，而是会得到错误的 K/V；要支持它，必须新增按 chunk 索引读取、反量化并恢复布局的实现。
 
-### 4.2 SIMO kernel 没有 LSE 返回值
+### 2.5.2 SIMO kernel 没有 LSE 返回值
 
 量化路径的 `SIMOTritonAttnBackend.forward_extend` 最终调用 SIMO 自定义 dequant attention kernel。该函数在检测到 `forward_batch.mha_return_lse` 时显式抛出异常，见 `simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:124-164，SIMOTritonAttnBackend.forward_extend`。原因是当前 kernel 只返回 attention output，不返回 chunk 合并所需的 LSE；而上游 caller 会在 `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:302-315，DeepseekMHAForwardMixin.forward_normal_chunked_kv_core` 解包 `(attn_output, lse)`。
 
@@ -316,7 +316,7 @@ SIMO 的 MLA pool 用 `uint8` 保存打包后的量化 payload 和 scale bytes�
 
 仅把 `triton_simo` 加入白名单，或仅删除脚本中的 disable 参数，都会绕过自动保护并触发上述未实现接口，不是正确修复。
 
-## 5. 为什么评测脚本要显式写 `true`
+## 2.6 为什么评测脚本要显式写 `true`
 
 当前脚本在指定 attention backend 时统一传入该选项，见 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:103-114，run_simo_config_list`：
 
@@ -332,17 +332,17 @@ SIMO 的 MLA pool 用 `uint8` 保存打包后的量化 payload 和 scale bytes�
 
 因此本次评测中应把“实际生效值”理解为 `True`。普通 Radix prefix cache 仍由 `disable_radix_cache=False` 独立控制，短前缀也仍可走普通的吸收式 MLA；关闭的只是长前缀 chunked MHA 方案。
 
-## 6. 如何判断一次启动的真实状态
+## 2.7 如何判断一次启动的真实状态
 
 不要只看命令行参数名的直觉含义。先看 `maybe_disable_chunked_prefix_cache` 是否打印 `Chunked prefix cache is turned on.`，该日志分支见 `python/sglang/srt/model_executor/model_runner_components/misc_utils.py:42-48，maybe_disable_chunked_prefix_cache`；再结合 resolved schedule config。由于自动门控写入的是 runtime config bag，`python/sglang/srt/runtime_context.py:1119-1120，get_schedule` 返回的是生效配置视图，而不是未经覆盖的原始 `ServerArgs` 对象。
 
 最终判断：**SGLang 的 `ServerArgs` 默认值是 `disable=False`，即功能默认允许；实际是否开启由 MLA/backend 能力门控决定。对当前 Llama3.1 + DeepSeek-V2-Lite 的 SIMO 量化测试，显式 `disable_chunked_prefix_cache=true` 是必要且正确的，当前有效值为关闭。**
 
-## 7. 四个环境变量的作用，以及与 Marlin/DeepGEMM 编译的关系
+## 2.8 四个环境变量的作用，以及与 Marlin/DeepGEMM 编译的关系
 
 本节按当前 checkout（release/v0.5.18-local-dep）的实际代码说明。四个变量都是“缓存/诊断”变量，不是选择 Marlin 或 DeepGEMM 算法的开关；是否走 Marlin 由启动参数 `--moe-runner-backend marlin` 决定，DeepGEMM 是否启用/预编译由另外的 `SGLANG_ENABLE_JIT_DEEPGEMM`、`SGLANG_JIT_DEEPGEMM_PRECOMPILE` 等变量决定。
 
-### 7.1 一览
+### 2.8.1 一览
 
 | 环境变量 | 当前代码默认值 | 直接控制的内容 | 对 Marlin | 对 DeepGEMM |
 |---|---|---|---|---|
@@ -353,7 +353,7 @@ SIMO 的 MLA pool 用 `uint8` 保存打包后的量化 payload 和 scale bytes�
 
 布尔变量接受 `true/1/yes/y` 和 `false/0/no/n`（见 `environ.py:133-140`）。
 
-### 7.2 `SGLANG_CACHE_DIR`：通用缓存根
+### 2.8.2 `SGLANG_CACHE_DIR`：通用缓存根
 
 定义在 `python/sglang/srt/environ.py:991`，默认是 `~/.cache/sglang`。导入 `sglang` 时，`sglang/__init__.py:6-14` 很早调用 `redirect_third_party_caches()`；该函数在 `environ.py:1633-1657` 用这个根，通过 `setdefault` 派生：
 
@@ -370,7 +370,7 @@ SGLang 的 Rust extension、Torch compile cache、FlashInfer autotune 等也使�
 
 由于第三方变量是 `setdefault`，如果 shell 里已经设置了 `TRITON_CACHE_DIR` 等变量，`SGLANG_CACHE_DIR` 不会覆盖它们。当前脚本显式设置了 `TRITON_CACHE_DIR=/data/like/cache/triton_cache_like`，因此实际 Triton 路径不是 `/data/like/cache/sglang/triton`。
 
-### 7.3 `SGLANG_JIT_CACHE_DIR`：Marlin 使用的 SGLang JIT 根
+### 2.8.3 `SGLANG_JIT_CACHE_DIR`：Marlin 使用的 SGLang JIT 根
 
 新版本的 `load_jit` 使用 `python/sglang/kernels/jit/utils/compile/cache.py:301-304` 选择根目录，缓存布局为：
 
@@ -403,7 +403,7 @@ moe_wna16_marlin.py:18-33
 
 这也是本次启动变慢的关键关联：历史日志没有显式设置该变量时，新 loader 使用了 `~/.cache/sglang/jit`；在本机 `/softhome` 是指向 `/share_data` 的 symlink，manifest 中的 staging 路径失效，导致 Marlin 每次启动反复编译。将它设为真实的 canonical 路径（例如 `/data/like/cache/sglang_jit`）可以绕开这类路径混用，但第一次启动仍可能需要编译，必须用第二次启动验证命中。
 
-### 7.4 `SGLANG_DG_CACHE_DIR`：DeepGEMM 的缓存目录
+### 2.8.4 `SGLANG_DG_CACHE_DIR`：DeepGEMM 的缓存目录
 
 定义在 `environ.py:980-982`。默认值是一个懒解析的 `<SGLANG_CACHE_DIR>/deep_gemm`；如果显式设置 `SGLANG_DG_CACHE_DIR`，就使用显式值。
 
@@ -432,7 +432,7 @@ DeepGEMM wrapper execution_hook
 
 等变量决定。当前启动脚本设置 `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`，因此不会执行“所有 M 值的显式预编译”，但实际首次使用的 DeepGEMM shape 仍可能发生按需 JIT。DeepGEMM 的 cache 与 Marlin 的 SGLang JIT cache 是两套独立目录和校验逻辑；清理/迁移其中一套不会让另一套命中。
 
-### 7.5 `SGLANG_JIT_CACHE_DEBUG`：只增加 cache miss 原因可见性
+### 2.8.5 `SGLANG_JIT_CACHE_DEBUG`：只增加 cache miss 原因可见性
 
 定义在 `environ.py:994-996`，默认 `false`。它唯一的行为在 `cache.py:394-397`：
 
@@ -450,7 +450,7 @@ DeepGEMM wrapper execution_hook
 
 另外，若整个 cache scope 尚不存在，当前实现可能没有“changed dependency”可打印；所以没有看到这条 debug 日志，不能单独证明没有发生编译。要判断是否命中，应同时观察 `.so` 时间戳、编译器输出和后续启动是否再次出现 staging/build。
 
-### 7.6 当前 `dsv4-flash-run.sh` 的实际配置
+### 2.8.6 当前 `dsv4-flash-run.sh` 的实际配置
 
 当前 `sglang_kernel_src/like-useful/env-build-pip.sh:17-37` 已显式设置：
 
@@ -487,7 +487,7 @@ which sglang
 python -c 'import os, sglang; from sglang.srt.environ import envs; print({k: (os.environ.get(k), getattr(envs, k).get()) for k in ("SGLANG_CACHE_DIR", "SGLANG_JIT_CACHE_DIR", "SGLANG_DG_CACHE_DIR", "SGLANG_JIT_CACHE_DEBUG")})'
 ~~~
 
-### 7.7 与本次启动耗时问题的对应关系
+### 2.8.7 与本次启动耗时问题的对应关系
 
 可以用下面的因果链理解四个变量：
 
@@ -517,7 +517,7 @@ SGLANG_JIT_CACHE_DEBUG=1
 
 ---
 
-## 本次追加结论：chunked prefix cache
+## 2.9 本次追加结论：chunked prefix cache
 
 按 `release/v0.5.18-local-dep` 当前源码，`ServerArgs.disable_chunked_prefix_cache` 的字段默认值是 `False`，因此**配置语义是默认允许 chunked prefix cache**，见 `python/sglang/srt/server_args.py:958-962，ServerArgs.disable_chunked_prefix_cache`。这不是“每个模型都实际开启”：`python/sglang/srt/model_executor/model_runner.py:369-372，ModelRunner.__init__` 会调用 `python/sglang/srt/model_executor/model_runner_components/misc_utils.py:25-48，maybe_disable_chunked_prefix_cache`，对非 MLA 模型或不在 `python/sglang/srt/server_args.py:211-224，CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS` 中的 prefill backend 自动覆写为 `True`（禁用）。
 
@@ -529,11 +529,11 @@ SGLANG_JIT_CACHE_DEBUG=1
 
 ---
 
-## `sglang serve` 如何把命令行参数变成 `ServerArgs` 成员
+# 3. `sglang serve` 如何把命令行参数变成 `ServerArgs` 成员
 
 本节针对 SGLang `release/v0.5.18-local-dep`，源码提交 `982d8495b7`。代码引用统一采用“相对 code base 路径:行号，类::函数”的形式；字段、常量和模块级配置使用对应符号名。
 
-### 结论先行
+## 3.1 结论先行
 
 这不是在某处手写一条 `parser.add_argument("--disable-chunked-prefix-cache", ...)`，而是 dataclass 字段自动生成 CLI 参数，再由同名 `dest` 传回 dataclass：
 
@@ -547,7 +547,7 @@ SGLANG_JIT_CACHE_DEBUG=1
     -> ServerArgs(...).disable_chunked_prefix_cache
 ```
 
-### 1. `sglang` 可执行文件先进入哪里
+## 3.2 `sglang` 可执行文件先进入哪里
 
 安装元数据在 `python/pyproject.toml:201-203，[project.scripts]` 声明：
 
@@ -557,7 +557,7 @@ sglang = "sglang.cli.main:main"
 
 因此执行 `sglang serve ...` 时，生成的 console-script wrapper 只负责导入并调用 `python/sglang/cli/main.py:12-40，main`。
 
-### 2. 顶层 parser 为什么不直接解析这个选项
+## 3.3 顶层 parser 为什么不直接解析这个选项
 
 `python/sglang/cli/main.py:12-21，main` 创建顶层 `argparse` 和 `serve` 子命令。`serve` 子命令没有注册全部 server 选项，并设置了 `add_help=False`。
 
@@ -571,7 +571,7 @@ sglang serve --model-path /path/to/model --disable-chunked-prefix-cache
 
 `serve` 在 `python/sglang/cli/serve.py:169-177，serve` 只处理 `--model-type` 和位置形式的 model path；`--disable-chunked-prefix-cache` 原样保留在 `dispatch_argv` 和 `ServeRequest.argv`。LLM backend 的 `run=_run_llm` 注册于 `python/sglang/cli/serve.py:129-135，_create_backend_registry`。
 
-### 3. LLM backend 把 argv 交给真正的 server parser
+## 3.4 LLM backend 把 argv 交给真正的 server parser
 
 `python/sglang/cli/serve.py:90-99，_run_llm` 执行：
 
@@ -582,7 +582,7 @@ run_server(server_args)
 
 也就是说，`sglang serve` 的参数解析分成两层：顶层 CLI 负责识别子命令，`prepare_server_args` 才负责识别 `--disable-chunked-prefix-cache`。
 
-### 4. `prepare_server_args` 创建 parser、解析 argv
+## 3.5 `prepare_server_args` 创建 parser、解析 argv
 
 `python/sglang/srt/server_args.py:9770-9804，prepare_server_args` 的关键顺序是：
 
@@ -594,11 +594,11 @@ run_server(server_args)
 
 所以 `raw_args` 是一个 `argparse.Namespace`，在这一步已经有 `raw_args.disable_chunked_prefix_cache` 属性。
 
-### 5. `ServerArgs.add_cli_args` 使用 dataclass 反射
+## 3.6 `ServerArgs.add_cli_args` 使用 dataclass 反射
 
 `python/sglang/srt/server_args.py:8658-8662，ServerArgs::add_cli_args` 没有为该选项单独写 `add_argument`，而是调用 `add_cli_args_from_dataclass(parser, ServerArgs)`。自动注册函数位于 `python/sglang/srt/arg_groups/arg_utils.py:218-337，add_cli_args_from_dataclass`，它读取类型注解和 dataclass 字段，逐个生成 argparse action。
 
-### 6. 字段声明决定 CLI 名称和默认值
+## 3.7 字段声明决定 CLI 名称和默认值
 
 字段定义在 `python/sglang/srt/server_args.py:958-962，ServerArgs::disable_chunked_prefix_cache`：
 
@@ -612,7 +612,7 @@ disable_chunked_prefix_cache: A[
 
 `ServerArgs` 的说明在 `python/sglang/srt/server_args.py:447-470，ServerArgs` 指出：`A` 是 `typing.Annotated` 的别名，字段名会自动转换为 CLI 名称。这里的 `NS("schedule")` 只是运行时配置分组标记，不是 CLI 名称的一部分；它不会生成 `--schedule-disable...`。
 
-### 7. 下划线如何变成连字符
+## 3.8 下划线如何变成连字符
 
 `python/sglang/srt/arg_groups/arg_utils.py:208-210，_field_to_cli_name` 的实现是：
 
@@ -624,7 +624,7 @@ return "--" + name.replace("_", "-")
 
 `python/sglang/srt/arg_groups/arg_utils.py:147-163，_unwrap_annotated` 负责取出 `Annotated` 的内部类型和 metadata；字段中的裸帮助字符串会被转换成 `Arg(help=...)`，所以该字段具备 CLI 注册所需的 metadata。
 
-### 8. 为什么 argparse 的 `dest` 恰好是下划线字段名
+## 3.9 为什么 argparse 的 `dest` 恰好是下划线字段名
 
 `python/sglang/srt/arg_groups/arg_utils.py:247-254，add_cli_args_from_dataclass` 还计算 `auto_dest`，并在字段名与自动生成的 dest 不同时才显式传入 `dest`：
 
@@ -635,7 +635,7 @@ dest_kwarg = {"dest": field.name} if field.name != auto_dest else {}
 
 对本字段，`cli_name` 是 `--disable-chunked-prefix-cache`，`auto_dest` 和 `field.name` 都是 `disable_chunked_prefix_cache`。两者相等，所以不需要显式传 `dest`；argparse 的默认规则也会得到同名 dest。这就是连字符 CLI 名与下划线 Python 成员之间的直接连接。
 
-### 9. `bool` 字段如何生成 `store_true`
+## 3.10 `bool` 字段如何生成 `store_true`
 
 `python/sglang/srt/arg_groups/arg_utils.py:313-319，add_cli_args_from_dataclass` 对 `bool` 类型走专门分支：
 
@@ -665,7 +665,7 @@ parser.add_argument(
 
 这里不是 `BooleanOptionalAction`，所以不能写成 `--no-disable-chunked-prefix-cache` 来显式恢复 `False`；恢复默认值的方式是不传该 flag，或由配置/代码设置字段。
 
-### 10. `Namespace` 如何变成 `ServerArgs` 成员
+## 3.11 `Namespace` 如何变成 `ServerArgs` 成员
 
 `python/sglang/srt/server_args.py:8920-8928，ServerArgs::from_cli_args` 遍历 `dataclasses.fields(cls)`，只保留 Namespace 中存在的同名属性，然后执行：
 
@@ -687,7 +687,7 @@ ServerArgs(
 
 这里的 `cls` 就是 `ServerArgs`，所以 dataclass 生成的构造函数把该关键字写入实例成员 `server_args.disable_chunked_prefix_cache`。`ServerArgs::__post_init__` 在 `python/sglang/srt/server_args.py:3585-3586，ServerArgs::__post_init__` 中继续调用 `_run_resolution_pipeline`；这发生在成员已经由构造函数接收之后。
 
-### 11. 之后谁读取这个成员
+## 3.12 之后谁读取这个成员
 
 `python/sglang/cli/serve.py:90-99，_run_llm` 将构造好的对象传给 `python/sglang/launch_server.py:16-53，run_server`，再进入 HTTP/gRPC launcher。后续 ModelRunner 初始化时，`python/sglang/srt/model_executor/model_runner.py:369-372，ModelRunner::__init__` 会读取/处理该配置，并调用 `python/sglang/srt/model_executor/model_runner_components/misc_utils.py:25-48，maybe_disable_chunked_prefix_cache` 做 MLA/backend 能力门控。
 
@@ -699,7 +699,7 @@ argv -> Namespace -> ServerArgs 成员       （本节说明的映射）
                          -> ModelRunner/runtime gate 可能覆写生效值
 ```
 
-### 12. 可复现的最小检查
+## 3.13 可复现的最小检查
 
 在目标 editable 环境中，可以不启动模型而直接观察两层值：
 
@@ -726,11 +726,11 @@ PY
 
 最终可用一句话概括：**`--disable-chunked-prefix-cache` 先由 `_field_to_cli_name` 从 `disable_chunked_prefix_cache` 自动生成，再由 argparse 的默认 `dest` 存回同名 Namespace 属性，最后由 `ServerArgs::from_cli_args` 以同名关键字构造出 `ServerArgs.disable_chunked_prefix_cache`。**
 
-## 13. 评测脚本中 CUDA graph、attention backend 与 EP 的修正
+# 4. 评测脚本中 CUDA graph、attention backend 与 EP 的修正
 
 本节针对 SGLang `release/v0.5.18-local-dep`（源码提交 `982d8495b7`）和当前 SIMO 工作树。所有代码说明均使用相对 code base 路径、行号和函数名；SGLang 的 code base 根目录是 `/share/users/like/package/sglang_kernel_src`，SIMO 的 code base 根目录是 `/share/users/like/package/simo_conda_sglang`。
 
-### 13.1 为什么之前加了 `disable_cuda_graph`
+## 4.1 为什么之前加了 `disable_cuda_graph`
 
 此前工作树中的
 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:103-114，run_simo_config_list`
@@ -770,7 +770,7 @@ SIMO 量化代码也没有拒绝普通 graph。比如：
 
 所以结论是：**适配 release 后并不是“基础 CUDA graph 不支持了”；之前的开关过于宽泛。** 当前修改删除了 `skip_server_warmup`/`disable_cuda_graph` 这组临时参数，让 SGLang 恢复正常 warmup 和 graph 决策。需要区分的是，release 仍可能因为模型、prefill backend、DCP、LoRA 等独立规则自动关闭某一阶段的 graph；这不等于 SIMO 普遍不支持 decode graph。
 
-### 13.2 恢复 graph 参数时为什么使用新字段
+## 4.2 恢复 graph 参数时为什么使用新字段
 
 旧脚本注释中的 `cuda_graph_max_bs` 不能原样复制到 lm-eval 的 JSON model args。lm-eval 的 SGLang adapter 最终调用 Engine；
 `python/sglang/srt/entrypoints/engine.py:232-252，Engine::__init__` 在没有现成 `server_args` 时直接执行：
@@ -802,7 +802,7 @@ release 的 dataclass 字段是
 `python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py:294-297，capture_prefill_graph`
 在 prefill capture bucket 为空时只关闭 prefill runner；本脚本通过 lm-eval 使用 `chunked_prefill_size=-1` 的默认值时，出现这条日志是预期行为，decode phase 仍按 `cuda_graph_max_bs_decode` 捕获。
 
-### 13.3 attention backend 只在 KV 量化时切换
+## 4.3 attention backend 只在 KV 量化时切换
 
 `SIMOLinearMethod` 和 `SIMOFusedMoEMethod` 只替换权重加载/专家计算，不读取 SIMO 打包 KV cache。把 `triton` 强行传给所有权重量化评测，会改变原脚本的 backend 选择范围，也会让不涉及 KV 的测试承担额外的 Triton attention 约束。
 
@@ -838,7 +838,7 @@ attention_backend == "triton_simo"
 
 最后两点只影响 DeepSeek 的 chunked-prefix MHA/LSE 拓扑，因此 `disable_chunked_prefix_cache=true` 仍保留在 KV 分支，但不会污染权重量化分支。它也不会关闭普通 Radix prefix cache 或普通 chunked prefill。
 
-### 13.4 为什么不再无条件限制 `SIMOFusedMoEMethod` 为 EP=1
+## 4.4 为什么不再无条件限制 `SIMOFusedMoEMethod` 为 EP=1
 
 此前在
 `simo/extensions/sglang_simo/quantization/quantization.py:1413-1417，SIMOFusedMoEMethod::get_moe_weight_loader`
@@ -863,7 +863,7 @@ release 的 EP 数据流和当前 SIMO 代码是相互对应的：
 
 因此对当前两个目标模型和本次最小改动目标，结论是：**不要在 `SIMOFusedMoEMethod` 构造时无条件拒绝 EP>1；保持 release/SIMO 已有的 global-to-local 和 invalid-expert 处理。** 本次回归范围仍是脚本默认的 EP=1，尚未把多进程 EP>1 端到端精度作为验收项；若以后要宣称 EP>1 的生产支持，应另做多 rank loader、dispatch、all-reduce 和精度测试，而不是重新加一个未经验证的全局禁用。
 
-### 13.5 本次修改与检查结果
+## 4.5 本次修改与检查结果
 
 已完成的代码修改：
 
@@ -885,7 +885,7 @@ release 的 EP 数据流和当前 SIMO 代码是相互对应的：
 
 随后用 Llama3.1-8B 的 `kvquant_mxfp8` 配置、`attention_backend=triton_simo`、`disable_chunked_prefix_cache=true` 做了同样的单请求 smoke。`simo/extensions/sglang_simo/layers/attention/triton_simo_backend.py:47-106，SIMOTritonAttnBackend::__init__` 成功创建量化 KV pool/backend，日志完成 `Capture target decode CUDA graph`，请求阶段同样显示 `cuda graph: True`。这验证的是当前 release 下 SIMO 自定义 KV read/write 路径可以参与普通 decode graph；它不表示 chunked-prefix 的 LSE 路径已实现，后者仍由前述显式开关关闭。
 
-### 13.6 恢复完整评测矩阵
+## 4.6 恢复完整评测矩阵
 
 应用户要求，当前
 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:25-39，QUANT_CONFIGS`
