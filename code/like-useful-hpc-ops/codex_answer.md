@@ -3753,3 +3753,165 @@ kTileM=64  -> 1
 3. 最外层 `(_48,_1)` 是 TMA atom 的 48-value fragment 的嵌套表示；它不是第三个 rest mode。
 4. `tASs` 的完整静态 view 可以读成 `((TMA-value), stage, rest)`，即 `((_48,_1),_8,_2)`；但实际 x-scale copy 使用 `tASs(_, ismem_write, 0)`，每次只传第一块 48 个 float，不会自动传第二块。
 5. 第三个 mode 若被错误地选为 `1`，`partition_D` 不会替你做边界保护；当前代码固定为 `0`，并且 MMA/transaction bytes 也都只依赖这 48 个有效 x-scale。
+
+# 19. `group_gemm_blockwise_fp8_kernel` 第 881 行为何仍读取 `cu_tiles_ptr`
+
+## 19.1 结论
+
+`src/group_gemm/sm90/kernels.cuh:881`（函数 `group_gemm_blockwise_fp8_kernel`）读取的 `cu_tiles_ptr[igroup]` 是一个 **用于计算 TMA 坐标的整数前缀值**，不是 TMA 要搬运的 x-scale 数据本身。对于 `kTaskLoopPolicy == 2`，现有代码已经把同一份前缀数组复制到 `shm_tiles`，并在使用前执行了 CTA 级同步；因此从正确性上说，可以把这一策略的表达式改成 `shm_tiles[igroup] + itile_m`。
+
+但是不能把所有策略都无条件改成 `shm_tiles[igroup]`：
+
+1. policy 0 的 `shm_tiles` 元素是 `int4` task record；
+2. policy 1 的 `shm_tiles` 元素是每个 group 的 tile 数量，不是 exclusive prefix；
+3. 只有 policy 2 的 `shm_tiles[i]` 才与 `cu_tiles_ptr[i]` 逐项相等。
+
+所以当前写法主要是一个适用于三个模板实例的公共路径写法，并不是 Hopper TMA 要求坐标必须从 global memory 读取。仓库中也没有注释说明“此处必须使用 global”；从代码历史和数据流看，更像是早期公共实现保留下来的保守写法。
+
+## 19.2 两个数组分别是什么
+
+### 19.2.1 `cu_tiles_ptr` 是 device global 的前缀数组
+
+`src/group_gemm/entry.cc:178-191`（函数 `group_gemm_blockwise_fp8_entry`）用 `torch::empty` 创建长度为 `num_group + 1` 的 CUDA `int32` tensor，并把它的 device pointer 传入异步 launch。它不是 kernel 内的 shared-memory 地址。
+
+`src/group_gemm/sm90/kernels.cuh:149-175`（函数 `update_grouped_tma`）先计算
+
+```text
+tiles_ptr[g] = ceil(seqlens[g] / kTileM)
+```
+
+随后对每个 block 的 `tiles` 做 `cub::BlockScan::ExclusiveSum`，再写入 `cu_tiles_ptr[g]`；`cu_tiles_ptr[num_group]` 是所有 group 的 tile-M 总数。因此：
+
+```text
+cu_tiles_ptr[g] = sum(tiles_ptr[0 .. g-1])
+```
+
+它给出了 group `g` 在拼接后的 padded-M tile 空间中的起始 tile。
+
+`src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:165-245`（函数 `launch_group_gemm_blockwise_fp8`）先在同一 CUDA stream 提交 `update_grouped_tma`，再提交 GEMM kernel；所以 GEMM 使用时这个 global 前缀数组已经被生产出来。PDL 路径还在 `src/group_gemm/sm90/kernels.cuh:770-772`（函数 `group_gemm_blockwise_fp8_kernel`）执行 grid dependency 同步。
+
+### 19.2.2 `shm_tiles` 是 policy 相关的动态 shared 工作区
+
+`src/group_gemm/sm90/kernels.cuh:666-674`（函数 `group_gemm_blockwise_fp8_kernel`）把 `extern __shared__` 区域尾部解释成 `Ttask *shm_tiles`，其中
+
+```cpp
+using Ttask = std::conditional_t<kTaskLoopPolicy == 0, int4, int>;
+```
+
+它是每个 CTA 私有的临时副本，不是跨 CTA 或跨 kernel 的持久数组。policy 2 的 launch 额外预留 `(num_group + 1) * sizeof(int)`，见 `src/group_gemm/sm90/group_gemm_blockwise_fp8.cu:383-397`（函数 `launch_group_gemm_blockwise_fp8`）。
+
+三种 policy 的写入内容不同：
+
+| policy | `shm_tiles` 内容 | 用途 |
+|---|---|---|
+| 0 | `int4` task records，见 `src/group_gemm/sm90/kernels.cuh:774-793`（函数 `group_gemm_blockwise_fp8_kernel`） | 直接保存 `(itile_m, itile_n, igroup)` 等任务信息 |
+| 1 | `tiles_ptr[i]`，见 `src/group_gemm/sm90/kernels.cuh:794-797`（函数 `group_gemm_blockwise_fp8_kernel`） | 让 horizon scheduler 累加每组 tile 数 |
+| 2 | `cu_tiles_ptr[0..num_group]`，见 `src/group_gemm/sm90/kernels.cuh:798-803`（函数 `group_gemm_blockwise_fp8_kernel`） | 让 vertical scheduler 二分查找 exclusive prefix |
+
+## 19.3 第 881 行到底在计算什么
+
+### 19.3.1 TMA 数据源和坐标元数据要分开看
+
+`src/group_gemm/sm90/kernels.cuh:689-704`（函数 `group_gemm_blockwise_fp8_kernel`）建立 `gAS` 和 `tASg`：`gAS` 是全局 x-scale tensor，`tASg` 是它按 TMA tile 切分后的 view。第 881 行的核心表达式是：
+
+```cpp
+tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m)
+```
+
+其中：
+
+- `itile_k` 选择 x-scale 的 K-block；
+- `itile_m` 是当前 group 内的局部 M tile；
+- `cu_tiles_ptr[igroup]` 把局部 M tile 转成拼接后全局 padded-M tile 的起点；
+- 两者相加后才是 `gAS` 第二维的 TMA tile 坐标。
+
+随后 `cute::copy` 使用 `tma_as` 将该 global x-scale tile 搬到 `tASs` 指向的 shared stage。也就是说，`cu_tiles_ptr[igroup]` 只参与 **地址/坐标计算**；把它换成从 shared 读取的整数，不会把 x-scale 的 TMA 数据源改成 shared，也不会改变 TMA descriptor。
+
+### 19.3.2 policy 2 下二者确实相等
+
+在 policy 2 中，`src/group_gemm/sm90/kernels.cuh:798-806`（函数 `group_gemm_blockwise_fp8_kernel`）执行：
+
+```cpp
+total_m = cu_tiles_ptr[num_group];
+for (int i = idx; i < num_group + 1; i += blockDim.x) {
+  shm_tiles[i] = cu_tiles_ptr[i];
+}
+__syncthreads();
+```
+
+因此对任意合法任务 `igroup < num_group`：
+
+```text
+shm_tiles[igroup] == cu_tiles_ptr[igroup]
+```
+
+`src/group_gemm/sm90/kernels.cuh:43-67`（函数 `get_next_tile_vert`）也把参数名写成 `cu_tiles_ptr`，但调用点 `src/group_gemm/sm90/kernels.cuh:848-853`（函数 `group_gemm_blockwise_fp8_kernel`）传入的实际对象是 `shm_tiles`。这说明该参数只是“prefix array”语义，变量名并不强制它必须位于 global memory。
+
+`__syncthreads()` 位于所有 policy 的 shared 初始化之后；而 `shm_tiles` 在后续 scheduler 和 TMA load 阶段没有再写入。因此在当前 kernel 生命周期内，用 `shm_tiles[igroup]` 没有数据竞争或可见性问题。
+
+## 19.4 为什么不能直接全局替换
+
+### 19.4.1 policy 0：shared 中根本不是 prefix
+
+policy 0 在 `src/group_gemm/sm90/kernels.cuh:774-793`（函数 `group_gemm_blockwise_fp8_kernel`）把 task record 写入 `shm_tiles[iwave * warp_count + iwarp]`。后续 `src/group_gemm/sm90/kernels.cuh:833-841`（函数 `group_gemm_blockwise_fp8_kernel`）按 `iwave` 取出 `task.x/task.y/task.z`。此时 `shm_tiles[igroup]` 既不是按 group 编排的数组，元素类型也不是单个整数前缀；直接替换会造成类型或语义错误。这个策略仍需使用 `cu_tiles_ptr[igroup]` 来把 task 的局部 `itile_m` 映射到全局 x-scale tile。
+
+### 19.4.2 policy 1：数量不等于前缀
+
+policy 1 的 `shm_tiles[i] = tiles_ptr[i]` 是本组 tile 数量。比如四个 group 的数量是 `[1, 1, 1, 2]`，exclusive prefix 是 `[0, 1, 2, 3, 5]`；对 group 3，`shm_tiles[3]` 为 `2`，但正确的起始偏移是 `cu_tiles_ptr[3] = 3`。因此 policy 1 直接改成 `shm_tiles[igroup] + itile_m` 会把 x-scale 坐标向前错移一个 tile。
+
+### 19.4.3 `cu_tiles_ptr` 仍有其他必要用途
+
+即使 policy 2 的第 881 行改用 shared，global 数组仍不能删除：policy 2 在 `src/group_gemm/sm90/kernels.cuh:798-801`（函数 `group_gemm_blockwise_fp8_kernel`）需要先从 `cu_tiles_ptr[num_group]` 得到 `total_m`，policy 0 在 `src/group_gemm/sm90/kernels.cuh:774-777`（函数 `group_gemm_blockwise_fp8_kernel`）也用它计算 `actual_tiles`。此外它还是 update kernel 与 GEMM kernel 之间的工作区。
+
+## 19.5 当前写法的性能含义
+
+### 19.5.1 这不是 384 个线程各读一次 global
+
+第 881 行位于 `src/group_gemm/sm90/kernels.cuh:869-885`（函数 `group_gemm_blockwise_fp8_kernel`）的 `itile_k` 循环内，但 load 路径只有 `src/group_gemm/sm90/kernels.cuh:817-820`（函数 `group_gemm_blockwise_fp8_kernel`）选出的 load leader 执行 TMA 发起。因此它是每个 outer tile 的每个 K tile 至多一次 32-bit 元数据读取，而不是整个 CTA 的 384 次 coalesced global load。
+
+本次 `temp/block.log:1-3` 的实例 `kTileM=48、kTileN=128、kTileK=128、num_block_k=56`，所以源码层面一个任务会在第 881 行重复使用同一个 group 前缀最多 56 次。实际 SASS 是否把不变加载提升到循环外，需要看编译器生成代码；不能仅凭 C++ 源码断言一定有 56 条 global load。
+
+### 19.5.2 global 命中缓存时收益可能很小
+
+本例 prefix 数组只有 `num_group + 1 = 9` 个 `int`，总共 36 字节，通常会留在 L1/L2。与此同时，`src/group_gemm/sm90/kernels.cuh:813-814`（函数 `group_gemm_blockwise_fp8_kernel`）按本例 FP8 输入计算每个 K tile 的 TMA transaction bytes 约为：
+
+```text
+(48 + 128) * 128 * 1 + (48 + 4) * 4 = 22,736 bytes
+```
+
+相比之下，第 881 行的前缀值只有 4 字节。因此换成 shared 可能降低元数据 load 的延迟，但通常不会显著改变总内存带宽；是否能改善端到端时间仍应通过 SASS 和 benchmark 验证。
+
+### 19.5.3 shared 更快不等于当前表达式就最优
+
+shared 读取通常比未命中的 device-global 读取延迟更低，但 policy 2 已经为 scheduler 把前缀数组复制到 shared，复制本身的代价由 `src/group_gemm/sm90/kernels.cuh:798-806`（函数 `group_gemm_blockwise_fp8_kernel`）承担。更重要的是，第 881 行的前缀对一个 outer tile 的所有 `itile_k` 都不变；如果编译器没有自动提升，反复计算才是可以直接消除的冗余。
+
+## 19.6 推荐的低风险优化
+
+不要在所有 specialization 中直接写 `shm_tiles[igroup]`。在 scheduler 成功得到 `igroup/itile_m` 后、`src/group_gemm/sm90/kernels.cuh:869-870`（函数 `group_gemm_blockwise_fp8_kernel`）进入 K 循环前，按编译期 policy 选择一次前缀，并把完整坐标留在寄存器中：
+
+```cpp
+int group_tile_begin;
+if constexpr (kTaskLoopPolicy == 2) {
+  group_tile_begin = shm_tiles[igroup];
+} else {
+  group_tile_begin = cu_tiles_ptr[igroup];
+}
+int xscale_tile_m = group_tile_begin + itile_m;
+
+for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+  // A/B/scale TMA copies
+  cute::copy(tma_as.with(readable[ismem_write]),
+             tASg(_, itile_k, xscale_tile_m), tASs(_, ismem_write, 0));
+}
+```
+
+`if constexpr` 会在 policy 0/1 的实例中编译掉 shared 分支，所以不会访问 `int4` task record；policy 2 则只做一次 shared 读取。这个改法保持三种策略的语义不变，并把潜在的每-K-tile global load 降为每任务一次。
+
+对 policy 2 还可以做更激进的改法：`src/group_gemm/sm90/kernels.cuh:43-67`（函数 `get_next_tile_vert`）内部已经计算 `itile_m_total = iblock % total_m`，并返回 `itile_m = itile_m_total - shm_tiles[igroup]`；所以 `shm_tiles[igroup] + itile_m` 代数上就是 `itile_m_total`。若让 scheduler 同时返回这个 flattened tile index，就能完全省掉第 881 行的 prefix load，但这需要修改 helper 的接口，风险和验证成本高于前面的寄存器缓存方案。
+
+## 19.7 对问题的直接回答
+
+1. **为什么仍读 `cu_tiles_ptr`？** 当前第 881 行是三个 task-loop policy 共用的代码；只有 policy 2 的 shared 数组是 prefix，保留 global 读取可以让 policy 0/1 也使用同一表达式。代码没有证据表明这是 TMA 硬件的强制要求，更可能是公共路径/历史实现的选择。
+2. **policy 2 能否改成 `shm_tiles`？** 能。第 798-806 行已复制相同的 `cu_tiles_ptr` 内容并同步，`shm_tiles[igroup] + itile_m` 与原表达式数值等价。
+3. **shared 是否一定明显更快？** 单个 load leader 读取的 4 字节元数据很小，global 数组通常缓存命中；收益可能有限。把前缀和最终坐标在 K 循环外缓存到寄存器，比只替换地址空间更稳妥。
+4. **能否删除 `cu_tiles_ptr`？** 不能。它仍用于构造 shared 快照、得到 `total_m`、计算 task 数量，并作为 update 与 GEMM 之间的 global workspace。

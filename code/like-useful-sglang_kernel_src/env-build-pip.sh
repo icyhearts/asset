@@ -18,7 +18,20 @@ export DG_JIT_CACHE_DIR=/data/like/cache/deep_gemm_cache_dir
 export TVM_FFI_CACHE_DIR=/data/like/cache/tvm_ffi_cache_dir
 export TRITON_CACHE_DIR=/data/like/cache/triton_cache_like
 
+export SGLANG_CACHE_DIR=/data/like/cache/sglang
+export SGLANG_JIT_CACHE_DIR=/data/like/cache/sglang_jit
+export SGLANG_DG_CACHE_DIR=/data/like/cache/deep_gemm_cache_dir
+
 
 mkdir -p $DG_JIT_CACHE_DIR
 mkdir -p $TVM_FFI_CACHE_DIR
 mkdir -p $TRITON_CACHE_DIR
+
+
+mkdir -p $SGLANG_CACHE_DIR
+mkdir -p $SGLANG_JIT_CACHE_DIR
+mkdir -p $SGLANG_DG_CACHE_DIR
+
+
+
+export SGLANG_JIT_CACHE_DEBUG=1

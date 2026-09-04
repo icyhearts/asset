@@ -3892,3 +3892,65 @@ dot 文件里面，node的 label风格 和 def ModelRunner::__init__ 这个节�
 
 
 }
+
+
+
+
+{
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
+sglang 源码位于 /share/users/like/package/sglang_kernel_src
+sglang 以  editable 方式安装
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+
+本次 sglang升级，从 main-local-dep 分支升级到  release/v0.5.18-local-dep 分支，有很多接口发生了变化，有些class被删除，有些文件被删除，我只关注对 sglang_simo 自定义 量化的影响, 包括 权重量化和 kv cache 量化.
+
+# 为了适应 release/v0.5.18-local-dep 分支, simo/extensions/sglang_simo 已经做了一些修改，帮我 review 这些修改, 帮我完善修改，适应 sglang release/v0.5.18-local-dep 分支
+# 核心需求是在对  simo 做最少的改动，不追求支持很多模型，  只考虑脚本中 llama3.1-8B-Instruct + DeepSeek-V2-Lite-Chat-16B_A2.4B, 让 simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh 的测试能运行，能输出 2个模型在不同量化数据类型下的精度数据, 包括 测试脚本 QUANT_CONFIGS 和  KV_CACHE_QUANT_CONFIGS 数组中量化配置的测试
+#  simo/extensions/sglang_simo/quantization/quantization.py SIMOLinearMethod  + SIMOFusedMoEMethod 是对 linear权重和专家权重量化的 method, 主要在 测试脚本 QUANT_CONFIGS  数组中的配置中生效,  SIMOKVCacheMethod 是 kv cache 量化，主要在测试脚本 KV_CACHE_QUANT_CONFIGS 数组中生效. 你不仅要考虑 release/v0.5.18-local-dep 分支升级对 simo 自定义kv cache  量化的的影响，还要考虑 升级对 SIMOLinearMethod  + SIMOFusedMoEMethod 的影响.
+# release/v0.5.18-local-dep 新加的 feature, 如果 llama3.1-8B-Instruct + DeepSeek-V2-Lite-Chat-16B_A2.4B 模型不需要，本次修改不需要支持，显式 assert 或者 raise exception
+
+# sglang_simo 自定义量化的测试脚本位于 simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh, 只考虑  /data_gpu/models/share_data/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weights /data_gpu/models/share_data/modelzoo/weights/llm/deepseek/DeepSeekV2/DeepSeek-V2-Lite-Chat-16B_A2.4B/safetensor_weights 2个模型，其他模型不暂时不考虑.
+# post_capture_active、unified memory、DCP、hybrid SWA/Mamba  这些特性，暂时不考虑支持。
+# 不考虑 flashinfer attentiono backend,只考虑 trition attention backend
+# 修改完成后，对 simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh 中的测试例子进行测试，但是例子太多，测试比较费时间，做如下筛选: QUANT_CONFIGS 只测试  quant_config_w8a8_mxfp.json:w8a8_mxfp, KV_CACHE_QUANT_CONFIGS 中只测试 "quant_config_kvquant_mxfp8.json:kvquant_mxfp8, llama3.1-8B-Instruct + DeepSeek-V2-Lite-Chat-16B_A2.4B  2个模型，每个模型 2个 json 配置，总共4种情况。脚本需要的其他环境变量，保持脚本中的默认值就可以
+
+把答案追加到 like-useful/answer_codex_v2.md
+}
+{
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
+sglang 源码位于 /share/users/like/package/sglang_kernel_src
+sglang 以  editable 方式安装
+
+本次 sglang升级，从 main-local-dep 分支升级到  release/v0.5.18-local-dep 分支，
+
+deepseek v4 flash 用 sglang 启动的脚本bash like-useful//dsv4-flash-run.sh
+
+grep "The server is fired up and ready" -n -r temp/sgl.dsv4-flash.log.*
+temp/sgl.dsv4-flash.log.2026_06_25___17_33_23:256:[2026-06-25 17:43:22] 2043288 http_server.py:2089 _wait_and_warmup INFO The server is fired up and ready to roll!
+temp/sgl.dsv4-flash.log.2026_07_02___10_07_39:256:[2026-07-02 10:15:43] 1224498 http_server.py:2089 _wait_and_warmup INFO The server is fired up and ready to roll!
+temp/sgl.dsv4-flash.log.2026_09_01___17_32_27:2335:[2026-09-01 17:57:34] 1503519 http_server.py:2402 _wait_and_warmup INFO The server is fired up and ready to roll!
+temp/sgl.dsv4-flash.log.2026_09_01___18_04_02:286:[2026-09-01 18:32:38] 1668077 http_server.py:2402 _wait_and_warmup INFO The server is fired up and ready to roll!
+temp/sgl.dsv4-flash.log.2026_09_03___16_21_20:2290:[2026-09-03 16:44:14] 3183287 http_server.py:2402 _wait_and_warmup INFO The server is fired up and ready to roll!
+显示: 2026-09-01 以后的日志， sglang server 启动耗时明显增加，2026-06-25, 2026-07-02 的日志, 是用的main-2026_07_08___17_53_37 分支和  main-local-dep 分支，从命令开始执行到The server is fired up and ready to roll，耗时大概 8min ~ 10 min, 2026-09-01 以后的日志，用的是  release/v0.5.18-local-dep 分支，耗时 20多分钟到30分钟，分析 sglang 启动 耗时增加原因.
+主要增加的时间消耗在哪个步骤了?
+
+把答案追加到 like-useful/answer_codex_v4.md
+}
+
+
+
+{
+为什么关闭 chunked prefix cache, chunked prefix cache在sglang中的默认选项是开启还是关闭的?
+讲解代码的时候要以 相对code base路径+行号+ 函数名的形式讲解.
+把答案追加到 like-useful/answer_codex_v4.md
+}
+
+SGLANG_CACHE_DIR SGLANG_JIT_CACHE_DIR SGLANG_DG_CACHE_DIR SGLANG_JIT_CACHE_DEBUG 环境变量的作用分别是什么？和 marlin deepgemm 编译有什么关系? 
+把答案追加到 like-useful/answer_codex_v4.md
+
+
+{
+sglang serve 的命令行参数 --disable-chunked-prefix-cache, 是如何变成 ServerArgs.disable_chunked_prefix_cache 的成员的 ？
+讲解代码的时候要以 相对code base路径+行号+ 函数名的形式讲解.
+把答案追加到 like-useful/answer_codex_v4.md
+}
