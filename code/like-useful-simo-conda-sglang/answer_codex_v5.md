@@ -387,12 +387,22 @@ au BufRead,BufNewFile */sirt/test/cuda/rt/*.su setfiletype cuda
 
 本节分析的日志是
 `temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_04___15_44_03`。
+本次命令实际使用 `CUDA_VISIBLE_DEVICES=7`、`MAX_RUNNING_REQUESTS=128`、
+`CUDA_GRAPH_MAX_BS=128`、`ADD_BOS_TOKEN=true` 和 `TASKS=gsm8k`；日志中的
+`ServerArgs` 也显示 `cuda_graph_max_bs_decode=128`。权重量化调用没有额外指定
+attention backend，KV-cache 调用则由
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:106-113（run_simo_config_list）`
+加入 `attention_backend=triton_simo` 和 `disable_chunked_prefix_cache=true`。
 脚本在 `simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:25-39（<top-level>）`
-定义了 13 个权重量化 JSON，在 `:42-50（<top-level>）` 定义了 7 个 KV-cache 量化
-JSON。`run_no_quant_eval:122-136` 运行未量化基线，
-`run_model_evaluations:140-154` 运行基线和 13 个权重量化，
-`run_model_evaluations_kv_cache_quant:157-167` 运行 7 个 KV-cache 配置；Llama 和
-DeepSeek 的调用位于 `:176-204（<top-level>）`。
+定义了 13 个权重量化 JSON，在
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:42-50（<top-level>）` 定义了 7 个 KV-cache 量化
+JSON。`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:122-136（run_no_quant_eval）`
+运行未量化基线，
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:140-154（run_model_evaluations）`
+运行基线和 13 个权重量化，
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:157-167（run_model_evaluations_kv_cache_quant）`
+运行 7 个 KV-cache 配置；Llama 和 DeepSeek 的调用位于
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:176-204（<top-level>）`。
 
 日志中的计数如下：
 
@@ -417,8 +427,10 @@ JSON），每个 KV 配置的日志都出现了 `Applying KV cache quantization`
 OOM 中止。
 
 日志确实打印了异常堆栈，但都是评测进程结束后的 loky/multiprocessing 清理异常，共
-42 次同样的 traceback。第一次位于 `temp/...log:739-745`，最后一次位于
-`:38873-38879`，模式是：
+42 次同样的 traceback。第一次位于
+`temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_04___15_44_03:739-745`，
+最后一次位于
+`temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_04___15_44_03:38873-38879`，模式是：
 
 ```text
 kill_process_tree called
@@ -436,7 +448,8 @@ KeyError: '/loky-...'
 严格说日志中“有 Python 异常堆栈”，但没有导致本次 42 项评测失败的异常。建议后续单独
 修复 `kill_process_tree` 与 loky resource tracker 的退出顺序，避免清理阶段泄漏。
 
-另外，`:78` 有被显式捕获的 `sarashina2_vision` 可选模型导入 warning，及多处 torch
+另外，`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:78（<top-level>）`
+对应日志有被显式捕获的 `sarashina2_vision` 可选模型导入 warning，及多处 torch
 `register_constant()` 弃用 warning、instruct/chat template 提示；它们与本次两个目标
 模型和量化结果无关。
 
@@ -449,6 +462,8 @@ KeyError: '/loky-...'
 `kvquant_fp8_per_group` 和 `kvquant_int8_per_group` 对应参考字段
 `fp8_per_group_64` 和 `int8_per_group_64`。完整结果已写入
 `tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.yaml`。
+已使用 simo conda 环境中的 YAML 解析器，并按模型和配置名将日志中的 42 行分数与该文件
+逐项校验，42/42 全部匹配。
 
 ### 8.4 Llama-3.1-8B-Instruct 结果和对比
 
