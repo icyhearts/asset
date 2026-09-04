@@ -335,3 +335,13 @@ torch_sipu本身是通过 wheel 包的方式安装，如果需要 c++代码代�
 
 答案追加到 like-useful/answer_codex.md
 }
+
+
+
+{
+vim 安装在 /data/like/vim-port-all/binary//vim-install-ubuntu22.04/
+vim 配置文件在 /data/like/vim-port-all/config
+/share/users/like/package/sirt/test/cuda/rt/04_execution/kernels.su 是 sipu 的 c++ 代码，语法类似 cuda语法, 
+clusterDim 和 clusterIdx 是 sipu 自己增加的 关键字，类似 blockDim, threadIdx, 如何让新增加的关键字也让 vim 语法高亮
+先不要改文件， 答案追加到 like-useful/answer_codex.md
+}
