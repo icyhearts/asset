@@ -1,7 +1,7 @@
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export DISABLE_AUTOUPDATER=1
 export EDITOR=vim
-export PATH=/softhome/like/bash-bin/universal-ctags/bin/:/share_data/users/like/bash-bin/bin:/share_data/users/like/package/h100/package/cmake//github/cmake-3.26.0-rc5-linux-x86_64/bin/:$PATH
+export PATH=/softhome/like/bash-bin/universal-ctags/bin/:/share_data/users/like/bash-bin/bin:/share_data/users/like/package/h100/package/cmake/github/cmake-4.2.0-rc2-linux-x86_64/bin/:$PATH
 #export PS1="\D{%Y-%m-%d %H:%M:%S}|\[\e]0;\u@\h: \w\a\]${debian_chroot:+($debian_chroot)}\u@\h:\w\$ "
 export PS1="\h|\D{%Y-%m-%d %H:%M:%S}\[\e[01;34m\][\[\e[01;32m\]\u@ \W\[\e[01;34m\]]\[\e[00m\] "
 
