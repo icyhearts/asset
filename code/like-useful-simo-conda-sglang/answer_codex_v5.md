@@ -539,3 +539,131 @@ KeyError: '/loky-...'
 5. `Llama w4a4_mxfp=47.61%`、`DeepSeek w4a4_mxfp=38.51%`、`DeepSeek KV mxfp4=31.39%`
    和 `DeepSeek KV nvfp4=47.08%` 的绝对精度确实较低，但它们与旧基准完全相同，属于
    量化配置本身的精度特征，而不是 v0.5.18 适配新引入的退化。
+
+## 9. sglang v0.5.18 MMLU 评测日志审计（2026-09-04）
+
+### 9.1 评测范围和结果完整性
+
+本节分析的日志是
+`temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_mmlu__CUDA_VISIBLE_DEVICES_6.log.2026_09_04___15_43_28`。
+脚本配置定义位于
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:25-39（<top-level>）`
+（13 个权重量化 JSON）和
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:42-50（<top-level>）`
+（7 个 KV-cache JSON）。基线、权重量化和 KV-cache 评测分别由
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:122-136（run_no_quant_eval）`、
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:140-154（run_model_evaluations）` 和
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:157-167（run_model_evaluations_kv_cache_quant）` 调用；两个模型的顶层调用位于
+`simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh:176-204（<top-level>）`。
+
+日志共启动 42 次评测，即每个模型各有 `1 个 no-quant + 13 个权重量化 + 7 个 KV-cache
+量化`。每次 MMLU 评测的 56,168 个 loglikelihood 请求都达到 `100%`，并输出结果表；
+因此 42 个配置（包含基线）均有总分。每次结果会打印一张详细 Tasks 表和一张 Groups
+表，两张表中的 `mmlu` 总行完全相同，所以本节每个配置只取第一张表的总行，不展开或
+写入学科分数。20 个 JSON 配置各出现两次 `Loaded config from`（两个模型各一次），KV
+配置均有 `Applying KV cache quantization` 日志，未发现缺失配置或静默回退。
+
+### 9.2 core dump 和异常判断
+
+在完整日志中检索 `core dump`、`core dumped`、`SIGSEGV`、`SIGABRT`、`SIGBUS`、
+`CUDA error`、`OutOfMemoryError`、`illegal memory access`、`FATAL` 和 `RuntimeError`，
+均没有匹配。因此没有记录 GPU core dump、CUDA 致命错误或 OOM 中止。
+
+日志中确实有 42 次 Python traceback 和 42 次 `KeyError`，但全部发生在评测结果输出
+之后的进程清理阶段：
+
+```text
+kill_process_tree called
+resource_tracker: process died unexpectedly, relaunching
+Traceback (most recent call last):
+  .../multiprocessing/resource_tracker.py:264, in main
+    cache[rtype].remove(name)
+KeyError: '/loky-...'
+```
+
+第一次清理位于
+`temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_mmlu__CUDA_VISIBLE_DEVICES_6.log.2026_09_04___15_43_28:1322-1328`，
+最后一次位于同一日志的 `:61323-61329`。每次 traceback 后脚本都进入下一个配置，且
+最后一个配置也输出了总分；这是 loky/multiprocessing resource tracker 的 teardown
+清理竞态（仍然属于日志中的异常堆栈），没有导致本次评测任务失败。另有被显式忽略的
+`sarashina2_vision` 可选模型导入 warning 和 torch 弃用 warning，与两个目标模型的
+MMLU 结果无关。
+
+### 9.3 总分提取和结果文件
+
+总分取日志中形如
+`|mmlu| ... |acc| ... |0.xxxx|` 的聚合行，乘以 100 后保留两位小数；同一配置的
+第二张 Groups 表只用于交叉校验。结果字段顺序严格复制
+`tests/sglang_simo/references_accuracy/mmlu.yaml:1-85`，并保留该文件中的 no-quant
+基线条目。完整总分已写入
+`tests/sglang_simo/references_accuracy/mmlu-v0.5.18.yaml`；没有把学科（humanities、
+stem 等）明细写入 YAML。
+
+### 9.4 Llama-3.1-8B-Instruct 总分对比
+
+旧基准来自 `tests/sglang_simo/references_accuracy/mmlu.yaml`；差值为
+`v0.5.18 - 旧基准`，单位为百分点（pp）。日志行是第一张 Tasks 表的总 `mmlu` 行。
+
+| 配置 | 日志行 | v0.5.18 (%) | 旧基准 (%) | 差值 (pp) |
+| --- | ---: | ---: | ---: | ---: |
+| no-quant | 1251 | 68.47 | 68.47 | +0.00 |
+| w8a8_fp8_per_block | 12790 | 68.02 | 68.18 | -0.16 |
+| w4a16_int4_per_group | 2703 | 66.21 | 66.22 | -0.01 |
+| w8a8_int8_per_block | 15672 | 67.98 | 68.17 | -0.19 |
+| w8a8_fp8_per_channel | 14231 | 68.02 | 67.89 | +0.13 |
+| w8a8_int8_per_channel | 17113 | 67.48 | 67.73 | -0.25 |
+| w8a8_mxint | 19995 | 68.20 | 68.20 | +0.00 |
+| w8a8_mxfp | 18554 | 67.67 | 67.67 | +0.00 |
+| w6a6_mxfp | 11349 | 68.07 | 68.07 | +0.00 |
+| w4a4_mxfp | 7026 | 57.99 | 57.99 | +0.00 |
+| w4a16_nvfp4_per_group | 5585 | 66.22 | 66.10 | +0.12 |
+| w4a16_nvfp4_per_group_4_over_6 | 4144 | 66.49 | 66.53 | -0.04 |
+| w4a4_nvfp | 9908 | 64.13 | 64.13 | +0.00 |
+| w4a4_nvfp_4_over_6 | 8467 | 64.45 | 64.45 | +0.00 |
+| mxfp8 | 21395 | 68.27 | 68.27 | +0.00 |
+| mxfp4 | 22776 | 68.27 | 68.27 | +0.00 |
+| mxfp6 | 24157 | 68.27 | 68.27 | +0.00 |
+| mxint8 | 25538 | 68.27 | 68.27 | +0.00 |
+| fp8_per_group_64 | 26919 | 68.27 | 68.27 | +0.00 |
+| int8_per_group_64 | 28300 | 68.27 | 68.27 | +0.00 |
+| nvfp4 | 29681 | 68.27 | 68.27 | +0.00 |
+
+### 9.5 DeepSeek-V2-Lite-Chat-16B_A2.4B 总分对比
+
+| 配置 | 日志行 | v0.5.18 (%) | 旧基准 (%) | 差值 (pp) |
+| --- | ---: | ---: | ---: | ---: |
+| no-quant | 31055 | 56.65 | 56.72 | -0.07 |
+| w8a8_fp8_per_block | 43197 | 56.38 | 56.52 | -0.14 |
+| w4a16_int4_per_group | 32579 | 54.88 | 54.62 | +0.26 |
+| w8a8_int8_per_block | 46250 | 56.47 | 56.55 | -0.08 |
+| w8a8_fp8_per_channel | 44737 | 55.97 | 55.94 | +0.03 |
+| w8a8_int8_per_channel | 47763 | 55.88 | 55.88 | +0.00 |
+| w8a8_mxint | 50789 | 56.51 | 56.56 | -0.05 |
+| w8a8_mxfp | 49276 | 55.83 | 55.86 | -0.03 |
+| w6a6_mxfp | 41657 | 55.86 | 55.93 | -0.07 |
+| w4a4_mxfp | 37118 | 48.43 | 48.66 | -0.23 |
+| w4a16_nvfp4_per_group | 35605 | 54.04 | 54.03 | +0.01 |
+| w4a16_nvfp4_per_group_4_over_6 | 34092 | 54.55 | 54.69 | -0.14 |
+| w4a4_nvfp | 40144 | 52.83 | 53.06 | -0.23 |
+| w4a4_nvfp_4_over_6 | 38631 | 52.94 | 52.98 | -0.04 |
+| mxfp8 | 52300 | 56.72 | 56.76 | -0.04 |
+| mxfp4 | 53792 | 56.72 | 56.76 | -0.04 |
+| mxfp6 | 55284 | 56.72 | 56.76 | -0.04 |
+| mxint8 | 56776 | 56.72 | 56.76 | -0.04 |
+| fp8_per_group_64 | 58268 | 56.72 | 56.76 | -0.04 |
+| int8_per_group_64 | 59760 | 56.72 | 56.76 | -0.04 |
+| nvfp4 | 61252 | 56.72 | 56.76 | -0.04 |
+
+### 9.6 精度变化结论
+
+1. Llama 基线与旧参考完全一致（68.47%）；DeepSeek 基线低 0.07 pp（56.65% 对
+   56.72%）。
+2. Llama 权重量化的最大绝对变化为 0.25 pp（`w8a8_int8_per_channel`），所有
+   KV-cache 配置均为 68.27%，与旧参考完全一致。
+3. DeepSeek 权重量化的最大变化为 +0.26 pp（`w4a16_int4_per_group`），下降最大为
+   -0.23 pp（`w4a4_mxfp` 和 `w4a4_nvfp`）；所有 KV-cache 配置均为 56.72%，比旧参考
+   的 56.76% 低 0.04 pp。
+4. 当前 MMLU 总分的报告 stderr 约为 0.37--0.41 pp，所有配置与旧参考的差值绝对值
+   不超过 0.26 pp，低于该次运行的不确定性范围。因此没有观察到 sglang v0.5.18
+   适配导致的明显精度回归或提升；结论仅基于这一次运行和已四舍五入的总分，若要判断
+   细微差异，应使用相同种子重复评测或比较逐样本预测。
