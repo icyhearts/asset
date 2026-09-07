@@ -3992,3 +3992,10 @@ DEEP_SEEK_MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ LLAMA
 并分析 这次升级至 sglang v0.5.18之后， simo 量化的 不同数据类型的 mmlu 和  tests/sglang_simo/references_accuracy/mmlu.yaml  对比，有没有明显精度上的变化
 把答案追加到 like-useful/answer_codex_v5.md
 }
+
+
+{
+sglang code base 位于 /share/users/like/package/sglang_kernel_src
+以 release/v0.5.18 分支为基础， release/v0.5.19 分支做了哪些重要的修改?
+把答案追加到 like-useful/answer_codex_v5.md
+}
