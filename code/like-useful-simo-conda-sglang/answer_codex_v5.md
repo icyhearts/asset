@@ -879,6 +879,30 @@ stem 等）明细写入 YAML。
    autotune 由 python/sglang/srt/environ.py:993-997
    （SGLANG_FLASHINFER_AUTOTUNE_EXTEND）控制，v0.5.19 默认 false。
 
+7. **DFlash2 和新的 candidate selector。**
+
+   c14312a664、99c12218c3 为 DFlash 增加本地 grouped convolution 和 selector。
+   python/sglang/srt/models/dflash.py:944-1063
+   （CandidateSelector::build_lattice、CandidateSelector::sample_path）在候选
+   token 之间建立 K x K lattice；:1066-1140
+   （DFlash2DraftModel::__init__、DFlash2DraftModel::compute_candidates）只在
+   TP ranks 间 gather 每个 shard 的 top-k，而不是 gather 全词表。FlashInfer 不可用
+   时会退回 torch.topk，首次 selector/conv graph 也可能引入额外 warmup。
+
+8. **Beam search 成为受限的正式 API。**
+
+   ec4bdbfa4a 增加 beam group/coordinator。请求字段在
+   python/sglang/srt/sampling/sampling_params.py:74-76
+   （SamplingParams::beam_width），校验在 :157-159
+   （SamplingParams::verify）；搜索状态在
+   python/sglang/srt/beam_search/beam_group.py:60-160
+   （BeamGroup::__init__、BeamGroup::advance_frontier）和
+   python/sglang/srt/beam_search/coordinator.py:101-180
+   （BeamCoordinator::validate_and_init）。一个 beam_width=k 请求使用一个 leader
+   和 k-1 个 req-to-token member rows，因此会直接增加 KV row/容量压力。
+   当前明确不支持 speculative、PD、page_size>1、DP/PP attention、HiCache、
+   LoRA、约束解码和 hybrid SWA/Mamba；不能把 beam_width 当成普通 sampling n。
+
 ### 10.6 KV cache、HiCache 和统一内存
 
 1. ReqKvInfo 收拢 KV 所有权。字段在
@@ -960,6 +984,15 @@ python/sglang/srt/hardware_backend/xpu/quantization/int4pack_utils.py:17-80
 （pack_int4_to_uint8、xpu_int4pack_mm）；CPU 修复在
 python/sglang/kernels/aot/csrc/cpu/extend.cpp:26-69、:239-310
 （extend_attention_kernel_impl 和 stage-2 mask）。
+
+Qwen3.8 rebase（5f216fc33f）还加入 Blackwell/NVLink 专用的 MNNVL CuTe DSL
+AllReduce + residual/RMSNorm/MoE finalize fusion。总开关位于
+python/sglang/srt/environ.py:1587-1595
+（SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION，默认 false），workspace 入口在
+python/sglang/kernels/ops/communication/mnnvl_cutedsl_ar.py:96-150
+（MNNVLCuteDSLAllReduceFusionWorkspace::__init__）。它会构建大量 CuTe kernel，
+但只在 Qwen3.5/3.8 等匹配模型并显式打开时影响启动，不能用于解释默认 DSV4
+启动增量。
 
 python/pyproject.toml 的硬依赖变化为：
 
