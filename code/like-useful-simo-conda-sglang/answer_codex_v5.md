@@ -1098,11 +1098,16 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    `python/sglang/srt/rust_server/server.py:47-229（RustServer::launch、RustServer::drain）`。
 
 8. **新增 API/模型能力有明确约束。**
+  Beam search 通过 `python/sglang/srt/sampling/sampling_params.py:74-76、157-159`
+  （`SamplingParams::beam_width`、`SamplingParams::verify`）和
+  `python/sglang/srt/beam_search/beam_group.py:60-160（BeamGroup::__init__、BeamGroup::advance_frontier）`
    Beam search 通过 `python/sglang/srt/sampling/sampling_params.py:74-76、157-159`
    （`SamplingParams::beam_width`、`SamplingParams::verify`）和
-   `python/sglang/srt/beam_search/beam_group.py:60-160（BeamGroup::__init__、BeamGroup::advance_frontier）`
+   `python/sglang/srt/beam_search/beam_group.py:60-160`
+   （`BeamGroup::__init__`、`BeamGroup::advance_frontier`）
   接入，但不支持 speculative、PD、page_size>1、DP/PP attention、HiCache、LoRA 等组合。
-   请求 fan-out 和 `n<=beam_width` 语义由 `python/sglang/srt/managers/io_struct.py:473-503（GenerateReqInput::_sampling_params_beam_width、GenerateReqInput::_handle_beam_search_parallel_sampling）` 处理；
+   请求 fan-out 和 `n<=beam_width` 语义由 `python/sglang/srt/managers/io_struct.py:473-503`（
+   `GenerateReqInput::_sampling_params_beam_width`、`GenerateReqInput::_handle_beam_search_parallel_sampling`）处理；
    它不是普通的 `sampling n`，每个 beam 会占用独立的 req-to-token row。
    DFlash2 candidate selector 位于 `python/sglang/srt/models/dflash.py:944-1140`
    （`CandidateSelector::build_lattice`、`DFlash2DraftModel::compute_candidates`）；
@@ -1110,20 +1115,20 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    `tools.expert_pack` 等 out-of-tree import 需要迁移到 package 内路径。
 
 9. **OpenAI/多模态协议和服务接口扩展。**
-   `python/sglang/srt/entrypoints/openai/protocol.py:355-449`
+   `python/sglang/srt/entrypoints/openai/protocol.py:355-356、418-449、863-864`
    （`CompletionRequest::return_spec_tokens_details`、`ChatCompletionRequest::return_spec_tokens_details`、`SpecTokensDetails`、`SglExt`）
    配合 `python/sglang/srt/entrypoints/openai/utils.py:158-192`
    （`spec_tokens_details_from_meta_info`、`process_spec_tokens_details_from_ret`）
    支持把 speculative 接受率/长度等统计返回到 OpenAI chat/completions。
-   同文件 :586-628（`ChatCompletionMessageContentInputAudio`、
+   `python/sglang/srt/entrypoints/openai/protocol.py:586-634`（`ChatCompletionMessageContentInputAudio`、
    `ChatCompletionMessageContentAudioInlinePart`、`_to_audio_url_part`）接受 inline
    base64 音频并统一为 data URI；`python/sglang/srt/entrypoints/openai/transcription_adapters/base.py:13-186`
    （`TranscriptionAdapter`、`register_transcription_adapter`、`resolve_adapter`）和
    `python/sglang/srt/entrypoints/openai/serving_transcription.py:65-129`（`OpenAIServingTranscription::create_transcription`）
    引入可注册 ASR adapter。
-   `python/sglang/srt/utils/msgpack_utils.py:22-221`（`_pack_ext`、`enc_hook`、`dec_hook`、
-   `ext_hook`）及 `python/sglang/srt/managers/io_struct.py:2460-2476`
-   （`msgpack_encode`、`msgpack_decode`、`sock_send`、`sock_recv`）增加 tensor/SHM/CUDA-IPC
+   `python/sglang/srt/utils/msgpack_utils.py:22-247`（`_pack_ext`、`enc_hook`、`dec_hook`、
+   `ext_hook`）及 `python/sglang/srt/managers/io_struct.py:2417-2497`
+   （`_msgpack_encoder`、`_msgpack_decoder`、`msgpack_encode`、`msgpack_decode`、`sock_send`、`sock_recv`）增加 tensor/SHM/CUDA-IPC
    的 msgpack 传输；这会影响多模态 worker 和自定义 IPC 结构。
    另外，`python/sglang/srt/sampling/sampling_params.py:38、220-260（SamplingParams::normalize）` 增加 stop/regex
    数量和长度上限，`python/sglang/srt/entrypoints/openai/serving_tokenize.py:39（OpenAIServingTokenize::_handle_non_streaming_request）`
@@ -1133,10 +1138,10 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    `python/sglang/srt/entrypoints/http_server.py:2449-2489`（HTTP server startup config）将其传给 Granian。
 
 10. **调度观测接口。**
-    `python/sglang/srt/disaggregation/kv_events.py:139（resolve_load_pub_range）`、
-    `python/sglang/srt/managers/scheduler_components/load_publisher.py:114-193`
-    （`SchedulerLoadPublisher`、`SchedulerLoadPublisher::publish_load_stat`）新增
-    `--load-publish-endpoint`，由每个 scheduler 发布 running/waiting/token load；
+    commit `97ba99067d`： `python/sglang/srt/disaggregation/kv_events.py:139-220（resolve_load_pub_range）`、
+    `python/sglang/srt/managers/scheduler_components/load_publisher.py:114-264`
+    （`SchedulerLoadPublisher`、`SchedulerLoadPublisher::publish_load_stat`、`SchedulerLoadPublisher::close`）新增
+    `--load-publish-endpoint`，并在 `python/sglang/srt/managers/scheduler.py:2178、4151` 接入；每个 scheduler 发布 running/waiting/token load；
     这是 router/load-aware 部署的新 opt-in 协议，不改变默认调度路径。
 
 11. **KV-aware Router 和外部 KV indexer。**
