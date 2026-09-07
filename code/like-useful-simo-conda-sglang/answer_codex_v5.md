@@ -667,3 +667,357 @@ stem 等）明细写入 YAML。
    不超过 0.26 pp，低于该次运行的不确定性范围。因此没有观察到 sglang v0.5.18
    适配导致的明显精度回归或提升；结论仅基于这一次运行和已四舍五入的总分，若要判断
    细微差异，应使用相同种子重复评测或比较逐样本预测。
+
+## 10. release/v0.5.18 -> release/v0.5.19 重要修改
+
+### 10.1 比较范围
+
+本节以 /share/users/like/package/sglang_kernel_src 为 code base，比较两个 branch
+的 tip；当前工作区未提交改动不在比较中。代码引用统一为“相对 code base 路径:行号
+（函数名）”，类成员函数写成 类名::函数名。
+
+- release/v0.5.18: 9d18277c2720f3a1d6e64f90259e1d1b9ba9a26a（2026-08-26）。
+- release/v0.5.19: 0bcd822377da7b5718e674eaf9c870d349424dd1（2026-09-03）。
+- 版本间 794 个提交，2786 个文件变化，新增 299538 行、删除 60541 行。
+- 变化最多的目录是 python、test、docs、rust；因此 v0.5.19 是功能和架构扩展版，
+  不是只修几个 CUDA kernel 的补丁版。
+
+题目指定 branch，不能用 tag 结果替代上面的结论；release 分支上的 cherry-pick
+可能使 branch-to-branch 与 tag-to-tag 的文件集合不同。
+
+### 10.2 重要修改总览
+
+| 子系统 | 主要提交/内容 | 直接影响 |
+| --- | --- | --- |
+| DSV4/DSA | Q8KV8 sparse prefill、fused top-k、top-k v2、FP4 runner 自动选择 | 新的 attention/MoE 分支和 JIT 模块 |
+| MoE | DeepGEMM 0.1.7、MegaMoE MXFP4、DeepEPv2、可插拔 runner | 通信布局、scale、SM 预算和编译缓存契约改变 |
+| Spec/graph | mixed chunk、DFlash2 selector、TP sync、PP FullCG | target_verify graph 的 shape 和 warmup 组合增加 |
+| KV/HiCache | ReqKvInfo、统一字节池、统一 radix/tree/linker | KV 所有权、容量、evict/retract 和外部存储语义改变 |
+| 配置/前端 | resolution pipeline、namespace bags、嵌入式 Rust server | 运行时配置读取和 IPC 兼容性改变 |
+| 平台/依赖 | FlashInfer 0.6.18、ROCm10/gfx1250、CUDA13.4/Rubin、XPU/NPU | native wheel、驱动和 JIT cache 需要重新对齐 |
+| 模型/扩散 | Qwen3.8、GLM-5.3-Flash、Ling-3.0-flash、EPD 等 | 模型覆盖面大幅扩大，diffusion 变更与文本路径相对独立 |
+
+### 10.3 DeepSeek V4、DSA 和 FP4
+
+1. **Q8KV8 sparse MLA prefill（9db4ba8da1）。**
+
+   入口是 python/sglang/srt/server_args.py:1777-1788
+   （ServerArgs::dsv4_prefill_backend），新增 auto、flashmla_sparse、
+   flashmla_sparse_q8。真正的 Q8 开关由
+   python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py:60-75
+   （use_dsv4_q8kv8_sparse_prefill）决定：显式选 flashmla_sparse_q8，或设置
+   SGLANG_DSV4_Q8KV8_PREFILL=true。
+
+   python/sglang/srt/layers/attention/deepseek_v4_backend.py:532-587
+   （DeepseekV4AttnBackend::__init__）检查 SM90、d_v=512；
+   :1668-1788（DeepseekV4AttnBackend::forward）在大查询的 extend path 路由；
+   :1933-1983（DeepseekV4AttnBackend::_prepare_q8kv8_q_and_sink）把 head 补齐到
+   64-head CTA；
+   :1985-2122（DeepseekV4AttnBackend::_forward_prefill_sparse_q8kv8）把压缩 KV
+   gather、dequant/requant 到 FP8 workspace 后调用新 kernel。
+
+   新模块在 python/sglang/kernels/ops/attention/sparse_mla_q8kv8_prefill_sm90.py:
+   60-74（_jit_sparse_mla_q8kv8_prefill_module），公开入口为 :268-528
+   （sparse_mla_q8kv8_prefill_fwd）。它要求 CUDA、FP8 E4M3、h_q 为 64 的倍数、
+   topk 为 128 的倍数、d_v=512；第一次命中可能编译，错误 shape 会快速报错。
+   backend=auto 本身不会打开 q8。
+
+2. **DSA top-k 后端和 v2 kernel。**
+
+   5edcd0a445 增加 FlashInfer 0.6.18 fused top-k。枚举和 target/draft 分流在
+   python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py:27-50
+   （DSATopKBackend::resolve）；实现位于 :55-91
+   （DSATopKBackend::topk_func）和 :93-210（DSATopKBackend::topk_transform），
+   支持 sgl-kernel、torch、flashinfer。target/draft 参数分别是
+   python/sglang/srt/server_args.py:1816-1823
+   （ServerArgs::dsa_topk_backend）和 :2186-2193
+   （ServerArgs::speculative_dsa_topk_backend）。默认仍为 sgl-kernel。
+
+   DSV4 的 FlashInfer transform 在
+   python/sglang/srt/layers/attention/dsv4/indexer.py:407-432
+   （topk_transform_512_flashinfer_fused），路由在 :855-890
+   （C4IndexerBackendMixin::forward_c4_indexer）。top-k v2 的单一 JIT 模块在
+   python/sglang/kernels/ops/attention/dsv4/topk.py:35-47
+   （_jit_topk_v2_module），paged/ragged 入口在 :78-92、:95-129、:132-178；
+   它减少按 k 编译的模块数量，但首次加载仍可能触发 JIT。
+
+3. **DSV4 FP4 的 auto runner 改变。**
+
+   60ff1e33a5 在
+   python/sglang/srt/arg_groups/model_overrides/deepseek_v4.py:20-76
+   （_deepseek_v4_overrides）中规定：CUDA、非 HIP、SM90/100/120、FP4 experts、
+   无 A2A、未强制 dequant 且 runner=auto 时使用 flashinfer_mxfp4；带
+   nvfp4_moe_meta 的混合 checkpoint 使用 flashinfer_trtllm_routed。因此同一个
+   DSV4 FP4 checkpoint 在两个版本的 auto 选择可能不同，不能假定仍走 Marlin。
+
+### 10.4 MoE、DeepGEMM、DeepEPv2 和 Marlin
+
+1. **DeepGEMM 0.1.5.post3 -> 0.1.7（a7ee399904、07c8f7294d）。**
+
+   MegaMoE 现在在 python/sglang/srt/layers/moe/mega_moe.py:48-50
+   （_mega_moe_mma_type）区分 fp8xfp4 与 mxf4xmxf4；
+   :52-86（_mega_moe_max_num_sms、
+   _configure_mega_moe_deep_gemm_num_sms）在 Blackwell 为 whole-grid barrier
+   预留 SM，默认值在 python/sglang/srt/environ.py:1132-1135
+   （SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS）为 2；
+   :89-122（_get_mega_moe_symm_buffer）把 mma_type 纳入 buffer key；
+   :257-304（forward_mega_moe、_run_mega_routed）使用新的 pre-dispatch；
+   :312-337（_interleave_mega_moe_gate_up 等）和 :351-408
+   （build_mega_moe_experts_weights）改写 MXFP4/UE8M0 权重布局。
+
+2. **本地 rank 的重复 JIT 编译被去重（7769ff8f1e）。**
+
+   python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py:120-140
+   （_local_rank_compile_lock）在 SGLANG_DG_CACHE_DIR/locks 下按
+   kernel、N、K、num_groups 加 fcntl 锁；:144-186
+   （_maybe_compile_deep_gemm_one_type_all）让锁持有者执行 :190-260
+   （_compile_deep_gemm_one_type_all）。锁只避免同节点多份 nvcc，不会消除首个
+   rank 的完整 M sweep；:161-170 明确提示无预编译时通常需要 10--20 分钟。
+   非 fast warmup 的 M 列表 :83-91 仍可覆盖到 128K。
+
+   预编译入口在 python/sglang/compile_deep_gemm.py:63-96
+   （warm_up_compile）；:183-204（compile_server_args）会关闭 CUDA graph 和
+   torch.compile 后发起 warmup。必须使用和 launch_server 相同的模型、TP、dtype、
+   MoE/A2A 参数，否则 cache 可能仍不命中。
+
+3. **DeepEPv2 ElasticBuffer A2A（a3ae667d67）。**
+
+   新文件 python/sglang/srt/layers/moe/token_dispatcher/deepep_v2.py 中，
+   :136-210（DeepEPv2Buffer::get_buffer）按通信组、hidden、topk、容量、FP8、
+   hybrid mode 复用进程级 ElasticBuffer；
+   :279-396（_DeepEPv2Impl::dispatch）支持 decode expanded/masked 和 extend
+   contiguous layout，使用 FP8 group-128 scale；
+   :398-419（_DeepEPv2Impl::combine）回收单次 handle；
+   :421-461（DeepEPv2Dispatcher::dispatch/combine）接入通用 dispatcher。
+
+   配置在 python/sglang/srt/server_args.py:2366-2414
+   （ServerArgs::moe_a2a_backend、ServerArgs::deepep_v2_mode），新增
+   deepep_v2 及 direct/hybrid；环境默认容量和 SM 数在
+   python/sglang/srt/environ.py:1107-1109
+   （SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK、
+   SGLANG_DEEPEP_V2_NUM_SMS）为 128、0。它要求 DeepGEMM runner，适配代码在
+   python/sglang/srt/layers/moe/moe_runner/deep_gemm.py:1566-1634
+   （pre_permute_deepep_v2_to_deep_gemm）和 :1701-1722
+   （post_permute_deep_gemm_to_deepep_v2）。
+
+4. **MoE runner 扩展和 Marlin。**
+
+   python/sglang/srt/layers/moe/moe_runner/runner.py:33-50
+   （register_moe_runner_core）及 :53-150（MoeRunner::__init__）增加自定义
+   runner core 注册接口；基类在
+   python/sglang/srt/layers/moe/moe_runner/base.py:117-134
+   （MoeRunnerCore）。旧的私有 runner/monkey-patch 需要审计。
+
+   Marlin 核心算法在本范围内没有同等级重写。其变化主要是
+   python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py:130-167
+   （Mxfp4MarlinMoEMethod::process_weights_after_loading）的 SM90/SM120 和
+   block-32 检查，以及 python/sglang/srt/layers/quantization/mxfp4.py:617-644、
+   :1458-1478（Mxfp4WeightQuantMethod::process_weights_after_loading、
+   Mxfp4WeightQuantMethod::_apply_marlin）。因此只有显式选择 Marlin 或其它模型
+   选中该 runner 时才会走 Marlin；DSV4 FP4 auto 通常优先 FlashInfer MXFP4。
+
+5. **FlashInfer FP4 后端增加。**
+
+   9a85473a89 增加 Blackwell NVFP4 W4A16 CuTe DSL，开关是
+   python/sglang/srt/environ.py:965-969
+   （SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16），权重准备在
+   python/sglang/srt/layers/quantization/modelopt_quant.py:1692-1701、
+   :1793-1809、:2053-2068。5b04408784 增加 SM90 MXFP4 W4A8
+   CUTLASS/Humming。它们是 Marlin 的并列 backend，不应把所有 FP4 转换都叫
+   Marlin 编译。
+
+6. **JIT 和 expert-pack 目录重构（db6f0a9d53）。**
+
+   elementwise/speculative csrc、MiniCPM-SALA ops 和 tools/expert_pack 已移到
+   package 内；工具入口在 python/sglang/srt/model_loader/expert_pack/build.py:230-274
+   （build），运行时准备在 python/sglang/srt/model_loader/expert_pack_runtime.py:
+   87-100（prepare_kimi_model_metadata）。外部脚本若仍引用 tools.expert_pack 或
+   旧 JIT source path，会在 editable 升级后失败。
+
+### 10.5 Speculative、CUDA graph 和调度
+
+1. 07d84ebd6d 让 mixed chunk prefill 与 spec 联动：
+   python/sglang/srt/speculative/spec_info.py:132-143
+   （SpeculativeAlgorithm::supports_mixed_chunk）允许 EAGLE/EAGLE3/DFlash/
+   DSpark；python/sglang/srt/managers/schedule_batch.py:2886-2957
+   （ScheduleBatch::mix_with_running）合并新 prefill 和 running decode；
+   python/sglang/srt/managers/overlap_utils.py:471-513
+   （FutureMap::resolve_mixed_spec_tails）在 publish fence 后重建 spec tail。
+   吞吐更好，但 forward mode、graph bucket 和跨 stream 状态组合更多。
+
+2. adaptive draft 容量与运行时宽度解耦：
+   python/sglang/srt/speculative/spec_info.py:242-263
+   （SpeculativeAlgorithm::resolve_max_speculative_num_draft_tokens）从
+   candidate-step 算最大 slot；python/sglang/srt/runtime_context.py:959-970
+   （RuntimeContext::set_server_args）把它写入 spec bag。它会改变显存预算和
+   target_verify/draft graph capture bucket。
+
+3. f60bc73c58 增加 DSpark/DFlash 的 TP 状态同步：
+   python/sglang/srt/speculative/spec_tp_sync.py:14-42
+   （SpecTpSyncSite）和 :99-129（SpecTpSync::sync）按
+   SGLANG_SPEC_TP_SYNC 对 memory、selector、sample、accept、target 等站点
+   broadcast；这修复 rank divergence，但增加同步边界。
+
+4. Full prefill CUDA graph 支持 PP proxy/full graph，并修复 padding/EAGLE capture
+   （b77cac06a9、26fd7fdaa2、9a9e167179）。最终逻辑在
+   python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py:
+   284-491（capture_prefill_graph），按 backend、max request、context length
+   筛选 buckets并记录耗时；python/sglang/srt/model_executor/model_runner.py:
+   1424-1456（ModelRunner::init_decode_cuda_graph、
+   ModelRunner::init_prefill_cuda_graph）把 target_verify/draft_decode 资源纳入
+   统计，:1774-1802（ModelRunner::_forward_raw）实际执行 prefill graph。
+
+5. 新增 prefill_decode_interval（python/sglang/srt/server_args.py:718-722，
+   ServerArgs::prefill_decode_interval）和 gated launch
+   （python/sglang/srt/distributed/gated_launch.py:22-37、
+   :40-65，maybe_wait_for_gated_launch、_wait_until_activated）。两者默认不会
+   改变普通单机路径；97ba99067d 的 per-scheduler load socket 主要给 load-aware
+   router。
+
+6. a3c4936438 让 FlashInfer autotune tactic 在 TP ranks 一致；路径在
+   python/sglang/srt/utils/flashinfer_autotune.py:177-285。额外 EXTEND dummy
+   autotune 由 python/sglang/srt/environ.py:993-997
+   （SGLANG_FLASHINFER_AUTOTUNE_EXTEND）控制，v0.5.19 默认 false。
+
+### 10.6 KV cache、HiCache 和统一内存
+
+1. ReqKvInfo 收拢 KV 所有权。字段在
+   python/sglang/srt/managers/schedule_batch.py:848-900（ReqKvInfo），有效
+   committed length 在 :1330-1335（Req::effective_kv_committed_len）；按行
+   释放在 python/sglang/srt/mem_cache/base_prefix_cache.py:372-383
+   （BasePrefixCache::free_kv_row）。自定义 attention、PD、hybrid wrapper
+   应传递真实 ReqKvInfo 和 KV index translator。
+
+2. 统一字节池在
+   python/sglang/srt/mem_cache/unified_memory_pool.py:293-345
+   （UnifiedKVPool::__init__）构造多种 view；:1810-1970
+   （init_unified_mamba_swa_pools）形成 [mamba up | swa float | full down]，
+   :1916-1936（_check_bs1_feasibility_floor）在启动时检查最低字节预算。
+   ef9e58fd6d、98cb3535b7、961beee9e5 改变了 hybrid cache 的 sizing、relocation、
+   eviction 和 retraction 失败行为。
+
+3. 44806dc507 让 unified radix tree 成为默认；旧开关在
+   python/sglang/srt/environ.py:638-643（SGLANG_ENABLE_UNIFIED_RADIX_TREE）
+   已 deprecated。9cf157c252 增加可选 Rust TreeCore，注册在
+   python/sglang/srt/mem_cache/unified_cache/tree_core_registry.py:57-75
+   （_rust_tree_core_factory、create_tree_core）。c9eb475a88 到 b21000aef1
+   定义统一 external linker，接口在
+   python/sglang/srt/mem_cache/unified_cache/unified_cache_linker.py:51-112
+   （UnifiedCacheLinker），运行时 attach/detach 在
+   python/sglang/srt/mem_cache/unified_cache/storage_attachment.py:37-165
+   （StorageAttachment::attach、StorageAttachment::detach）。
+
+4. 977412ae61 增加 HiCache buffer_only host mode，把 host memory 作为
+   GPU<->storage staging 而非持久 L2 cache；启用时要重新验证 sidecar、unified-SWA、
+   prefetch/write-back 的组合。
+
+### 10.7 配置架构、Rust 前端和 EPD
+
+1. c2928e86d7 到 e51a3ae65e 把 ServerArgs 改为 raw input + resolution result：
+   python/sglang/srt/server_args.py:3663-3671（ServerArgs::__post_init__）不再
+   立即改写字段，:3673-3706（ServerArgs::resolve_once）只运行一次 pipeline，
+   :3708-3719（ServerArgs::resolved_dict）返回解析值；pipeline 在
+   python/sglang/srt/arg_groups/pipeline.py:26-110、:340-370
+   （run_resolution_pipeline）；bags 和 runtime override 在
+   python/sglang/srt/runtime_context.py:798-846（_build_config_bags）、
+   :939-989（RuntimeContext::set_server_args）、:1020-1060
+   （RuntimeContext::override）、:1465-1512（publish）。
+
+   out-of-tree code 应在启动阶段读取 resolving_view/resolved_view，运行阶段读取
+   get_exec/get_spec 等 bags；直接写 server_args.foo 不再保证同步到 runtime。
+
+2. SGLANG_RUST_SERVER 默认 false。打开后
+   python/sglang/srt/rust_server/server.py:47-166（RustServer::launch）在
+   scheduler 进程内启动 Rust threads，:168-229（RustServer::drain）用
+   columnar input-id buffer 传输请求。Rust 边界在
+   rust/sglang-server/src/lib.rs:75-130（Server::start）和 :132-163
+   （Server::recv_requests、Server::wait_request）；sampling ABI 在
+   rust/sglang-server/src/message/sampling.rs:94-115、:247-275、:321-340。
+   这属于 opt-in，不应解释未开启 Rust server 的普通启动耗时。
+
+3. 8a123cbd0e 重构 EPD encoder disaggregation。入口包括
+   python/sglang/srt/disaggregation/encoder/http_server.py:264
+   （handle_encode_request）、runtime.py:101（EncoderScheduler）、
+   :353（EncoderRuntime）和 python/sglang/srt/entrypoints/server.py:2012
+   （run_encoder）。它主要影响 multimodal/encoder-only PD。
+
+### 10.8 硬件和依赖
+
+| 平台 | 重要内容 |
+| --- | --- |
+| NVIDIA | CUDA 13.4/Rubin 容器、SM90 FP8 decode 修复、Blackwell NVFP4 CuTe DSL、SM90 MXFP4 W4A8 |
+| AMD | ROCm10/gfx1250、Lean persistent-CTA decode、12-head MLA Gluon、MoRI MXFP8 dispatch |
+| XPU | dense AWQ/GPTQ INT4 native int4pack、FP8、SYCL DSV4 top-k、fused GDN |
+| NPU | DSV4 compressor/sparse-attn、ModelSlim W4A4 MXFP4、NPU kernel wheel |
+| CPU | bidirectional attention 的 is_causal 修复、GPTQ INT4、ERNIE |
+
+代表性代码位置：AMD Lean 在
+python/sglang/kernels/ops/attention/decode_attention.py:1156-1234
+（decode_attention_fwd）和 :1737-1872（lean_capture_policy、
+lean_decode_seqlen_gate）；XPU INT4 在
+python/sglang/srt/hardware_backend/xpu/quantization/int4pack_utils.py:17-80
+（pack_int4_to_uint8、xpu_int4pack_mm）；CPU 修复在
+python/sglang/kernels/aot/csrc/cpu/extend.cpp:26-69、:239-310
+（extend_attention_kernel_impl 和 stage-2 mask）。
+
+python/pyproject.toml 的硬依赖变化为：
+
+- :31 compressed-tensors==0.18.0；
+- :42 flashinfer_python[cu13]==0.6.18；
+- :44 humming-kernels[cu13]==0.1.12；
+- :77 sgl-deep-ep==0.1.2；
+- :78 sgl-deep-gemm==0.1.7；
+- :83 tilelang==0.1.12；
+- :85 tokenizers==0.22.2；
+- build-system :1-8 新增 setuptools-rust>=1.11、torch==2.13.0。
+
+python/setup.py:1-27（<top-level>）、:56-109（_cargo_metadata/
+_cargo_workspace_metadata）、:131-162（_discovered_rust_extensions）现在自动
+发现并构建 Cargo/PyO3 扩展。editable install 仍指向源码，但 Rust extension、
+PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 branch 不会
+自动同步这些二进制依赖。
+
+### 10.9 对当前 DeepSeek V4 Flash 启动的解释
+
+用户现有日志给出的阶段时间是：旧版本 2026-07-02 的 target CUDA graph capture
+约 367 秒；v0.5.19 2026-09-01 的 target_verify capture 约 1149.44 秒，ready
+前 scheduler_e2e 约 1583 秒，其中 load_weight 约 123.26 秒、draft_decode
+25.40 秒、draft_extend 7.71 秒。
+
+因此新增时间主要集中在首次 target_verify/full-prefill CUDA graph capture 及其
+内部 kernel/JIT warmup，而不是权重加载。计时点对应
+python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py:
+471-491（capture_prefill_graph）和
+python/sglang/srt/model_executor/model_runner.py:1783-1795
+（ModelRunner::_forward_raw）。日志不能单独证明某一个 commit 是唯一根因，较
+合理的组合解释是：
+
+1. DSV4/DSA、Spec、MoE runner 使 target_verify 的 shape/bucket 组合增加；
+2. DeepGEMM 0.1.7、FlashInfer 0.6.18、Q8/top-k v2 使旧 JIT cache key 或 ABI
+   不再命中；
+3. capture 中首次编译新 kernel，并分配更大的 temporary workspace；
+4. local-rank lock 只消除重复 nvcc，不能消除首个 rank 的编译和 graph capture。
+
+建议按以下顺序做 A/B：
+
+1. 在 /share_data/users/like/miniconda3/envs/simo_sglang/ 中确认
+   import sglang 的路径、FlashInfer/DeepGEMM/DeepEP/Humming/Torch 实际版本；
+2. 检查 SGLANG_CACHE_DIR、SGLANG_JIT_CACHE_DIR、SGLANG_DG_CACHE_DIR、
+   SGLANG_JIT_CACHE_DEBUG。v0.5.19 在
+   python/sglang/srt/environ.py:1073-1093（<top-level>）默认把 DeepGEMM cache
+   放到 SGLANG_CACHE_DIR/deep_gemm，并在
+   python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py:38-40
+   （<top-level>）转给 DG_JIT_CACHE_DIR；所有 TP ranks 应看到同一个可写目录；
+3. 用完全相同的 launch 参数先运行 python -m sglang.compile_deep_gemm，比较
+   预热前后的 target_verify 时间；
+4. 只改变一个变量，分别比较禁用 prefill/target_verify graph、暂时关闭
+   speculative、明确 dsv4_prefill_backend=auto 和 dsa-topk-backend=sgl-kernel，
+   再单独打开 q8、FlashInfer fused top-k、top-k v2 或 FP4 runner；
+5. 保存 Capture begin/end、Entering DeepGEMM JIT Pre-Compile session、
+   DSV4_Q8KV8_SPARSE_PREFILL_HIT 和 FlashInfer autotune 日志，并按 branch、
+   GPU、driver、第三方版本划分持久 cache。
+
+最终判断：v0.5.19 的主要编译契约变化来自 DeepGEMM/MegaMoE、DeepEPv2 和新的
+DSV4/DSA/FlashInfer JIT；Marlin 核心算法没有同等规模重写。结合现有日志，当前
+20--30 分钟增量首先应归到 target_verify graph 与冷 JIT/cache 的组合；只有日志
+明确显示 Marlin runner 的 prepare/build 时间时，才应把它单独归因于 Marlin。
