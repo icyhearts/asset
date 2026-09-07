@@ -1277,3 +1277,111 @@ release v0.5.18 weight-loader-v2 接口变化。
 `sglang.srt.layers.quantization.kv_cache`；这属于测试夹具与当前 release 布局不一致，
 不是本 commit 的运行时失败。此次没有运行完整 42 项 lm-eval 矩阵，完整精度矩阵仍需
 在目标 GPU 和模型权重环境中执行。
+
+## 5.10 `_call_weight_loader` 是否真的有必要
+
+### 5.10.1 结论
+
+这个函数不是 SIMO 量化算法本身的一部分，而是权重加载接口的兼容层。结论分两层：
+
+1. **对 v0.5.18 的通用 SIMO 适配，建议保留。** 原来的
+   `original_weight_loader(param, packed_weight, **kwargs)` 只在底层 loader 接受
+   `loaded_shard_id` 时成立；v0.5.18 同时存在两参数和三参数 loader。只要一个普通
+   `Column/Row/Replicated` 层被带着非空 shard id 调用，原写法就会直接抛
+   `TypeError: got an unexpected keyword argument 'loaded_shard_id'`。
+2. **对本次限定的 Llama3.1-8B-Instruct + DeepSeek-V2-Lite-Chat、TP=1、默认权重加载路径，
+   它不是每次都必然被用到。** 这两个模型当前的带 shard id 映射主要落在 fused
+   `MergedColumn`/`QKV` 层，普通层通常以两个参数调用，所以删除它可能仍能完成这组测试。
+   但这属于当前调用图的偶然保证，不是旧写法满足 v0.5.18 合同的证明；打开新的权重加载器、
+   改变模型映射或引入另一种 fused/非 fused 组合后，旧写法会重新暴露问题。
+
+### 5.10.2 原写法为什么不总是够用
+
+文件：`simo/extensions/sglang_simo/quantization/quantization.py:973-1043，SIMOLinearMethod::get_weight_loader`
+
+`:974-979` 的 `online_weight_loader` 同时声明 `loaded_shard_id` 和 `**kwargs`，因为上游
+调用方既可能用第三个位置参数，也可能使用 `shard_id=`/`loaded_shard_id=` 关键字。旧代码在
+`:954` 先把非空 id 组装成 `{"loaded_shard_id": id}`，再在权重、scale、global scale 三处
+直接执行：
+
+```python
+original_weight_loader(param, packed_weight, **kwargs)
+```
+
+当 `kwargs` 为空时这等价于两参数调用，没有问题；当 `kwargs` 非空时，Python 会在进入
+loader 函数体之前按关键字匹配形参。若底层函数只有
+`(param, loaded_weight)`，调用立即失败，loader 根本没有机会自行完成 TP slicing。
+因此不能简单地“始终传 id”，也不能简单地“始终不传 id”：后者会破坏 fused QKV/gate-up
+权重的分片定位。
+
+### 5.10.3 v0.5.18 中确实存在两套签名
+
+以下均为 `sglang_kernel_src` code base 的相对路径：
+
+- `python/sglang/srt/layers/linear.py:272-294，ReplicatedLinear::weight_loader`：只有
+  `(param, loaded_weight)`。
+- `python/sglang/srt/layers/linear.py:465-490，ColumnParallelLinear::weight_loader_v2`：
+  只有两个业务参数；TP rank 和 slicing 由函数内部传给 parameter object。
+- `python/sglang/srt/layers/linear.py:1574-1602，RowParallelLinear::weight_loader_v2`：
+  同样只有两个业务参数。
+- `python/sglang/srt/layers/linear.py:863-941，MergedColumnParallelLinear::weight_loader_v2`：
+  额外接受 `loaded_shard_id`，并在 `:915-941` 用它计算 fused 分片偏移。
+- `python/sglang/srt/layers/linear.py:1139-1191，QKVParallelLinear::weight_loader_v2`：
+  额外接受 `loaded_shard_id`；`:1171` 还要求其为 `q/k/v`，随后在 `:1183-1191` 依据它
+  选择对应 Q/K/V 的偏移和 TP rank。
+
+这也解释了为什么把 id 丢掉并不是安全的“简化”：对于 Merged/QKV，id 是数据应该落入
+哪一个逻辑 shard 的必要信息；对于普通 Column/Row，id 是不被声明的多余信息。
+
+### 5.10.4 shard id 是怎样进入 SIMO 包装器的
+
+- `python/sglang/srt/model_loader/auto_loader.py:86-108，StackedParamsDispatch::try_load`：
+  `:98-107` 从 checkpoint 名称得到 `shard_id`，再调用
+  `param.weight_loader(param, tensor, shard_id)`。
+- `python/sglang/srt/models/llama.py:829-900，LlamaForCausalLM::_legacy_load_weights`：
+  `:830-836` 把 `q_proj/k_proj/v_proj` 映射到 `qkv_proj`，把 `gate_proj/up_proj` 映射到
+  `gate_up_proj`；`:873-884` 将对应 id 作为第三个参数传入。
+- `python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py:289-318，
+  DeepseekV2WeightLoaderMixin::do_load_weights`：`:289-318` 对 `gate_up_proj` 也把
+  `shard_id` 传给参数 loader；而普通 MLA 投影在 `:447-457` 以两参数调用。
+
+SIMO 在 `simo/extensions/sglang_simo/quantization/quantization.py:903-940，
+SIMOLinearMethod::__init__` 将 `SIMOLinearMethod` 加入 `WEIGHT_LOADER_V2_SUPPORTED`，所以
+上面这些 SGLang 线性类会把其 v2 loader 交给
+`simo/extensions/sglang_simo/quantization/quantization.py:973-1043，
+SIMOLinearMethod::get_weight_loader` 包装。包装器因此必须同时处理两种签名。
+
+### 5.10.5 `_call_weight_loader` 做了什么
+
+文件：`simo/extensions/sglang_simo/quantization/quantization.py:143-171，_call_weight_loader`
+
+- `:156-157` 在 id 为空时保持两参数调用，兼容普通参数和 fused-in-checkpoint 的整块权重。
+- `:159-167` 反射底层 callable 的签名；只有声明了 `loaded_shard_id`，或明确接受
+  `**kwargs` 时，才把 id 作为关键字转发。
+- `:169-171` 对普通两参数 loader 不转发 id，让其按自身的 TP 逻辑处理输入。
+- `:991`、`:1019`、`:1031-1041` 让 packed weight、`weight_scale`、NVFP4 global scale
+  使用同一规则，避免只修主权重而在 scale 加载时再次失败。
+
+用“捕获 `TypeError` 后重试两参数”也能实现类似效果，但会把 loader 内部真正的
+`TypeError` 误判为签名不兼容并重复加载；当前的签名判断避免了这种副作用。反射只发生在
+模型启动加载阶段，不在推理热路径上，性能影响可以忽略。
+
+### 5.10.6 对本次两个模型的实际判断与建议
+
+`python/sglang/srt/environ.py:293，环境变量 SGLANG_ENABLE_WEIGHT_LOADER_V2` 的默认值是
+`False`。本次 `llm_eval_online_quant.sh` 没有打开它；在默认 legacy 路径中，Llama 的
+第三参数映射落到 QKV/Merged 层，DeepSeek 的第三参数映射落到 `gate_up_proj`，普通层走
+两参数路径。因此在严格限定的四类模型/配置组合中，旧写法可能“看起来也能跑”。
+
+但 `SIMOLinearMethod` 是通用 quant method，不能把这个调用图假设写成全局接口保证。建议
+保留 `_call_weight_loader`，因为它改动小、只影响启动加载、不会改变量化数值，而且覆盖了：
+
+- 打开 `SGLANG_ENABLE_WEIGHT_LOADER_V2=true` 后的 `AutoWeightsLoader`/模型新 loader 路径；
+- 某个模型把 shard id 传给普通 Column/Row 参数的路径；
+- 后续 release 对 loader 分层或参数类型的扩展。
+
+如果目标是进一步收紧代码，优先为 `_call_weight_loader` 增加两个单元测试：一个用两参数
+loader 验证非空 id 被丢弃，一个用 Merged/QKV 风格三参数 loader 验证 id 被保留；不建议直接
+删除该函数。当前实现唯一需要留意的边界是 `inspect.signature` 无法反射的 opaque callable
+会静默走两参数 fallback；在本次两个模型的 Python bound-method loader 中不会触发，但若以后
+接入 C/C++ callable，最好改为显式报错而不是静默丢弃 shard id。
