@@ -993,16 +993,16 @@ python/sglang/kernels/ops/communication/mnnvl_cutedsl_ar.py:96-150
 （MNNVLCuteDSLAllReduceFusionWorkspace::__init__）。它会构建大量 CuTe kernel，
 但只在 Qwen3.5/3.8 等匹配模型并显式打开时才进入该路径；默认 DSV4 配置不受其影响。
 
-python/pyproject.toml 的硬依赖变化为：
+python/pyproject.toml 的 v0.5.18 -> v0.5.19 依赖差异为：
 
-- :31 compressed-tensors==0.18.0；
-- :42 flashinfer_python[cu13]==0.6.18；
-- :44 humming-kernels[cu13]==0.1.12；
-- :77 sgl-deep-ep==0.1.2；
-- :78 sgl-deep-gemm==0.1.7；
-- :83 tilelang==0.1.12；
-- :85 tokenizers==0.22.2；
-- build-system :1-8 新增 setuptools-rust>=1.11、torch==2.13.0。
+- `python/pyproject.toml:25 -> :31`，`compressed-tensors` 从不固定改为 `==0.18.0`；
+- `python/pyproject.toml:36 -> :42`，`flashinfer_python[cu13]` `0.6.17 -> 0.6.18`；
+- `python/pyproject.toml:38 -> :44`，`humming-kernels[cu13]` `0.1.10 -> 0.1.12`；
+- `python/pyproject.toml:71 -> :77`，`sgl-deep-ep` `0.1.0 -> 0.1.2`；
+- `python/pyproject.toml:72 -> :78`，`sgl-deep-gemm` `0.1.5.post3 -> 0.1.7`；
+- `python/pyproject.toml:77 -> :83`，`tilelang` `0.1.11 -> 0.1.12`；
+- `python/pyproject.toml:85`（v0.5.19）新增 `tokenizers==0.22.2`；
+- `python/pyproject.toml:2 -> :2-8`（build-system），`setuptools-rust` `>=1.10 -> >=1.11`，并新增 build-time `torch==2.13.0`。
 
 python/setup.py:1-27（<top-level>）、:56-109（_cargo_metadata/
 _cargo_workspace_metadata）、:131-162（_discovered_rust_extensions）现在自动
@@ -1199,9 +1199,9 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
 4. 按目标 GPU 检查对应 native wheel 和开关：NVIDIA 的 FlashInfer/CuTe DSL，AMD 的
    ROCm10/gfx1250，XPU/NPU/CPU 的专用量化和 attention 路径；不匹配的平台应验证
    fallback，而不是复用另一平台的 JIT/native cache。
-5. 将 v0.5.18 共有的提交与真正的 v0.5.18→v0.5.19 新提交分开记录。例如
-   content-addressed JIT loader `b784726863` 已在两个 release branch 中存在，
-   不能把它列为 v0.5.19 独有改动；真正的新依赖和上述新后端则应在升级记录中单独 pin。
+5. 将 merge-base 之前的共有基础改动与真正的 v0.5.18→v0.5.19 新提交分开记录，
+   以 `git diff release/v0.5.18..release/v0.5.19` 及 v0.5.19 的依赖清单为准；
+   新依赖、新后端和接口迁移应在升级记录中单独 pin/标注。
 
 综上，v0.5.19 的核心变化不是某一个 kernel 的小修补，而是 DSV4/DSA attention、
 DeepGEMM/MegaMoE、DeepEPv2、speculative graph、统一 KV/cache、配置解析和多平台
