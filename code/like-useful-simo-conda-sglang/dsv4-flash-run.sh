@@ -6,7 +6,7 @@ SGLANG_LOGGING_CONFIG_PATH=/share_data/users/like/package/h100/package/sglang_ke
   --trust-remote-code \
   --model-path /data/like/hf-models/deepseek-v4-flash/ \
   --mem-fraction-static 0.7 \
-   --cuda-graph-max-bs 16 \
+  --cuda-graph-max-bs-decode 16 \
   --log-level debug \
   --tp 4 \
   --moe-runner-backend marlin \
