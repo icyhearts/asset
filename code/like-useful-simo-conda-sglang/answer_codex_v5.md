@@ -1019,9 +1019,9 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
   `flashinfer_mxfp4`；
 - `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`，不能把本次日志直接解释为
   SGLang 主动执行 DeepGEMM 全量 precompile；
-+ `--speculative-algorithm EAGLE`、`--speculative-num-steps 3`、
+- `--speculative-algorithm EAGLE`、`--speculative-num-steps 3`、
   `--speculative-num-draft-tokens 4`，所以 target verify 每个请求宽度为 4；
-+ 只设置 `--cuda-graph-max-bs-decode 16`。日志同时显示普通 prefill graph
+- 只设置 `--cuda-graph-max-bs-decode 16`。日志同时显示普通 prefill graph
   disabled，发生的是 speculative target-verify decode graph capture。
 
 用户现有日志给出的阶段时间是：
