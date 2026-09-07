@@ -1300,8 +1300,8 @@ release v0.5.18 weight-loader-v2 接口变化。
 文件：`simo/extensions/sglang_simo/quantization/quantization.py:973-1043，SIMOLinearMethod::get_weight_loader`
 
 `:974-979` 的 `online_weight_loader` 同时声明 `loaded_shard_id` 和 `**kwargs`，因为上游
-调用方既可能用第三个位置参数，也可能使用 `shard_id=`/`loaded_shard_id=` 关键字。旧代码在
-`:954` 先把非空 id 组装成 `{"loaded_shard_id": id}`，再在权重、scale、global scale 三处
+调用方既可能用第三个位置参数，也可能使用 `shard_id=`/`loaded_shard_id=` 关键字。commit
+`4da2709^` 的同一文件 `:954` 先把非空 id 组装成 `{"loaded_shard_id": id}`，再在权重、scale、global scale 三处
 直接执行：
 
 ```python
@@ -1338,6 +1338,9 @@ loader 函数体之前按关键字匹配形参。若底层函数只有
 - `python/sglang/srt/model_loader/auto_loader.py:86-108，StackedParamsDispatch::try_load`：
   `:98-107` 从 checkpoint 名称得到 `shard_id`，再调用
   `param.weight_loader(param, tensor, shard_id)`。
+- `python/sglang/srt/models/utils.py:187-207，AutoWeightsLoader::_load_param`：
+  `:205-206` 只以 `(param, weight_data)` 两个参数调用。也就是说，打开 v2 loader
+  本身不会自动产生 shard id；真正需要兼容第三参数的是仍使用 stacked dispatch 的模型路径。
 - `python/sglang/srt/models/llama.py:829-900，LlamaForCausalLM::_legacy_load_weights`：
   `:830-836` 把 `q_proj/k_proj/v_proj` 映射到 `qkv_proj`，把 `gate_proj/up_proj` 映射到
   `gate_up_proj`；`:873-884` 将对应 id 作为第三个参数传入。
@@ -1371,14 +1374,25 @@ SIMOLinearMethod::get_weight_loader` 包装。包装器因此必须同时处理�
 `python/sglang/srt/environ.py:293，环境变量 SGLANG_ENABLE_WEIGHT_LOADER_V2` 的默认值是
 `False`。本次 `llm_eval_online_quant.sh` 没有打开它；在默认 legacy 路径中，Llama 的
 第三参数映射落到 QKV/Merged 层，DeepSeek 的第三参数映射落到 `gate_up_proj`，普通层走
-两参数路径。因此在严格限定的四类模型/配置组合中，旧写法可能“看起来也能跑”。
+两参数路径。因此在严格限定的两模型测试中，旧写法并非严格必需。一个旁证是：
+`temp/llm_eval_online_quant.sh...TASKS_mmlu...2026_09_04___15_43_28` 和
+`...TASKS_gsm8k...2026_09_04___15_40_59` 的评测在 15:43/15:44 开始，而 commit
+`4da2709` 在 16:32 才创建；两份日志均完成全部 42 个 run，未出现
+`loaded_shard_id` 的 `TypeError`。这说明该调用图中实际没有把非空 id 传给两参数普通 loader
+（需要注意：若测试前在工作树中已经存在未提交的同等修改，时间证据只能作为旁证）。
 
 但 `SIMOLinearMethod` 是通用 quant method，不能把这个调用图假设写成全局接口保证。建议
 保留 `_call_weight_loader`，因为它改动小、只影响启动加载、不会改变量化数值，而且覆盖了：
 
-- 打开 `SGLANG_ENABLE_WEIGHT_LOADER_V2=true` 后的 `AutoWeightsLoader`/模型新 loader 路径；
+- 与 `SGLANG_ENABLE_WEIGHT_LOADER_V2=true` 引入的模型新 loader 路径共存，并覆盖其中可能
+  继续使用 stacked shard dispatch 的模型；
 - 某个模型把 shard id 传给普通 Column/Row 参数的路径；
 - 后续 release 对 loader 分层或参数类型的扩展。
+
+`_call_weight_loader` 只包住 `SIMOLinearMethod::get_weight_loader`；
+`simo/extensions/sglang_simo/quantization/quantization.py:1411-1508，
+SIMOFusedMoEMethod::get_moe_weight_loader` 仍使用独立的五参数
+`original_weight_loader` 协议。因此不能把这个 helper 当成 SIMO MoE loader 的修复。
 
 如果目标是进一步收紧代码，优先为 `_call_weight_loader` 增加两个单元测试：一个用两参数
 loader 验证非空 id 被丢弃，一个用 Merged/QKV 风格三参数 loader 验证 id 被保留；不建议直接
