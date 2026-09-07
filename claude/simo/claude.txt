@@ -4011,3 +4011,15 @@ simo 以 editable 方式安装.
 
 把答案追加到 like-useful/answer_codex_v4.md
 }
+
+{
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
+sglang 源码位于 /share/users/like/package/sglang_kernel_src
+sglang 以  editable 方式安装
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+simo 以 editable 方式安装.
+
+# simo 为了适配 sglang  release/v0.5.18-local-dep 分支做了修改， 只考虑 llama3.1-8B-Instruct + DeepSeek-V2-Lite-Chat-16B_A2.4B 模型，最新 commit  4da2709396207c241003db49085e516093a62df1, 加了_call_weight_loader 函数,   simo 原始的 写法: def online_weight_loader 里面有  kwargs = {"loaded_shard_id": loaded_shard_id} if loaded_shard_id is not None else {},  然后调用 original_weight_loader(param, packed_weight, **kwargs), 这样，loaded_shard_id 非None 会把 loaded_shard_id 放进  kwargs 传给 original_weight_loader, 这不是仍旧能够兼容 2参数和3参数的吗？不是和 _call_weight_loader 这种复杂的封装一样的效果吗？
+
+把答案追加到 like-useful/answer_codex_v4.md
+}
