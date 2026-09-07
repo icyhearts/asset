@@ -1104,8 +1104,8 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    接入，但不支持 speculative、PD、page_size>1、DP/PP attention、HiCache、LoRA 等组合。
    DFlash2 candidate selector 位于 `python/sglang/srt/models/dflash.py:944-1140`
    （`CandidateSelector::build_lattice`、`DFlash2DraftModel::compute_candidates`）；
-  expert-pack、EPD encoder 和新的音频/模型适配器则改变了工具入口与模型注册表，旧的
-  `tools.expert_pack` 等 out-of-tree import 需要迁移到 package 内路径。
+   expert-pack、EPD encoder 和新的音频/模型适配器则改变了工具入口与模型注册表，旧的
+   `tools.expert_pack` 等 out-of-tree import 需要迁移到 package 内路径。
 
 9. **OpenAI/多模态协议和服务接口扩展。**
    `python/sglang/srt/entrypoints/openai/protocol.py:356-432`
@@ -1117,14 +1117,14 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    `ChatCompletionMessageContentAudioInlinePart`、`_to_audio_url_part`）接受 inline
    base64 音频并统一为 data URI；`python/sglang/srt/entrypoints/openai/transcription_adapters/base.py:13-186`
    （`TranscriptionAdapter`、`register_transcription_adapter`、`resolve_adapter`）和
-   `serving_transcription.py:65-129`（`OpenAIServingTranscription::create_transcription`）
+   `python/sglang/srt/entrypoints/openai/serving_transcription.py:65-129`（`OpenAIServingTranscription::create_transcription`）
    引入可注册 ASR adapter。
    `python/sglang/srt/utils/msgpack_utils.py:22-221`（`_pack_ext`、`enc_hook`、`dec_hook`、
    `ext_hook`）及 `python/sglang/srt/managers/io_struct.py:2460-2476`
    （`msgpack_encode`、`msgpack_decode`、`sock_send`、`sock_recv`）增加 tensor/SHM/CUDA-IPC
    的 msgpack 传输；这会影响多模态 worker 和自定义 IPC 结构。
-   另外，`sampling_params.py:38、220-260（SamplingParams::normalize）` 增加 stop/regex
-   数量和长度上限，`serving_tokenize.py:39（OpenAIServingTokenize::_handle_non_streaming_request）`
+   另外，`python/sglang/srt/sampling/sampling_params.py:38、220-260（SamplingParams::normalize）` 增加 stop/regex
+   数量和长度上限，`python/sglang/srt/entrypoints/openai/serving_tokenize.py:39（OpenAIServingTokenize::_handle_non_streaming_request）`
    修正 unlimited tokenizer context；旧客户端/扩展应检查错误码和返回字段。
 
 10. **调度观测接口。**
@@ -1133,6 +1133,42 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
     （`SchedulerLoadPublisher`、`SchedulerLoadPublisher::publish_load_stat`）新增
     `--load-publish-endpoint`，由每个 scheduler 发布 running/waiting/token load；
     这是 router/load-aware 部署的新 opt-in 协议，不改变默认调度路径。
+
+11. **KV-aware Router 和外部 KV indexer。**
+    commit `360d10d6bc` 在 `experimental/sgl-router/sgl-kv-indexer` 增加进程内内存
+    indexer，以及 ZMQ KV-event -> gRPC 的 bridge；服务端抽象在
+    `experimental/sgl-router/sgl-kv-indexer/src/service.rs:45-178`
+    （`KvIndexerBackend`、`KvIndexerService::new`、`KvIndexerService::into_server`），
+   bridge 配置在 `.../src/bridge.rs:36-78（BridgeConfig::from_env）`。
+    bridge 配置在 `experimental/sgl-router/sgl-kv-indexer/src/bridge.rs:36-78（BridgeConfig::from_env）`。
+    `experimental/sgl-router/src/policies/cache_aware_zmq.rs:175-298`
+    （`CacheAwareZmqPolicy::select`）可用 `--kv-indexer-endpoint` 查询最长 KV 前缀，
+    再按 active load 选 worker；indexer 是 soft-state，重启不提供持久化/复制，
+    因此部署和故障恢复语义与 v0.5.18 的 router-local radix tree 不同。
+
+12. **PD/DCP 和 SSD expert-pack 路径。**
+    `python/sglang/srt/layers/attention/trtllm_mla_backend.py:189-370`
+    （`TRTLLMMLABackend::__init__`、`TRTLLMMLABackend::_get_dcp_local_seq_lens`、
+    `TRTLLMMLABackend::_get_dcp_local_max_seq_len`）增加 TRT-LLM MLA decode context parallel；
+    `python/sglang/srt/disaggregation/common/dcp_pack.py:17-120`
+    （`dcp_pack_buffer_bytes`、`try_pack_dcp_src`、`init_dcp_pack_buffers`）把
+    DCP1->DCP-N 的 PD KV 行打包为目标连续 RDMA block，Mooncake/NIXL 的传输接口
+    随之改变。`python/sglang/srt/model_loader/expert_pack_loader.py:142-204`
+    （`ExpertPackModelLoader::__init__`、`ExpertPackModelLoader::load_model`）和
+    `python/sglang/srt/arg_groups/expert_pack_hook.py:32-204（handle_expert_pack）`
+    新增 DeepSeek-V4/Kimi-K3 的 GGUF + manifest + SSD expert-pack；它有专用的
+    并行度、CUDA graph 和 shared-expert-fusion 约束，不能当作普通 checkpoint loader。
+
+13. **模型和 Diffusion 覆盖面扩大。**
+    v0.5.19 新增/完整接入 Ling-3.0-flash（`python/sglang/srt/models/bailing_moe_v3.py`）、
+    Qwen3.8、GLM-5.3-Flash、MiniCPM-SALA（`models/minicpm.py`）、
+    Dots3-Note Omni（`models/dots3_common/modeling.py` 与 `multimodal/processors/dots_note_omni.py`）、
+    Spark、LFM2-DSpark、Nemotron 3.5 Lightning、Granite SWA 等；同时 Diffusion 侧
+    增加按 component 的权重来源/精度 override、Comfy/NVFP4/INT8 混合 checkpoint、
+    cache-dit/offload、FLUX.2/Qwen-Image/MiniMax-H3/Cosmos3 等路径。它们主要是
+    新模型和新 pipeline 能力，不应与核心 autoregressive scheduler 的行为变化混为一谈；
+    但会扩大模型注册、权重格式和 native kernel 的兼容矩阵。
+
 
 #### 10.9.3 升级时的最小核对清单
 
