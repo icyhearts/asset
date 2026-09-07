@@ -957,7 +957,7 @@ stem 等）明细写入 YAML。
    rust/sglang-server/src/lib.rs:75-130（Server::start）和 :132-163
    （Server::recv_requests、Server::wait_request）；sampling ABI 在
    rust/sglang-server/src/message/sampling.rs:94-115、:247-275、:321-340。
-   这属于 opt-in，不应解释未开启 Rust server 的普通启动耗时。
+   这属于 opt-in，默认配置不会进入 Rust 前端路径。
 
 3. 8a123cbd0e 重构 EPD encoder disaggregation。入口包括
    python/sglang/srt/disaggregation/encoder/http_server.py:264
@@ -1012,7 +1012,7 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
 
 ### 10.9 升级重点、兼容性与迁移建议
 
-本节只总结 `release/v0.5.18` 到 `release/v0.5.19` 的代码、依赖和接口差异；不把某台机器的启动日志或缓存状态作为分支差异证据。
+本节只总结 `release/v0.5.18` 到 `release/v0.5.19` 的代码、依赖和接口差异。
 
 #### 10.9.1 影响优先级
 
@@ -1104,8 +1104,35 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    接入，但不支持 speculative、PD、page_size>1、DP/PP attention、HiCache、LoRA 等组合。
    DFlash2 candidate selector 位于 `python/sglang/srt/models/dflash.py:944-1140`
    （`CandidateSelector::build_lattice`、`DFlash2DraftModel::compute_candidates`）；
-   expert-pack、EPD encoder 和新的音频/模型适配器则改变了工具入口与模型注册表，旧的
-   `tools.expert_pack` 等 out-of-tree import 需要迁移到 package 内路径。
+  expert-pack、EPD encoder 和新的音频/模型适配器则改变了工具入口与模型注册表，旧的
+  `tools.expert_pack` 等 out-of-tree import 需要迁移到 package 内路径。
+
+9. **OpenAI/多模态协议和服务接口扩展。**
+   `python/sglang/srt/entrypoints/openai/protocol.py:356-432`
+   （`CompletionRequest::return_spec_tokens_details`、`SpecTokensDetails`、`SglExt`）
+   配合 `python/sglang/srt/entrypoints/openai/utils.py:158-192`
+   （`spec_tokens_details_from_meta_info`、`process_spec_tokens_details_from_ret`）
+   支持把 speculative 接受率/长度等统计返回到 OpenAI chat/completions。
+   同文件 :586-628（`ChatCompletionMessageContentInputAudio`、
+   `ChatCompletionMessageContentAudioInlinePart`、`_to_audio_url_part`）接受 inline
+   base64 音频并统一为 data URI；`python/sglang/srt/entrypoints/openai/transcription_adapters/base.py:13-186`
+   （`TranscriptionAdapter`、`register_transcription_adapter`、`resolve_adapter`）和
+   `serving_transcription.py:65-129`（`OpenAIServingTranscription::create_transcription`）
+   引入可注册 ASR adapter。
+   `python/sglang/srt/utils/msgpack_utils.py:22-221`（`_pack_ext`、`enc_hook`、`dec_hook`、
+   `ext_hook`）及 `python/sglang/srt/managers/io_struct.py:2460-2476`
+   （`msgpack_encode`、`msgpack_decode`、`sock_send`、`sock_recv`）增加 tensor/SHM/CUDA-IPC
+   的 msgpack 传输；这会影响多模态 worker 和自定义 IPC 结构。
+   另外，`sampling_params.py:38、220-260（SamplingParams::normalize）` 增加 stop/regex
+   数量和长度上限，`serving_tokenize.py:39（OpenAIServingTokenize::_handle_non_streaming_request）`
+   修正 unlimited tokenizer context；旧客户端/扩展应检查错误码和返回字段。
+
+10. **调度观测接口。**
+    `python/sglang/srt/disaggregation/kv_events.py:139（resolve_load_pub_range）`、
+    `python/sglang/srt/managers/scheduler_components/load_publisher.py:114-193`
+    （`SchedulerLoadPublisher`、`SchedulerLoadPublisher::publish_load_stat`）新增
+    `--load-publish-endpoint`，由每个 scheduler 发布 running/waiting/token load；
+    这是 router/load-aware 部署的新 opt-in 协议，不改变默认调度路径。
 
 #### 10.9.3 升级时的最小核对清单
 
