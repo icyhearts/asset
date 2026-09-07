@@ -3999,3 +3999,15 @@ sglang code base 位于 /share/users/like/package/sglang_kernel_src
 以 release/v0.5.18 分支为基础， release/v0.5.19 分支做了哪些重要的修改?
 把答案追加到 like-useful/answer_codex_v5.md
 }
+
+{
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang/
+sglang 源码位于 /share/users/like/package/sglang_kernel_src
+sglang 以  editable 方式安装
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+simo 以 editable 方式安装.
+
+# simo 为了适配 sglang  release/v0.5.18-local-dep 分支做了修改， 只考虑 llama3.1-8B-Instruct + DeepSeek-V2-Lite-Chat-16B_A2.4B 模型，最新 commit  4da2709396207c241003db49085e516093a62df1, 加了_call_weight_loader 函数, 这个函数有必要加吗? 修改前的写法 original_weight_loader(param, packed_weight, **kwargs), 不够用吗 ？
+
+把答案追加到 like-useful/answer_codex_v4.md
+}

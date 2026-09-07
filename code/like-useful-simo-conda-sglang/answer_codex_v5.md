@@ -1101,15 +1101,17 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    Beam search 通过 `python/sglang/srt/sampling/sampling_params.py:74-76、157-159`
    （`SamplingParams::beam_width`、`SamplingParams::verify`）和
    `python/sglang/srt/beam_search/beam_group.py:60-160（BeamGroup::__init__、BeamGroup::advance_frontier）`
-   接入，但不支持 speculative、PD、page_size>1、DP/PP attention、HiCache、LoRA 等组合。
+  接入，但不支持 speculative、PD、page_size>1、DP/PP attention、HiCache、LoRA 等组合。
+   请求 fan-out 和 `n<=beam_width` 语义由 `python/sglang/srt/managers/io_struct.py:473-503（GenerateReqInput::_sampling_params_beam_width、GenerateReqInput::_handle_beam_search_parallel_sampling）` 处理；
+   它不是普通的 `sampling n`，每个 beam 会占用独立的 req-to-token row。
    DFlash2 candidate selector 位于 `python/sglang/srt/models/dflash.py:944-1140`
    （`CandidateSelector::build_lattice`、`DFlash2DraftModel::compute_candidates`）；
    expert-pack、EPD encoder 和新的音频/模型适配器则改变了工具入口与模型注册表，旧的
    `tools.expert_pack` 等 out-of-tree import 需要迁移到 package 内路径。
 
 9. **OpenAI/多模态协议和服务接口扩展。**
-   `python/sglang/srt/entrypoints/openai/protocol.py:356-432`
-   （`CompletionRequest::return_spec_tokens_details`、`SpecTokensDetails`、`SglExt`）
+   `python/sglang/srt/entrypoints/openai/protocol.py:355-449`
+   （`CompletionRequest::return_spec_tokens_details`、`ChatCompletionRequest::return_spec_tokens_details`、`SpecTokensDetails`、`SglExt`）
    配合 `python/sglang/srt/entrypoints/openai/utils.py:158-192`
    （`spec_tokens_details_from_meta_info`、`process_spec_tokens_details_from_ret`）
    支持把 speculative 接受率/长度等统计返回到 OpenAI chat/completions。
@@ -1126,6 +1128,9 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
    另外，`python/sglang/srt/sampling/sampling_params.py:38、220-260（SamplingParams::normalize）` 增加 stop/regex
    数量和长度上限，`python/sglang/srt/entrypoints/openai/serving_tokenize.py:39（OpenAIServingTokenize::_handle_non_streaming_request）`
    修正 unlimited tokenizer context；旧客户端/扩展应检查错误码和返回字段。
+   HTTP/2 并发窗口也变为可配置：commit `3904b309db` 在
+   `python/sglang/srt/server_args.py:1273-1288（ServerArgs::enable_http2、ServerArgs::http2_max_concurrent_streams、ServerArgs::http2_initial_connection_window_size）` 声明参数，
+   `python/sglang/srt/entrypoints/http_server.py:2449-2489`（HTTP server startup config）将其传给 Granian。
 
 10. **调度观测接口。**
     `python/sglang/srt/disaggregation/kv_events.py:139（resolve_load_pub_range）`、
@@ -1139,7 +1144,6 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
     indexer，以及 ZMQ KV-event -> gRPC 的 bridge；服务端抽象在
     `experimental/sgl-router/sgl-kv-indexer/src/service.rs:45-178`
     （`KvIndexerBackend`、`KvIndexerService::new`、`KvIndexerService::into_server`），
-   bridge 配置在 `.../src/bridge.rs:36-78（BridgeConfig::from_env）`。
     bridge 配置在 `experimental/sgl-router/sgl-kv-indexer/src/bridge.rs:36-78（BridgeConfig::from_env）`。
     `experimental/sgl-router/src/policies/cache_aware_zmq.rs:175-298`
     （`CacheAwareZmqPolicy::select`）可用 `--kv-indexer-endpoint` 查询最长 KV 前缀，
@@ -1160,14 +1164,26 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
     并行度、CUDA graph 和 shared-expert-fusion 约束，不能当作普通 checkpoint loader。
 
 13. **模型和 Diffusion 覆盖面扩大。**
-    v0.5.19 新增/完整接入 Ling-3.0-flash（`python/sglang/srt/models/bailing_moe_v3.py`）、
-    Qwen3.8、GLM-5.3-Flash、MiniCPM-SALA（`models/minicpm.py`）、
-    Dots3-Note Omni（`models/dots3_common/modeling.py` 与 `multimodal/processors/dots_note_omni.py`）、
-    Spark、LFM2-DSpark、Nemotron 3.5 Lightning、Granite SWA 等；同时 Diffusion 侧
-    增加按 component 的权重来源/精度 override、Comfy/NVFP4/INT8 混合 checkpoint、
-    cache-dit/offload、FLUX.2/Qwen-Image/MiniMax-H3/Cosmos3 等路径。它们主要是
-    新模型和新 pipeline 能力，不应与核心 autoregressive scheduler 的行为变化混为一谈；
-    但会扩大模型注册、权重格式和 native kernel 的兼容矩阵。
+    v0.5.19 新增/完整接入多个模型（commit `20621aa14b`、`8a1e6e4e46`、
+    `dfc40e0efe`、`092d85eb87`、`af39ad9349`、`0c42a44cd7`、`046454404a`、
+    `41e7612dee`、`70983bd7db`）。代表性实现及入口为：
+    `python/sglang/srt/models/bailing_moe_v3.py:1299-1719`
+    （`BailingMoeV3ForCausalLM`、`BailingMoeV3ForCausalLM::forward`、
+    `BailingMoeV3ForCausalLM::load_weights`）；
+   `python/sglang/srt/models/minicpm.py:517-563`
+   （`MiniCPMSALAForCausalLM`、`MiniCPMSALAForCausalLM::forward`、
+   `MiniCPMSALAForCausalLM::load_weights`）；
+    sparse attention backend 在 `python/sglang/srt/layers/attention/minicpm/backend.py:122（MiniCPMSparseBackend）`；
+    `python/sglang/srt/models/dots3_common/modeling.py:2719-2823`
+    （`DotsNoteOmniForConditionalGeneration`、`Dots3NoteForCausalLM`）和
+    `python/sglang/srt/multimodal/processors/dots_note_omni.py:179-373`
+    （`DotsNoteOmniProcessor`、`DotsNoteOmniProcessor::process_mm_data_async`）；
+    另有 Qwen3.8、GLM-5.3-Flash、Spark、LFM2-DSpark、Nemotron 3.5 Lightning、
+    Granite SWA 等模型及 speculative 适配。
+    Diffusion 侧同时增加按 component 的权重来源/精度 override、Comfy/NVFP4/INT8
+    混合 checkpoint、cache-dit/offload、FLUX.2/Qwen-Image/MiniMax-H3/Cosmos3 等路径。
+    这些主要是新模型和新 pipeline 能力，不应与核心 autoregressive scheduler 的行为
+    变化混为一谈；但会扩大模型注册、权重格式和 native kernel 的兼容矩阵。
 
 
 #### 10.9.3 升级时的最小核对清单
