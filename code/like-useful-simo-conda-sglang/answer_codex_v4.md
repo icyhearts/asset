@@ -1399,3 +1399,81 @@ loader 验证非空 id 被丢弃，一个用 Merged/QKV 风格三参数 loader �
 删除该函数。当前实现唯一需要留意的边界是 `inspect.signature` 无法反射的 opaque callable
 会静默走两参数 fallback；在本次两个模型的 Python bound-method loader 中不会触发，但若以后
 接入 C/C++ callable，最好改为显式报错而不是静默丢弃 shard id。
+
+### 5.10.7 对“原来的 `kwargs` 已经兼容 2/3 参数”的澄清
+
+这个判断有一半是对的：**对本次两个模型实际会遇到的 loader，父提交中的写法确实能够工作**；
+但它不是 Python 意义上的“自动按参数个数兼容”。关键在于 `**kwargs` 展开后传的是一个
+**关键字参数**，而不是无条件的第三个位置参数。
+
+文件：`simo/extensions/sglang_simo/quantization/quantization.py:973-1043，SIMOLinearMethod::get_weight_loader`
+（父提交 `4da2709^` 的对应代码为 `:941-1003`）。父提交的逻辑是：
+
+```python
+kwargs = {"loaded_shard_id": loaded_shard_id} \
+    if loaded_shard_id is not None else {}
+original_weight_loader(param, packed_weight, **kwargs)
+```
+
+它在 Python 中分别等价于：
+
+```python
+# loaded_shard_id is None
+original_weight_loader(param, packed_weight)
+
+# loaded_shard_id == "q"
+original_weight_loader(param, packed_weight, loaded_shard_id="q")
+```
+
+第二种调用只有在底层函数声明了名字为 `loaded_shard_id` 的形参，或声明了 `**kwargs` 时才会
+成功。它**不**等价于下面这个位置参数调用：
+
+```python
+original_weight_loader(param, packed_weight, "q")
+```
+
+因此，底层签名的行为是：
+
+| 底层签名 | `kwargs={}` | `kwargs={"loaded_shard_id": "q"}` |
+|---|---:|---:|
+| `f(param, weight)` | 成功 | `TypeError: unexpected keyword argument` |
+| `f(param, weight, loaded_shard_id=None)` | 成功 | 成功 |
+| `f(param, weight, shard_id=None)` | 成功 | `TypeError: unexpected keyword argument` |
+| `f(param, weight, **kwargs)` | 成功 | 成功 |
+
+也就是说，父提交的代码根据“id 是否为空”选择两参数或带关键字的调用，却没有根据
+`original_weight_loader` 的真实签名选择调用方式。若某一条路径把非空 id 送到只有两个形参的
+普通 loader，即使 Python 代码写了 `**kwargs`，也不会被忽略，函数体甚至不会开始执行。把 id
+改成第三个位置参数同样不能修复两参数 loader，只会变成 `too many positional arguments`。
+
+### 5.10.8 结合 v0.5.18 签名后的准确结论
+
+文件（相对于 `sglang_kernel_src` code base）：`python/sglang/srt/layers/linear.py`：
+
+- `:465-490，ColumnParallelLinear::weight_loader_v2` 和 `:1574-1602，RowParallelLinear::weight_loader_v2`
+  只有 `(param, loaded_weight)`；非空 id 传入父提交的 `**kwargs` 会失败。
+- `:863-941，MergedColumnParallelLinear::weight_loader_v2` 和 `:1139-1191，QKVParallelLinear::weight_loader_v2`
+  显式声明 `loaded_shard_id`；父提交的关键字传递完全正确，而且该 id 会参与 fused shard
+  的偏移计算。
+
+文件（相对于 `sglang_kernel_src` code base）：`python/sglang/srt/models/llama.py:829-900，LlamaForCausalLM::_legacy_load_weights`。
+`:830-836` 将 q/k/v、gate/up 映射到 fused 参数，`:873-884` 只对这些 fused 参数传第三个
+`shard_id`；普通 Column/Row 参数在 `:898` 以两个参数调用。
+
+文件（相对于 `sglang_kernel_src` code base）：`python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py:289-318，DeepseekV2WeightLoaderMixin::do_load_weights`。
+该路径只对 gate/up 的 fused 参数携带 shard id，普通 MLA 投影仍是两参数调用。因此对于用户
+限定的 Llama3.1-8B-Instruct、DeepSeek-V2-Lite、当前 legacy loader 和 TP=1，父提交的
+`kwargs` 写法的“id 与 loader 类型恰好匹配”，所以**原始写法足够，`_call_weight_loader` 不是
+这组测试严格必需的修复**。
+
+文件：`simo/extensions/sglang_simo/quantization/quantization.py:143-171，_call_weight_loader`。
+该函数的额外价值仅在于处理“非空 id 意外到达两参数 loader”的情况：`:159-171` 先检查
+签名，只有发现 `loaded_shard_id` 或 `**kwargs` 才转发，否则主动省略 id。故两种写法在当前
+目标调用图上结果相同，但在更换模型映射、启用另一套 loader 或未来 release 改变调用图时，
+`_call_weight_loader` 更稳妥；若目标始终严格限定这两个模型，也可以删除它并恢复父提交写法，
+不会改变量化算法本身。
+
+还要注意：`_call_weight_loader` 并非“所有三参数函数的通用适配器”。它和父提交一样只识别
+名为 `loaded_shard_id` 的关键字（另加 `**kwargs`）；如果未来出现第三参数名为 `shard_id` 或
+仅允许位置传参的 callable，两者都需要专门适配。当前 v0.5.18 的 Merged/QKV 签名正好使用
+`loaded_shard_id`，所以不存在这个边界问题。
