@@ -1013,26 +1013,70 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
 
 ### 10.9 对当前 DeepSeek V4 Flash 启动的解释
 
-用户现有日志给出的阶段时间是：旧版本 2026-07-02 的 target CUDA graph capture
-约 367 秒；v0.5.19 2026-09-01 的 target_verify capture 约 1149.44 秒，ready
-前 scheduler_e2e 约 1583 秒，其中 load_weight 约 123.26 秒、draft_decode
-25.40 秒、draft_extend 7.71 秒。
+用户脚本 like-useful/dsv4-flash-run.sh 的关键参数是：
 
-因此新增时间主要集中在首次 target_verify CUDA graph capture 及其内部
-kernel/JIT warmup，而不是权重加载。计时点对应
+- `--moe-runner-backend marlin`，本次不会采用 DSV4 auto
+  `flashinfer_mxfp4`；
+- `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`，不能把本次日志直接解释为
+  SGLang 主动执行 DeepGEMM 全量 precompile；
+- `--speculative-algorithm EAGLE`、`--speculative-num-steps 3__、
+  `--speculative-num-draft-tokens 4__，所以 target verify 每个请求宽度为 4；
+- 只设置 `--cuda-graph-max-bs-decode 16__。日志同时显示普通 prefill graph
+  disabled，发生的是 speculative target-verify decode graph capture。
+
+用户现有日志给出的阶段时间是：
+
+- 旧版本 2026-06-25：target CUDA graph capture 约 463.55 秒；
+- 旧版本 2026-07-02：约 367.48 秒；
+- v0.5.19 2026-09-01：target-verify capture 1149.44 秒
+  （18:12:27--18:31:37），ready 18:32:38；
+- v0.5.19 2026-09-03：同一阶段 1106.02 秒，说明不是单次偶然抖动；
+- v0.5.19 的 load_weight 只有 123.26 秒/88.94 秒，KV allocation 小于
+  0.1 秒，draft decode/extend 约 25.39+7.71 秒或 25.00+1.32 秒。
+
+因此“主要增加在哪一步”的证据结论是：**几乎全部集中在 target-verify CUDA
+graph capture（约 18--19 分钟），不是权重加载、KV allocation 或 draft graph。**
+计时入口是
 python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py:
-494-583（capture_decode_graph，其中 speculative target 的 memory_phase/name
-为 target_verify）和
+494-583（capture_decode_graph；speculative target 的 memory_phase/name 是
+target_verify）；它构造
+python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py:209-441
+（DecodeCudaGraphRunner::__init__），其中 :319-374 把 capture mode 固定为
+TARGET_VERIFY、num_tokens_per_req=4、batch buckets=[1,2,3,4,5,6,7,8,10,12,14,16]，
+随后 :486-493 执行 capture。运行时 graph replay 分支在
 python/sglang/srt/model_executor/model_runner.py:1729-1749
-（ModelRunner::_forward_raw 的 decode_cuda_graph_runner 分支）。非 CUDA-graph
-情况下的 extend/target_verify fallback 仍在同文件 :1774-1797。日志不能单独证明某一个 commit 是唯一根因，较
-合理的组合解释是：
+（ModelRunner::_forward_raw）。
 
-1. DSV4/DSA、Spec、MoE runner 使 target_verify 的 shape/bucket 组合增加；
-2. DeepGEMM 0.1.7、FlashInfer 0.6.18、Q8/top-k v2 使旧 JIT cache key 或 ABI
-   不再命中；
-3. capture 中首次编译新 kernel，并分配更大的 temporary workspace；
-4. local-rank lock 只消除重复 nvcc，不能消除首个 rank 的编译和 graph capture。
+**这次具体日志能排除或降级的解释：**
+
+1. Marlin 权重准备确实出现“Preparing MXFP4 experts for Marlin backend”，但
+   从阶段时间看只是秒级，不能解释 1100--1150 秒；
+2. DSV4 auto flashinfer_mxfp4 不是本次脚本路径，因为 runner 已显式指定 marlin；
+3. DeepGEMM 全量 precompile 被显式关闭；DeepGEMM 0.1.7 仍可能被其它被选中
+   kernel 间接使用，但需要日志证明，不能仅凭版本号归因；
+4. 普通 prefill CUDA graph 没有捕获，不能把这段时间叫作普通 prefill graph。
+
+**与 v0.5.19 差异最相关、但仍需 A/B 才能定因的改动：**
+
+1. b8a6adadfe 修复 speculative adaptive 启动并调整 graph capture 资源；相关
+   路径在 python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py:
+   209-441（DecodeCudaGraphRunner::__init__）。37c09ff3d8 引入 graph-pool
+   borrowing；实现位于 python/sglang/srt/model_executor/runner_utils/pool.py:
+   45-230（disable_graph_pool_borrow、graph_pool_capture_scope、
+   borrow_graph_pool），可能改变捕获期间的分配/回收和串行化。
+2. 9a9e167179、26fd7fdaa2、b77cac06a9 扩大/修正 FullCG、PP proxy、EAGLE
+   padding 和 metadata；这些变化会改变 target-verify graph 的初始化 shape、
+   capture stream 和临时 buffer。
+3. 4f761e8649 把 FlashInfer 升到 0.6.18，a3c4936438 让 TP ranks 的 autotune
+   tactic 一致；本次是否命中 FlashInfer kernel，要以启动日志中的 backend 和
+   autotune 行为为准。
+4. unified memory、ReqKvInfo 和 config pipeline 可能改变 graph 前的资源构造，
+   但当前日志中的 KV allocation <0.1 秒，暂时不是主要耗时点。
+
+所以目前不能声称“v0.5.19 一定是 DeepGEMM 或 Marlin 编译导致变慢”。更准确的
+结论是：**v0.5.19 的 speculative target-verify CUDA graph capture 路径在该
+脚本/硬件上显著变慢；根因候选包括 graph-pool/shape/metadata 变化和 capture
+内部首次 kernel 编译，需进一步拆分。**
 
 建议按以下顺序做 A/B：
 
@@ -1044,16 +1088,22 @@ python/sglang/srt/model_executor/model_runner.py:1729-1749
    放到 SGLANG_CACHE_DIR/deep_gemm，并在
    python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py:38-40
    （<top-level>）转给 DG_JIT_CACHE_DIR；所有 TP ranks 应看到同一个可写目录；
-3. 用完全相同的 launch 参数先运行 python -m sglang.compile_deep_gemm，比较
-   预热前后的 target_verify 时间；
-4. 只改变一个变量，分别比较禁用 prefill/target_verify graph、暂时关闭
-   speculative、明确 dsv4_prefill_backend=auto 和 dsa-topk-backend=sgl-kernel，
-   再单独打开 q8、FlashInfer fused top-k、top-k v2 或 FP4 runner；
-5. 保存 Capture begin/end、Entering DeepGEMM JIT Pre-Compile session、
+3. 以当前脚本参数做 graph A/B：保持 Marlin、EAGLE、TP=4 和
+   num_draft_tokens=4 不变，分别禁用 decode CUDA graph，或把
+   `--cuda-graph-max-bs-decode` 临时降到 1。若 1100 秒消失，便确认
+   瓶颈在 target-verify capture，而不是模型加载。
+4. 再逐项对照 graph pool、padding、FlashInfer autotune 和 DSA backend；不要同时
+   修改 speculative、MoE runner、cache 目录。
+5. DeepGEMM 预编译可作为独立实验，但当前脚本把它关闭，且显式 Marlin；只有
+   看到 DeepGEMM compile 日志后才把实验结果用于本次归因。
+6. 保存 Capture begin/end、Entering DeepGEMM JIT Pre-Compile session、
    DSV4_Q8KV8_SPARSE_PREFILL_HIT 和 FlashInfer autotune 日志，并按 branch、
    GPU、driver、第三方版本划分持久 cache。
 
 最终判断：v0.5.19 的主要编译契约变化来自 DeepGEMM/MegaMoE、DeepEPv2 和新的
-DSV4/DSA/FlashInfer JIT；Marlin 核心算法没有同等规模重写。结合现有日志，当前
-20--30 分钟增量首先应归到 target_verify graph 与冷 JIT/cache 的组合；只有日志
-明确显示 Marlin runner 的 prepare/build 时间时，才应把它单独归因于 Marlin。
+DSV4/DSA/FlashInfer JIT；Marlin 核心算法没有同等规模重写。结合当前脚本和日志，
+20--30 分钟增量首先应归到 **target_verify decode CUDA graph capture**；冷 JIT/cache
+是可能的内部因素，但当前 `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` 和显式
+Marlin 使“DeepGEMM 全量预编译”及“DSV4 auto 切到 FlashInfer MXFP4”都不是已
+证实的主因。只有日志明确显示 Marlin runner 的 prepare/build 长时间占用，才应
+把它单独归因于 Marlin。
