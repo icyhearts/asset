@@ -991,8 +991,7 @@ python/sglang/srt/environ.py:1587-1595
 （SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION，默认 false），workspace 入口在
 python/sglang/kernels/ops/communication/mnnvl_cutedsl_ar.py:96-150
 （MNNVLCuteDSLAllReduceFusionWorkspace::__init__）。它会构建大量 CuTe kernel，
-但只在 Qwen3.5/3.8 等匹配模型并显式打开时影响启动，不能用于解释默认 DSV4
-启动增量。
+但只在 Qwen3.5/3.8 等匹配模型并显式打开时才进入该路径；默认 DSV4 配置不受其影响。
 
 python/pyproject.toml 的硬依赖变化为：
 
@@ -1011,135 +1010,122 @@ _cargo_workspace_metadata）、:131-162（_discovered_rust_extensions）现在�
 PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 branch 不会
 自动同步这些二进制依赖。
 
-### 10.9 对当前 DeepSeek V4 Flash 启动的解释
+### 10.9 升级重点、兼容性与迁移建议
 
-用户脚本 like-useful/dsv4-flash-run.sh 的关键参数是：
+本节只总结 `release/v0.5.18` 到 `release/v0.5.19` 的代码、依赖和接口差异；不把某台机器的启动日志或缓存状态作为分支差异证据。
 
-- `--moe-runner-backend marlin`，本次不会采用 DSV4 auto
-  `flashinfer_mxfp4`；
-- `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`，不能把本次日志直接解释为
-  SGLang 主动执行 DeepGEMM 全量 precompile；
-- `--speculative-algorithm EAGLE`、`--speculative-num-steps 3`、
-  `--speculative-num-draft-tokens 4`，所以 target verify 每个请求宽度为 4；
-- 只设置 `--cuda-graph-max-bs-decode 16`。日志同时显示普通 prefill graph
-  disabled，发生的是 speculative target-verify decode graph capture。
+#### 10.9.1 影响优先级
 
-用户现有日志给出的阶段时间是：
+| 优先级 | v0.5.19 的变化 | 影响范围 |
+| --- | --- | --- |
+| P0 | DSV4/DSA 新 attention 路径、DeepGEMM 0.1.7、DeepEPv2、FP4 runner 选择 | DSV4、FP4 MoE、跨 GPU 专家并行的默认/可选执行路径 |
+| P0 | `ServerArgs` resolution pipeline、runtime config bags、统一 KV memory/tree | 自定义 scheduler、attention、PD/HiCache 和 out-of-tree 集成 |
+| P1 | speculative mixed chunk、adaptive draft、TP sync、FullCG/PP、graph-pool borrowing | EAGLE/DFlash/DSpark 的 shape、同步和 CUDA graph 资源 |
+| P1 | FlashInfer/CuTe DSL、AMD/XPU/NPU/CPU 后端扩展 | 硬件条件分支、native extension 和 JIT 编译输入 |
+| P2 | Rust server、EPD encoder、beam search、DFlash2 selector、新模型/音频接口 | opt-in 服务端、API 和模型覆盖面 |
 
-- 旧版本 2026-06-25：target CUDA graph capture 约 463.55 秒；
-- 旧版本 2026-07-02：约 367.48 秒；
-- v0.5.19 2026-09-01：target-verify capture 1149.44 秒
-  （18:12:27--18:31:37），ready 18:32:38；
-- v0.5.19 2026-09-03：同一阶段 1106.02 秒，说明不是单次偶然抖动；
-- v0.5.19 的 load_weight 只有 123.26 秒/88.94 秒，KV allocation 小于
-  0.1 秒，draft decode/extend 约 25.39+7.71 秒或 25.00+1.32 秒。
+#### 10.9.2 需要特别审计的行为变化
 
-因此“主要增加在哪一步”的证据结论是：**几乎全部集中在 target-verify CUDA
-graph capture（约 18--19 分钟），不是权重加载、KV allocation 或 draft graph。**
-计时入口是
-python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py:
-494-583（capture_decode_graph；speculative target 的 memory_phase/name 是
-target_verify）；它构造
-python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py:209-441
-（DecodeCudaGraphRunner::__init__），其中 :319-374 把 capture mode 固定为
-TARGET_VERIFY、num_tokens_per_req=4、batch buckets=[1,2,3,4,5,6,7,8,10,12,14,16]，
-随后 :486-493 执行 capture。运行时 graph replay 分支在
-python/sglang/srt/model_executor/model_runner.py:1729-1749
-（ModelRunner::_forward_raw）。
+1. **DSV4 FP4 的默认 runner 不再固定等同于 Marlin。**
+   `python/sglang/srt/arg_groups/model_overrides/deepseek_v4.py:20-76（_deepseek_v4_overrides）`
+   在 CUDA、非 HIP、SM90/100/120、FP4 experts、无 A2A、runner=auto 等条件满足时
+   选择 `flashinfer_mxfp4`；显式 `--moe-runner-backend marlin` 才保持 Marlin 路径。
+   同一 checkpoint 在升级前后的实际 kernel 集合可能不同，应把 runner 选择写入回归矩阵。
 
-**这次具体日志能排除或降级的解释：**
+2. **DSV4 sparse prefill 与 DSA top-k 从单一路径扩展为可配置后端。**
+   `python/sglang/srt/server_args.py:1777-1788（ServerArgs::dsv4_prefill_backend）`
+   增加 `flashmla_sparse_q8`；`python/sglang/srt/layers/attention/deepseek_v4_backend.py:1933-2122`
+   （`DeepseekV4AttnBackend::_prepare_q8kv8_q_and_sink`、
+   `DeepseekV4AttnBackend::_forward_prefill_sparse_q8kv8`）接入 Q8KV8 kernel。
+   `python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py:27-210`
+   （`DSATopKBackend::resolve`、`DSATopKBackend::topk_func`、
+   `DSATopKBackend::topk_transform`）增加 sgl-kernel/torch/FlashInfer 分流；默认仍是
+   sgl-kernel，只有显式参数或模型 override 才改变后端。
 
-1. Marlin 权重准备确实出现“Preparing MXFP4 experts for Marlin backend”，但
-   从阶段时间看只是秒级，不能解释 1100--1150 秒；
-2. DSV4 auto flashinfer_mxfp4 不是本次脚本路径，因为 runner 已显式指定 marlin；
-3. DeepGEMM 全量 precompile 被显式关闭；DeepGEMM 0.1.7 仍可能被其它被选中
-   kernel 间接使用，但需要日志证明，不能仅凭版本号归因；
-4. 普通 prefill CUDA graph 没有捕获，不能把这段时间叫作普通 prefill graph。
+3. **MoE 通信和量化布局发生实质扩展。**
+   `python/sglang/srt/layers/moe/mega_moe.py:48-122、257-408`
+   （`_mega_moe_mma_type`、`_get_mega_moe_symm_buffer`、`forward_mega_moe`、
+   `build_mega_moe_experts_weights`）增加 MXFP4 MMA 类型、SM 预留和新的 expert layout。
+   `python/sglang/srt/layers/moe/token_dispatcher/deepep_v2.py:136-461`
+   （`DeepEPv2Buffer::get_buffer`、`_DeepEPv2Impl::dispatch`、
+   `_DeepEPv2Impl::combine`、`DeepEPv2Dispatcher::dispatch/combine`）引入 ElasticBuffer
+   A2A；对应 `python/sglang/srt/layers/moe/moe_runner/deep_gemm.py:1566-1722`
+   增加 permute/unpermute。DeepEPv2 要求 DeepGEMM runner，不能直接和任意旧 runner 组合。
+   `python/sglang/srt/layers/moe/moe_runner/runner.py:33-150`
+   （`register_moe_runner_core`、`MoeRunner::__init__`）开放 runner core 注册，私有
+   monkey-patch/自定义 runner 需要重新验证接口。
 
-**与 v0.5.19 差异最相关、但仍需 A/B 才能定因的改动：**
+4. **DeepGEMM 编译契约和依赖版本升级。**
+   `python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py:120-260`
+   （`_local_rank_compile_lock`、`_maybe_compile_deep_gemm_one_type_all`、
+   `_compile_deep_gemm_one_type_all`）新增本地 rank 锁和新的 M/SM 编译组合；
+   `python/sglang/compile_deep_gemm.py:63-204`
+   （`warm_up_compile`、`compile_server_args`）改为先解析一次 ServerArgs 再预编译。
+   `python/pyproject.toml:42-44、77-85` 把 FlashInfer、Humming、DeepEP、DeepGEMM、
+   TileLang、tokenizers 等 pin 到 v0.5.19 对应版本；旧 wheel 或旧 native extension
+   不能视为等价运行时。
 
-1. b8a6adadfe 修复 speculative adaptive 启动并调整 graph capture 资源；相关
-   路径在 python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py:
-   209-441（DecodeCudaGraphRunner::__init__）。37c09ff3d8 引入 graph-pool
-   borrowing；实现位于 python/sglang/srt/model_executor/runner_utils/pool.py:
-   45-230（disable_graph_pool_borrow、graph_pool_capture_scope、
-   borrow_graph_pool），可能改变捕获期间的分配/回收和串行化。
-2. 9a9e167179、26fd7fdaa2、b77cac06a9 扩大/修正 FullCG、PP proxy、EAGLE
-   padding 和 metadata；这些变化会改变 target-verify graph 的初始化 shape、
-   capture stream 和临时 buffer。
-3. 4f761e8649 把 FlashInfer 升到 0.6.18，a3c4936438 让 TP ranks 的 autotune
-   tactic 一致；本次是否命中 FlashInfer kernel，要以启动日志中的 backend 和
-   autotune 行为为准。
-4. unified memory、ReqKvInfo 和 config pipeline 可能改变 graph 前的资源构造，
-   但当前日志中的 KV allocation <0.1 秒，暂时不是主要耗时点。
+5. **Speculative 和 CUDA graph 的资源/状态模型扩大。**
+   `python/sglang/srt/speculative/spec_info.py:132-143、242-263`
+   （`SpeculativeAlgorithm::supports_mixed_chunk`、
+   `SpeculativeAlgorithm::resolve_max_speculative_num_draft_tokens`）支持 mixed chunk
+   并把候选步数转换为运行时容量；`python/sglang/srt/speculative/spec_tp_sync.py:14-129`
+   （`SpecTpSyncSite`、`SpecTpSync::sync`）增加 target/draft 等同步站点。
+   `python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py:284-491`
+   （`capture_prefill_graph`）和 `python/sglang/srt/model_executor/runner_utils/pool.py:45-230`
+   （`graph_pool_capture_scope`、`borrow_graph_pool`）扩展 FullCG、PP proxy 和 graph-pool
+   生命周期；自定义 graph shape、memory pool 或 speculative runner 必须重新检查。
 
-所以目前不能声称“v0.5.19 一定是 DeepGEMM 或 Marlin 编译导致变慢”。更准确的
-结论是：**v0.5.19 的 speculative target-verify CUDA graph capture 路径在该
-脚本/硬件上显著变慢；根因候选包括 graph-pool/shape/metadata 变化和 capture
-内部首次 kernel 编译，需进一步拆分。**
+6. **KV/HiCache 从分散配置转向统一所有权和字节容量模型。**
+   `python/sglang/srt/managers/schedule_batch.py:848-900（ReqKvInfo）`、
+   `python/sglang/srt/managers/schedule_batch.py:1330-1335（Req::effective_kv_committed_len）`
+   统一请求侧 KV 元数据；`python/sglang/srt/mem_cache/unified_memory_pool.py:293-345、1810-1970`
+   （`UnifiedKVPool::__init__`、`init_unified_mamba_swa_pools`）按字节预算管理多种 view。
+   unified radix tree 成为默认，Rust TreeCore 注册于
+   `python/sglang/srt/mem_cache/unified_cache/tree_core_registry.py:57-75`
+   （`create_tree_core`）；external linker/attachment 位于
+   `python/sglang/srt/mem_cache/unified_cache/unified_cache_linker.py:51-112`
+   （`UnifiedCacheLinker`）和 `storage_attachment.py:37-165`。
 
-#### 10.9.1 缓存路径交互：这次慢启动的直接取证
+7. **配置读取语义和可选 Rust 前端改变。**
+   `python/sglang/srt/server_args.py:3663-3719`
+   （`ServerArgs::__post_init__`、`ServerArgs::resolve_once`、`ServerArgs::resolved_dict`）
+   将原始参数和解析结果分开；`python/sglang/srt/arg_groups/pipeline.py:26-110、340-370`
+   （`run_resolution_pipeline`）及 `python/sglang/srt/runtime_context.py:798-1060`
+   （`_build_config_bags`、`RuntimeContext::set_server_args`、`RuntimeContext::override`）
+   负责运行时 bags。扩展代码不应继续假设直接写 `server_args.foo` 就能同步全部运行时状态。
+   `SGLANG_RUST_SERVER` 默认仍为 false；打开后才使用
+   `python/sglang/srt/rust_server/server.py:47-229（RustServer::launch、RustServer::drain）`。
 
-慢日志与后续热日志还显示了一个必须从分支回归中单独拆出的环境因素：
+8. **新增 API/模型能力有明确约束。**
+   Beam search 通过 `python/sglang/srt/sampling/sampling_params.py:74-76、157-159`
+   （`SamplingParams::beam_width`、`SamplingParams::verify`）和
+   `python/sglang/srt/beam_search/beam_group.py:60-160（BeamGroup::__init__、BeamGroup::advance_frontier）`
+   接入，但不支持 speculative、PD、page_size>1、DP/PP attention、HiCache、LoRA 等组合。
+   DFlash2 candidate selector 位于 `python/sglang/srt/models/dflash.py:944-1140`
+   （`CandidateSelector::build_lattice`、`DFlash2DraftModel::compute_candidates`）；
+   expert-pack、EPD encoder 和新的音频/模型适配器则改变了工具入口与模型注册表，旧的
+   `tools.expert_pack` 等 out-of-tree import 需要迁移到 package 内路径。
 
-- 2026-09-01/09-03 的慢启动在 `/softhome/like/.cache/sglang/jit` 下运行；该路径的上层
-  `/softhome/like/.cache` 是指向 `/share_data/users/like/.cache` 的符号链接。
-  18:12--18:18 几乎每个 DSV4/Marlin JIT module 都出现 4 份构建记录，正好对应 TP=4
-  的 rank；`moe_wna16_marlin_bf16_t_false_false` 单个模块约 214 秒，模块之间还会串行。
-- 后续使用 `/data/like/cache/sglang_jit` 的运行只有一个 module leaf；首次构建后 target-verify
-  graph 约 378 秒，热启动约 9--10 秒。这说明缓存命中状态足以解释大部分 1100 秒级差异。
+#### 10.9.3 升级时的最小核对清单
 
-代码链（相对 SGLang code base `/share/users/like/package/sglang_kernel_src`）：
+1. 以 `release/v0.5.19` 的 `python/pyproject.toml`、Dockerfile 和 `setup.py` 同步
+   Python wheel、CUDA/ROCm 扩展、Rust/PyO3 扩展；editable install 只解决源码指向，
+   不会自动替换已安装的第三方二进制包。
+2. 固定并记录 `dsv4_prefill_backend`、DSA target/draft top-k backend、
+   `moe_runner_backend`、`moe_a2a_backend`、speculative 算法和 HiCache/radix 设置，
+   再比较功能与性能；不要用 `auto` 结果推断两个分支一定走同一 kernel。
+3. 对自定义 attention/PD/LoRA/runner 适配代码，按 `ReqKvInfo`、resolution views/bags、
+   `DispatchMoeRunnerCore` 和 unified linker 的新接口做编译与单元测试。
+4. 按目标 GPU 检查对应 native wheel 和开关：NVIDIA 的 FlashInfer/CuTe DSL，AMD 的
+   ROCm10/gfx1250，XPU/NPU/CPU 的专用量化和 attention 路径；不匹配的平台应验证
+   fallback，而不是复用另一平台的 JIT/native cache。
+5. 将 v0.5.18 共有的提交与真正的 v0.5.18→v0.5.19 新提交分开记录。例如
+   content-addressed JIT loader `b784726863` 已在两个 release branch 中存在，
+   不能把它列为 v0.5.19 独有改动；真正的新依赖和上述新后端则应在升级记录中单独 pin。
 
-- `python/sglang/kernels/jit/utils/compile/loader.py:128-169（load_jit）` 在私有
-  `.staging-` UUID 目录中构建，然后调用 `cache.commit_build`；:157 创建 staging，
-  :159--168 扫描依赖并提交，:170--171 删除 staging。
-- `python/sglang/kernels/jit/utils/compile/cache.py:463-486（_to_entries）` 会先把
-  depfile candidate 做 `path.resolve()`（:474--478），但 :479 用未 resolve 的 `build_dir` 执行
-  `path.is_relative_to(build_dir)`。在本机，candidate 解析为 `/share_data/.../.staging-UUID/cuda.cu`，
-  而 build_dir 仍是 `/softhome/...` 拼法，比较失败，临时生成的 `cuda.cu` 被写进
-  `sgl_deps.json`。UUID 每次变化，`find_prebuilt` 就会判定旧 leaf 无效并重新编译。
-- 引入这套 content-addressed loader 的 commit `b784726863` 在 v0.5.18 和 v0.5.19 两个分支
-  中都已存在，因此这是符号链接/缓存路径交互的既有问题，不应冒充 v0.5.19 新增功能；
-  但 v0.5.19 新增或改变了 DSV4、DSA、Marlin 相关 JIT module 和依赖键，缓存失效时暴露得更明显。
-
-因此，当前证据应分两层表述：**观察到的新增耗时仍发生在 target-verify decode graph capture；
-该 capture 内部的主要实际工作是因缓存未命中而重复编译 JIT module。** 这比笼统归因于
-DeepGEMM 全量预编译或 Marlin 算法改写更符合日志；当前脚本显式 `--moe-runner-backend marlin` 且
-`SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`，同时没有证据显示 DeepGEMM 全量 precompile 是耗时源头。
-
-在不修改源码的前提下，建议把 JIT cache 和相关 `SGLANG_CACHE_DIR` 统一到真实、可写且不经过
-符号链接的目录（例如 `/data/like/cache/sglang_jit`），并用 `SGLANG_JIT_CACHE_DEBUG=1` 跑一次。
-检查每个 leaf 的 `sgl_deps.json` 是否仍含 `.staging-<UUID>/cuda.cu`；不要把不同 branch、
-GPU 或第三方 wheel 共用未经核对的旧 cache。若要做本地验证性修补，可在 `_to_entries` 入口先将
-`build_dir = build_dir.resolve()`，但这不属于本次文档请求，也不应据此改写分支归因。
-
-建议按以下顺序做 A/B：
-
-1. 在 /share_data/users/like/miniconda3/envs/simo_sglang/ 中确认
-   import sglang 的路径、FlashInfer/DeepGEMM/DeepEP/Humming/Torch 实际版本；
-2. 检查 SGLANG_CACHE_DIR、SGLANG_JIT_CACHE_DIR、SGLANG_DG_CACHE_DIR、
-   SGLANG_JIT_CACHE_DEBUG。v0.5.19 在
-   python/sglang/srt/environ.py:1073-1093（<top-level>）默认把 DeepGEMM cache
-   放到 SGLANG_CACHE_DIR/deep_gemm，并在
-   python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py:38-40
-   （<top-level>）转给 DG_JIT_CACHE_DIR；所有 TP ranks 应看到同一个可写目录；
-3. 以当前脚本参数做 graph A/B：保持 Marlin、EAGLE、TP=4 和
-   num_draft_tokens=4 不变，分别禁用 decode CUDA graph，或把
-   `--cuda-graph-max-bs-decode` 临时降到 1。若 1100 秒消失，便确认
-   瓶颈在 target-verify capture，而不是模型加载。
-4. 再逐项对照 graph pool、padding、FlashInfer autotune 和 DSA backend；不要同时
-   修改 speculative、MoE runner、cache 目录。
-5. DeepGEMM 预编译可作为独立实验，但当前脚本把它关闭，且显式 Marlin；只有
-   看到 DeepGEMM compile 日志后才把实验结果用于本次归因。
-6. 保存 Capture begin/end、Entering DeepGEMM JIT Pre-Compile session、
-   DSV4_Q8KV8_SPARSE_PREFILL_HIT 和 FlashInfer autotune 日志，并按 branch、
-   GPU、driver、第三方版本划分持久 cache。
-
-最终判断：v0.5.19 的主要编译契约变化来自 DeepGEMM/MegaMoE、DeepEPv2 和新的
-DSV4/DSA/FlashInfer JIT；Marlin 核心算法没有同等规模重写。结合当前脚本和日志，
-20--30 分钟增量首先应归到 **target_verify decode CUDA graph capture**；冷 JIT/cache
-是可能的内部因素，但当前 `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` 和显式
-Marlin 使“DeepGEMM 全量预编译”及“DSV4 auto 切到 FlashInfer MXFP4”都不是已
-证实的主因。只有日志明确显示 Marlin runner 的 prepare/build 长时间占用，才应
-把它单独归因于 Marlin。
+综上，v0.5.19 的核心变化不是某一个 kernel 的小修补，而是 DSV4/DSA attention、
+DeepGEMM/MegaMoE、DeepEPv2、speculative graph、统一 KV/cache、配置解析和多平台
+构建链的同步扩展。对现有部署最可能产生行为变化的两个开关是 DSV4 FP4 的 auto
+runner 选择和 DeepEPv2/MoE runner 组合；对现有扩展最需要改代码的是 ServerArgs
+resolution/bags、ReqKvInfo 和 runner core 接口。
