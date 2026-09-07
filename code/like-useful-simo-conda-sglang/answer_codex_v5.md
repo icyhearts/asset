@@ -1019,9 +1019,9 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
   `flashinfer_mxfp4`；
 - `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`，不能把本次日志直接解释为
   SGLang 主动执行 DeepGEMM 全量 precompile；
-- `--speculative-algorithm EAGLE`、`--speculative-num-steps 3__、
-  `--speculative-num-draft-tokens 4__，所以 target verify 每个请求宽度为 4；
-- 只设置 `--cuda-graph-max-bs-decode 16__。日志同时显示普通 prefill graph
++ `--speculative-algorithm EAGLE`、`--speculative-num-steps 3`、
+  `--speculative-num-draft-tokens 4`，所以 target verify 每个请求宽度为 4；
++ 只设置 `--cuda-graph-max-bs-decode 16`。日志同时显示普通 prefill graph
   disabled，发生的是 speculative target-verify decode graph capture。
 
 用户现有日志给出的阶段时间是：
@@ -1077,6 +1077,42 @@ python/sglang/srt/model_executor/model_runner.py:1729-1749
 结论是：**v0.5.19 的 speculative target-verify CUDA graph capture 路径在该
 脚本/硬件上显著变慢；根因候选包括 graph-pool/shape/metadata 变化和 capture
 内部首次 kernel 编译，需进一步拆分。**
+
+#### 10.9.1 缓存路径交互：这次慢启动的直接取证
+
+慢日志与后续热日志还显示了一个必须从分支回归中单独拆出的环境因素：
+
+- 2026-09-01/09-03 的慢启动在 `/softhome/like/.cache/sglang/jit` 下运行；该路径的上层
+  `/softhome/like/.cache` 是指向 `/share_data/users/like/.cache` 的符号链接。
+  18:12--18:18 几乎每个 DSV4/Marlin JIT module 都出现 4 份构建记录，正好对应 TP=4
+  的 rank；`moe_wna16_marlin_bf16_t_false_false` 单个模块约 214 秒，模块之间还会串行。
+- 后续使用 `/data/like/cache/sglang_jit` 的运行只有一个 module leaf；首次构建后 target-verify
+  graph 约 378 秒，热启动约 9--10 秒。这说明缓存命中状态足以解释大部分 1100 秒级差异。
+
+代码链（相对 SGLang code base `/share/users/like/package/sglang_kernel_src`）：
+
+- `python/sglang/kernels/jit/utils/compile/loader.py:128-169（load_jit）` 在私有
+  `.staging-` UUID 目录中构建，然后调用 `cache.commit_build`；:157 创建 staging，
+  :159--168 扫描依赖并提交，:170--171 删除 staging。
+- `python/sglang/kernels/jit/utils/compile/cache.py:463-486（_to_entries）` 会先把
+  depfile candidate 做 `path.resolve()`（:474--478），但 :479 用未 resolve 的 `build_dir` 执行
+  `path.is_relative_to(build_dir)`。在本机，candidate 解析为 `/share_data/.../.staging-UUID/cuda.cu`，
+  而 build_dir 仍是 `/softhome/...` 拼法，比较失败，临时生成的 `cuda.cu` 被写进
+  `sgl_deps.json`。UUID 每次变化，`find_prebuilt` 就会判定旧 leaf 无效并重新编译。
+- 引入这套 content-addressed loader 的 commit `b784726863` 在 v0.5.18 和 v0.5.19 两个分支
+  中都已存在，因此这是符号链接/缓存路径交互的既有问题，不应冒充 v0.5.19 新增功能；
+  但 v0.5.19 新增或改变了 DSV4、DSA、Marlin 相关 JIT module 和依赖键，缓存失效时暴露得更明显。
+
+因此，当前证据应分两层表述：**观察到的新增耗时仍发生在 target-verify decode graph capture；
+该 capture 内部的主要实际工作是因缓存未命中而重复编译 JIT module。** 这比笼统归因于
+DeepGEMM 全量预编译或 Marlin 算法改写更符合日志；当前脚本显式 `--moe-runner-backend marlin` 且
+`SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`，同时没有证据显示 DeepGEMM 全量 precompile 是耗时源头。
+
+在不修改源码的前提下，建议把 JIT cache 和相关 `SGLANG_CACHE_DIR` 统一到真实、可写且不经过
+符号链接的目录（例如 `/data/like/cache/sglang_jit`），并用 `SGLANG_JIT_CACHE_DEBUG=1` 跑一次。
+检查每个 leaf 的 `sgl_deps.json` 是否仍含 `.staging-<UUID>/cuda.cu`；不要把不同 branch、
+GPU 或第三方 wheel 共用未经核对的旧 cache。若要做本地验证性修补，可在 `_to_entries` 入口先将
+`build_dir = build_dir.resolve()`，但这不属于本次文档请求，也不应据此改写分支归因。
 
 建议按以下顺序做 A/B：
 
