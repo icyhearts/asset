@@ -1374,12 +1374,12 @@ SIMOLinearMethod::get_weight_loader` 包装。包装器因此必须同时处理�
 `python/sglang/srt/environ.py:293，环境变量 SGLANG_ENABLE_WEIGHT_LOADER_V2` 的默认值是
 `False`。本次 `llm_eval_online_quant.sh` 没有打开它；在默认 legacy 路径中，Llama 的
 第三参数映射落到 QKV/Merged 层，DeepSeek 的第三参数映射落到 `gate_up_proj`，普通层走
-两参数路径。因此在严格限定的两模型测试中，旧写法并非严格必需。一个旁证是：
+两参数路径。因此在严格限定的两模型测试中，旧写法并非严格必需。此前的
 `temp/llm_eval_online_quant.sh...TASKS_mmlu...2026_09_04___15_43_28` 和
-`...TASKS_gsm8k...2026_09_04___15_40_59` 的评测在 15:43/15:44 开始，而 commit
-`4da2709` 在 16:32 才创建；两份日志均完成全部 42 个 run，未出现
-`loaded_shard_id` 的 `TypeError`。这说明该调用图中实际没有把非空 id 传给两参数普通 loader
-（需要注意：若测试前在工作树中已经存在未提交的同等修改，时间证据只能作为旁证）。
+`...TASKS_gsm8k...2026_09_04___15_40_59` 日志确实完成了评测且没有出现
+`loaded_shard_id` 的 `TypeError`，但不能据此证明测试使用的是 commit 前的 direct-call
+实现：日志中已经出现由工作树未提交改动产生的 SIMO patch 日志，而 commit `4da2709` 是之后
+才创建的。因此这些日志只能证明整体调用流程成功，不能作为删除 helper 的严格回归证明。
 
 但 `SIMOLinearMethod` 是通用 quant method，不能把这个调用图假设写成全局接口保证。建议
 保留 `_call_weight_loader`，因为它改动小、只影响启动加载、不会改变量化数值，而且覆盖了：
