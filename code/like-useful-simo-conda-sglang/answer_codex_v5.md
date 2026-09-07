@@ -804,16 +804,16 @@ stem 等）明细写入 YAML。
 
    python/sglang/srt/layers/moe/moe_runner/runner.py:33-50
    （register_moe_runner_core）及 :53-150（MoeRunner::__init__）增加自定义
-   runner core 注册接口；基类在
+   runner core 注册接口；直接接收 dispatch 表示的接口基类在
    python/sglang/srt/layers/moe/moe_runner/base.py:117-134
-   （MoeRunnerCore）。旧的私有 runner/monkey-patch 需要审计。
+   （DispatchMoeRunnerCore）。旧的私有 runner/monkey-patch 需要审计。
 
    Marlin 核心算法在本范围内没有同等级重写。其变化主要是
    python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py:130-167
    （Mxfp4MarlinMoEMethod::process_weights_after_loading）的 SM90/SM120 和
    block-32 检查，以及 python/sglang/srt/layers/quantization/mxfp4.py:617-644、
-   :1458-1478（Mxfp4WeightQuantMethod::process_weights_after_loading、
-   Mxfp4WeightQuantMethod::_apply_marlin）。因此只有显式选择 Marlin 或其它模型
+   :1458-1478（Mxfp4MoEMethod::process_weights_after_loading、
+   Mxfp4MoEMethod::_apply_marlin）。因此只有显式选择 Marlin 或其它模型
    选中该 runner 时才会走 Marlin；DSV4 FP4 auto 通常优先 FlashInfer MXFP4。
 
 5. **FlashInfer FP4 后端增加。**
@@ -875,7 +875,7 @@ stem 等）明细写入 YAML。
    router。
 
 6. a3c4936438 让 FlashInfer autotune tactic 在 TP ranks 一致；路径在
-   python/sglang/srt/utils/flashinfer_autotune.py:177-285。额外 EXTEND dummy
+   python/sglang/srt/model_executor/runner/flashinfer_autotune.py:177-285。额外 EXTEND dummy
    autotune 由 python/sglang/srt/environ.py:993-997
    （SGLANG_FLASHINFER_AUTOTUNE_EXTEND）控制，v0.5.19 默认 false。
 
@@ -937,8 +937,9 @@ stem 等）明细写入 YAML。
 
 3. 8a123cbd0e 重构 EPD encoder disaggregation。入口包括
    python/sglang/srt/disaggregation/encoder/http_server.py:264
-   （handle_encode_request）、runtime.py:101（EncoderScheduler）、
-   :353（EncoderRuntime）和 python/sglang/srt/entrypoints/server.py:2012
+   （handle_encode_request）、
+   python/sglang/srt/disaggregation/encoder/runtime.py:101（EncoderScheduler）、
+   :353（EncoderRuntime）和 python/sglang/srt/disaggregation/encoder/server.py:2012
    （run_encoder）。它主要影响 multimodal/encoder-only PD。
 
 ### 10.8 硬件和依赖
@@ -984,12 +985,14 @@ PyTorch ABI、FlashInfer/DeepGEMM wheel 必须一起重建或核对；只切换 
 前 scheduler_e2e 约 1583 秒，其中 load_weight 约 123.26 秒、draft_decode
 25.40 秒、draft_extend 7.71 秒。
 
-因此新增时间主要集中在首次 target_verify/full-prefill CUDA graph capture 及其
-内部 kernel/JIT warmup，而不是权重加载。计时点对应
+因此新增时间主要集中在首次 target_verify CUDA graph capture 及其内部
+kernel/JIT warmup，而不是权重加载。计时点对应
 python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py:
-471-491（capture_prefill_graph）和
-python/sglang/srt/model_executor/model_runner.py:1783-1795
-（ModelRunner::_forward_raw）。日志不能单独证明某一个 commit 是唯一根因，较
+494-583（capture_decode_graph，其中 speculative target 的 memory_phase/name
+为 target_verify）和
+python/sglang/srt/model_executor/model_runner.py:1729-1749
+（ModelRunner::_forward_raw 的 decode_cuda_graph_runner 分支）。非 CUDA-graph
+情况下的 extend/target_verify fallback 仍在同文件 :1774-1797。日志不能单独证明某一个 commit 是唯一根因，较
 合理的组合解释是：
 
 1. DSV4/DSA、Spec、MoE runner 使 target_verify 的 shape/bucket 组合增加；
