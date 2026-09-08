@@ -1429,6 +1429,9 @@ temp/env-offlie-infer.sh
   `python/sglang/srt/arg_groups/overrides.py:1158-1163（_deepseek_v4_overrides）` 对
   `device="sipu"` 保留 prefill/decode 的 `dsv4` backend，不把 DSV4 错误地降成普通
   `sipu` DSA/MHA backend。
+  DSV4 自己的频率表由 `python/sglang/srt/models/deepseek_v4.py:643-652（MqaAttentionBase::__init__）`
+  按 `config.max_position_embeddings` 计算后移动到 SIPU；这与通用 RotaryEmbedding
+  仍在 CPU 初始化的 workaround 是两条不同路径。
   当启用 TileLang MHC 时，`python/sglang/srt/models/deepseek_v4.py:1715-1810（DeepseekV4DecoderLayer::hc_pre）`
   和 `python/sglang/srt/models/deepseek_v4.py:1850-1876（DeepseekV4DecoderLayer::hc_post）`
   会把 SIPU 的 MHC pre/post 改调用 `sgl_kernel.mhc_pre_tilelang`/
@@ -1560,6 +1563,9 @@ temp/env-offlie-infer.sh
   SIPU 的 CPU embedding/lm_head、attention 或量化分支；
   `python/sglang/srt/speculative/draft_utils.py:278-295（DraftBackendFactory::_create_sipu_decode_backend、
   DraftBackendFactory::_create_sipu_prefill_backend）` 增加 SIPU speculative backend。
+  `README.md:12-16（News）` 和 `docs-sipu/supported-models.md:1-17（支持模型清单）`
+  将覆盖面记为 81 个模型；这是模型/测试 inventory，不等价于所有模型都已通过
+  多卡或真实芯片验证。
 - `python/sglang/check_env.py:417-475（SIPUEnv::__init__、SIPUEnv::get_info、
   SIPUEnv::get_device_info、SIPUEnv::_get_sipu_version_info）` 增加环境诊断，能输出
   `torch_sipu`、`sgl-kernel`、SDK/CModel 和设备能力。

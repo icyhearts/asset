@@ -4090,3 +4090,12 @@ else 使用 /tmp/like 作为保底，并给出 warning
 
 把答案追加到 like-useful/answer_claude_v3.md 
 }
+{
+从 /share/users/like/bjhost.PNG 读取主机和ip,  加到 /softhome/like/.ssh//config里面，风格和现在的 /softhome/like/.ssh//config里面保持一致，Host 标题取 png 文件的 主机名，HostName  取自 png文件的 ip地址，其他的 
+```
+  Port 22
+  User like
+```
+# 如果现在的文件一级标题 Host字段已经存在， 比如 node22 已经,用 png里面的 主机名和 ip地址更新这个字段, 并把这一个主机搬到文件末尾和  png 里面保持一致顺序
+# png 里面的主机添加到 /softhome/like/.ssh//config里面，顺序保持和 png 文件顺序一致
+}
