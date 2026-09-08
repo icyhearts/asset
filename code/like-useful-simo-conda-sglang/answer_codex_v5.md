@@ -1847,3 +1847,362 @@ quantization=simo
 
 所以该 if 的目的，是只放行输出普通 tensor 的下游线性层；对需要量化输入语义的线性层
 明确报告未实现，避免静默走未经验证的数值或布局路径。
+
+## 13. `torch.ops.sgl_kernel.rmsnorm.default` 的真实实现与调用链
+
+### 13.1 先确定本次运行使用的 code base
+
+本节的 `sgl-kernel-sipu` code base 根目录是容器内的
+`/sgl-workspace/sgl-kernel-sipu`，因此下面所有 `sgl_kernel/...`、`csrc/...` 和
+`sikernel/...` 路径都相对于这个根目录；SGLang 的相对路径相对于
+`/sgl-workspace/sglang`。
+
+`docker inspect sipu-dev` 的关键挂载是：
+
+```text
+/share/users/like/package/sglang_sipu -> /sgl-workspace/sglang       (rw)
+/share                         -> /share                            (rw)
+/share_data/torch_sipu         -> /share_data/torch_sipu             (ro)
+/share_data/sicx_sdk           -> /share_data/sicx_sdk               (ro)
+/share_data/arch_cmodel_release -> /share_data/arch_cmodel_release   (ro)
+```
+
+`/sgl-workspace/sgl-kernel-sipu` 本身不是上述 bind mount，而是镜像内的目录。执行
+`source /sgl-workspace/sglang/temp/env-offlie-infer.sh` 时，
+`temp/env-offlie-infer.sh:1-4（顶层脚本）` 会 source 该目录的 `setup.sh`；容器中
+`sgl_kernel` 的 editable finder 也明确把包映射到
+`/sgl-workspace/sgl-kernel-sipu/sgl_kernel`。因此，本题给出的
+`/sgl-workspace/sgl-kernel-sipu/sgl_kernel/element_wise.py:91` 是实际导入的文件。
+宿主机挂载树中另有 `/sgl-workspace/sglang/sgl-kernel-sipu`，但它不是这次 Python
+import 命中的那一份，不能混用两份文件的行号。
+
+容器中实际检查到的对象位置和 dispatcher 结果为：
+
+```text
+sgl_kernel.__file__
+  /sgl-workspace/sgl-kernel-sipu/sgl_kernel/__init__.py
+sgl_kernel.common_ops
+  /sgl-workspace/sgl-kernel-sipu/sgl_kernel/common_ops.cpython-310-x86_64-linux-gnu.so
+schema
+  sgl_kernel::rmsnorm(Tensor($0! -> ) output, Tensor input,
+                      Tensor weight, float eps, bool enable_pdl) -> ()
+dispatch
+  PrivateUse1: registered at
+  /sgl-workspace/sgl-kernel-sipu/csrc/common_extension.cc:266 [kernel]
+```
+
+所以 `torch.ops.sgl_kernel.rmsnorm.default` 中的 `.default` 只是 PyTorch
+`OpOverloadPacket` 选择默认 overload 的写法，不是一个 Python 实现文件名；真正执行
+哪个函数由 dispatcher 按输入 tensor 的 device 选择。
+
+### 13.2 Python 入口：`rmsnorm`
+
+`sgl_kernel/element_wise.py:42-102（rmsnorm）` 是用户态 facade。它的职责是准备
+输入和输出，随后把工作交给 C++ custom op，而不是在 Python 中逐元素实现 native
+SIPU 路径。
+
+1. `sgl_kernel/element_wise.py:49-67（rmsnorm）` 先检查最后一维的总字节数是否为
+   1024 的倍数。若不满足，则把 `input`、`weight` 拷到 CPU 的 `float32`，计算
+   `input * rsqrt(mean(input**2) + eps) * weight`，再按 `out` 的 device/dtype 拷回；
+   这条分支不会调用 `torch.ops.sgl_kernel.rmsnorm.default`，只是为 trim/debug
+   shape 准备的低性能 fallback。
+2. `sgl_kernel/element_wise.py:69-89（rmsnorm）` 检查 `input`、`weight` 和 `out`
+   的 contiguous 状态。非连续时创建连续临时 tensor；`out is None` 时先创建与
+   `input` 同 shape/dtype/device 的输出。
+3. `sgl_kernel/element_wise.py:91-97（rmsnorm）` 调用：
+
+   ```python
+   torch.ops.sgl_kernel.rmsnorm.default(
+       out_work,
+       input_work,
+       weight_work,
+       eps,
+       bool(enable_pdl) if enable_pdl is not None else False,
+   )
+   ```
+
+   custom op 的 schema 返回 `()`，但第一个参数是可变的 `Tensor! output`；因此
+   `sgl_kernel/element_wise.py:99-102（rmsnorm）` 必要时把临时结果复制回原 `out`，
+   最后由 Python facade 返回 `out`。
+4. `sgl_kernel/element_wise.py:91-97（rmsnorm）` 传递了 `enable_pdl`，但下游
+   `csrc/attention/rmsnorm.cpp:34-72（rmsnorm）` 在 `:40` 明确忽略它，当前实现没有
+   PDL 分支。
+
+### 13.3 `torch.ops` 是怎样绑定到 C++ 的
+
+导入顺序决定注册时机：
+
+- `sgl_kernel/__init__.py:3-6（模块导入）` 先尝试导入 `_torch_impl`，注册 CPU
+  reference custom ops；
+- `sgl_kernel/__init__.py:8-11（模块导入）` 导入 `common_ops` 这个 C++ 扩展，触发
+  `TORCH_LIBRARY_FRAGMENT` 静态初始化；
+- `sgl_kernel/__init__.py:38-41（模块导入）` 再把 `element_wise.py` 的 Python
+  facade 导出到包根。
+
+`csrc/common_extension.cc:8（kSIPU）` 把 `kSIPU` 定义为
+`torch::kPrivateUse1`。注册本身位于
+`csrc/common_extension.cc:266-280（TORCH_LIBRARY_FRAGMENT(sgl_kernel)）`：
+
+- `csrc/common_extension.cc:279（TORCH_LIBRARY_FRAGMENT(sgl_kernel)）` 定义
+  `rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()`；
+- `csrc/common_extension.cc:280（TORCH_LIBRARY_FRAGMENT(sgl_kernel)）` 把算子在
+  `PrivateUse1` dispatch key 上绑定到 C++ 函数 `&rmsnorm`。
+
+因此当 `input_work.device` 是 `sipu:0` 时，torch_sipu 把该设备映射到
+`PrivateUse1`，dispatcher 命中 `csrc/attention/rmsnorm.cpp:34-72（rmsnorm）`；它
+不会走 CUDA kernel，也不会走 `_torch_impl` 的 CPU reference。
+
+### 13.4 C++ bridge 做了什么
+
+`csrc/attention/rmsnorm.cpp:34-72（rmsnorm）` 是 PyTorch tensor 到 SiKernel API
+之间的 bridge。
+
+- `csrc/attention/rmsnorm.cpp:41-46（rmsnorm）` 要求 output/input 为二维、两者
+  shape 相同、weight 为一维且长度等于 hidden size，并要求 input contiguous。Python
+  facade 已经在 `sgl_kernel/element_wise.py:69-89（rmsnorm）` 处理了常见的非连续
+  输入。
+- `csrc/attention/rmsnorm.cpp:48-50（rmsnorm）` 取出
+  `batch_size=input.size(0)` 和 `original_normalized_size=input.size(1)`，然后计算
+  `normalized_size = ceil(original_normalized_size / 512) * 512`。普通 Llama
+  BF16 hidden size（例如 4096）本来就是 512 的倍数，两个值相同。
+- `csrc/attention/rmsnorm.cpp:52-71（rmsnorm）` 使用 `AT_DISPATCH_V2` 选择
+  `float32`、`float16` 或 `bfloat16` 实例，在 `:57-67` 调用 SiKernel 的裸指针入口：
+
+  ```cpp
+  ::rms_norm<sifmt_type>(
+      output.data_ptr(), input.data_ptr(), weight.data_ptr(),
+      static_cast<float>(eps), batch_size, normalized_size,
+      original_normalized_size, 1, 1, get_current_sipu_stream());
+  ```
+
+  两个 `1` 分别表示 `weight_opt=1` 和 `eps_opt=1`，所以这条 SGLang 路径始终乘
+  RMSNorm weight，并始终加 epsilon。
+- `include/op_sipu_type.h:39-65（OpSIPUType/opsipu_type）` 将 PyTorch 类型转换为
+  SiKernel 类型：`at::Half -> sifmt::float16`、`at::BFloat16 -> sifmt::bfloat16`、
+  `float -> sifmt::float32`。
+- `include/sikernel_utils.h:11-13（get_current_sipu_stream）` 返回
+  `at::sipu::getCurrentSIPUStream().stream()`，所以 native kernel 在当前 PyTorch
+  SIPU stream 上异步 launch。
+
+这里的 `::rms_norm` 不是 `torch.ops` 直接调用的 Python 函数，而是链接到
+`libsglang_sipu_kernels.so` 的 C++/SCC 符号。`setup.py:34-46（sources）`
+把 `csrc/attention/rmsnorm.cpp` 编进 `sgl_kernel.common_ops`，
+`setup.py:77-93（CppExtension）` 则把它链接到
+`libsglang_sipu_kernels.so`、`libtorch_sipu.so` 等库。
+
+### 13.5 SiKernel 的裸指针兼容层
+
+SiKernel 的公开声明在
+`sikernel/include/sikernel.h:1262-1289（rms_norm）`：
+
+- `sikernel/include/sikernel.h:1277-1280（rms_norm）` 是带 tensor metadata 的接口；
+- `sikernel/include/sikernel.h:1285-1289（rms_norm）` 是 bridge 当前使用的裸指针
+  兼容接口，额外接收 `batch_size`、`normalized_size` 和
+  `original_normalized_size`。
+
+裸指针接口的源码在
+`sikernel/source/source_builtin/attention/rms_norm/kernel/legacy_api.su:10-23（rms_norm<T>）`：
+
+1. `legacy_api.su:15-17（rms_norm<T>）` 用 `(batch_size, normalized_size)` 构造
+   output/input tensor 和 `(normalized_size)` 构造 weight tensor；构造函数会生成默认
+   contiguous strides。
+2. `legacy_api.su:18-20（rms_norm<T>）` 把三个 PyTorch data pointer 写入这些 tensor
+   的 `data` 字段。
+3. `legacy_api.su:21-22（rms_norm<T>）` 转调 metadata 版本的
+   `rms_norm<T>(output_tensor, input_tensor, weight_tensor, ...)`。
+4. `legacy_api.su:25-36（rms_norm<T>）` 显式实例化 `float32`、`float16`、`bfloat16`
+   三种类型，确保它们出现在 release shared library 中。
+
+### 13.6 真正的 host launcher 和 device kernel
+
+#### Host launcher
+
+`sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel.su:204-240（rms_norm_launch<T>）`
+是 tensor API 的主要分派逻辑。
+
+- `rms_norm_kernel.su:34-49（is_contiguous_layout）` 按 sizes/strides 逐维检查真实
+  contiguous layout；这比只看 PyTorch 的某些 size-1 stride 更严格。
+- `rms_norm_kernel.su:51-79（check_rms_norm_tensor_metadata）` 检查 data pointer
+  非空、输入/输出为二维且 shape 相同、normalized dimension 的字节数为 1024 的
+  倍数、`original_normalized_size` 在合法范围内，以及启用 weight 时 weight 的
+  rank/长度正确。
+- `rms_norm_kernel.su:83-160（rms_norm_contiguous_launch<T>）` 为连续 tensor 设置
+  launch 配置：batch 小于 2 时每个 block 使用 1 个线程，batch 至少 2 时每个
+  block 使用 2 个线程；batch 至少 32 时使用 16 个 grid block，否则使用
+  `(batch_size+1)/2` 个 grid block。随后按模板类型在
+  `rms_norm_kernel.su:102-120（rms_norm_contiguous_launch<T>）`、
+  `rms_norm_kernel.su:121-139（rms_norm_contiguous_launch<T>）`、
+  `rms_norm_kernel.su:140-159（rms_norm_contiguous_launch<T>）` 分别启动 F32、F16、
+  BF16 kernel。
+- `rms_norm_kernel.su:162-202（rms_norm_bf16_strided_input_launch）` 是 BF16 特殊
+  非连续输入的 launch wrapper。
+- `rms_norm_kernel.su:204-240（rms_norm_launch<T>）` 先在 `:213-217` 走连续路径；
+  如果不连续，只在 BF16、normalized size 为 512 或 1536、输入 stride 为
+  `(2176, 1)`、输出和 weight 连续时，于 `:220-231` 走 strided kernel；其它布局在
+  `:235-239` 通过 `sipu::check(false, ...)` 报错。
+- `rms_norm_kernel.su:242-248（rms_norm_timed<T>）` 是带性能时间戳的入口；
+  `rms_norm_kernel.su:250-256（rms_norm<T>）` 是公开 tensor API，转调
+  `rms_norm_launch<T>`；`rms_norm_kernel.su:263-265（rms_norm<T>）` 显式实例化
+  三种 dtype。
+
+#### F32/F16/BF16 device kernel 的共同算法
+
+三个 `.hpp` 文件中的 `__global__` 函数才是逐元素计算发生的地方；`.su` 是 SCC 的
+SIPU kernel 源码，使用 SIPU 的 `<<<grid, cluster, block, 0, stream>>>` launch 语法，
+不是 CUDA 编译出来的普通 GPU kernel。
+
+对每一行输入，数学结果为：
+
+```text
+mean = sum(x[j] * x[j] for j in [0, original_normalized_size))
+       / original_normalized_size
+r = 1 / sqrt(mean + eps)
+y[j] = x[j] * r * weight[j]       (weight_opt = 1)
+```
+
+实际代码会按 `normalized_size` 的 1024-byte tile 处理，
+`original_normalized_size` 用作分母；因此调用者必须遵守 API 对齐/填充契约。
+
+- `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:25-98（rms_norm_f32_kernel）`
+  以 1024 字节（256 个 FP32）为 tile，从 global memory 读取数据，在
+  `:47-70` 做平方累加和 RVV reduction，在 `:70-78` 计算 reciprocal square root，
+  再于 `:80-94` 乘以 weight 并写回 output。
+- `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f16.hpp:25-112（rms_norm_f16_kernel）`
+  使用 FP16 输入/输出，但在 `:59-78` 先转换到 FP32 做平方、向量归约和
+  `1/sqrt(...)`，然后在 `:97-107` 转回 FP16 写回。
+- `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:25-112（rms_norm_bf16_kernel）`
+  对 BF16 做同样的 FP32 累加；`:52-63（rms_norm_bf16_kernel）` 读取 tile 并累加平方，`:65-87（rms_norm_bf16_kernel）` 完成 RVV
+  reduction 和 reciprocal square root，`:89-107` 第二次读取数据、乘归一化因子和
+  weight、转回 BF16 并写回。
+- `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:114-201（rms_norm_bf16_strided_input_kernel）`
+  是 BF16 特殊 stride 版本：第一遍按 `input_stride0` 读取并归约，第二遍按连续
+  output stride 写出；它只服务 `rms_norm_kernel.su:220-231（rms_norm_launch<T>）`
+  接受的两个布局。
+
+连续 kernel 的共同结构是“两遍扫描”：第一遍把每个 tile 转为 FP32、平方并累加；
+第二遍重用 shared memory 中的 tile（超出 shared buffer 时重新从 global memory 读），
+乘同一行的 reciprocal RMS，再乘可选 weight。这样每一行只计算一次归一化因子，
+而不是每个元素重复计算。
+
+#### 编译/链接到运行时库
+
+- `sikernel/source/source_builtin/attention/rms_norm/CMakeLists.txt:31-34（scc_add_library）`
+  把 `kernel/rms_norm_kernel.su` 和 `kernel/legacy_api.su` 编译成 rms_norm native
+  library。
+- `sikernel/release/build/release.list:1-3（release module list）` 中的第 2 行包含
+  `source/source_builtin/attention/rms_norm`。
+- `sikernel/release/build/CMakeLists.txt:33-59（release source collection）` 收集
+  release list 中各目录的 `.su` 文件，`:70-79（scc_add_library）` 将它们合并为
+  `sipu_kernels`；`:93-95（scc_install）` 安装到 `sikernel/release/lib`。
+ - `sgl-sikernel-integration/build.sh:31-56（构建脚本）` 最后把
+  `libsipu_kernels.so` 重命名为 `libsglang_sipu_kernels.so`，供
+  `setup.py:77-93（CppExtension）` 链接。
+
+因此“真实实现”有两个可见层次：可读的 host launcher/device kernel 源码在
+`sikernel/source/source_builtin/attention/rms_norm/kernel/`，当前进程实际执行的是
+这些源码预编译后、并由 `sgl_kernel/common_ops...so` 间接链接的
+`sikernel/release/lib/libsglang_sipu_kernels.so`。只修改 `.su` 文件而不重新构建该
+shared library，不会改变正在运行的 kernel。
+
+### 13.7 从离线推理脚本到 `rmsnorm.default` 的调用链
+
+本次离线 smoke test 的上层链路如下（每一项都按相对 code base 路径标注）：
+
+```text
+temp/sipu_offline_infer.py:4-22（main）
+  -> python/sglang/srt/entrypoints/engine.py:232-284（Engine::__init__）
+  -> python/sglang/srt/entrypoints/engine.py:1060-1130（Engine::_launch_subprocesses）
+  -> python/sglang/srt/managers/scheduler.py:5054-5142（run_scheduler_process）
+  -> python/sglang/srt/model_executor/model_runner.py:632-649（ModelRunner::initialize）
+  -> python/sglang/srt/model_executor/model_runner.py:1061-1122（ModelRunner::load_model）
+  -> python/sglang/srt/models/llama.py:612（LlamaForCausalLM::forward）
+  -> python/sglang/srt/models/llama.py:466（LlamaModel::forward）
+  -> python/sglang/srt/models/llama.py:350-378（LlamaDecoderLayer::forward）
+  -> python/sglang/kernels/fused_op.py:629-662（BaseFusedOp::forward）
+  -> python/sglang/srt/layers/layernorm.py:575-614（RMSNorm::forward_sipu）
+  -> sgl_kernel/element_wise.py:42-102（rmsnorm）
+  -> csrc/common_extension.cc:266-280（TORCH_LIBRARY_FRAGMENT(sgl_kernel)）
+  -> csrc/attention/rmsnorm.cpp:34-72（rmsnorm）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/legacy_api.su:10-23（rms_norm<T>）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel.su:250-256（rms_norm<T>）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel.su:204-240（rms_norm_launch<T>）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:25-98（rms_norm_f32_kernel）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f16.hpp:25-112（rms_norm_f16_kernel）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:25-112（rms_norm_bf16_kernel）
+  -> SIPU stream/runtime
+```
+
+关键的模型层细节如下：
+
+- `temp/sipu_offline_infer.py:6-16（main）` 用 `device="sipu"`、
+  `attention_backend="sipu"` 创建 Engine，并关闭 CUDA graph；这让模型执行走 SIPU
+  eager 路径。
+- `python/sglang/srt/models/llama.py:360-366（LlamaDecoderLayer::forward）` 在
+  attention 前把 `hidden_states` 送进 `input_layernorm`；第一次进入 layer 时
+  `residual is None`，因此最终调用的是普通 `rmsnorm`。
+- `python/sglang/srt/models/llama.py:374-375（LlamaDecoderLayer::forward）` 在
+  attention 后把 `hidden_states` 和 residual 送进
+  `post_attention_layernorm`；这条分支调用的是
+  `python/sglang/srt/layers/layernorm.py:606-610（RMSNorm::forward_sipu）` 中的
+  `fused_add_rmsnorm`，它是另一个 custom op，不应与本题的 `rmsnorm.default` 混淆。
+- `python/sglang/kernels/fused_op.py:182-185（_platform_key）` 在 SIPU 环境优先
+  返回 `"sipu"`；`python/sglang/kernels/fused_op.py:538-567（BaseFusedOp::_resolve_forward_method）`
+  因而选择 `forward_sipu`；最终
+  `python/sglang/kernels/fused_op.py:629-662（BaseFusedOp::forward）` 调用绑定方法。
+- `python/sglang/srt/layers/layernorm.py:575-599（RMSNorm::forward_sipu）` 处理空
+  tensor、residual 和 reshape；无 residual 时在
+  `python/sglang/srt/layers/layernorm.py:611-614（RMSNorm::forward_sipu）` 调用
+  `rmsnorm(x, self.weight.data, self.variance_epsilon)`，这就是进入
+  `sgl_kernel/element_wise.py:42-102（rmsnorm）` 的直接调用点。
+
+`sgl_kernel/_kernel_log.py:188-204（kernel_log）` 包装公开 Python
+  facade，`sgl-kernel-sipu/sgl_kernel/_kernel_log.py:312-320（install_kernel_log_hooks）`
+  安装包装。因此 `temp/off.log.3` 中的
+  `[SGL_KERNEL] -> rmsnorm` / `<- rmsnorm` 记录的是 Python wrapper 的进入/返回，
+  不是另一个名为 `rmsnorm` 的 Python 实现；wrapper 内部紧接着调用了上面的 C++/SIPU
+  链。该日志中的第一次普通 norm（例如 `temp/off.log.3:43-55`）显示输入
+  `(13, 4096)`、BF16、`sipu:0`，与 native kernel 的二维 BF16 contract 相符。
+
+### 13.8 运行时验证与限制
+
+在 `sipu-dev` 中执行 `source /sgl-workspace/sglang/temp/env-offlie-infer.sh` 后，用
+`sipu:0` 上的 BF16 `(2, 512)` tensor 做了最小调用：
+
+```text
+[SGL_KERNEL] -> rmsnorm
+[SGL_KERNEL] <- rmsnorm (约 1.4ms)
+output: shape=(2, 512), dtype=torch.bfloat16, device=sipu:0
+finite=True
+```
+
+这验证了 Python facade、PrivateUse1 registration、C++ bridge、动态库和 SIPU
+kernel 至少能完成一次端到端调用；它不等价于完整模型的数值精度验证。
+
+需要特别注意：
+
+1. `sgl_kernel/element_wise.py:49-67（rmsnorm）` 的 1024-byte 对齐检查只保证
+   wrapper 的 native/fallback 分界；`csrc/attention/rmsnorm.cpp:48-67（rmsnorm）`
+   还会把 normalized size 向上补到 512 元素。对直接调用 API 的非 512 hidden size，
+   应确认调用者确实分配了 padded buffer，因为 device kernel 会按
+   `normalized_size` tile 读取/写出。
+2. `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel.su:69-70（check_rms_norm_tensor_metadata）`
+   要求 normalized dimension 的字节数为 1024 的倍数；F32、F16、BF16 支持范围由
+   `csrc/attention/rmsnorm.cpp:68-71（rmsnorm）` 的 dtype dispatch 共同决定。
+3. Python wrapper 会在 `sgl_kernel/element_wise.py:69-100（rmsnorm）` 对非连续
+   tensor 做 copy，所以底层 `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:114-201（rms_norm_bf16_strided_input_kernel）`
+   主要面向直接使用 SiKernel tensor API 的调用者；不能据此推断任意 PyTorch
+   non-contiguous layout 都被支持。
+4. `csrc/attention/rmsnorm.cpp:40（rmsnorm）` 把 `enable_pdl` 丢弃，故目前不能用
+   该参数开启 PDL 优化。
+
+最终可以把本题的“真实实现”压缩成下面这条链：
+
+```text
+Python facade（准备 contiguous output）
+  -> PyTorch schema/PrivateUse1 dispatcher
+  -> csrc/attention/rmsnorm.cpp:34-72（rmsnorm）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/legacy_api.su:10-23（rms_norm<T>）
+  -> sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel.su:204-240（rms_norm_launch<T>）
+  -> dtype-specific SIPU __global__ kernel
+  -> SIPU runtime 在当前 stream 上写回 output
+```
