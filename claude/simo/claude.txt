@@ -4082,3 +4082,11 @@ else 使用 /tmp/like 作为保底，并给出 warning
 只回答问题，不要修改模型.
 把答案追加到 like-useful/answer_claude_v3.md 
 }
+
+
+{
+/share_data/inference-framework/tiny-models/trim/trim_llama31_8b.py layer_map={0: 0, 1: 1, 2: 2, 3: 3} 这个参数的功能是什么？
+最好用 ascii 图示意
+
+把答案追加到 like-useful/answer_claude_v3.md 
+}

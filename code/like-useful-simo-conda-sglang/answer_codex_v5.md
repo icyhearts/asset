@@ -1262,9 +1262,25 @@ temp/env-offlie-infer.sh
 1. **容器和 editable 源码。** `docker inspect sipu-dev` 显示宿主机
    `/share/users/like/package/sglang_sipu` 以读写方式挂载到容器
    `/sgl-workspace/sglang`，所以容器内 editable 安装实际指向
-   `/sgl-workspace/sglang/python`，修改宿主机源码会直接影响容器运行。SICX SDK、
-   CModel、`torch_sipu` 和 tiny model 是只读挂载；`/sgl-workspace/sgl-kernel-sipu`
-   是镜像内预置目录，不随 SGLang git checkout 自动重编译。
+   `/sgl-workspace/sglang/python`，修改宿主机源码会直接影响容器运行。关键挂载如下：
+
+   | 宿主机路径 | 容器路径 | 模式 |
+   |---|---|---|
+   | `/share/users/like/package/sglang_sipu` | `/sgl-workspace/sglang` | rw |
+   | `/share_data/inference-framework/tiny-models` | `/share_data/inference-framework/tiny-models` | ro |
+   | `/share_data/sicx_sdk` | `/share_data/sicx_sdk` | ro |
+   | `/share_data/sicx_sdk/release` | `/share_data/sicx_sdk/release` | ro |
+   | `/share_data/arch_cmodel_release` | `/share_data/arch_cmodel_release` | ro |
+   | `/share_data/torch_sipu` | `/share_data/torch_sipu` | ro |
+   | `/share_data/sglang_sipu` | `/share_data/sglang_sipu` | rw |
+   | `/data_gpu` | `/data_gpu` | rw |
+   | `/share` | `/share` | rw |
+   | `/share2` | `/share2` | rw |
+   | `/softhome` | `/softhome` | rw |
+
+   SICX SDK、CModel、`torch_sipu` 和 tiny model 是只读挂载；
+   `/sgl-workspace/sgl-kernel-sipu` 是镜像内预置目录，不在 mount 列表中，也不会随
+   SGLang git checkout 自动重编译。
 
 2. **环境初始化。** `temp/env-offlie-infer.sh:1-4（顶层脚本）` source
    `sgl-kernel-sipu/setup.sh`，设置 SIPU 动态库路径、SDK/CModel 和 `SGL_KERNEL_LOG`，
@@ -1501,7 +1517,7 @@ temp/env-offlie-infer.sh
   和 `python/sglang/kernels/ops/quantization/fp8_kernel.py:825-847（sglang_per_token_quant_fp8）`
   提供对应 `sgl_kernel` 量化入口。
   CModel 不支持或效率不佳的 block/channel scale 转换在
-  `python/sglang/srt/layers/quantization/fp8_utils.py:1424（block_quant_to_tensor_quant）`、
+  `python/sglang/srt/layers/quantization/fp8_utils.py:1421-1471（block_quant_to_tensor_quant）`、
   `python/sglang/srt/layers/quantization/fp8_utils.py:1771-1787（channel_quant_to_tensor_quant）`
   使用 CPU workaround。
 - **未量化层和权重加载。**
@@ -1511,7 +1527,7 @@ temp/env-offlie-infer.sh
   要求使用 Triton/fused MoE
   runner。`python/sglang/srt/model_loader/loader.py:151-180（device_loading_context）`
   在 SIPU 跳过 shard load 后的 bulk `p.data.to(sipu)`，因为该操作可能使 CModel hang；
-  `python/sglang/srt/model_loader/utils.py:294（should_async_load）` 关闭 threaded async H2D。
+  `python/sglang/srt/model_loader/utils.py:290-305（should_async_load）` 关闭 threaded async H2D。
 - **Embedding/lm_head 和 KV allocator。**
   `python/sglang/srt/models/cpu_embedding_lm_head.py:21-30（use_cpu_embedding_lm_head）`
   默认让 SIPU 的大 embedding/lm_head 留在 CPU，
@@ -1608,7 +1624,7 @@ temp/env-offlie-infer.sh
    1M RoPE 上限、特殊 MHC 分支以及若干默认设置；结论应以 HEAD 的
    `python/sglang/srt/hardware_backend/sipu/utils.py:28-33（set_default_server_args）` 为准，而不是
    首个 `91462e29` 的中间状态。
-7. **验证范围有限。** `README.md:...` 的 SIPU 说明把当前测试限定为单 rank/archmodel，
+7. **验证范围有限。** `README.md:26-34（SIPU scope 说明）` 把当前测试限定为单 rank/archmodel，
    online serving 以及 TP/EP/DP 仍是 TODO；因此本次单卡离线日志不能代表多卡生产部署。
 
 综上，`v0.5.18` 到 `sglang_sipu` HEAD 的核心新增是一个贯穿式 SIPU runtime：
