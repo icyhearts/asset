@@ -1925,8 +1925,8 @@ SIPU 路径。
    `sgl_kernel/element_wise.py:99-102（rmsnorm）` 必要时把临时结果复制回原 `out`，
    最后由 Python facade 返回 `out`。
 4. `sgl_kernel/element_wise.py:91-97（rmsnorm）` 传递了 `enable_pdl`，但下游
-   `csrc/attention/rmsnorm.cpp:34-72（rmsnorm）` 在 `:40` 明确忽略它，当前实现没有
-   PDL 分支。
+  `csrc/attention/rmsnorm.cpp:34-72（rmsnorm）` 在
+  `csrc/attention/rmsnorm.cpp:40（rmsnorm）` 明确忽略它，当前实现没有 PDL 分支。
 
 ### 13.3 `torch.ops` 是怎样绑定到 C++ 的
 
@@ -1966,7 +1966,8 @@ SIPU 路径。
   `normalized_size = ceil(original_normalized_size / 512) * 512`。普通 Llama
   BF16 hidden size（例如 4096）本来就是 512 的倍数，两个值相同。
 - `csrc/attention/rmsnorm.cpp:52-71（rmsnorm）` 使用 `AT_DISPATCH_V2` 选择
-  `float32`、`float16` 或 `bfloat16` 实例，在 `:57-67` 调用 SiKernel 的裸指针入口：
+  `float32`、`float16` 或 `bfloat16` 实例，在
+  `csrc/attention/rmsnorm.cpp:57-67（rmsnorm）` 调用 SiKernel 的裸指针入口：
 
   ```cpp
   ::rms_norm<sifmt_type>(
@@ -2036,10 +2037,12 @@ SiKernel 的公开声明在
   BF16 kernel。
 - `rms_norm_kernel.su:162-202（rms_norm_bf16_strided_input_launch）` 是 BF16 特殊
   非连续输入的 launch wrapper。
-- `rms_norm_kernel.su:204-240（rms_norm_launch<T>）` 先在 `:213-217` 走连续路径；
+- `rms_norm_kernel.su:204-240（rms_norm_launch<T>）` 先在
+  `rms_norm_kernel.su:213-217（rms_norm_launch<T>）` 走连续路径；
   如果不连续，只在 BF16、normalized size 为 512 或 1536、输入 stride 为
-  `(2176, 1)`、输出和 weight 连续时，于 `:220-231` 走 strided kernel；其它布局在
-  `:235-239` 通过 `sipu::check(false, ...)` 报错。
+  `(2176, 1)`、输出和 weight 连续时，于
+  `rms_norm_kernel.su:220-231（rms_norm_launch<T>）` 走 strided kernel；其它布局在
+  `rms_norm_kernel.su:235-239（rms_norm_launch<T>）` 通过 `sipu::check(false, ...)` 报错。
 - `rms_norm_kernel.su:242-248（rms_norm_timed<T>）` 是带性能时间戳的入口；
   `rms_norm_kernel.su:250-256（rms_norm<T>）` 是公开 tensor API，转调
   `rms_norm_launch<T>`；`rms_norm_kernel.su:263-265（rms_norm<T>）` 显式实例化
@@ -2054,26 +2057,36 @@ SIPU kernel 源码，使用 SIPU 的 `<<<grid, cluster, block, 0, stream>>>` lau
 对每一行输入，数学结果为：
 
 ```text
-mean = sum(x[j] * x[j] for j in [0, original_normalized_size))
-       / original_normalized_size
+sum_kernel = sum(x[j] * x[j] for j in [0, normalized_size))
+mean = sum_kernel / original_normalized_size
 r = 1 / sqrt(mean + eps)
 y[j] = x[j] * r * weight[j]       (weight_opt = 1)
 ```
 
-实际代码会按 `normalized_size` 的 1024-byte tile 处理，
-`original_normalized_size` 用作分母；因此调用者必须遵守 API 对齐/填充契约。
+实际代码会按 `normalized_size` 的 1024-byte tile 处理，并用
+`original_normalized_size` 作分母。两者相等时就是通常的 RMSNorm；如果
+`normalized_size` 是向上补齐的值，补齐区必须符合调用者约定（通常是有效的 padding），
+否则额外 tile 也会参与平方和。因此调用者必须遵守 API 的对齐/填充契约。
 
 - `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:25-98（rms_norm_f32_kernel）`
   以 1024 字节（256 个 FP32）为 tile，从 global memory 读取数据，在
-  `:47-70` 做平方累加和 RVV reduction，在 `:70-78` 计算 reciprocal square root，
-  再于 `:80-94` 乘以 weight 并写回 output。
+  `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:47-70（rms_norm_f32_kernel）`
+  做平方累加和 RVV reduction，在
+  `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:70-78（rms_norm_f32_kernel）`
+  计算 reciprocal square root，再于
+  `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:80-94（rms_norm_f32_kernel）`
+  乘以 weight 并写回 output。
 - `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f16.hpp:25-112（rms_norm_f16_kernel）`
-  使用 FP16 输入/输出，但在 `:59-78` 先转换到 FP32 做平方、向量归约和
-  `1/sqrt(...)`，然后在 `:97-107` 转回 FP16 写回。
+  使用 FP16 输入/输出，但在
+  `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f16.hpp:59-78（rms_norm_f16_kernel）`
+  先转换到 FP32 做平方、向量归约和 `1/sqrt(...)`，然后在
+  `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f16.hpp:97-107（rms_norm_f16_kernel）`
+  转回 FP16 写回。
 - `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:25-112（rms_norm_bf16_kernel）`
-  对 BF16 做同样的 FP32 累加；`:52-63（rms_norm_bf16_kernel）` 读取 tile 并累加平方，`:65-87（rms_norm_bf16_kernel）` 完成 RVV
-  reduction 和 reciprocal square root，`:89-107` 第二次读取数据、乘归一化因子和
-  weight、转回 BF16 并写回。
+  对 BF16 做同样的 FP32 累加；`sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:52-63（rms_norm_bf16_kernel）`
+  读取 tile 并累加平方，`sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:65-87（rms_norm_bf16_kernel）`
+  完成 RVV reduction 和 reciprocal square root，`sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:89-107（rms_norm_bf16_kernel）`
+  第二次读取数据、乘归一化因子和 weight、转回 BF16 并写回。
 - `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:114-201（rms_norm_bf16_strided_input_kernel）`
   是 BF16 特殊 stride 版本：第一遍按 `input_stride0` 读取并归约，第二遍按连续
   output stride 写出；它只服务 `rms_norm_kernel.su:220-231（rms_norm_launch<T>）`
@@ -2089,12 +2102,14 @@ y[j] = x[j] * r * weight[j]       (weight_opt = 1)
 - `sikernel/source/source_builtin/attention/rms_norm/CMakeLists.txt:31-34（scc_add_library）`
   把 `kernel/rms_norm_kernel.su` 和 `kernel/legacy_api.su` 编译成 rms_norm native
   library。
-- `sikernel/release/build/release.list:1-3（release module list）` 中的第 2 行包含
+- `sgl-sikernel-integration/release.list:1-3（release module list）` 中的第 2 行包含
   `source/source_builtin/attention/rms_norm`。
 - `sikernel/release/build/CMakeLists.txt:33-59（release source collection）` 收集
-  release list 中各目录的 `.su` 文件，`:70-79（scc_add_library）` 将它们合并为
-  `sipu_kernels`；`:93-95（scc_install）` 安装到 `sikernel/release/lib`。
- - `sgl-sikernel-integration/build.sh:31-56（构建脚本）` 最后把
+  release list 中各目录的 `.su` 文件，
+  `sikernel/release/build/CMakeLists.txt:70-79（scc_add_library）` 将它们合并为
+  `sipu_kernels`；`sikernel/release/build/CMakeLists.txt:93-95（scc_install）` 安装到
+  `sikernel/release/lib`。
+- `sgl-sikernel-integration/build.sh:31-56（构建脚本）` 最后把
   `libsipu_kernels.so` 重命名为 `libsglang_sipu_kernels.so`，供
   `setup.py:77-93（CppExtension）` 链接。
 
@@ -2156,7 +2171,7 @@ temp/sipu_offline_infer.py:4-22（main）
   `sgl_kernel/element_wise.py:42-102（rmsnorm）` 的直接调用点。
 
 `sgl_kernel/_kernel_log.py:188-204（kernel_log）` 包装公开 Python
-  facade，`sgl-kernel-sipu/sgl_kernel/_kernel_log.py:312-320（install_kernel_log_hooks）`
+  facade，`sgl_kernel/_kernel_log.py:312-320（install_kernel_log_hooks）`
   安装包装。因此 `temp/off.log.3` 中的
   `[SGL_KERNEL] -> rmsnorm` / `<- rmsnorm` 记录的是 Python wrapper 的进入/返回，
   不是另一个名为 `rmsnorm` 的 Python 实现；wrapper 内部紧接着调用了上面的 C++/SIPU
@@ -2184,7 +2199,8 @@ kernel 至少能完成一次端到端调用；它不等价于完整模型的数�
    wrapper 的 native/fallback 分界；`csrc/attention/rmsnorm.cpp:48-67（rmsnorm）`
    还会把 normalized size 向上补到 512 元素。对直接调用 API 的非 512 hidden size，
    应确认调用者确实分配了 padded buffer，因为 device kernel 会按
-   `normalized_size` tile 读取/写出。
+   `normalized_size` tile 读取/写出；尤其 FP32 的 Python 1024-byte 检查允许 256
+   元素，但 C++ bridge 仍会向上取到 512，不能仅凭 Python 检查断言这种 shape 安全。
 2. `sikernel/source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel.su:69-70（check_rms_norm_tensor_metadata）`
    要求 normalized dimension 的字节数为 1024 的倍数；F32、F16、BF16 支持范围由
    `csrc/attention/rmsnorm.cpp:68-71（rmsnorm）` 的 dtype dispatch 共同决定。
