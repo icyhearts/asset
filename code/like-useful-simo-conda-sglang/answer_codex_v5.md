@@ -1287,7 +1287,10 @@ temp/env-offlie-infer.sh
    `python/sglang/srt/utils/common.py:854-870（get_device_memory_capacity）`
    改用 `torch.sipu.device_count/current_device/mem_get_info`；
    `python/sglang/srt/utils/common.py:916-945（get_device）` 在显式 SIPU 可用时返回
-   `sipu` 或 `sipu:<id>`。
+   `sipu` 或 `sipu:<id>`。SGLang 自定义算子还由
+   `python/sglang/srt/utils/common.py:2848-2858（direct_register_custom_op）`
+   注册到 PyTorch `PrivateUse1` dispatch key；因此算子可以在不改写每个
+   `torch.ops` 调用点的情况下落到 `torch_sipu`。
 
 4. **通用算子分派。** `python/sglang/srt/platforms/device_mixin.py:38-55（PlatformEnum）`
    增加 `SIPU` 枚举，
@@ -1364,6 +1367,8 @@ temp/env-offlie-infer.sh
   `merge_state_v2`，并支持部分 cascade、context-parallel、SWA 和 speculative 状态。
   该 backend 的注释明确说明 extend/draft-extend 不做 graph，graph 主要限于 decode/target
   verify；page table 还额外保留对齐空间，因为 SIPU kernel 会读取对齐 page。
+  具体的 `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:248-257（SIPUAttnBackend::_page_table_width）`
+  将宽度临时扩展 `128`，避免 paged kernel 按 `Chunk_Bc/page_size` 读取时越界。
 
 - **DSA/FlashMLA/indexer。**
   `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:244-305（DeepseekSparseAttnBackend::__init__）`
@@ -1408,6 +1413,10 @@ temp/env-offlie-infer.sh
   `python/sglang/srt/arg_groups/overrides.py:1158-1163（_deepseek_v4_overrides）` 对
   `device="sipu"` 保留 prefill/decode 的 `dsv4` backend，不把 DSV4 错误地降成普通
   `sipu` DSA/MHA backend。
+  当启用 TileLang MHC 时，`python/sglang/srt/models/deepseek_v4.py:1715-1810（DeepseekV4DecoderLayer::hc_pre）`
+  和 `python/sglang/srt/models/deepseek_v4.py:1850-1876（DeepseekV4DecoderLayer::hc_post）`
+  会把 SIPU 的 MHC pre/post 改调用 `sgl_kernel.mhc_pre_tilelang`/
+  `mhc_post_tilelang`。
 
 #### 11.3.2 MoE、DeepGEMM 和 DeepEP
 
@@ -1521,6 +1530,13 @@ temp/env-offlie-infer.sh
   将 SIPU 的 schedule stream 绑定到 forward stream，
   `python/sglang/srt/model_executor/model_runner.py:397-415（ModelRunner::__init__）`
   也把 forward stream 绑定到 default stream，当前实现优先保证 CModel 正确性而不是多流并行。
+  例如 `python/sglang/srt/layers/layernorm.py:575-614（RMSNorm::forward_sipu）` 和
+  `python/sglang/srt/layers/activation.py:153-154（SiluAndMul::forward_sipu）` 分别接入
+  fused RMSNorm、SiLU/mul；`python/sglang/srt/layers/rotary_embedding/base.py:194-199（RotaryEmbedding::_rope_cache_init_device）`
+  则把 RoPE cache 暂时在 CPU 初始化。KV 写入侧的
+  `python/sglang/srt/mem_cache/memory_pool.py:4078-4120（MLATokenToKVPool::_write_mla_kv_buffer）`
+  复用 `quantize_k_cache_separate` 和 `set_mla_kv_buffer_triton`，以适配 SIPU 的
+  MLA/DSA KV layout。
 
 #### 11.3.5 模型、镜像、文档和测试
 
@@ -1574,7 +1590,8 @@ temp/env-offlie-infer.sh
    默认路径会 CPU/Gloo 往返；单卡离线 smoke test 不会覆盖这些问题。
 3. **存在明确 fallback 和性能折衷。** stream 是单流别名，权重加载、未量化 linear、
    embedding/lm_head、KV allocator、部分 DSA top-k/RoPE 会走 CPU 或同步拷贝；不能把
-   “能启动”解释为所有 kernel 已经原生高性能。
+   “能启动”解释为所有 kernel 已经原生高性能。当前还没有经过验证的
+   `MHA_CHUNKED_KV_SIPU` 和 dual-stream attention 路径。
 4. **DSV4/MoE 仍不完整。** `python/sglang/srt/models/deepseek_v4.py:220-224（模块常量）`
    设置 `_SKIP_DSV4_ROUTED_MOE=True`；
    `python/sglang/srt/models/deepseek_v4.py:2038-2048（DeepseekV4DecoderLayer::_run_moe_ffn_dp_sync）`
@@ -1591,6 +1608,8 @@ temp/env-offlie-infer.sh
    1M RoPE 上限、特殊 MHC 分支以及若干默认设置；结论应以 HEAD 的
    `python/sglang/srt/hardware_backend/sipu/utils.py:28-33（set_default_server_args）` 为准，而不是
    首个 `91462e29` 的中间状态。
+7. **验证范围有限。** `README.md:...` 的 SIPU 说明把当前测试限定为单 rank/archmodel，
+   online serving 以及 TP/EP/DP 仍是 TODO；因此本次单卡离线日志不能代表多卡生产部署。
 
 综上，`v0.5.18` 到 `sglang_sipu` HEAD 的核心新增是一个贯穿式 SIPU runtime：
 PyTorch PrivateUse1 设备接入、SIPU attention/DSA/FlashMLA、masked DeepGEMM 和
