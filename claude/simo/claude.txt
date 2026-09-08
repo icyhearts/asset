@@ -4099,3 +4099,23 @@ else 使用 /tmp/like 作为保底，并给出 warning
 # 如果现在的文件一级标题 Host字段已经存在， 比如 node22 已经,用 png里面的 主机名和 ip地址更新这个字段, 并把这一个主机搬到文件末尾和  png 里面保持一致顺序
 # png 里面的主机添加到 /softhome/like/.ssh//config里面，顺序保持和 png 文件顺序一致
 }
+
+
+{
+
+sglang_sipu 代码位于 /share/users/like/package/sglang_sipu. sglang_sipu 需要的 docker contianer name=sipu-dev, docker mount目录情况需要你自己查看.
+sglang_sipu 在 docker 环境内部仍旧以 editable 方式安装, 包名仍旧是 sglang
+
+simo 代码位于 /share/users/like/package/simo_conda_sglang_sipu, simo 在 docker 环境内部仍旧以 editable 方式安装
+
+在 docker container 内使用 sipu 设备推理的流程:
+进入 container后:
+source /sgl-workspace/sglang/temp/env-offlie-infer.sh
+python /sgl-workspace/sglang/temp/sipu_offline_infer.py > /sgl-workspace/sglang/temp/off.log.3 2>&1 &
+
+日志位于 container 内部 /sgl-workspace/sglang/temp/off.log.3
+
+sglang_sipu 代码 tag: v0.5.18 仍旧是开源 sglang 部分，比 tag: v0.5.18 更新的commit，是为了适配 sipu 做的 commit, 
+请对比 tag: v0.5.18 和 sglang_sipu 的  HEAD, 主要实现了哪些新功能? 它是如何让 sglang 支持新的device:sipu 的?
+把答案追加到 like-useful/answer_codex_v5.md
+}
