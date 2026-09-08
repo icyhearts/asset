@@ -1516,7 +1516,7 @@ temp/env-offlie-infer.sh
   fallback。新增的 `python/sglang/srt/layers/attention/linear/kernels/gdn_custom.py:25-175（CustomGDNKernel::packed_decode、CustomGDNKernel::decode、CustomGDNKernel::extend、CustomGDNKernel::target_verify）`
   通过 `sgl_kernel` 提供 SIPU GDN 的 decode/extend/verify；选择入口是
   `python/sglang/srt/layers/attention/linear/gdn_backend.py:66-68（模块设备分支）` 和
-  `python/sglang/srt/layers/attention/linear/gdn_backend.py:147-155（GDNBackend::__init__ 的 custom 分支）`。
+  `python/sglang/srt/layers/attention/linear/gdn_backend.py:147-155（GDNKernelDispatcher::__init__ 的 custom 分支）`。
   `python/sglang/srt/managers/scheduler.py:1681-1694（Scheduler::run_event_loop）`
   将 SIPU 的 schedule stream 绑定到 forward stream，
   `python/sglang/srt/model_executor/model_runner.py:397-415（ModelRunner::__init__）`
@@ -1531,7 +1531,7 @@ temp/env-offlie-infer.sh
 - `python/sglang/check_env.py:417-475（SIPUEnv::__init__、SIPUEnv::get_info、
   SIPUEnv::get_device_info、SIPUEnv::_get_sipu_version_info）` 增加环境诊断，能输出
   `torch_sipu`、`sgl-kernel`、SDK/CModel 和设备能力。
-- `.gitmodules:1-3` 增加 `sgl-kernel-sipu` 子模块（当前 gitlink 为
+- `.gitmodules:1-3（子模块声明）` 增加 `sgl-kernel-sipu` 子模块（当前 gitlink 为
   `42ed0661061e621b468a21d7a14f871887731065`）；`docker/sipu-0.5.18-base.Dockerfile`
   和 `docker/sipu-0.5.18.Dockerfile` 固定 Ubuntu/toolchain、CPU 版 torch 2.10、
   `torch_sipu`、SiOrigin Triton、`siinfer` 和预编译 kernel。也就是说，SGLang editable
