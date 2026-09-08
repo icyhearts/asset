@@ -1647,19 +1647,18 @@ DeepEP 接口、SiCCL/custom collective、FP8/量化、CPU fallback 加载与 KV
 torch_sipu 实现 + 明确 fallback”这一整条链；当前仍应把它视为面向 SIPU CModel/仿真
 环境的适配版本，并按上述限制评估生产可用性。
 
-<!-- pending section -->
 ## 12. SIMO MXFP8 离线推理失败分析：RMSNorm 的 quant_method 检查
 
 ### 12.1 环境、挂载和日志
 
 本节针对容器 sipu-dev、工作目录 /sgl-workspace/sglang 和命令：
 
-`bash
+```bash
 source /sgl-workspace/sglang/temp/env-offlie-infer.sh
 debug_env_file=/dev/shm/like/ipc.sglang.2.json \
   python3 like-useful/sipu_offline_infer_simo_quant.py \
   > temp/simo.log.2026_09_08___16_25_46 2>&1
-`
+```
 
 docker inspect sipu-dev 显示：宿主 /share/users/like/package/sglang_sipu 以 rw 挂载到
 /sgl-workspace/sglang；/share 以 rw 挂载到 /share；SIPU SDK、CModel 和 torch_sipu
@@ -1676,10 +1675,10 @@ SGLang 实际从 /sgl-workspace/sglang/python 的 editable 源码导入，SIMO �
 
 真正的首个致命异常在 temp/simo.log.2026_09_08___16_25_46:150-199：
 
-`text
+```text
 NotImplementedError: RMSNorm with quant_linear is not supported on SIPU,
 quant_method=<simo.extensions.sglang_simo.quantization.quantization.SIMOLinearMethod ...>
-`
+```
 
 准确位置是 python/sglang/srt/layers/layernorm.py:587-589（RMSNorm::forward_sipu）。
 此前 SDK/CModel、插件、两个权重 shard 都已成功初始化/加载，没有 OOM。
@@ -1698,23 +1697,23 @@ KV-cache fallback 均为 warning。
 
 日志 traceback 对应下列相对 code base 路径和函数：
 
-`text
+```text
 python/sglang/srt/managers/scheduler.py:5121（run_scheduler_process）
- -> :1713（Scheduler::run_event_loop）
- -> :4970（dispatch_event_loop）
- -> :1811（Scheduler::event_loop_overlap）
- -> :3751（Scheduler::run_batch）
+ -> python/sglang/srt/managers/scheduler.py:1713（Scheduler::run_event_loop）
+ -> python/sglang/srt/managers/scheduler.py:4970（dispatch_event_loop）
+ -> python/sglang/srt/managers/scheduler.py:1811（Scheduler::event_loop_overlap）
+ -> python/sglang/srt/managers/scheduler.py:3751（Scheduler::run_batch）
 python/sglang/srt/managers/tp_worker.py:614（TpModelWorker::forward_batch_generation）
  -> python/sglang/srt/model_executor/model_runner.py:1559（ModelRunner::forward）
- -> :1746（ModelRunner::_forward_raw）
+ -> python/sglang/srt/model_executor/model_runner.py:1746（ModelRunner::_forward_raw）
 python/sglang/srt/model_executor/runner/eager_runner.py:210（EagerRunner::execute）
- -> :345（EagerRunner::_execute_extend）
+ -> python/sglang/srt/model_executor/runner/eager_runner.py:345（EagerRunner::_execute_extend）
 python/sglang/srt/models/llama.py:612（LlamaForCausalLM::forward）
- -> :466（LlamaModel::forward）
- -> :360（LlamaDecoderLayer::forward）
+ -> python/sglang/srt/models/llama.py:466（LlamaModel::forward）
+ -> python/sglang/srt/models/llama.py:360（LlamaDecoderLayer::forward）
 python/sglang/kernels/fused_op.py:659（BaseFusedOp::forward）
  -> python/sglang/srt/layers/layernorm.py:587（RMSNorm::forward_sipu）
-`
+```
 
 python/sglang/srt/models/llama.py:350-378（LlamaDecoderLayer::forward）有两处传入下游 Linear：
 行 360-366 的 self_attn.qkv_proj 传给 input_layernorm，行 374-375 的 mlp.gate_up_proj
@@ -1735,7 +1734,7 @@ qkv_proj、o_proj、gate_up_proj、down_proj 都被量化。
 - simo/extensions/sglang_simo/quantization/quantization_registry.py:8-15（register_simo_quantization）
   把 simo 注册为 SIMOConfig；
 - simo/extensions/sglang_simo/model_loader/loader.py:46-85（_get_quantization_config）
-  读取 override 配置文件；
+  读取 override 配置文件，并调用 simo/extensions/sglang_simo/quantization/quantization.py:682-726（SIMOConfig::from_config_file）；
 - simo/extensions/sglang_simo/quantization/quantization.py:793-846（SIMOConfig::get_quant_method）
   对未排除的 LinearBase 选择目标规格；
 - simo/extensions/sglang_simo/quantization/quantization.py:848-865（SIMOConfig::get_quant_method_by_target_spec）
@@ -1747,10 +1746,10 @@ qkv_proj、o_proj、gate_up_proj、down_proj 都被量化。
 
 运行时关系为：
 
-`text
+```text
 self.self_attn.qkv_proj.quant_method -> SIMOLinearMethod
 self.mlp.gate_up_proj.quant_method   -> SIMOLinearMethod
-`
+```
 
 容器内 issubclass(SIMOLinearMethod, UnquantizedLinearMethod) 为 False，条件必然成立。
 
@@ -1758,14 +1757,14 @@ self.mlp.gate_up_proj.quant_method   -> SIMOLinearMethod
 
 代码位于 python/sglang/srt/layers/layernorm.py:575-614（RMSNorm::forward_sipu）：
 
-`python
+```python
 if quant_linear is not None:
     quant_method = getattr(quant_linear, "quant_method", None)
     if quant_method is not None and not isinstance(
         quant_method, UnquantizedLinearMethod
     ):
         raise NotImplementedError(...)
-`
+```
 
 它检查的是下游 Linear 的输入契约，而不是只看 dtype：
 
@@ -1822,7 +1821,7 @@ SIPU forward_sipu 不接收 quant_linear；该提交把潜在的参数签名错�
 
 ### 12.8 结论
 
-`text
+```text
 quantization=simo
  -> JSON 将 Linear 设为 MXFP8
  -> SIMOConfig::get_quant_method 返回 SIMOLinearMethod
@@ -1831,7 +1830,7 @@ quantization=simo
  -> BaseFusedOp 选择 RMSNorm::forward_sipu
  -> SIPU 尚无 RMSNorm + SIMO activation-quant 融合契约
  -> layernorm.py:584-589 按设计 fail-fast
-`
+```
 
 所以该 if 的目的，是只放行输出普通 tensor 的下游线性层；对需要量化输入语义的线性层
 明确报告未实现，避免静默走未经验证的数值或布局路径。
