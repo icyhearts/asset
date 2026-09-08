@@ -3,7 +3,7 @@ import sglang as sgl
 
 def main():
     # First smoke: dense Llama tiny. Copy the YAML `sipu:` block for other models.
-    quant_config = "/share_data/users/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_mxfp.json"
+    quant_config = "/share/users/like/package/simo_conda_sglang/simo/extensions/sglang_simo/example/simo_quantization_config/online_quantization/quant_config_w8a8_mxfp.json"
     json_model_override_args = f'{{"quantization_config_file": "{quant_config}"}}'
     engine_kwargs = {
       "quantization": "simo",
