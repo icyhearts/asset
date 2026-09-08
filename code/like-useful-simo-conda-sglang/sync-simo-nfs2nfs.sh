@@ -9,7 +9,7 @@ git push -f gitlab $current_branch
 
 
 
-all_dst_dirs=("/share/users/like/package/simo_conda_vllm/" "/share/users/like/package/simo_conda_vllm_sipu/")
+all_dst_dirs=("/share/users/like/package/simo_conda_vllm/" "/share/users/like/package/simo_conda_vllm_sipu/" "/share/users/like/package/simo_conda_sglang_sipu/")
 
 # Loop over the values
 for dist_dir in "${all_dst_dirs[@]}"; do

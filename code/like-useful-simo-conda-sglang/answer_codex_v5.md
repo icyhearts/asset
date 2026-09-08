@@ -1259,7 +1259,8 @@ temp/env-offlie-infer.sh
   -> sgl_kernel、torch_sipu，必要时 CPU fallback
 ```
 
-1. **容器和 editable 源码。** `docker inspect sipu-dev` 显示宿主机
+1. **容器和 editable 源码。** `docker inspect sipu-dev` 显示该容器使用镜像
+   `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0`，并将宿主机
    `/share/users/like/package/sglang_sipu` 以读写方式挂载到容器
    `/sgl-workspace/sglang`，所以容器内 editable 安装实际指向
    `/sgl-workspace/sglang/python`；import 名和发行包名仍为 `sglang`，修改宿主机源码
