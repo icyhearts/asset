@@ -1262,7 +1262,8 @@ temp/env-offlie-infer.sh
 1. **容器和 editable 源码。** `docker inspect sipu-dev` 显示宿主机
    `/share/users/like/package/sglang_sipu` 以读写方式挂载到容器
    `/sgl-workspace/sglang`，所以容器内 editable 安装实际指向
-   `/sgl-workspace/sglang/python`，修改宿主机源码会直接影响容器运行。关键挂载如下：
+   `/sgl-workspace/sglang/python`；import 名和发行包名仍为 `sglang`，修改宿主机源码
+   会直接影响容器运行。关键挂载如下：
 
    | 宿主机路径 | 容器路径 | 模式 |
    |---|---|---|
@@ -1292,6 +1293,8 @@ temp/env-offlie-infer.sh
    `SIPU_ARCH=150` 并装载 SDK/CModel。实测环境为
    `SI_SDK_ROOT=/share_data/sicx_sdk/release/2608282232`、
    `SI_CMODEL_ROOT=/share_data/arch_cmodel_release/sipu1.5/2608270400`。
+   这一步必须发生在首次 import SGLang/相关 backend 之前，因为
+   `is_sipu()` 使用 `lru_cache`，多个模块还会在 import 时保存 `_is_sipu`。
 
 3. **PyTorch 设备名。** 这里的 `torch.sipu` 来自已安装的 `torch_sipu`，不是
    SGLang 自己实现的 `torch.Device`。`python/sglang/srt/utils/common.py:193-203（is_sipu）`
@@ -1428,7 +1431,8 @@ temp/env-offlie-infer.sh
   `python/sglang/kernels/ops/attention/dsv4/topk.py:49-68（topk_transform_512）`。
   `python/sglang/srt/arg_groups/overrides.py:1158-1163（_deepseek_v4_overrides）` 对
   `device="sipu"` 保留 prefill/decode 的 `dsv4` backend，不把 DSV4 错误地降成普通
-  `sipu` DSA/MHA backend。
+  `sipu` DSA/MHA backend，并沿用该函数默认的 DSV4 `page_size=256`；普通 SIPU
+  模型的 helper 默认值仍是 `page_size=32`。
   DSV4 自己的频率表由 `python/sglang/srt/models/deepseek_v4.py:643-652（MqaAttentionBase::__init__）`
   按 `config.max_position_embeddings` 计算后移动到 SIPU；这与通用 RotaryEmbedding
   仍在 CPU 初始化的 workaround 是两条不同路径。
