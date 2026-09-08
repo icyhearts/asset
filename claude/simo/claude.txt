@@ -4055,7 +4055,9 @@ DEEP_SEEK_MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ LLAMA
 {
 
 sglang_sipu 代码位于 /share/users/like/package/sglang_sipu. sglang_sipu 需要的 docker contianer name=sipu-dev
-sglang_sipu 在 docker 环境内部仍旧以 editable 方式安装
+sglang_sipu 在 docker 环境内部仍旧以 editable 方式安装, 包名仍旧是 sglang
+
+sglang_sipu 代码 tag: v0.5.18 仍旧是开源 sglang 部分，比 tag: v0.5.18 更新的commit，是为了适配 sipu 做的 commit
 
 
 python /sgl-workspace/sglang/temp/sipu_offline_infer.py > /sgl-workspace/sglang/temp/off.log.2 2>&1 &

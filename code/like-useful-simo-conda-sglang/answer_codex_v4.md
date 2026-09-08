@@ -1477,3 +1477,130 @@ original_weight_loader(param, packed_weight, "q")
 名为 `loaded_shard_id` 的关键字（另加 `**kwargs`）；如果未来出现第三参数名为 `shard_id` 或
 仅允许位置传参的 callable，两者都需要专门适配。当前 v0.5.18 的 Merged/QKV 签名正好使用
 `loaded_shard_id`，所以不存在这个边界问题。
+
+## 5.11 pip wheel 环境删除 `_call_weight_loader` 后的复测
+
+### 5.11.1 输入、版本和提取规则
+
+本次复测工作树是 `simo_conda_sglang_pip` 的 `sglv0518` 分支，SGLang 通过 wheel 安装，
+Simo 也通过 wheel 安装。使用的两个日志（路径相对于该工作树）是：
+
+```text
+temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_mmlu__CUDA_VISIBLE_DEVICES_6.log.2026_09_07___18_15_43
+temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_07___18_16_02
+```
+
+脚本中的 `QUANT_CONFIGS` 有 13 个权重量化 JSON，`KV_CACHE_QUANT_CONFIGS` 有 7 个 KV
+cache 量化 JSON；每个模型还运行一次 no-quant baseline。因此每个任务应有
+`2 * (1 + 13 + 7) = 42` 个评测实例。
+
+MMLU 取每个实例结果表中任务名为 `mmlu` 的总 `acc` 行。lm-eval 会在详细结果表和
+`Groups` 表各打印一次，所以日志中有 84 行总行，但两行属于同一个实例，按实例去重后为
+42 个分数。例如首个 baseline 在 MMLU 日志 `:1247`，最后一个 KV 配置在 `:59999`。
+
+GSM8K 只取 `flexible-extract` 的 `exact_match`，忽略同一表中的 `strict-match`。首个
+baseline 位于 GSM8K 日志 `:732`；DeepSeek 的两个有差异的结果位于 `:26055` 和 `:27059`，
+最后一个 KV 配置位于 `:37591`。
+
+pip 工作树原本没有 `tests/sglang_simo/references_accuracy/mmlu-v0.5.18.yaml` 和
+`gsm8k-v0.5.18.yaml`；本次以同目录现有的 `mmlu.yaml`/`gsm8k.yaml` 作为字段顺序，并与
+同级 `simo_conda_sglang` 工作树中的 v0.5.18 基准逐字节核对，二者内容一致。恢复结果写入：
+
+- `tests/sglang_simo/references_accuracy/mmlu-v0.5.18.recover.yaml`
+- `tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.recover.yaml`
+
+两个文件均保留了基准的模型、量化类型和字段顺序；每个模型各有 21 条记录。
+
+### 5.11.2 运行完整性和日志异常
+
+两个任务都是 42/42 个实例出现了对应的总分行；也就是说，两个模型的 13 个权重量化和
+7 个 KV cache JSON 都实际执行并产生了结果，没有在中途因 loader 或 CUDA 错误停止。
+
+日志中确实有 traceback，但它们是每个实例结束后的进程清理噪声，不是模型推理异常：
+
+```text
+resource_tracker: process died unexpectedly, relaunching
+Traceback (most recent call last):
+  .../multiprocessing/resource_tracker.py:264, in main
+    cache[rtype].remove(name)
+KeyError: '/loky-...'
+```
+
+该片段总是在 `kill_process_tree called` 之后出现；MMLU 和 GSM8K 日志各出现 42 次，之后
+下一个配置继续运行且最终 42 个结果齐全。因此应记录为 cleanup 阶段的已知警告/异常，不能
+把它等同于 core dump。日志中没有发现 `core dumped`、`SIGSEGV`、`SIGABRT`、
+`Segmentation fault`、OOM、`Killed` 或 `fatal error`。另外，每个实例都有一次可选模型
+`sarashina2_vision` 的 `Ignore import error`（缺少 `MultimodalDataItem`）；该模块与本次
+Llama/DeepSeek 目标模型无关，SGLang 明确将其忽略。
+
+### 5.11.3 MMLU 总分提取结果和对比
+
+下面的权重量化顺序严格对应 recover YAML：
+
+```text
+w8a8_fp8_per_block, w4a16_int4_per_group, w8a8_int8_per_block,
+w8a8_fp8_per_channel, w8a8_int8_per_channel, w8a8_mxint, w8a8_mxfp,
+w6a6_mxfp, w4a4_mxfp, w4a16_nvfp4_per_group,
+w4a16_nvfp4_per_group_4_over_6, w4a4_nvfp, w4a4_nvfp_4_over_6
+```
+
+```text
+Llama-3.1-8B-Instruct
+baseline: 68.47
+weight:   68.02, 66.21, 67.98, 68.02, 67.48, 68.20, 67.67,
+          68.07, 57.99, 66.22, 66.49, 64.13, 64.45
+KV (mxfp8, mxfp4, mxfp6, mxint8, fp8_per_group_64, int8_per_group_64, nvfp4):
+          68.27, 68.27, 68.27, 68.27, 68.27, 68.27, 68.27
+
+DeepSeek-V2-Lite-Chat-16B_A2.4B
+baseline: 56.65
+weight:   56.38, 54.88, 56.47, 55.97, 55.88, 56.51, 55.83,
+          55.86, 48.43, 54.04, 54.55, 52.83, 52.94
+KV (mxfp8, mxfp4, mxfp6, mxint8, fp8_per_group_64, int8_per_group_64, nvfp4):
+          56.72, 56.72, 56.72, 56.72, 56.72, 56.72, 56.72
+```
+
+将 `mmlu-v0.5.18.recover.yaml` 与 v0.5.18 基准逐模型、逐条目比较，42/42 条在两位小数
+精度下完全相同。因此删除 `_call_weight_loader` 后，本次两个模型的 MMLU 总体精度没有
+可见变化。
+
+### 5.11.4 GSM8K flexible-extract 总分提取结果和对比
+
+GSM8K 的权重量化顺序与上一节相同，下面只列 `flexible-extract` 总分（百分数）：
+
+```text
+Llama-3.1-8B-Instruct
+baseline: 77.63
+weight:   77.26, 73.39, 77.94, 76.88, 77.03, 77.48, 77.03,
+          76.35, 47.61, 73.24, 75.51, 69.07, 70.13
+KV (mxfp8, mxfp4, mxfp6, mxint8, fp8_per_group_64, int8_per_group_64, nvfp4):
+          76.72, 69.90, 77.79, 77.94, 78.47, 77.33, 76.57
+
+DeepSeek-V2-Lite-Chat-16B_A2.4B
+baseline: 66.03
+weight:   65.66, 56.86, 65.88, 65.88, 63.31, 65.28, 64.90,
+          64.37, 38.51, 63.08, 63.91, 56.79, 57.77
+KV (mxfp8, mxfp4, mxfp6, mxint8, fp8_per_group_64, int8_per_group_64, nvfp4):
+          66.03, 31.39, 64.37, 66.03, 66.34, 66.34, 47.08
+```
+
+与 `gsm8k-v0.5.18.yaml` 比较，Llama 的 21/21 条全部相同；DeepSeek 的 21 条中 19 条相同，
+只有两项发生变化：
+
+| 模型/量化配置 | v0.5.18 基准 | 本次 recover | 变化 |
+|---|---:|---:|---:|
+| DeepSeek / `w8a8_fp8_per_block` | 65.96 | 65.66 | -0.30 个百分点 |
+| DeepSeek / `w8a8_fp8_per_channel` | 65.58 | 65.88 | +0.30 个百分点 |
+
+这两项的变化方向相反、绝对值均为 0.30 个百分点，而日志中的 GSM8K flexible-extract 标准
+误差约为 1.3 个百分点，不能据此判断为系统性精度回归。低比特配置相对 baseline 的较大
+差异（例如 Llama `w4a4_mxfp` 为 47.61、DeepSeek `mxfp4` KV cache 为 31.39）在基准中
+也已经存在，本次不是由删除 helper 新引入的变化。
+
+### 5.11.5 结论
+
+本次 wheel 环境复测证明：所有目标 JSON 配置均完成 MMLU/GSM8K 评测并写入 recover YAML；
+没有 core dump 或 CUDA 崩溃。删除 `_call_weight_loader` 对当前 Llama3.1-8B-Instruct 和
+DeepSeek-V2-Lite、TP=1、当前加载路径的总体精度没有明显影响；MMLU 完全一致，GSM8K 仅有
+两项相反方向的 0.30 个百分点波动。`resource_tracker` 的 `KeyError` 应另行清理，但不
+影响本次分数提取结论。
