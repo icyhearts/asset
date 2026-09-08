@@ -4074,3 +4074,10 @@ else 使用 /tmp/like 作为保底，并给出 warning
 
 
 }
+
+{
+/data_gpu/modelzoo/weights/llm/llama/llama3.1/llama3.1-8B-Instruct/safetensor_weight 是原始模型,
+/share_data/inference-framework/tiny-models/Llama-3.1-8B-Instruct-4layer/safetensor_weights 是一个裁剪后的模型.
+裁剪模型在原始模型上做了哪些修改?
+把答案追加到 like-useful/answer_codex_v6.md
+}
