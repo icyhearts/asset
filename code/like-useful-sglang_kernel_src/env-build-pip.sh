@@ -14,9 +14,10 @@ export CMAKE_VERBOSE_MAKEFILE=ON
 export SKBUILD_VERBOSE=1
 
 
-if [[ -d /data/like ]]; then
+# Prefer a persistent cache root, then local storage, and finally /tmp.
+if [ -d /data/like ]; then
     export LIKE_CACHE_ROOT_DIR=/data/like
-elif [[ -d /local_data/like ]]; then
+elif [ -d /local_data/like ]; then
     export LIKE_CACHE_ROOT_DIR=/local_data/like
 else
     export LIKE_CACHE_ROOT_DIR=/tmp/like
@@ -32,14 +33,14 @@ export SGLANG_JIT_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/sglang_jit
 export SGLANG_DG_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/deep_gemm_cache_dir
 
 
-mkdir -p $DG_JIT_CACHE_DIR
-mkdir -p $TVM_FFI_CACHE_DIR
-mkdir -p $TRITON_CACHE_DIR
+mkdir -p "$DG_JIT_CACHE_DIR"
+mkdir -p "$TVM_FFI_CACHE_DIR"
+mkdir -p "$TRITON_CACHE_DIR"
 
 
-mkdir -p $SGLANG_CACHE_DIR
-mkdir -p $SGLANG_JIT_CACHE_DIR
-mkdir -p $SGLANG_DG_CACHE_DIR
+mkdir -p "$SGLANG_CACHE_DIR"
+mkdir -p "$SGLANG_JIT_CACHE_DIR"
+mkdir -p "$SGLANG_DG_CACHE_DIR"
 
 
 
