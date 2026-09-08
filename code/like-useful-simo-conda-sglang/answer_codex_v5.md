@@ -1369,13 +1369,17 @@ temp/env-offlie-infer.sh
   `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:244-305（DeepseekSparseAttnBackend::__init__）`
   和 `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:307-624（DeepseekSparseAttnBackend::init_forward_metadata）`
   构造 DSA metadata、
-  real/page table 和 FlashMLA schedule；`:1151（DeepseekSparseAttnBackend::forward_extend）`
-  与 `:1250（DeepseekSparseAttnBackend::forward_decode）` 分别覆盖 prefill/decode；
+  real/page table 和 FlashMLA schedule；
+  `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1151（DeepseekSparseAttnBackend::forward_extend）`
+  与 `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1250（DeepseekSparseAttnBackend::forward_decode）`
+  分别覆盖 prefill/decode；
   `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1336-1396（DeepseekSparseAttnBackend::_forward_flashmla_kv）` 调用
   `sgl_kernel.flash_mla_with_kvcache`。当前 SIPU FlashMLA-KV 要求 FP8 DSA KV cache、
   real page size 64，并把 query head 补齐到 kernel 支持的 64/128 变体；短 prefill
   由 `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1458-1482（DeepseekSparseAttnBackend::set_dsa_prefill_impl）` 选择 dense MHA
-  以降低开销。文件末尾 `:1618-1622` 将该实现导出为 `SIPUDSAAttnBackend`。
+  以降低开销。文件末尾
+  `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1618-1622（SIPUDSAAttnBackend 导出别名）`
+  将该实现导出为 `SIPUDSAAttnBackend`。
 
 - **DSA indexer 和 top-k。**
   `python/sglang/srt/hardware_backend/sipu/attention/dsa_sipu_indexer.py:409-474（DSASIPUIndexerMixin::forward_sipu）`
@@ -1480,27 +1484,30 @@ temp/env-offlie-infer.sh
 #### 11.3.4 FP8/量化、加载和内存管理
 
 - **FP8 linear。** `python/sglang/srt/layers/quantization/fp8_utils.py:748-751（_dispatch_auto_backend）`
-  在 auto backend 中优先选择 SIPU；`:1140-1200（sipu_w8a8_block_fp8_linear）`
+  在 auto backend 中优先选择 SIPU；
   通过 `sglang_per_token_group_quant_fp8` 做输入量化，再调用
   `torch._scaled_grouped_mm`，输出 bf16。
-  `python/sglang/srt/layers/quantization/fp8_utils.py:1140-1200（sipu_w8a8_block_fp8_linear）`
+  `python/sglang/srt/layers/quantization/fp8_utils.py:1140-1200（sipu_w8a8_block_fp8_linear）`、
   `python/sglang/kernels/ops/quantization/fp8_kernel.py:527-572（_run_per_token_group_quant_8bit_kernel）`
-  和 `:825-847（sglang_per_token_quant_fp8）` 提供对应 `sgl_kernel` 量化入口。
-  `python/sglang/kernels/ops/quantization/fp8_kernel.py:825-847（sglang_per_token_quant_fp8）`
-  提供对应 `sgl_kernel` 量化入口。CModel 不支持或效率不佳的 block/channel scale 转换在
+  和 `python/sglang/kernels/ops/quantization/fp8_kernel.py:825-847（sglang_per_token_quant_fp8）`
+  提供对应 `sgl_kernel` 量化入口。
+  CModel 不支持或效率不佳的 block/channel scale 转换在
   `python/sglang/srt/layers/quantization/fp8_utils.py:1424（block_quant_to_tensor_quant）`、
   `python/sglang/srt/layers/quantization/fp8_utils.py:1771-1787（channel_quant_to_tensor_quant）`
   使用 CPU workaround。
 - **未量化层和权重加载。**
   `python/sglang/srt/layers/quantization/unquant.py:217-229（UnquantizedLinearMethod::apply）`
   对 SIPU 用 CPU `F.linear` 后拷回，绕过慢或不稳定的 CModel bf16 GEMM；
-  `:849-856（UnquantizedFusedMoEMethod::forward_sipu）` 要求使用 Triton/fused MoE
+  `python/sglang/srt/layers/quantization/unquant.py:849-856（UnquantizedFusedMoEMethod::forward_sipu）`
+  要求使用 Triton/fused MoE
   runner。`python/sglang/srt/model_loader/loader.py:151-180（device_loading_context）`
   在 SIPU 跳过 shard load 后的 bulk `p.data.to(sipu)`，因为该操作可能使 CModel hang；
   `python/sglang/srt/model_loader/utils.py:294（should_async_load）` 关闭 threaded async H2D。
 - **Embedding/lm_head 和 KV allocator。**
   `python/sglang/srt/models/cpu_embedding_lm_head.py:21-30（use_cpu_embedding_lm_head）`
-  默认让 SIPU 的大 embedding/lm_head 留在 CPU，`:38-56（embed_input_ids）`、`:59-103（logits_processor_with_cpu_lm_head）`
+  默认让 SIPU 的大 embedding/lm_head 留在 CPU，
+  `python/sglang/srt/models/cpu_embedding_lm_head.py:38-56（embed_input_ids）`、
+  `python/sglang/srt/models/cpu_embedding_lm_head.py:59-103（logits_processor_with_cpu_lm_head）`
   负责 CPU/SIPU 间搬运。`python/sglang/srt/mem_cache/allocator/paged.py:215-232（PagedTokenToKVPoolAllocator::alloc_extend）`
   和 `python/sglang/srt/mem_cache/allocator/paged.py:274-284（PagedTokenToKVPoolAllocator::alloc_decode）` 因 Triton allocator 在 SIPU
   上可能挂起，改用 CPU naive 分配后复制索引；这保证可用性，但会引入同步和拷贝开销。
@@ -1509,7 +1516,7 @@ temp/env-offlie-infer.sh
   fallback。新增的 `python/sglang/srt/layers/attention/linear/kernels/gdn_custom.py:25-175（CustomGDNKernel::packed_decode、CustomGDNKernel::decode、CustomGDNKernel::extend、CustomGDNKernel::target_verify）`
   通过 `sgl_kernel` 提供 SIPU GDN 的 decode/extend/verify；选择入口是
   `python/sglang/srt/layers/attention/linear/gdn_backend.py:66-68（模块设备分支）` 和
-  `:147-155（GDNBackend::__init__ 的 custom 分支）`。
+  `python/sglang/srt/layers/attention/linear/gdn_backend.py:147-155（GDNBackend::__init__ 的 custom 分支）`。
   `python/sglang/srt/managers/scheduler.py:1681-1694（Scheduler::run_event_loop）`
   将 SIPU 的 schedule stream 绑定到 forward stream，
   `python/sglang/srt/model_executor/model_runner.py:397-415（ModelRunner::__init__）`
@@ -1542,8 +1549,9 @@ temp/env-offlie-infer.sh
 - `temp/sipu_offline_infer.py:4-26（main）` 创建
   `sgl.Engine(model_path=..., device="sipu", attention_backend="sipu", disable_cuda_graph=True,
   skip_server_warmup=True)`，生成 8 个 token 后 shutdown。
-- `temp/off.log.3:1-7` 显示 SIPU SDK、CModel shim 和 `SGL_KERNEL_LOG` 已加载；
-  `:41-44` 显示 worker 使用 SIPU stream，两个 shard 完成加载；`:47-110` 的首个
+- `temp/off.log.3:1-7（日志记录）` 显示 SIPU SDK、CModel shim 和 `SGL_KERNEL_LOG` 已加载；
+  `temp/off.log.3:41-44（日志记录）` 显示 worker 使用 SIPU stream，两个 shard 完成加载；
+  `temp/off.log.3:47-110（日志记录）` 的首个
   prefill 张量均为 `device=sipu:0`，并调用 SIPU `rmsnorm` 和 paged
   `flash_attn_with_kvcache`。
 - `temp/off.log.3:2636` 记录请求完成：`prompt_tokens=13`、`completion_tokens=8`、
@@ -1568,9 +1576,12 @@ temp/env-offlie-infer.sh
    embedding/lm_head、KV allocator、部分 DSA top-k/RoPE 会走 CPU 或同步拷贝；不能把
    “能启动”解释为所有 kernel 已经原生高性能。
 4. **DSV4/MoE 仍不完整。** `python/sglang/srt/models/deepseek_v4.py:220-224（模块常量）`
-   设置 `_SKIP_DSV4_ROUTED_MOE=True`；`:2038-2048（DeepseekV4DecoderLayer::_run_moe_ffn_dp_sync）`
-   直接保留 residual，`:3406-3420（DeepseekV4ForCausalLM::load_weights）` 跳过
-   `.experts.`/`tid2eid`，`:3653-3660（DeepseekV4ForCausalLM::load_weights 的参数检查）`
+   设置 `_SKIP_DSV4_ROUTED_MOE=True`；
+   `python/sglang/srt/models/deepseek_v4.py:2038-2048（DeepseekV4DecoderLayer::_run_moe_ffn_dp_sync）`
+   直接保留 residual，
+   `python/sglang/srt/models/deepseek_v4.py:3406-3420（DeepseekV4ForCausalLM::load_weights）` 跳过
+   `.experts.`/`tid2eid`，
+   `python/sglang/srt/models/deepseek_v4.py:3653-3660（DeepseekV4ForCausalLM::load_weights 的参数检查）`
    也跳过对应未加载参数。这个 workaround 是为了让 attention/MHC 对齐测试继续，
    不能宣称已经支持完整 routed MXFP4 expert。
 5. **fake top-k 影响精度解释。** `moe/topk.py` 的固定 expert 路由只适合当前
@@ -1578,7 +1589,7 @@ temp/env-offlie-infer.sh
    端到端 accuracy test。
 6. **HEAD 后的清理改变了早期实验行为。** `770f80bc` 删除了临时 SIPU 同步日志、
    1M RoPE 上限、特殊 MHC 分支以及若干默认设置；结论应以 HEAD 的
-   `hardware_backend/sipu/utils.py:28-33（set_default_server_args）` 为准，而不是
+   `python/sglang/srt/hardware_backend/sipu/utils.py:28-33（set_default_server_args）` 为准，而不是
    首个 `91462e29` 的中间状态。
 
 综上，`v0.5.18` 到 `sglang_sipu` HEAD 的核心新增是一个贯穿式 SIPU runtime：
