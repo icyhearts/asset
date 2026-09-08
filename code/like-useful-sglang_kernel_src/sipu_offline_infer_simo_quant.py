@@ -9,6 +9,7 @@ def main():
       "quantization": "simo",
       "json_model_override_args": json_model_override_args,
       "watchdog_timeout": 2592000,
+      "skip_server_warmup": True,
     }
     llm = sgl.Engine(
         model_path="/share_data/inference-framework/tiny-models/Llama-3.1-8B-Instruct-4layer/safetensor_weights",
