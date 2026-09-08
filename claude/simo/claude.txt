@@ -4071,3 +4071,9 @@ python /sgl-workspace/sglang/temp/sipu_offline_infer.py > /sgl-workspace/sglang/
 
 把答案追加到 like-useful/answer_codex_v5.md
 }
+{
+修改  /share/users/like/package/sglang_kernel_src/like-useful/env-build-pip.sh， 对于 各种 CACHE_DIR变量的 root dir, 如果 /data/like/ 存在, 使用 /data/like/, else if /local_data/like 存在，使用 /local_data/like,
+else 使用 /tmp/like 作为保底，并给出 warning 
+
+
+}

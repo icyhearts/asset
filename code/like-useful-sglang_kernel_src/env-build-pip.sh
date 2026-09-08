@@ -14,13 +14,22 @@ export CMAKE_VERBOSE_MAKEFILE=ON
 export SKBUILD_VERBOSE=1
 
 
-export DG_JIT_CACHE_DIR=/data/like/cache/deep_gemm_cache_dir
-export TVM_FFI_CACHE_DIR=/data/like/cache/tvm_ffi_cache_dir
-export TRITON_CACHE_DIR=/data/like/cache/triton_cache_like
+if [[ -d /data/like ]]; then
+    export LIKE_CACHE_ROOT_DIR=/data/like
+elif [[ -d /local_data/like ]]; then
+    export LIKE_CACHE_ROOT_DIR=/local_data/like
+else
+    export LIKE_CACHE_ROOT_DIR=/tmp/like
+    echo "WARNING: /data/like and /local_data/like do not exist; using ${LIKE_CACHE_ROOT_DIR} for build caches." >&2
+fi
 
-export SGLANG_CACHE_DIR=/data/like/cache/sglang
-export SGLANG_JIT_CACHE_DIR=/data/like/cache/sglang_jit
-export SGLANG_DG_CACHE_DIR=/data/like/cache/deep_gemm_cache_dir
+export DG_JIT_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/deep_gemm_cache_dir
+export TVM_FFI_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/tvm_ffi_cache_dir
+export TRITON_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/triton_cache_like
+
+export SGLANG_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/sglang
+export SGLANG_JIT_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/sglang_jit
+export SGLANG_DG_CACHE_DIR=${LIKE_CACHE_ROOT_DIR}/cache/deep_gemm_cache_dir
 
 
 mkdir -p $DG_JIT_CACHE_DIR
