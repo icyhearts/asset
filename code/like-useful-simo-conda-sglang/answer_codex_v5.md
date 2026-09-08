@@ -1804,9 +1804,22 @@ tensor，再由 SIMOLinearMethod 自行量化；但 residual、scale、layout、
 
 ### 12.7 检查来源和处理建议
 
-git blame 表明 python/sglang/srt/layers/layernorm.py:575-589（RMSNorm::forward_sipu）
-的参数和检查来自 commit d6dd88127（fix randn so slow and rmsnorm error）。更早的
-SIPU forward_sipu 不接收 quant_linear；该提交把潜在的参数签名错误改成显式能力错误。
+当前 `sglang_sipu` HEAD 中，git blame 表明
+python/sglang/srt/layers/layernorm.py:575-589（RMSNorm::forward_sipu）的参数和检查
+来自 commit `91462e291`（`feat(sipu): add sipu support on v0.5.18`）。该提交把
+SIPU 的 `forward_sipu` 增加到统一分派，并将 `quant_linear` 纳入签名；随后用显式
+能力检查替代潜在的参数签名错误。`d6dd88127`（`fix randn so slow and rmsnorm error`）
+是另一条并行开发分支上的同名修复，不是当前 HEAD 的 blame 依据。
+
+还要注意一个被上述异常遮蔽的后续问题：当前 SIMO HEAD 的
+`simo/extensions/sglang_simo/quantization/quantization.py:1116-1247`
+（`SIMOLinearMethod::apply`）在 debug 代码的 :1137 和 :1210 直接调用
+`torch.cuda.is_current_stream_capturing()`。SIPU 的 `torch.cuda` 是 dummy backend，
+绕过 RMSNorm 检查后可能先得到
+`RuntimeError: Tried to instantiate dummy base class _cuda_isCurrentStreamCapturing`。
+应改用设备无关的 capture helper（或 `torch.sipu.is_current_stream_capturing()`）后，
+才能继续验证 SIMO 的 SIPU GEMM；这属于第二个独立兼容性问题，不是本次日志中首先
+抛出的 RMSNorm 异常。
 
 不改源码时：
 
