@@ -1283,25 +1283,30 @@ temp/env-offlie-infer.sh
    `python/sglang/srt/configs/device_config.py:10-23（DeviceConfig::__init__）`
    把 `sipu` 加入支持列表并构造 `torch.device("sipu")`；
    `python/sglang/srt/utils/common.py:495-509（get_available_gpu_memory）`、
-   `:764-770（get_sipu_memory_capacity）`、`:854-870（get_device_memory_capacity）`
+   `python/sglang/srt/utils/common.py:764-770（get_sipu_memory_capacity）`、
+   `python/sglang/srt/utils/common.py:854-870（get_device_memory_capacity）`
    改用 `torch.sipu.device_count/current_device/mem_get_info`；
-   `:916-945（get_device）` 在显式 SIPU 可用时返回 `sipu` 或 `sipu:<id>`。
+   `python/sglang/srt/utils/common.py:916-945（get_device）` 在显式 SIPU 可用时返回
+   `sipu` 或 `sipu:<id>`。
 
 4. **通用算子分派。** `python/sglang/srt/platforms/device_mixin.py:38-55（PlatformEnum）`
    增加 `SIPU` 枚举，`:85-93（_DEVICE_TO_DISTRIBUTED_BACKEND）` 根据
-   `SGLANG_SIPU_USE_SICCL` 选择 `siccl` 或 `gloo`，`:131-132（DeviceMixin::is_sipu）`
+   `python/sglang/srt/platforms/device_mixin.py:85-93（_DEVICE_TO_DISTRIBUTED_BACKEND）` 根据
+   `SGLANG_SIPU_USE_SICCL` 选择 `siccl` 或 `gloo`，
+   `python/sglang/srt/platforms/device_mixin.py:131-132（DeviceMixin::is_sipu）`
    提供平台谓词。`python/sglang/kernels/fused_op.py:147-155（_PLATFORM_METHODS）`
-   为 SIPU 定义 `forward_sipu`，并在 `:163-198（_platform_key）` 中**先于 CUDA**检查
+   为 SIPU 定义 `forward_sipu`，并在 `python/sglang/kernels/fused_op.py:163-198（_platform_key）`
+   中**先于 CUDA**检查
    SIPU，因为某些 `torch_sipu` 构建会让 `torch.cuda.is_available()` 得到误导性的结果；
-   `:523-567（BaseFusedOp::_platform_method、BaseFusedOp::_resolve_forward_method）`
+   `python/sglang/kernels/fused_op.py:523-567（BaseFusedOp::_platform_method、BaseFusedOp::_resolve_forward_method）`
    先找 `forward_sipu`，再退回 `forward_cuda` 或 native 实现。
 
 5. **ServerArgs 和 graph 约束。**
    `python/sglang/srt/server_args.py:3664-3675（ServerArgs::_run_resolution_pipeline）`
-   将 SIPU 校正纳入参数解析；`:4390-4402（ServerArgs::_handle_sipu_backends）`
+   将 SIPU 校正纳入参数解析；`python/sglang/srt/server_args.py:4390-4402（ServerArgs::_handle_sipu_backends）`
    调用 `python/sglang/srt/hardware_backend/sipu/utils.py:28-33（set_default_server_args）`，
    HEAD 最终只在未指定时设置 `page_size=32`，并把 SIPU 的 prefill compiler 强制为
-   `eager`。`:4614-4635（ServerArgs::_disable_tc_piecewise_cudagraph_if_incompatible）`
+   `eager`。`python/sglang/srt/server_args.py:4614-4635（ServerArgs::_disable_tc_piecewise_cudagraph_if_incompatible）`
    将 SIPU 列为不支持 tc-piecewise CUDA graph 的设备。不要把首个提交中曾出现、
    后来由 `770f80bc` 删除的内存比例、特殊 graph 或 custom-allreduce 默认值当作当前
    默认行为。
@@ -1353,8 +1358,8 @@ temp/env-offlie-infer.sh
 - **DSA/FlashMLA/indexer。**
   `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:244-305（DeepseekSparseAttnBackend::__init__）`
   和 `:307-624（DeepseekSparseAttnBackend::init_forward_metadata）` 构造 DSA metadata、
-  real/page table 和 FlashMLA schedule；`:1151-...（DeepseekSparseAttnBackend::forward_extend）`
-  与 `:1250-1334（DeepseekSparseAttnBackend::forward_decode）` 分别覆盖 prefill/decode；
+  real/page table 和 FlashMLA schedule；`:1151（DeepseekSparseAttnBackend::forward_extend）`
+  与 `:1250（DeepseekSparseAttnBackend::forward_decode）` 分别覆盖 prefill/decode；
   `:1336-1396（DeepseekSparseAttnBackend::_forward_flashmla_kv）` 调用
   `sgl_kernel.flash_mla_with_kvcache`。当前 SIPU FlashMLA-KV 要求 FP8 DSA KV cache、
   real page size 64，并把 query head 补齐到 kernel 支持的 64/128 变体；短 prefill
@@ -1378,7 +1383,7 @@ temp/env-offlie-infer.sh
   `elementwise.py:119-...（fused_rope_inplace）`、`gemm.py:145-...（linear_bf16_fp32）`、
   `metadata_kernel.py:196-...（init_compression_metadata）`、
   `moe.py:113-...（hash_topk）` 和 `topk.py:49-68（topk_transform_512）`。
-  `python/sglang/srt/arg_groups/overrides.py:1158-1163（get_dsv4_overrides）` 对
+  `python/sglang/srt/arg_groups/overrides.py:1158-1163（_deepseek_v4_overrides）` 对
   `device="sipu"` 保留 prefill/decode 的 `dsv4` backend，不把 DSV4 错误地降成普通
   `sipu` DSA/MHA backend。
 
