@@ -1575,8 +1575,9 @@ temp/env-offlie-infer.sh
   `torch_sipu`、`sgl-kernel`、SDK/CModel 和设备能力。
 - `.gitmodules:1-3（子模块声明）` 增加 `sgl-kernel-sipu` 子模块（当前 gitlink 为
   `42ed0661061e621b468a21d7a14f871887731065`）；`docker/sipu-0.5.18-base.Dockerfile`
-  和 `docker/sipu-0.5.18.Dockerfile` 固定 Ubuntu/toolchain、CPU 版 torch 2.10、
-  `torch_sipu`、SiOrigin Triton、`siinfer` 和预编译 kernel。也就是说，SGLang editable
+  和 `docker/sipu-0.5.18.Dockerfile:77-102（Docker 构建步骤）` 固定 Ubuntu/toolchain、
+  CPU 版 torch 2.10、`torch_sipu`、SiOrigin Triton、`siinfer` 和预编译 kernel，并执行
+  `pip install --no-cache-dir -e python --no-deps`。也就是说，SGLang editable
   安装只改变 Python 源码指向，不会自动重编译或替换 `sgl-kernel-sipu`、CModel、
   `torch_sipu` 等二进制依赖。
 - `scripts/ci/sipu_ci_cases.py`、`sipu_ci_exec.sh`、`sipu_ci_suites.yaml`、
