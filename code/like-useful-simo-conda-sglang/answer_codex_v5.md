@@ -1367,7 +1367,7 @@ temp/env-offlie-infer.sh
 
 - **DSA/FlashMLA/indexer。**
   `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:244-305（DeepseekSparseAttnBackend::__init__）`
-  和 `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:307-624（DeepseekSparseAttnBackend::init_forward_metadata）`
+  和 `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:362-624（DeepseekSparseAttnBackend::init_forward_metadata）`
   构造 DSA metadata、
   real/page table 和 FlashMLA schedule；
   `python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1151（DeepseekSparseAttnBackend::forward_extend）`
