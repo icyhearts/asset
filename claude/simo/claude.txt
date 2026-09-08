@@ -4050,3 +4050,30 @@ DEEP_SEEK_MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ LLAMA
 
 把答案追加到 like-useful/answer_codex_v4.md
 }
+
+
+{
+我删除了 _call_weight_loader, 重新测试，代码分支在 sglv0518 分支, 并同步到 /share/users/like/package/simo_conda_sglang_pip  sglv0518 分支.
+
+conda 环境位于  /share_data/users/like/miniconda3/envs/simo_sglang_pip/
+sglang 以  pip wheel 方式安装
+simo 代码位于 /share/users/like/package/simo_conda_sglang_pip
+simo 以 pip wheel 方式安装.
+
+我用新的conda 环境测试, 工作目录 :/share/users/like/package/simo_conda_sglang_pip 
+
+DEEP_SEEK_MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ LLAMA_MODEL_PATH=/data/like/hf-models/Llama3.1-8B-Instruct/ MAX_RUNNING_REQUESTS=128 CUDA_GRAPH_MAX_BS=128 ADD_BOS_TOKEN=true TASKS=mmlu CUDA_VISIBLE_DEVICES=6 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh > temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_mmlu__CUDA_VISIBLE_DEVICES_6.log.`nowstr.sh` 2>&1
+日志位于 /share/users/like/package/simo_conda_sglang_pip/temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_mmlu__CUDA_VISIBLE_DEVICES_6.log.2026_09_07___18_15_43
+
+你帮我从 本次日志 中提取每个 mmlu  得分，参考 tests/sglang_simo/references_accuracy/mmlu-v0.5.18.yaml, ，结果写入 tests/sglang_simo/references_accuracy/mmlu-v0.5.18.recover.yaml, 字段顺序保持和tests/sglang_simo/references_accuracy/mmlu-v0.5.18.yaml   的顺序一致。
+并分析  simo 量化的 不同数据类型的 mmlu 和  tests/sglang_simo/references_accuracy/mmlu-v0.5.18.yaml,   对比，有没有明显精度上的变化. 只考虑总体的 mmlu 得分，不考虑各学科分数
+
+
+DEEP_SEEK_MODEL_PATH=/data/like/hf-models/DeepSeek-V2-Lite-Chat-16B_A2.4B/ LLAMA_MODEL_PATH=/data/like/hf-models/Llama3.1-8B-Instruct/ MAX_RUNNING_REQUESTS=128 CUDA_GRAPH_MAX_BS=128 ADD_BOS_TOKEN=true TASKS=gsm8k CUDA_VISIBLE_DEVICES=7 bash simo/extensions/sglang_simo/example/online_quantization/llm_eval_online_quant.sh > temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.`nowstr.sh` 2>&1
+日志位于 /share/users/like/package/simo_conda_sglang_pip/temp/llm_eval_online_quant.sh.MAX_RUNNING_REQUESTS_128_CUDA_GRAPH_MAX_BS_128_ADD_BOS_TOKEN_true__TASKS_gsm8k__CUDA_VISIBLE_DEVICES_7.log.2026_09_07___18_16_02
+
+ 你帮我从 本次日志 中提取每个 gsm8k flexible-extract  得分，参考  tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.yaml,  ，  结果写入 tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.recover.yaml, 字段顺序 保持和  tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.yaml,   的顺序一致。
+ 并分析  simo 量化的 不同数据类型的 gsm8k flexible-extract 和  tests/sglang_simo/references_accuracy/gsm8k-v0.5.18.yaml 对比，有没有明显精度上的变化
+
+把答案追加到 like-useful/answer_codex_v5.md
+}
