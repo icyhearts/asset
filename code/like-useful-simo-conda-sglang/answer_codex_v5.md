@@ -2569,10 +2569,23 @@ kernel 分派；tensor 放在哪个设备，主要由 `device="sipu"` 及各模�
 `sglang_simo_extensions`（相对 SIMO code base 的
 `pyproject.toml:29-30（project.entry-points["sglang.srt.plugins"]）`）。由于白名单只有
 `mywhite`，`python/sglang/srt/plugins/__init__.py:95-99（load_plugins_by_group）` 会跳过
-该 entry-point；因此本次给出的 Llama smoke 日志没有启用 SIMO 的 attention/KV-pool
+该 entry-point。结合容器中的 entry-point 查询结果和这段过滤逻辑，本次给出的 Llama smoke 日志没有启用 SIMO 的 attention/KV-pool
 替换，使用的是 SGLang 原生 `SIPUAttnBackend` 和原生 MHA KV pool。若将来把
-`sglang_simo_extensions` 加入白名单，扩展可以替换 pool/backend 类，但不会改变
-`device=self.device` 这一层设备参数传播规则。
+`sglang_simo_extensions` 加入白名单，则会额外注册 `triton_simo` 并启用其自身的
+KV-pool 条件检查；那是另一条需要单独核对的路径，不应把它的 pool 类直接套到本次
+`attention_backend="sipu"` 运行上。
+
+容器内用同样的环境导入 registry 可观察到
+`ATTENTION_BACKENDS["sipu"] == create_sipu_backend`，而 `triton_simo` 未注册；这与
+上述源码路径和日志中的 `flash_attn_with_kvcache` 相互印证。
+
+对这次 dense Llama 运行，`KVCacheConfigurator::_build_token_to_kv_pool` 在
+`python/sglang/srt/mem_cache/kv_cache_configurator.py:981-1060（KVCacheConfigurator::_build_token_to_kv_pool）`
+走普通 MHA 分支，最终调用
+`python/sglang/srt/mem_cache/kv_cache_configurator.py:1570-1604（KVCacheConfigurator::_build_mha_kv_pool）`；
+不是依赖 OOT platform factory 的
+`python/sglang/srt/mem_cache/kv_cache_configurator.py:981-994（KVCacheConfigurator::_build_token_to_kv_pool）`
+分支。
 
 `python/sglang/srt/server_args.py:1701-1709（ServerArgs::attention_backend）` 的
 choices 包含 `sipu`；完整列表位于
@@ -2756,6 +2769,8 @@ ServerArgs.device = "sipu"
    将 `self.device` 传给
    `python/sglang/srt/model_executor/model_runner_components/load_model_utils.py:268-325（load_model_with_memory_saver）`；后者在 `python/sglang/srt/model_executor/model_runner_components/load_model_utils.py:301-324（load_model_with_memory_saver）`
    创建 `DeviceConfig` 并调用 loader。
+   KV cache 侧由 `python/sglang/srt/model_executor/model_runner.py:587-615（ModelRunner::init_kv_cache_configurator）`
+   以 `device=self.device` 构造 `KVCacheConfigurator`。
 4. `python/sglang/srt/model_loader/loader.py:978-1017（DefaultModelLoader::load_model）`
    在 `python/sglang/srt/model_loader/loader.py:992-1001（DefaultModelLoader::load_model）` 建立 `target_device=torch.device(device_config.device)`，并在
    `with target_device:` 中调用 `_initialize_model`；随后
