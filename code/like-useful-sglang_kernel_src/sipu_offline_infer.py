@@ -3,6 +3,10 @@ import sglang as sgl
 
 def main():
     # First smoke: dense Llama tiny. Copy the YAML `sipu:` block for other models.
+    engine_kwargs = {
+      "watchdog_timeout": 2592000,
+      "skip_server_warmup": True,
+    }
     llm = sgl.Engine(
         model_path="/share_data/inference-framework/tiny-models/Llama-3.1-8B-Instruct-4layer/safetensor_weights",
         device="sipu",
