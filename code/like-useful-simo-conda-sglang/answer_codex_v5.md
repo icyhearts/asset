@@ -2235,3 +2235,287 @@ Python facade（准备 contiguous output）
   -> dtype-specific SIPU __global__ kernel
   -> SIPU runtime 在当前 stream 上写回 output
 ```
+
+## 14. 提交 `11d03eaeef` 的核心功能与测试覆盖
+
+### 14.1 提交范围和结论
+
+提交信息为：
+
+```text
+commit:  11d03eaeefd87c867f3fcbdf63f58cc0ae04de39
+parent:  7120f3ee13de565cc737e0598110e7f7603c4e9f
+subject: runtime: Add flashinfer rmsnorm + quant fusion support SM90, SM100, SM120
+```
+
+提交修改 11 个文件（`+851/-33`）。`11d03eaeef` 是当前
+`v0.5.18-sipu-dev` 分支的祖先，因此可以直接用该提交树的源码和行号复核。下面的
+行号均以 `git show 11d03eaeef:<path>` 得到的提交快照为准；后续 SIPU 提交可能使
+工作树中的行号发生变化。
+
+容器中 `/share/users/like/package/sglang_sipu` 以读写方式挂载为
+`/sgl-workspace/sglang`，SGLang 的 editable 安装指向
+`/sgl-workspace/sglang/python`。但本提交的功能不是 SIPU kernel：它依赖 CUDA
+FlashInfer，并针对 CUDA SM90、SM100、SM120 的 CUTLASS FP8 scale 约定做了适配。
+在 SIPU 上，`torch.cuda.is_available()` 为 `False`，且容器没有 `flashinfer`，所以
+不会进入这条融合路径。
+
+核心优化可以概括为把原来的：
+
+```text
+RMSNorm -> 单独的 static per-tensor FP8 activation quant -> FP8 Linear GEMM
+```
+
+改成：
+
+```text
+FlashInfer rmsnorm_quant（或 fused_add_rmsnorm_quant）
+    -> (fp8_activation, input_scale, original_dtype)
+    -> FP8 Linear GEMM，跳过重复 quant
+```
+
+有 residual 时，`fused_add_rmsnorm_quant` 同时完成 residual add、RMSNorm 和量化。
+因此通常少一次独立的 activation-quant kernel launch；同时通过
+`original_dtype` 保留 FP16/BF16 模型的输出 dtype，避免把 FP8 输入误当成 BF16。
+
+### 14.2 RMSNorm 融合的实现
+
+#### FlashInfer 可用性和下游线性层识别
+
+- `python/sglang/srt/layers/layernorm.py:57-58（模块级初始化）` 增加
+  `_flashinfer_rmsnorm_quant_available`，默认值为 `False`。
+- `python/sglang/srt/layers/layernorm.py:88-99（模块级初始化）` 尝试导入
+  `flashinfer.norm.rmsnorm_quant` 和
+  `flashinfer.norm.fused_add_rmsnorm_quant`；任意导入失败就保持关闭，运行时会
+  回到原有 RMSNorm/quant 路径。
+- `python/sglang/srt/layers/layernorm.py:370-390（_fp8_static_input_scale）`
+  从下游 `linear` 取出 `input_scale`，只接受单元素（per-tensor）scale，并把它
+  作为融合 kernel 的量化 scale 返回。
+- `python/sglang/srt/layers/layernorm.py:393-418（_is_static_per_tensor_fp8_linear）`
+  识别两类下游实现：
+  1. 原生 `Fp8LinearMethod`，但排除 `block_quant`、`use_mxfp8` 和
+     `use_marlin`；
+  2. `CompressedTensorsLinearMethod` 加
+     `CompressedTensorsW8A8Fp8`，且该 scheme 的
+     `is_static_input_scheme` 为真。
+
+这层过滤很重要：FlashInfer 这里实现的是静态 per-tensor activation quant，不能
+把 block/MXFP8/Marlin 或 per-token scale 当成相同的接口。
+
+#### `RMSNorm::forward_cuda` 的选择逻辑
+
+`python/sglang/srt/layers/layernorm.py:469-568（RMSNorm::forward_cuda）` 的顺序是：
+
+1. `:476-486` 处理空输入和高维输入 reshape。
+2. `:487-503` 对 `variance_size_override`、batch-invariant 等不兼容情形直接走
+   原有路径。
+3. `:504-517` 在下列条件同时满足时启用融合：
+
+   ```python
+   quant_linear is not None
+   and not self.cast_x_before_out_mul
+   and _flashinfer_rmsnorm_quant_available
+   and _fp8_static_input_scale(quant_linear) is not None
+   ```
+
+   得到 scale 后调用 `RMSNorm::forward_with_per_tensor_quant_fusion`。
+4. 其它情况继续执行原有 HF-semantics、residual RMSNorm 或普通 `rmsnorm`。
+
+`quant_linear` 是新增的可选参数。为使统一调用在其它设备不报 unexpected keyword，
+提交也给 `RMSNorm::forward_npu`（`:570-584`）、`RMSNorm::forward_aiter`
+（`:586-661`）、`RMSNorm::forward_hip`（`:663-701`）、`RMSNorm::forward_musa`
+（`:703-725`）、`RMSNorm::forward_native`（`:727-776`）、
+`RMSNorm::forward_cpu`（`:778-797`）和 `RMSNorm::forward_xpu`（`:799-825`）增加
+了同名可选参数；这些后端本提交并不消费该参数。
+
+#### 融合函数的数据契约
+
+`python/sglang/srt/layers/layernorm.py:858-915（RMSNorm::forward_with_per_tensor_quant_fusion）`
+实现具体的 FlashInfer 调用：
+
+- `:885-891` 保存 `orig_dtype = x.dtype`，并把高维/非 contiguous 输入整理成二维
+  contiguous tensor。
+- `:893` 分配 `torch.float8_e4m3fn` 输出。
+- `:894-908` 有 residual 时先合并 `post_residual_addition`，然后调用
+  `_flashinfer_fused_add_rmsnorm_quant(out, x, residual, weight, scale, eps)`；该
+  API 原地更新 residual，并把量化后的 RMSNorm 输出写入 `out`。
+- `:910-915` 无 residual 时调用
+  `_flashinfer_rmsnorm_quant(out, x, weight, scale, eps)`。
+
+返回值约定为：
+
+```text
+无 residual:  (fp8_out, scale, orig_dtype)
+有 residual: ((fp8_out, scale, orig_dtype), residual_out)
+```
+
+scale 的语义与 `static_quant_fp8` 一致：`q = normed / scale`，下游 GEMM 使用同一
+scale 还原量化激活。`orig_dtype` 是量化前的 FP16/BF16（而不是 `fp8_out.dtype`）。
+
+### 14.3 下游 FP8 Linear 如何消费融合结果
+
+#### 原生和 compressed-tensors 线性层
+
+- `python/sglang/srt/layers/quantization/fp8.py:957-1061（Fp8LinearMethod::apply）`
+  在普通、非 block/MXFP8 分支的 `:1035-1051` 识别三元组，拆出
+  `qx=x[0]`、`x_scale=x[1]`、`out_dtype=x[2]`，再调用
+  `apply_fp8_linear(..., pre_quant_output_dtype=out_dtype)`。
+- `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py:228-280（CompressedTensorsW8A8Fp8::apply_weights）`
+  在 `:234-250` 做同样的 tuple 转发，并设置 `compressed_tensor_quant=True`。
+- `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py:222-226（CompressedTensorsW8A8Fp8::process_weights_after_loading）`
+  对静态输入 scheme 把加载的 input scale 归约为单元素 scale，正好满足上游
+  `_fp8_static_input_scale` 的契约。
+
+#### `apply_fp8_linear` 的预量化和输出 dtype
+
+`python/sglang/srt/layers/quantization/fp8_utils.py:1713-1944（apply_fp8_linear）`
+ 进行了三组配套修改：
+
+1. `:1724` 新增 `pre_quant_output_dtype` 参数。
+2. `:1741-1752` 根据输入 dtype 判断是否已经是 FP8。若是 FP8，跳过再次 quant，
+   要求 `input_scale` 非空且为单元素（`:1765-1767`），并把输出 dtype 设为
+   `pre_quant_output_dtype`；没有传该参数时才兼容性回退到 BF16（`:1749-1751`）。
+3. `:1754-1763` 将 channel-wise weight scale、矩阵 16 对齐和硬件能力组合成
+   `use_cutlass_channelwise_gemm`，并在 SM90/SM100/SM120 上打开
+   `native_scalar_a_scale`。
+
+   - 这些架构的 CUTLASS `fp8_scaled_mm` 可以直接接收一个 scalar A（activation）
+     scale，因此融合输出的单元素 scale 无需复制。
+   - 其它仍要求每行 A scale 的 channel-wise 路径在 `:1768-1771` 将 scale 复制为
+     `(M, 1)`；普通静态 quant 路径也在 `:1812-1818` 使用同一条件控制
+     `repeat_scale`。
+
+最后，`:1838-1944` 把 `output_dtype` 贯穿 Triton、CUTLASS、`torch._scaled_mm`
+和 fallback GEMM。这样 FP16 模型的预量化输入不会因为输入 tensor 是 FP8 而被
+错误地产生 BF16 输出。
+
+### 14.4 模型调用链和兼容性改动
+
+- `python/sglang/srt/models/llama.py:341-369（LlamaDecoderLayer::forward）`：
+  `:351-357` 将 `self.self_attn.qkv_proj` 传给 input RMSNorm，`:365-367` 将
+  `self.mlp.gate_up_proj` 传给 post-attention RMSNorm。这样 RMSNorm 可以看到
+  紧接着的 Linear 是否有静态 FP8 input scale。
+- `python/sglang/srt/models/qwen2.py:284-312（Qwen2DecoderLayer::forward）`：
+  `:294-300` 和 `:308-310` 做同样的 qkv/gate-up 传递。
+- `python/sglang/srt/models/llama_eagle.py:49-54（LlamaDecoderLayer::__init__）`
+  和 `python/sglang/srt/models/qwen2_eagle.py:50-55（Qwen2DecoderLayer::__init__）`
+  将跳过 layernorm 的 lambda 改为接受 `quant_linear=None`，避免 EAGLE 第 0 层
+  因统一调用新增关键字而报错。
+
+运行时的关键链路是：
+
+```text
+LlamaDecoderLayer::forward / Qwen2DecoderLayer::forward
+  -> BaseFusedOp::forward
+       python/sglang/kernels/fused_op.py:623-656（BaseFusedOp::forward）
+  -> RMSNorm::forward_cuda
+       python/sglang/srt/layers/layernorm.py:469-568（RMSNorm::forward_cuda）
+  -> _fp8_static_input_scale
+  -> RMSNorm::forward_with_per_tensor_quant_fusion
+       python/sglang/srt/layers/layernorm.py:858-915（RMSNorm::forward_with_per_tensor_quant_fusion）
+  -> flashinfer.norm.rmsnorm_quant / fused_add_rmsnorm_quant
+  -> (fp8, scale, orig_dtype)
+  -> Fp8LinearMethod::apply 或 CompressedTensorsW8A8Fp8::apply_weights
+  -> apply_fp8_linear
+       python/sglang/srt/layers/quantization/fp8_utils.py:1713-1944（apply_fp8_linear）
+  -> fp8_scaled_mm / Triton / torch._scaled_mm
+```
+
+### 14.5 是否有测试用例
+
+有，而且提交新增了一个专门的 RMSNorm 融合测试文件，并扩展了 FP8 utility 测试。
+不过它们都是 CUDA CI 测试，不是 SIPU 测试。
+
+#### RMSNorm 融合单元测试
+
+`test/registered/layers/test_layernorm_fusion.py:13-142（TestRMSNormFp8QuantFusion）`
+在 `:10` 注册为 `base-b`、`1-gpu-large` CUDA CI。
+
+- `TestRMSNormFp8QuantFusion::setUpClass` `:21-29`：没有 CUDA 或没有
+  `flashinfer.norm.rmsnorm_quant` 时直接 `SkipTest`。
+- `TestRMSNormFp8QuantFusion::_run_fusion_test` `:31-78`：以
+  `RMSNorm::forward_native` 为 reference，调用
+  `RMSNorm::forward_with_per_tensor_quant_fusion`，检查：
+  - 输出 dtype 是 `torch.float8_e4m3fn`、shape 正确；
+  - 返回的是同一个 scale 对象，且 `orig_dtype` 保持 FP16/BF16；
+  - residual 输出 dtype 和数值；
+  - 反量化结果 cosine similarity `> 0.99`，平均相对误差 `< 0.1`。
+- `TestRMSNormFp8QuantFusion::test_rms_norm_fp8_quant_fusion` `:80-93` 用
+  `itertools.product` 覆盖 24 个组合：
+  `num_tokens=[7,83,512]`、`hidden_size=[512,4096]`、residual 有/无、
+  dtype 为 BF16/FP16。
+- `TestRMSNormFp8QuantFusion::test_forward_cuda_quant_linear_dispatch` `:95-138`
+  monkeypatch 静态 scale，验证普通 RMSNorm 会返回融合 tuple；同时验证
+  `var_hidden_size` 和 `cast_x_before_out_mul=True` 两个不兼容配置仍返回普通
+  dtype，而不会走该融合契约。
+
+#### FP8 Linear scale/dtype 测试
+
+`test/registered/quant/test_fp8_utils.py` 将 CUDA CI 预计时间从 9 秒调整为 12 秒
+（`:15`），并增加：
+
+- `TestApplyFp8LinearScaleDispatch::test_native_scalar_a_static_prequant_and_dynamic_scale_shapes`
+  `:65-140`：分别伪造 SM90、SM100、SM120，mock `fp8_scaled_mm`，验证静态、预量化
+  和动态输入在支持 native scalar-A scale 时的 scale 形状。
+- `TestApplyFp8LinearScaleDispatch::test_without_native_scalar_a_static_scale_is_repeated`
+  `:142-177`：验证不支持 scalar-A scale 的路径会把 scalar 复制成 `(M,1)`。
+- `TestApplyFp8LinearScaleDispatch::test_linear_methods_forward_fused_scalar_tuple`
+  `:179-227`：mock 原生 `Fp8LinearMethod::apply` 和
+  `CompressedTensorsW8A8Fp8::apply_weights`，确认 `(fp8, scale, dtype)` 的 scale
+  和 `pre_quant_output_dtype` 被正确转发。
+- `TestApplyFp8LinearPrequantOutputDtype::_run` `:245-304` 及
+  `::test_prequant_output_dtype` `:306-309`：对 FP16/BF16 验证预量化 FP8 输入的
+  GEMM 输出遵循调用者传入 dtype，数值与未预量化 reference 接近；不传 dtype 时
+  明确验证兼容性默认值为 BF16。
+- 原有 `TestInverseTransformScaleUe8m0::test_round_trip` `:18-45` 仍保留，主要
+  验证 UE8M0 scale transform 的 round-trip，并非本次 RMSNorm 融合测试。
+
+#### Benchmark 中的 correctness 检查
+
+`benchmark/kernels/bench_fused_rmsnorm_fp8_quant.py:1-185` 不是 unittest，但提供了
+可运行的微基准：
+
+- `run_unfused` `:67-74` 对比 RMSNorm 加独立 `static_quant_fp8`；
+- `run_fused_default` `:87-89` 使用 FlashInfer 默认 fused kernel；
+- `run_fused_cute` `:91-94` 使用可选 CuTe-DSL kernel；
+- `_check_correctness` `:128-155` 在 hidden size 4096/8192、residual 有/无下比较
+  反量化结果，要求 cosine `> 0.99`；
+- `benchmark` `:175-179` 测量 token 数 512 到 16384 的延迟。
+
+### 14.6 在 `sipu-dev` 中的实际测试结果和边界
+
+按容器流程 source 环境后，对当前 editable checkout 的新增测试执行了：
+
+```text
+python3 test/registered/layers/test_layernorm_fusion.py -q
+  Ran 0 tests ... OK (skipped=1)
+
+python3 test/registered/quant/test_fp8_utils.py -q
+  新增的两个测试类 skipped=2；原有 test_round_trip 直接申请 cuda tensor，
+  因 Torch 未编译 CUDA 报 AssertionError: Torch not compiled with CUDA enabled
+```
+
+原因是容器使用 `torch==2.10.0+cpu` 加 `torch_sipu`，不是 CUDA Torch；同时
+`flashinfer` 在容器中不可导入。第一个文件的 class-level skip 是预期行为，第二个
+文件的失败来自旧测试没有 CUDA guard，不是新融合逻辑抛出的失败。
+
+因此测试结论应准确表述为：
+
+1. **有**针对提交核心功能的测试：覆盖 FlashInfer RMSNorm+FP8 的输出契约、数值、
+   residual、dispatch guard，以及 SM90/100/120 的 scale dispatch 和 FP16/BF16
+   输出 dtype。
+2. 测试只在 CUDA + FlashInfer 环境运行；没有 SIPU 设备测试、SIMO/MXFP8/Marlin
+   测试，也没有真实 Llama/Qwen 端到端请求把 RMSNorm tuple 一直跑到 FP8 GEMM。
+3. 提交本身没有新增 `RMSNorm::forward_sipu` 实现；当前 SIPU 分支后来增加的
+   SIPU 路径仍是独立实现。因此不能把这些 CUDA CI 的通过（或源码中存在测试）
+   解读为 `sipu-dev` 上已经支持该融合。
+4. 覆盖仍有空白：没有独立测试
+   `python/sglang/srt/layers/layernorm.py:370-418（_fp8_static_input_scale / _is_static_per_tensor_fp8_linear）`
+   对原生、compressed-tensors、block/MXFP8/Marlin 等识别和排除条件；也没有专门
+   覆盖 `post_residual_addition`、高维/non-contiguous reshape、FlashInfer 不可用时
+   的完整回退链。
+
+最终答案：`11d03eaeef` 的核心是 **FlashInfer RMSNorm（含 residual add）与静态
+per-tensor FP8 activation quant 的融合，以及预量化激活到 FP8 Linear 的 tuple/dtype
+传递**；它有明确的 CUDA 单元测试和 benchmark correctness 检查，但目前没有 SIPU
+或 SIMO 的对应测试覆盖。
