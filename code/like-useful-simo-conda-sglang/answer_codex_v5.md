@@ -2591,7 +2591,8 @@ temp/sipu_offline_infer.py:4-17（main）
   -> ServerArgs::__post_init__ / ServerArgs::_run_resolution_pipeline
        python/sglang/srt/server_args.py:3588-3692
   -> Scheduler::init_model_worker / Scheduler::init_all_attention_backends
-       python/sglang/srt/managers/scheduler.py:993-1006、:981-985
+       python/sglang/srt/managers/scheduler.py:993-1006（Scheduler::init_model_worker）
+       -> python/sglang/srt/managers/scheduler.py:981-985（Scheduler::init_all_attention_backends）
   -> ModelRunner::init_attention_backends
        python/sglang/srt/model_executor/model_runner.py:931-951
   -> resolve_attention_backend_strs -> build_attention_backends
@@ -2735,8 +2736,9 @@ ServerArgs.device = "sipu"
    创建 `DeviceConfig` 并调用 loader。
 4. `python/sglang/srt/model_loader/loader.py:978-1017（DefaultModelLoader::load_model）`
    在 `python/sglang/srt/model_loader/loader.py:992-1001（DefaultModelLoader::load_model）` 建立 `target_device=torch.device(device_config.device)`，并在
-   `with target_device:` 中调用 `_initialize_model`；随后 `:1007-1009` 调用
-   `python/sglang/srt/model_loader/loader.py:1007-1009（DefaultModelLoader::load_model）` 调用 `load_weights_and_postprocess(..., target_device)`。因此未被模型代码特别标记的
+   `with target_device:` 中调用 `_initialize_model`；随后
+   `python/sglang/srt/model_loader/loader.py:1007-1009（DefaultModelLoader::load_model）` 调用
+   `load_weights_and_postprocess(..., target_device)`。因此未被模型代码特别标记的
    普通参数和 buffer 会在 SIPU device context 中构造，权重也加载到这些目标参数。
 5. `python/sglang/srt/model_loader/loader.py:151-160（device_loading_context）`
    对 SIPU 特意直接 `yield module`，没有执行通用的
@@ -2750,12 +2752,12 @@ ServerArgs.device = "sipu"
 |---|---|---|
 | 普通 Transformer block 参数、线性层权重、norm 权重 | `python/sglang/srt/model_loader/loader.py:978-1017（DefaultModelLoader::load_model）` | 通常在 `sipu:0`；模型在 SIPU default-device context 中创建并加载。 |
 | `embed_tokens`、未绑定的 `lm_head` | `python/sglang/srt/models/cpu_embedding_lm_head.py:21-30（use_cpu_embedding_lm_head）`；`python/sglang/srt/models/cpu_embedding_lm_head.py:52-56（create_on_cpu）`；`python/sglang/srt/models/llama.py:395-411（LlamaModel::__init__）`、`python/sglang/srt/models/llama.py:559-595（LlamaForCausalLM::__init__）` | SIPU 默认 `SGLANG_CPU_EMBEDDING_LM_HEAD=true`，因此这些权重通常留在 CPU；`python/sglang/srt/models/cpu_embedding_lm_head.py:38-49（embed_input_ids）` 和 `python/sglang/srt/models/cpu_embedding_lm_head.py:59-113（logits_processor_with_cpu_lm_head）` 负责 CPU↔SIPU 拷贝。设置 `SGLANG_CPU_EMBEDDING_LM_HEAD=false` 才会选择普通 SIPU 构造路径。 |
-| 主 MHA K/V cache | `python/sglang/srt/model_executor/model_runner.py:811-825（ModelRunner::alloc_memory_pool）` -> `python/sglang/srt/mem_cache/kv_cache_configurator.py:276-309（KVCacheConfigurator::configure）`；`kv_cache_configurator.py:1570-1604（KVCacheConfigurator::_build_mha_kv_pool）` | pool 构造函数收到 `device=self.device`，标准主 K/V cache 在 SIPU。MLA、DSA、DSV4 的专用 pool builder 也把同一 device 向下传递。 |
+| 主 MHA K/V cache | `python/sglang/srt/model_executor/model_runner.py:811-825（ModelRunner::alloc_memory_pool）` -> `python/sglang/srt/mem_cache/kv_cache_configurator.py:276-309（KVCacheConfigurator::configure）`；`python/sglang/srt/mem_cache/kv_cache_configurator.py:1570-1604（KVCacheConfigurator::_build_mha_kv_pool）` | pool 构造函数收到 `device=self.device`，标准主 K/V cache 在 SIPU。MLA、DSA、DSV4 的专用 pool builder 也把同一 device 向下传递。 |
 | 标准 MHA K/V buffer | `python/sglang/srt/mem_cache/memory_pool.py:1761-1862（MHATokenToKVPool::__init__）`；`python/sglang/srt/mem_cache/memory_pool.py:1937-1954（MHATokenToKVPool::_create_buffers）`；`python/sglang/srt/mem_cache/memory_pool.py:2064-2115（MHATokenToKVPool::_create_buffers_normal）` | `torch.zeros(..., device=self.device)`，K/V 的物理 backing buffer 在 SIPU；`python/sglang/srt/mem_cache/memory_pool.py:2026-2049（MHATokenToKVPool::_init_data_ptrs_and_strides）` 的 pointer/stride metadata 也在 SIPU。KV dtype/layout 仍由 `kv_cache_dtype` 和 layout 配置决定，不由 `device` 决定。 |
 | request-to-token page table | `python/sglang/srt/mem_cache/kv_cache_configurator.py:761-789（KVCacheConfigurator::_build_req_to_token_pool）`、`python/sglang/srt/mem_cache/kv_cache_configurator.py:924-946（KVCacheConfigurator::_build_default_req_pool）`；`python/sglang/srt/mem_cache/memory_pool.py:262-290（ReqToTokenPool::__init__）` | `req_to_token` 主表用传入 device 分配，通常为 `sipu:0`；但同一构造函数中的 `req_generation`（`python/sglang/srt/mem_cache/memory_pool.py:289（ReqToTokenPool::__init__）`）没有 device 参数，属于 CPU bookkeeping。 |
 | 请求长度、page table、cu-seqlens 等 forward metadata | `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:384-493（SIPUAttnBackend::init_forward_metadata）`；`python/sglang/srt/model_executor/forward_batch_info.py:809-848（ForwardBatch::init_new）` | 由 `seq_lens.device` 或 `model_runner.device` 创建，正常 eager SIPU forward 中在 `sipu:0`。 |
 | `input_ids`、`seq_lens_cpu`、CPU 镜像和 pinned staging | `python/sglang/srt/managers/schedule_batch.py:2401-2411（ScheduleBatch::prepare_for_extend）`；`python/sglang/srt/mem_cache/allocation.py:303-315（alloc_for_extend）` | 明确保留 CPU/pinned CPU 版本，再异步或显式拷贝到 SIPU；它们不是 `device` 失效，而是调度设计的一部分。 |
-| paged allocator 的临时索引计算 | `python/sglang/srt/mem_cache/allocator/paged.py:190-257（PagedTokenToKVPoolAllocator::alloc_extend）`、`:259-307（PagedTokenToKVPoolAllocator::alloc_decode）` | 输出 `out_indices` 先在 SIPU 分配，但 SIPU 分支 `:215-232`、`:275-284` 因 Triton allocator 会 hang，先在 CPU 用 naive allocator 计算，再 copy 回 SIPU。 |
+| paged allocator 的临时索引计算 | `python/sglang/srt/mem_cache/allocator/paged.py:190-257（PagedTokenToKVPoolAllocator::alloc_extend）`、`python/sglang/srt/mem_cache/allocator/paged.py:259-307（PagedTokenToKVPoolAllocator::alloc_decode）` | 输出 `out_indices` 先在 SIPU 分配，但 `python/sglang/srt/mem_cache/allocator/paged.py:215-232（PagedTokenToKVPoolAllocator::alloc_extend）`、`python/sglang/srt/mem_cache/allocator/paged.py:275-284（PagedTokenToKVPoolAllocator::alloc_decode）` 因 Triton allocator 会 hang，先在 CPU 用 naive allocator 计算，再 copy 回 SIPU。 |
 | host/offload/层级 cache 副本 | 由 `cpu_offload_gb`、weights CPU backup、HiCache/disaggregation 等独立配置控制 | 可能在 CPU 或远端 host；这是副本/迁移策略，不改变主 SIPU pool 的目标 device。 |
 
 ### 15.6 “模型权重、KV cache 都受它控制吗？”的直接回答
@@ -2803,14 +2805,17 @@ host/offload 副本不属于这条“主 KV cache”结论。
 
 `temp/off.log.2026_09_09___14_42_55` 提供了实际运行证据：
 
-- `:74-115` 是首次 prefill 的 `flash_attn_with_kvcache`。`q=(13,32,128)`，
+- `temp/off.log.2026_09_09___14_42_55:74-115` 是首次 prefill 的
+  `flash_attn_with_kvcache`。`q=(13,32,128)`，
   `k_cache/v_cache=(9,32,8,128)`，page table 为 `(1,5)`，q/k/v 和 metadata 都是
-  BF16 `device=sipu:0`；`:109-112` 打印 `Selected Config: Config_128_128`，与
+  BF16 `device=sipu:0`；`temp/off.log.2026_09_09___14_42_55:109-112` 打印
+  `Selected Config: Config_128_128`，与
   `kernel_mha_fwd_paged.su` 的 paged prefill 配置选择一致。
-- `:389-424` 是首次 decode，`q=(1,32,128)`、`max_seqlen_q=1`、page table 为
+- `temp/off.log.2026_09_09___14_42_55:389-424` 是首次 decode，`q=(1,32,128)`、`max_seqlen_q=1`、page table 为
   `(1,1)`，同样由 `flash_attn_with_kvcache` 处理；这些条件满足 C++ bridge 的
   paged decode 判断，随后进入 `mha_decode_with_kvcache`。
-- `:52-59` 的 RMSNorm weight、`:117-123` 的 fused RMSNorm input/residual/weight
+- `temp/off.log.2026_09_09___14_42_55:52-59` 的 RMSNorm weight、
+  `temp/off.log.2026_09_09___14_42_55:117-123` 的 fused RMSNorm input/residual/weight
   也都是 `sipu:0`，说明 transformer block 的运行张量确实在 SIPU。
 
 日志只记录了 kernel API 名称，没有直接打印 Python backend 类名；
