@@ -191,3 +191,207 @@ value_mismatches=0
 - 改变 RoPE、最大上下文长度或 token id；
 - 权重量化、反量化或 scale 重算；
 - 蒸馏、微调、权重平均或其他训练。
+
+## 5.1 对 commit 11d03eaeef 的核查范围
+
+本次核查在 Docker 容器 /sipu-dev 中进行。容器把宿主机的
+/share/users/like/package/sglang_sipu 挂载到 /sgl-workspace/sglang，
+容器内 sglang 的 editable 安装也指向 /sgl-workspace/sglang/python。
+容器当前的 PyTorch 是 CPU 版且没有 CUDA/FlashInfer，因此下面的 kernel
+数量是由源码和调用关系推导的，不能把本容器的运行结果当成真实 CUDA
+profile。
+
+## 5.2 先给结论
+
+1. 11d03eaeef 有实际意义，但它做的不是“FP8 activation quantization +
+   FP8 TensorCore MMA 融合”。它融合的是 RMSNorm（或 residual-add-RMSNorm）
+   + 静态 per-tensor FP8 activation quantization。下游 FP8 GEMM/MMA 仍然
+   是另一个 kernel。
+2. 对满足条件的 CUDA 静态 FP8 路径，典型 kernel 数量从
+   RMSNorm + quant + GEMM = 3 变成 fused RMSNorm+quant + GEMM = 2，
+   因此少一个 launch，并省掉 normalized BF16 中间张量的一次写入和一次
+   读取。
+3. 该提交不适用于 dynamic per-token、block quant、MXFP8 或 Marlin
+   路径；这些路径不会因为该提交自动少一个 launch。
+4. “quant 产生的 scale 是否写 global memory”必须分静态和动态两种情况：
+   - 静态 per-tensor：scale 不是 quant kernel 计算出来的，而是权重检查点中
+     已存在的 layer.input_scale。普通 scalar 路径只从 device/global tensor
+     读取它，不再写一个新 scale；为不支持 scalar-A-scale 的 CUTLASS 路径，
+     旧代码会额外生成并写入每 token 一个 scale 的 global tensor。
+   - 动态 per-token（或动态 per-tensor）：scale 是 quant kernel 计算出的
+     输出，确实写入 device/global memory。因为旧 quant 和 GEMM 是两个
+     kernel，不能只把 scale 留在前一个 kernel 的 register/shared memory 中
+     交给后一个 kernel。
+
+## 5.3 提交前的真实调用路径
+
+在 11d03eaeef^：
+
+- python/sglang/srt/models/llama.py:341-363
+  (LlamaDecoderLayer::forward) 只调用
+  self.input_layernorm(hidden_states) 和
+  self.post_attention_layernorm(...)，没有把下游 linear 传给 RMSNorm。
+- python/sglang/srt/layers/layernorm.py:405-489
+  (RMSNorm::forward_cuda) 走 rmsnorm 或 fused_add_rmsnorm，输出
+  BF16/FP16 normalized activation。
+- python/sglang/srt/layers/quantization/fp8.py:960-1046
+  (Fp8LinearMethod::apply) 的普通分支调用 apply_fp8_linear。
+- python/sglang/srt/layers/quantization/fp8_utils.py:1713-1816
+  (apply_fp8_linear) 先调用 quant：static_quant_fp8（静态 scale）或
+  sglang_per_token_quant_fp8（动态 scale），随后在
+  python/sglang/srt/layers/quantization/fp8_utils.py:1799-1815
+  (apply_fp8_linear) 调用 triton_scaled_mm/fp8_scaled_mm。这两个
+  Python 调用对应两个独立的 GPU operation，不是一个 quant+MMA kernel。
+
+提交自带的 benchmark 也明确把
+benchmark/kernels/bench_fused_rmsnorm_fp8_quant.py:1-13
+(module docstring) 的 unfused 定义为 “RMSNorm followed by a separate
+static FP8 quant”，把 fused 定义为 FlashInfer rmsnorm_quant；
+benchmark/kernels/bench_fused_rmsnorm_fp8_quant.py:67-84
+(run_unfused/_run_fused) 也分别写出了两个调用和一个调用。这个 benchmark
+本身不包含下游 GEMM，所以不能解读成 quant+GEMM 已经融合。
+
+## 5.4 提交后的变化，以及实际少了哪个 launch
+
+提交在 python/sglang/srt/models/llama.py:341-369
+(LlamaDecoderLayer::forward, 11d03eaeef) 把
+quant_linear=self.self_attn.qkv_proj 和
+quant_linear=self.mlp.gate_up_proj 传给 RMSNorm（Qwen2 也有同样修改）。
+
+python/sglang/srt/layers/layernorm.py:370-418
+(_fp8_static_input_scale/_is_static_per_tensor_fp8_linear, 11d03eaeef)
+只接受 native Fp8LinearMethod 的非 block、非 MXFP8、非 Marlin
+情况，并且要求 input_scale.numel() == 1。满足条件且 FlashInfer 可用时，
+python/sglang/srt/layers/layernorm.py:469-517
+(RMSNorm::forward_cuda, 11d03eaeef) 调用
+forward_with_per_tensor_quant_fusion。
+
+python/sglang/srt/layers/layernorm.py:858-915
+(RMSNorm::forward_with_per_tensor_quant_fusion, 11d03eaeef)：
+
+- 分配 FP8 输出 out；
+- 调用 _flashinfer_rmsnorm_quant 或 _flashinfer_fused_add_rmsnorm_quant；
+- 返回 (fp8_out, scale, orig_dtype)（有 residual 时再带 residual）。
+
+然后 python/sglang/srt/layers/quantization/fp8.py:1035-1061
+(Fp8LinearMethod::apply, 11d03eaeef) 识别这个 tuple，
+python/sglang/srt/layers/quantization/fp8_utils.py:1741-1772
+(apply_fp8_linear, 11d03eaeef) 把它当作已经量化的 FP8 输入，跳过
+再次 quantize；但 python/sglang/srt/layers/quantization/fp8_utils.py:1838-1854
+(apply_fp8_linear, 11d03eaeef) 仍然单独调用 fp8_scaled_mm
+（其它形状则调用 torch._scaled_mm）。因此：
+
+| 情况 | 提交前 | 提交后 | 是否由该提交减少 |
+| --- | --- | --- | --- |
+| 静态 per-tensor、无 residual | RMSNorm + quant + GEMM（3） | fused RMSNorm+quant + GEMM（2） | 是，少 1 |
+| 静态 per-tensor、有 residual | fused-add-RMSNorm + quant + GEMM（3） | fused-add-RMSNorm+quant + GEMM（2） | 是，少 1 |
+| dynamic per-token | RMSNorm + dynamic quant + GEMM | 通常仍为这三步 | 否 |
+| block/MXFP8/Marlin | 各自原有路径 | helper 不匹配，仍走原路径 | 否 |
+
+这里的“3/2”是该线性层前向中对应 operation 的逻辑数量；CUDA Graph
+捕获只会把这些 operation 作为 graph node，不能把两个 kernel 变成一个。
+此外，旧静态 quant kernel 已经使用了 PDL（见
+python/sglang/kernels/ops/quantization/fp8_kernel.py:885-899
+(_static_quant_fp8)）；PDL 可以改善 producer/consumer 的依赖等待，
+但仍不等价于 kernel fusion。
+
+## 5.5 scale 是否写入 global memory
+
+### 5.5.1 静态 per-tensor scale
+
+python/sglang/srt/layers/quantization/fp8.py:613-629
+(Fp8LinearMethod::create_fp8_weight_) 在静态 activation scheme 下注册
+layer.input_scale；python/sglang/srt/layers/quantization/fp8.py:879-950
+(Fp8LinearMethod::process_weights_after_loading) 将它保留为不可训练的
+device parameter。因此这个 scale 在进入 quant kernel 之前就已经存在，
+不是本次量化临时算出来的。
+
+旧实现 python/sglang/kernels/ops/quantization/fp8_kernel.py:865-921
+(static_quant_fp8, 11d03eaeef^) 的行为是：
+
+- x_q = torch.empty_like(..., device=x.device)：FP8 activation 输出在
+  device/global memory；
+- repeat_scale=False 时，_static_quant_fp8 在
+  python/sglang/kernels/ops/quantization/fp8_kernel.py:814-863
+  (_static_quant_fp8, 11d03eaeef^) 的 line 852 只执行 tl.load(y_s_ptr)，
+  line 860 写 FP8 输出，不写新 scale；返回的仍是原来的 x_s；
+- repeat_scale=True 时，line 890-897 分配 (M,1) 的 x_s_repeat，line 862
+  把 scale 写入这个 global tensor。提交前
+  python/sglang/srt/layers/quantization/fp8_utils.py:1773-1779
+  (apply_fp8_linear, 11d03eaeef^) 对 CUTLASS channelwise 情况会请求这种
+  repeat。
+
+提交后的 python/sglang/srt/layers/quantization/fp8_utils.py:1754-1763
+(apply_fp8_linear, 11d03eaeef) 引入 native_scalar_a_scale，在
+SM90/SM100/SM120 且 CUTLASS 支持 scalar A scale 时，
+python/sglang/srt/layers/quantization/fp8_utils.py:1812-1818
+(apply_fp8_linear, 11d03eaeef) 不再 repeat scale，直接把原 scalar
+传给 GEMM。这减少了 repeated-scale 的 global allocation/store，但仍然
+不能消除 FP8 activation qinput 的 global 写入，因为 GEMM 还是后续独立
+kernel。
+
+### 5.5.2 动态 per-token scale
+
+提交前 python/sglang/kernels/ops/quantization/fp8_kernel.py:788-804
+(sglang_per_token_quant_fp8, 11d03eaeef^) 明确分配
+x_s = torch.empty(x.shape[0], 1, device=x.device, dtype=torch.float32)，
+再调用 CUDA quant op。
+
+在其 CUDA 实现
+python/sglang/kernels/aot/csrc/gemm/per_token_quant_fp8.cu:17-121
+(per_token_quant_fp8_kernel, 11d03eaeef^) 中，line 32 把 token_scale
+指向 output_s + token_id，line 78 执行 token_scale[0] = scale；
+小 batch kernel 也把 output_s.data_ptr() 作为输出（line 289-309）。
+宿主入口
+python/sglang/kernels/aot/csrc/gemm/per_token_quant_fp8.cu:242-314
+(sgl_per_token_quant_fp8, 11d03eaeef^) 负责发射这些 kernel。
+所以动态 scale 的确会写入 global/device memory。
+
+即使量化 kernel 内部先把 scale 放在 register 或 shared memory 做归约，
+旧架构中它必须在 kernel 边界前写到 x_s，下一个 GEMM 才能读取。
+register/shared memory 的生命周期和可见范围都不能跨 kernel launch；只有把
+quant 和 GEMM 真正写成同一个 kernel（或采用专门的 persistent producer/
+consumer 设计）才能完全省掉这个跨 kernel global hand-off。
+
+## 5.6 该提交是否把 weight 放进 shared/register
+
+没有。提交的 fused FlashInfer kernel 只负责 RMSNorm 和 FP8 输出生成；
+python/sglang/srt/layers/quantization/fp8_utils.py:1838-1854
+(apply_fp8_linear, 11d03eaeef) 随后仍把 FP8 activation、weight 和 scale
+交给独立的 fp8_scaled_mm。CUDA 实现
+python/sglang/kernels/aot/csrc/gemm/fp8_gemm_kernel.cu:1125-1205
+(fp8_scaled_mm) 自己检查输入、分配输出并 dispatch CUTLASS。前一个
+RMSNorm/quant kernel 中的 register/shared 数据不会保留给它；FP8 activation
+也必须作为 global tensor 交接。weight 是长期驻留的 device tensor，但是否
+被 GEMM tile 缓存到该 GEMM 自身的 shared/register 由 GEMM kernel 决定，
+不是 11d03eaeef 新增的跨 kernel 融合。
+
+## 5.7 对 sglang_sipu 的实际影响
+
+这个提交的目标架构是 CUDA SM90/SM100/SM120。当前 SIPU 路径
+python/sglang/srt/layers/layernorm.py:575-614
+(RMSNorm::forward_sipu) 在收到 quantized quant_linear 时会直接抛出
+NotImplementedError("RMSNorm with quant_linear is not supported on SIPU")，
+随后只调用普通 SIPU rmsnorm/fused_add_rmsnorm。因此在 sglang_sipu
+上不能把 11d03eaeef 的 CUDA FlashInfer fusion 当作已经生效；SIPU 的
+fp8_scaled_mm 和 sgl_per_token_quant_fp8 仍是独立接口
+（sgl-kernel-sipu/sgl_kernel/gemm.py:56-64 (fp8_scaled_mm)、
+:150-155 (sgl_per_token_quant_fp8)）。
+
+## 5.8 最终回答
+
+对核心问题的直接回答是：
+
+> 在 11d03eaeef 之前，若 Fp8LinearMethod 走 dynamic per-token
+> activation quantization，BF16->FP8 计算出的 scale 会写入
+> device/global memory（x_s[M,1]），因为后面的独立 GEMM 必须读取它。
+> 若走 static per-tensor activation quantization，不存在“quant 新产生的
+> scale”：layer.input_scale 早已是 device tensor，旧 kernel 只读取 scalar；
+> 只有为旧 CUTLASS channelwise 接口做 repeat_scale 时，才会额外把重复
+> scale 写到 global memory。
+
+所以你的判断“如果 11d03eaeef 把 BF16->FP8 quant 和 TensorCore MMA
+放进同一个 kernel，那它意义不大”是成立的；但实际提交并没有做这件事。
+它把 RMSNorm + static quant 合并，留下 FP8 GEMM 为独立 kernel，因此在
+适用的 CUDA 静态路径上确实少一次 launch 和一轮 BF16 中间结果的 global
+memory traffic，而不是消除了 quant+MMA 之间的全部 global hand-off。

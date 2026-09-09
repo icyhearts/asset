@@ -2565,7 +2565,7 @@ per-tensor FP8 activation quant 的融合，以及预量化激活到 FP8 Linear 
 choices 包含 `sipu`；完整列表位于
 `python/sglang/srt/server_args.py:182-211（ATTENTION_BACKEND_CHOICES）`。
 `python/sglang/srt/server_args.py:3588-3590（ServerArgs::__post_init__）` 调用
-`ServerArgs::_run_resolution_pipeline`（`python/sglang/srt/server_args.py:3591-3692`）。
+`python/sglang/srt/server_args.py:3591-3692（ServerArgs::_run_resolution_pipeline）`。
 其中：
 
 - `python/sglang/srt/server_args.py:4260-4268（ServerArgs::_handle_missing_default_values）`
@@ -2587,20 +2587,22 @@ choices 包含 `sipu`；完整列表位于
 ```text
 temp/sipu_offline_infer.py:4-17（main）
   -> Engine::__init__
-       python/sglang/srt/entrypoints/engine.py:232-284
+       python/sglang/srt/entrypoints/engine.py:232-284（Engine::__init__）
   -> ServerArgs::__post_init__ / ServerArgs::_run_resolution_pipeline
-       python/sglang/srt/server_args.py:3588-3692
+       python/sglang/srt/server_args.py:3588-3590（ServerArgs::__post_init__）
+       -> python/sglang/srt/server_args.py:3591-3692（ServerArgs::_run_resolution_pipeline）
   -> Scheduler::init_model_worker / Scheduler::init_all_attention_backends
        python/sglang/srt/managers/scheduler.py:993-1006（Scheduler::init_model_worker）
        -> python/sglang/srt/managers/scheduler.py:981-985（Scheduler::init_all_attention_backends）
   -> ModelRunner::init_attention_backends
-       python/sglang/srt/model_executor/model_runner.py:931-951
+       python/sglang/srt/model_executor/model_runner.py:931-951（ModelRunner::init_attention_backends）
   -> resolve_attention_backend_strs -> build_attention_backends
-       python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py:69-178
+       python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py:158-178（resolve_attention_backend_strs）
+       -> python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py:69-143（build_attention_backends）
   -> _build_full_attention_backend_from_str
-       python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py:251-258
+       python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py:251-258（_build_full_attention_backend_from_str）
   -> ATTENTION_BACKENDS["sipu"] -> create_sipu_backend
-       python/sglang/srt/layers/attention/attention_registry.py:133-150
+       python/sglang/srt/layers/attention/attention_registry.py:133-150（create_sipu_backend）
 ```
 
 `python/sglang/srt/layers/attention/attention_registry.py:34-39（register_attention_backend）`
@@ -2626,26 +2628,26 @@ model-specific override 也可能把最终的 prefill/decode backend 解析成�
 
 ```text
 ModelRunner::_forward_raw
-  python/sglang/srt/model_executor/model_runner.py:1658-1669
+  python/sglang/srt/model_executor/model_runner.py:1658-1669（ModelRunner::_forward_raw）
   建立 ForwardContext(attn_backend=self.attn_backend)
       |
       v
 get_attn_backend
-  python/sglang/srt/model_executor/forward_context.py:46-67
+  python/sglang/srt/model_executor/forward_context.py:46-67（get_attn_backend）
       |
       v
 LlamaDecoderLayer::forward
-  python/sglang/srt/models/llama.py:350-378
+  python/sglang/srt/models/llama.py:350-378（LlamaDecoderLayer::forward）
   -> LlamaAttention::forward
-       python/sglang/srt/models/llama.py:249-273
+       python/sglang/srt/models/llama.py:249-273（LlamaAttention::forward）
       |
       v
 RadixAttention::forward
-  python/sglang/srt/layers/radix_attention.py:150-287
+  python/sglang/srt/layers/radix_attention.py:150-287（RadixAttention::forward）
       |
       v
 AttentionBackend::forward
-  python/sglang/srt/layers/attention/base_attn_backend.py:215-258
+  python/sglang/srt/layers/attention/base_attn_backend.py:215-258（AttentionBackend::forward）
   -> SIPUAttnBackend::forward_extend（prefill）
      或 SIPUAttnBackend::forward_decode（decode）
 ```
