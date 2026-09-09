@@ -78,6 +78,24 @@ bool should_truncate(const struct stat &file_stat, const Options &options) {
 
 bool truncate_file(const fs::path &path, const Options &options,
                    Statistics &statistics) {
+  // Use lstat first so files that are below the limit do not require write
+  // permission merely to be inspected. It also makes symbolic-link handling
+  // explicit; the later O_NOFOLLOW open protects the write side of the race.
+  struct stat path_stat {};
+  if (::lstat(path.c_str(), &path_stat) != 0) {
+    report_errno(path, "lstat");
+    ++statistics.failures;
+    return false;
+  }
+  if (!S_ISREG(path_stat.st_mode)) {
+    return true;
+  }
+
+  ++statistics.regular_files;
+  if (!should_truncate(path_stat, options)) {
+    return true;
+  }
+
   int open_flags = O_WRONLY | O_CLOEXEC;
 #ifdef O_NOFOLLOW
   open_flags |= O_NOFOLLOW;
@@ -104,7 +122,6 @@ bool truncate_file(const fs::path &path, const Options &options,
     return true;
   }
 
-  ++statistics.regular_files;
   if (!should_truncate(file_stat, options)) {
     if (::close(file_descriptor) != 0) {
       report_errno(path, "close");

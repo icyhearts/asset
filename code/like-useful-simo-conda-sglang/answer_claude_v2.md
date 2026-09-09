@@ -2604,3 +2604,183 @@ y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
 1. **减少 kernel launch：真的减了，但只有 1 次（3→2）**，省掉的是 RMSNorm→quant 之间的 bf16 激活往返；**fp8 激活仍然往返 global memory**。
 2. **提交前静态 per-tensor 的量化不写 scale**（scale 是 checkpoint 常量，只读）；**动态 per-token 才写 scale**，而那个路径本提交不覆盖。
 3. 你的批评在「没把量化融进 GEMM、因此没能把 scale 留在 register/SMEM」这一点上成立；但「完全没有意义」不成立——省一次 launch + 省一次 bf16 往返 + 修 dtype 传播，对 decode 是有实际收益的，只是它不是最优融合。
+
+---
+
+## 42. `/share/liwang/` 空间占用统计（cache / temp / 数据集 / 模型权重）
+
+### 42.1 背景
+
+```
+$ df -h /share
+Filesystem            Size  Used Avail Use% Mounted on
+10.97.128.245:/share   78T   78T  2.3G 100% /share     # NFS4.2, 已 100% 满
+```
+
+统计方法：`du -sh` / `du -h --max-depth=1`（NFS 上按 apparent size，含硬链接不去重）。本次统计范围 **仅 `/share/liwang/`**。
+
+**`/share/liwang/` 自身合计约 8.3 TB**（占 78T 全盘的一小部分，说明 `/share` 满不全由 liwang 造成，但下面这些目录确实是 liwang 名下的大头）。
+
+### 42.2 一级目录排行
+
+| 目录 | 大小 | 类别 |
+|---|---|---|
+| `/share/liwang/VLM_projects` | **5.0T** | 项目/模型权重 |
+| `/share/liwang/Projects` | **2.6T** | 项目/模型权重 |
+| `/share/liwang/JD_evaluation` | **384G** | 项目/数据集/缓存 |
+| `/share/liwang/envs` | **161G** | conda 环境 |
+| `/share/liwang/Benchmark` | **101G** | 评测框架/缓存 |
+| `/share/liwang/nim-cache-v2` | 30G | **cache** |
+| `/share/liwang/nim-cache` | 16G | **cache** |
+| `/share/liwang/.conda` | 15G | **cache**（pkgs 15G） |
+| `/share/liwang/.cache` | 3.3G | **cache** |
+| `/share/liwang/pip_cache` | 1.5G | **cache** |
+| `/share/liwang/.trae-cn-server` | 1.4G | 工具 |
+| `/share/liwang/tools` | 670M | 工具 |
+| `/share/liwang/workspace-20260907-025142` | 79M | 临时工作区 |
+| `/share/liwang/perf-test` | 39M | 测试 |
+| `/share/liwang/.agents` | 4.3M | 工具 |
+| `/share/liwang/xdg_cache` | 148K | **cache** |
+| 其余（`=24`、`test`、`.bashrc`、`.vimrc`、`.npm`、`.claude` 等） | < 20K | — |
+
+### 42.3 按类别归类
+
+#### (1) 模型权重 / checkpoints —— 绝对大头（约 8.2T）
+
+| 目录 | 大小 |
+|---|---|
+| `/share/liwang/VLM_projects/Griffon/GThinker/EasyR1/checkpoints_RL` | **2.3T** |
+| `/share/liwang/VLM_projects/Griffon/GThinker/EasyR1/checkpoints_RL_0429` | **839G** |
+| `/share/liwang/Projects/LlamaGen/checkpoints_vqvae` | **839G** |
+| `/share/liwang/Projects/LlamaGen/results_tokenizer_image` | **839G**（中间产物） |
+| `/share/liwang/VLM_projects/Griffon/GThinker/SFT_code/checkpoints-0324` | **814G** |
+| `/share/liwang/VLM_projects/ml-fastvlm/checkpoints-distill` | **469G** |
+| `/share/liwang/VLM_projects/Griffon/GThinker/SFT_code/checkpoints-0429-v2` | **302G** |
+| `/share/liwang/VLM_projects/ml-fastvlm/checkpoints` | 109G |
+| `/share/liwang/VLM_projects/ml-fastvlm/checkpoints-distill-liwang` | 102G |
+| `/share/liwang/VLM_projects/Griffon/GThinker/SFT_code/checkpoints-0429-v2-1` | 55G |
+| `/share/liwang/VLM_projects/Griffon/GThinker/SFT_code/checkpoints` | 20G |
+| `/share/liwang/JD_evaluation/NavDP/checkpoints` | 521M |
+
+> 层级：`VLM_projects/Griffon(4.3T)/GThinker(4.3T)` = `EasyR1(3.1T)` + `SFT_code(1.2T)`；`Projects/LlamaGen` 总 1.8T（其中 checkpoints_vqvae 839G）。
+
+#### (2) 数据集 —— 相对不大（约 47G）
+
+| 目录 | 大小 |
+|---|---|
+| `/share/liwang/JD_evaluation/datasets` | 42G |
+| `/share/liwang/Projects/Dataset` | 3.8G |
+| `/share/liwang/VLM_projects/Griffon/GThinker/EasyR1/split_datasets` | 922M |
+| `/share/liwang/JD_evaluation/Mask2Former/datasets` | 2.1M |
+| `Projects/JiT*/dataset`（3 个） | 各 4.0K |
+
+#### (3) cache —— 约 115G
+
+| 目录 | 大小 |
+|---|---|
+| `/share/liwang/Benchmark/.cache` | **28G** |
+| `/share/liwang/JD_evaluation/JV-Adas/.sam3d-cache` | **21G** |
+| `/share/liwang/nim-cache-v2` | **30G** |
+| `/share/liwang/nim-cache` | **16G** |
+| `/share/liwang/.conda/pkgs` | 15G |
+| `/share/liwang/Benchmark/evalscope_main/.cache` | 14G |
+| `/share/liwang/.cache`（含 `.cache/vllm/torch_compile_cache` 2.9G） | 3.3G |
+| `/share/liwang/JD_evaluation/JV-Adas/.sam3-cache` | 2.4G |
+| `/share/liwang/pip_cache` | 1.5G |
+| `/share/liwang/xdg_cache` | 148K |
+| `/share/liwang/Benchmark/.triton/cache` | 1.9M |
+
+#### (4) temp / tmp —— **没有**
+
+在 `/share/liwang/` 下 `find -maxdepth 3` 未发现名为 `tmp` / `temp` 的目录。最接近的是 `/share/liwang/workspace-20260907-025142`（79M，临时工作区，可确认后清理）。
+
+#### (5) conda 环境（非 cache，但占空间）
+
+`/share/liwang/envs` 161G，按大小：`navdp_isaaclab` 22G、`bench_vllm` 16G、`bench_sglang` 14G、`griffon` 13G、`navdp_rtx` 12G、`evalscope` 12G、`vllm` 11G、`vlmevalkit` 9.3G、`giga_brain_0` 9.0G、`jit` 8.6G、`llamagen` 7.9G、`fastvlm` 7.4G、`clip-eval` 6.0G、`sail7b` 5.5G、`torch_sipu` 4.8G、`torch_sipu_final` 4.2G 等。
+
+### 42.4 完整钻取树（Top 分支）
+
+```
+/share/liwang/                                   ≈ 8.3T
+├── VLM_projects/                                5.0T
+│   ├── Griffon/                                 4.3T
+│   │   ├── GThinker/                            4.3T
+│   │   │   ├── EasyR1/                          3.1T
+│   │   │   │   ├── checkpoints_RL/              2.3T   ← 模型权重
+│   │   │   │   └── checkpoints_RL_0429/         839G   ← 模型权重
+│   │   │   └── SFT_code/                        1.2T
+│   │   │       ├── checkpoints-0324/            814G   ← 模型权重
+│   │   │       ├── checkpoints-0429-v2/         302G   ← 模型权重
+│   │   │       └── checkpoints-0429-v2-1/        55G
+│   │   └── Griffon-G&R/                          19G
+│   ├── ml-fastvlm/                              683G
+│   │   ├── checkpoints-distill/                 469G   ← 模型权重
+│   │   ├── checkpoints/                         109G
+│   │   └── checkpoints-distill-liwang/          102G
+│   ├── VLMEvalKit/                              4.9G
+│   └── Qwen3-VL/                                4.3G
+├── Projects/                                    2.6T
+│   ├── LlamaGen/                                1.8T
+│   │   ├── checkpoints_vqvae/                   839G   ← 模型权重
+│   │   ├── results_tokenizer_image/             839G   ← 中间产物
+│   │   └── imagenet_code_c2i_flip_ten_crop_105/  69G   ← 中间产物
+│   ├── JiT_advanced/                            386G
+│   ├── JiT_Advanced_HD/                         163G
+│   ├── JiT_local_attention/                     147G
+│   ├── pdf_to_images/                           111G   ← 中间产物
+│   ├── test_torch_sipu/                17G
+│   ├── JiT/                                      16G
+│   └── Dataset/                                 3.8G   ← 数据集
+├── JD_evaluation/                               384G
+│   ├── JV-Adas/                                 281G
+│   │   ├── .sam3d-cache/                         21G   ← cache
+│   │   └── .sam3-cache/                         2.4G   ← cache
+│   ├── datasets/                                 42G   ← 数据集
+│   ├── JD_evaluation_clean/                      38G
+│   ├── ultralytics/                             7.0G
+│   ├── .agentos/                                6.7G   ← cache
+│   └── NavDP/                                   3.0G
+├── envs/                                        161G   ← conda 环境
+├── Benchmark/                                   101G
+│   ├── evalscope_main/                           36G（含 .cache 14G）
+│   ├── .cache/                                   28G   ← cache
+│   ├── evalscaope_main_v1.9.1/                   23G
+│   ├── .agentos/                                 11G   ← cache
+│   └── Perf_test/ venv/                          1.3G / 1.1G
+├── nim-cache-v2/                                 30G   ← cache
+├── nim-cache/                                    16G   ← cache
+├── .conda/pkgs/                                  15G   ← cache
+├── .cache/                                      3.3G   ← cache
+├── pip_cache/                                   1.5G   ← cache
+└── .trae-cn-server/ tools/ …                    1.4G / 670M
+```
+
+### 42.5 可清理候选（仅列出，**未执行任何删除**）
+
+按「回收空间 / 风险」排序，供 liwang 确认：
+
+| 候选 | 大小 | 说明 |
+|---|---|---|
+| `VLM_projects/Griffon/GThinker/EasyR1/checkpoints_RL_0429` | 839G | RL 旧版本 checkpoint，确认不再用可删 |
+| `Projects/LlamaGen/checkpoints_vqvae` | 839G | VQVAE 权重，若已有备份可删 |
+| `Projects/LlamaGen/results_tokenizer_image` | 839G | 看起来是 tokenizer 训练中间结果 |
+| `VLM_projects/Griffon/GThinker/SFT_code/checkpoints-0324` | 814G | 3 月旧 checkpoint |
+| `VLM_projects/ml-fastvlm/checkpoints-distill` | 469G | 蒸馏中间 checkpoint |
+| `VLM_projects/Griffon/GThinker/SFT_code/checkpoints-0429-v2` | 302G | 旧版本 |
+| `Projects/pdf_to_images` | 111G | 看起来是中间产物 |
+| `nim-cache-v2` + `nim-cache` | 46G | NIM 模型缓存，可重建 |
+| `Benchmark/.cache` | 28G | 评测缓存，可重建 |
+| `JD_evaluation/JV-Adas/.sam3d-cache` | 21G | 模型缓存，可重建 |
+| `.conda/pkgs` | 15G | `conda clean -a` 可回收 |
+| `Benchmark/evalscope_main/.cache` | 14G | 可重建 |
+| `.cache/vllm/torch_compile_cache` | 2.9G | torch.compile 缓存，可重建 |
+| `pip_cache` | 1.5G | `pip cache purge` 可回收 |
+| `workspace-20260907-025142` | 79M | 临时工作区 |
+
+**注意**：`/share` 总盘 78T 已 100% 满，liwang 名下约 8.3T。清理 liwang 只能释放其中一部分；若目标是让 `/share` 恢复可用，还需排查其它用户的占用（本次未做，因为任务只指定了 `/share/liwang/`）。
+
+### 42.6 备注
+
+- 本次所有统计均为**只读操作**（`du` / `find`），未删除、未移动任何文件。
+- NFS 上 `du` 很慢（大量小文件 + 网络 stat），单目录 5T 级遍历耗时数分钟到十几分钟。
+- 未发现 `tmp` / `temp` 目录；最大的「缓存类」目录是 `Benchmark/.cache`(28G)、`JV-Adas/.sam3d-cache`(21G)、`nim-cache*`(46G)。
