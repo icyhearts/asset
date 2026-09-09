@@ -18,6 +18,7 @@ def main():
         context_length=128,
         skip_server_warmup=True,
         attention_backend="sipu",
+        **engine_kwargs,
     )
     print(llm.generate(
         ["Hello, this is a SIPU offline inference smoke test."],
