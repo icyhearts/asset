@@ -2406,3 +2406,47 @@ Ort::Status Compute(const Ort::Custom::Tensor<uint8_t>& in,
 - **易踩的坑**：预量化路径若不带 `orig_dtype`，GEMM 默认 bf16，在 FP16 模型上会引发 attention q/k dtype 不匹配——这正是 `test_prequant_output_dtype` 守护的点。
 
 > 环境备注：`sglang_sipu` 在容器 `sipu-dev` 内挂载为 `/share/users/like/package/sglang_sipu -> /sgl-workspace/sglang`（workdir 同），镜像 `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0`；包名仍为 `sglang`（editable 安装）。
+
+---
+
+## 39. `static_quant_fp8` 的 scale 是现场按 max/min 算的，还是从 safetensors 加载的？
+
+**结论：从 safetensors（checkpoint）加载的，不是现场按 tensor 的 max/min 算的。** `static_quant_fp8` 本身只是一个「用给定 scale 做量化」的 kernel，它不做任何 reduce/max 运算，scale 是它的**入参**。
+
+### 39.1 证据一：kernel 签名与函数体都不算 scale
+
+`static_quant_fp8`（`python/sglang/kernels/ops/quantization/fp8_kernel.py:902`）签名是 `(x, x_s, repeat_scale)`，`x_s` 由外部传入。函数体（`fp8_kernel.py:894-895`）直接：
+
+```python
+y_s_inv = 1.0 / y_s
+y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
+```
+
+只有乘法 + clamp，没有任何求 max/absmax 的操作。它对应的 triton kernel `_static_quant_fp8` 同理。
+
+### 39.2 证据二：scale 通过 weight_loader 从 checkpoint 加载
+
+- **原生 FP8**：`Fp8LinearMethod::create_weights`（`python/sglang/srt/layers/quantization/fp8.py:610-626`）中，只有当 `activation_scheme == "static"` 时才注册
+  ```python
+  layer.register_parameter("input_scale", PerTensorScaleParameter(..., weight_loader=weight_loader))
+  ```
+  `weight_loader` 就是 HF checkpoint 的加载器，会把 safetensors 里名为 `...input_scale` 的张量读进来。`activation_scheme == "dynamic"` 时注册的是 `input_scale = None`（`fp8.py:626`），根本不加载 scale。
+- **compressed-tensors**：`CompressedTensorsW8A8Fp8::create_weights`（`python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py:137-143`）在 `is_static_input_scheme` 时同样用 `PerTensorScaleParameter(weight_loader=...)` 从 checkpoint 加载。
+
+### 39.3 证据三：加载后有一次 `.max()` 归约（仍是 checkpoint 的值）
+
+`process_weights_after_loading` 里会做 `layer.input_scale = Parameter(layer.input_scale.max(), ...)`（`fp8.py:946-948`；compressed-tensors 在 `compressed_tensors_w8a8_fp8.py:223-224`）。因为 checkpoint 可能按 shard/channel 存了多个 scale，这里取 max 归约成一个 per-tensor 标量——注意这是对**加载进来的值**做归约，不是重新按激活统计量计算。
+
+### 39.4 对比：dynamic 才是现场算的
+
+| 维度 | static | dynamic |
+|---|---|---|
+| scale 来源 | safetensors 加载（校准阶段算好并写入 checkpoint） | 推理时现场按激活统计量算 |
+| 代码路径 | `input_scale` 非 None → `static_quant_fp8`（`fp8_utils.py:1951`） | `input_scale is None` → `sglang_per_token_quant_fp8(input_2d)`（`fp8_utils.py:1959`） |
+| kernel 行为 | 只做 `x * (1/scale)` + clamp | `per_token_quant_fp8`（`python/sglang/kernels/ops/quantization/per_token_quant_fp8.py:43`），docstring 明写 "Dynamically quantize each row"，在 kernel 内对每行求 max |
+
+即：quantization 术语里 static / dynamic 的差别，就是「激活 scale 是否在量化校准阶段预先确定并写进 checkpoint」。
+
+### 39.5 与第 38 节的衔接
+
+第 38 节里 `_fp8_static_input_scale`（`layernorm.py:370`）读的 `linear.input_scale`，正是这个从 safetensors 加载、再 `.max()` 归约后的 per-tensor 标量。RMSNorm + FP8 量化融合 kernel 只是**复用它**传给 FlashInfer，并不会重新计算——这也正是 `_fp8_static_input_scale` 要求 `input_scale.numel() == 1` 的原因。
