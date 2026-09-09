@@ -2273,3 +2273,136 @@ Ort::Status Compute(const Ort::Custom::Tensor<uint8_t>& in,
 #### 37.3.4 一句话总结
 
 > **onnxruntime 的 CUDA LSTM 是直接调用 `cudnnRNNForward`（`cudnn_rnn_base.cc:351`），没有自己的 LSTM CUDA kernel。SimoQuantizeLSTM 当前在 matmul/sigmoid/tanh/elementwise 上使用 torch（`simo_lstm_ops.cc:739-751`），且构建时硬链接 libtorch（`build_runtime.py:89-111`）。"调用 ORT 的 cuda 算子"对外部自定义算子而言架构上不可行——ORT 只对外暴露 stream（`onnxruntime_c_api.h:4662`），内置 kernel 的 cublas/cudnn 句柄对外不可见。真正可行的去 torch 化路线是自写 cuBLAS/cuDNN 实现（路线 Y），但那要自己维护三套 dtype 的 kernel；如果以工程规范和迭代效率为第一目标，继续调用 torch 反而更稳妥，因为 `at::matmul` 底层同样是 cuBLAS，数值上与 ORT 一致，且 QDQ 核心计算本来就是 SIMO 自己的 Triton kernel。**
+
+---
+
+## 38. sglang 提交 11d03eaeef：FlashInfer RMSNorm + FP8 量化融合（SM90/SM100/SM120）
+
+> 行号说明：本节行号基于提交 `11d03eaeef` 自身（即 `git show 11d03eaeef:<path>`）。该提交之后仓库有改动，当前工作区行号有偏移（`layernorm.py` 偏移较大，如 `forward_with_per_tensor_quant_fusion` 从 858 漂到 905），定位时请以函数名为主。测试文件提交后未被修改，行号与工作区一致。
+
+### 38.1 一句话核心功能
+
+把 **RMSNorm（含 add-residual RMSNorm）+ 静态 per-tensor FP8 激活量化** 合并成一次 FlashInfer kernel 调用，从而在 norm 与下游 FP8 GEMM 之间**省掉一次独立的量化 kernel 启动**（以及激活的两趟 HBM 读写往返）。该融合在 **SM90 / SM100 / SM120** 上启用，覆盖两种 FP8 linear 实现：原生 `Fp8LinearMethod`（非 block / mxfp8 / marlin）与 compressed-tensors 的 `CompressedTensorsW8A8Fp8`（静态 per-tensor 输入 scale）。
+
+```
+提交前： RMSNorm kernel ──► bf16 激活 ──► static_quant_fp8 ──► fp8 激活 ──► FP8 GEMM
+                          (HBM 写+读)        (HBM 写+读)
+提交后： FlashInfer rmsnorm_quant ──► (fp8 激活, scale) ──► FP8 GEMM
+```
+
+### 38.2 改动清单（四个层面）
+
+| 层面 | 文件 | 作用 |
+|---|---|---|
+| 生产者（norm） | `python/sglang/srt/layers/layernorm.py` | 新增融合 kernel 调用 + 判定下游能否吃 pre-quant |
+| 接线（模型） | `python/sglang/srt/models/llama.py`、`qwen2.py`（+ eagle） | 把下游 linear 作为 `quant_linear` 传给 norm |
+| 消费者（quant） | `python/sglang/srt/layers/quantization/fp8.py`、`compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py` | 识别 tuple 形式的预量化输入 |
+| GEMM 调度 | `python/sglang/srt/layers/quantization/fp8_utils.py` | 跳过重复量化、传递 out_dtype、处理 scalar-A scale |
+
+### 38.3 代码走读
+
+#### 38.3.1 生产者：RMSNorm 侧（layernorm.py）
+
+1. **能力探测**：`layernorm.py:58` 新增模块级开关 `_flashinfer_rmsnorm_quant_available`；`layernorm.py:89-99` 尝试 `from flashinfer.norm import rmsnorm_quant, fused_add_rmsnorm_quant`，导入失败则置 `False`——装不上就静默降级。
+
+2. **判定下游是否可融合**：`_fp8_static_input_scale`（`layernorm.py:370`）——若传入的 linear 是「静态 per-tensor FP8」，返回它的 `input_scale`（要求 `numel()==1`），否则返回 `None`。内部由 `_is_static_per_tensor_fp8_linear`（`layernorm.py:393`）做类型判定：
+   - 原生 `Fp8LinearMethod` 且非 block / mxfp8 / marlin；或
+   - compressed-tensors 的 `CompressedTensorsW8A8Fp8` 且 `is_static_input_scheme`。
+   `numel()==1` 的限制来自 flashinfer 该 kernel 只支持 per-tensor 量化。
+
+3. **新入参 `quant_linear`**：`RMSNorm` 各 backend `forward_*` 都加了 `quant_linear: Optional[nn.Module] = None`（提交里加在 `layernorm.py:474/575/591/668/708/732/783/804`）。它由 `BaseFusedOp::forward`（`python/sglang/kernels/fused_op.py:630`）以 `**kwargs` 透传到具体 backend。
+
+4. **调度点**：`RMSNorm::forward_cuda`（`layernorm.py:469`）在 `layernorm.py:508-518` 判断：
+   ```python
+   if (quant_linear is not None
+       and not self.cast_x_before_out_mul
+       and _flashinfer_rmsnorm_quant_available):
+       scale = _fp8_static_input_scale(quant_linear)
+       if scale is not None:
+           return self.forward_with_per_tensor_quant_fusion(...)
+   ```
+   它被刻意放在 empty-input / `variance_size_override` / batch-invariant 等 guard **之后**——这些路径与融合 kernel 不兼容。
+
+5. **融合实现**：`RMSNorm::forward_with_per_tensor_quant_fusion`（`layernorm.py:858`）：
+   - 无 residual → `_flashinfer_rmsnorm_quant(out, x, weight, scale, eps)`；
+   - 有 residual → `_flashinfer_fused_add_rmsnorm_quant(out, x, residual, weight, scale, eps)`（就地 `residual += x`，再 `out = quant(rmsnorm(residual) * w)`）；
+   - 返回契约：无 residual 返回 `(fp8_out, scale, orig_dtype)`；有 residual 返回 `((fp8_out, scale, orig_dtype), residual_out)`。
+   - `orig_dtype` 是关键：把「原本的激活 dtype」带下去，让下游 GEMM 输出回到模型 dtype 而非默认 bf16（见 38.3.4 与 38.5 的回归测试）。
+
+#### 38.3.2 接线：模型层（llama.py / qwen2.py）
+
+- `LlamaDecoderLayer::forward`（`llama.py:341`）：
+  - `llama.py:352` / `llama.py:356`：`self.input_layernorm(..., quant_linear=self.self_attn.qkv_proj)`
+  - `llama.py:366`：`self.post_attention_layernorm(..., quant_linear=self.mlp.gate_up_proj)`
+- `Qwen2DecoderLayer::forward`（`qwen2.py:284`）：对应 `qwen2.py:295/299/309`。
+- EAGLE 变体：layer 0 把 `input_layernorm` 换成恒等占位，签名同步改为 `lambda x, quant_linear=None: x`（`llama_eagle.py:53`、`qwen2_eagle.py:54`），否则新 kwarg 会 TypeError。
+
+即：融合的「开关」由模型自己给——只有下游确实是静态 per-tensor FP8 linear 时才真的融合。
+
+#### 38.3.3 消费者：FP8 linear 识别 tuple（fp8.py / compressed_tensors_w8a8_fp8.py）
+
+- `Fp8LinearMethod::apply`（`fp8.py:957`）在 `fp8.py:1035` 新增分支：输入是 tuple 时取 `qx, x_scale = x[0], x[1]`、`out_dtype = x[2] if len(x) > 2 else None`，直接调 `apply_fp8_linear(..., input_scale=x_scale, pre_quant_output_dtype=out_dtype)`。
+- `CompressedTensorsW8A8Fp8::apply_weights`（`compressed_tensors_w8a8_fp8.py:228`）在 `:234` 做同样的事，额外带 `compressed_tensor_quant=True`。
+
+#### 38.3.4 GEMM 调度（fp8_utils.py）
+
+`apply_fp8_linear`（`fp8_utils.py:1713`）是这套融合真正落地的地方：
+
+1. **新参数** `pre_quant_output_dtype`（`fp8_utils.py:1724`）。
+2. **识别预量化输入**（`fp8_utils.py:1745`）：`input_prequantized = input_2d.dtype in (float8_e4m3fn, float8_e4m3fnuz)`；随后 `output_dtype = pre_quant_output_dtype or torch.bfloat16`（`:1749-1752`）。**没有 dtype 提示时退回 bf16**——这正是下面回归测试要防的坑。
+3. **跳过重复量化**（`:1765-1772`）：预量化分支直接 `qinput = input_2d`，复用调用方给的 per-tensor `input_scale`（`assert input_scale.numel() == 1`），不再走 `static_quant_fp8`。
+4. **scalar-A scale 的原生支持**（`:1754-1763`）：新增 `channelwise_cutlass` / `use_cutlass_channelwise_gemm` / `native_scalar_a_scale`。当硬件是 SM90/SM100/SM120 时，per-tensor 的 A scale 可**原样（scalar）**交给 CUTLASS kernel；否则（不支持的 epilogue）需 `repeat` 成 per-row（`:1768-1771`、`:1807-1809`）。这解释了标题为何强调 SM90/SM100/SM120。
+5. **统一 output_dtype**：所有 GEMM 分支（`fp8_scaled_mm`、`triton_scaled_mm`、aiter、`torch._scaled_mm`、padding 分支）都由 `input.dtype` 改为 `output_dtype`。
+
+### 38.4 数据流（提交后）
+
+```
+   ┌────────────── RMSNorm::forward_cuda (layernorm.py:469) ──────────────┐
+   │ quant_linear 非空 且 _fp8_static_input_scale() 命中                   │
+   │      │                                                               │
+   │      ├─ 否 ──► 原路径：norm → bf16 激活 ──► apply_fp8_linear 内部     │
+   │      │                                    static_quant_fp8           │
+   │      └─ 是 ──► forward_with_per_tensor_quant_fusion                  │
+   │                    (layernorm.py:858)                                │
+   └──────────────────────────────┬──────────────────────────────────────┘
+                                  ▼
+        FlashInfer rmsnorm_quant / fused_add_rmsnorm_quant
+                                  ▼
+      (fp8_act, input_scale, orig_dtype) ──tuple──► Fp8LinearMethod::apply
+                                  ▼                        (fp8.py:1035)
+        apply_fp8_linear(input_prequantized=True) (fp8_utils.py:1713)
+                                  ▼
+                  fp8_scaled_mm(out_dtype=orig_dtype)
+```
+
+### 38.5 测试用例：有，且覆盖较细
+
+两个测试文件都在提交里新增/扩充，并以 `register_cuda_ci(... stage="base-b", runner_config="1-gpu-large")` 注册进 CI（**需要 GPU，无 GPU 会 `SkipTest`**）。
+
+**A. `test/registered/layers/test_layernorm_fusion.py`（新增，142 行）**
+
+| 用例（类::方法） | 行号 | 覆盖点 |
+|---|---|---|
+| `TestRMSNormFp8QuantFusion::_run_fusion_test` | 31 | 公共断言：输出 dtype=fp8、`s is scale`、`out_dtype==dtype`、shape、residual 正确性、反量化后 cos>0.99 且 rel_err<0.1 |
+| `TestRMSNormFp8QuantFusion::test_rms_norm_fp8_quant_fusion` | 80 | 参数扫描 NUM_TOKENS×HIDDEN_SIZES×ADD_RESIDUAL×DTYPES（7/83/512 × 512/4096 × {无/有 residual} × {bf16/fp16}），对比 `forward_native` |
+| `TestRMSNormFp8QuantFusion::test_forward_cuda_quant_linear_dispatch` | 95 | **调度正确性**：monkeypatch `_fp8_static_input_scale`，验证普通 norm 走融合；而 `variance_size_override` 与 `cast_x_before_out_mul`（HF 语义）**必须不融合** |
+
+**B. `test/registered/quant/test_fp8_utils.py`（扩充 +268 行）**
+
+| 用例（类::方法） | 行号 | 覆盖点 |
+|---|---|---|
+| `TestApplyFp8LinearScaleDispatch::test_native_scalar_a_static_prequant_and_dynamic_scale_shapes` | 65 | 逐个 mock `_is_sm90/100/120_supported`，断言静态预量化、compressed-tensor 静态、动态三条路径传给 GEMM 的 A-scale 形状：native scalar 时 `numel()==1`，预量化时 `is input_scale`，动态时 `(M,1)` |
+| `TestApplyFp8LinearScaleDispatch::test_without_native_scalar_a_static_scale_is_repeated` | 142 | 非 SM90/100/120 时，scalar scale 被 `repeat` 成 `(M,1)` |
+| `TestApplyFp8LinearScaleDispatch::test_linear_methods_forward_fused_scalar_tuple` | 179 | `Fp8LinearMethod::apply` 与 `CompressedTensorsW8A8Fp8::apply_weights` 能接收 fused tuple，并把 `input_scale` / `pre_quant_output_dtype` 正确透传 |
+| `TestApplyFp8LinearPrequantOutputDtype::test_prequant_output_dtype` | 306（helper `_run` 245） | **回归测试**：预量化输入必须输出调用方给的 dtype（fp16 & bf16），缺省才回 bf16，并与非预量化路径数值对齐。注释点明动机：*FP16 模型里硬编码 bf16 会导致 attention 的 query/key dtype 不匹配* |
+
+**C. 性能基准（非单测）**：`benchmark/kernels/bench_fused_rmsnorm_fp8_quant.py`（新增 185 行）——`run_unfused`(67) / `run_fused_default`(87) / `run_fused_cute`(91) 三种实现对比，`_check_correctness`(128) 做数值校验，`benchmark`(176) 出吞吐数据。
+
+### 38.6 小结与边界
+
+- **核心**：RMSNorm 与静态 per-tensor FP8 激活量化融合为单个 FlashInfer kernel，省一次 kernel 启动与两趟激活 HBM 往返；仅在 SM90/SM100/SM120 + flashinfer 可用 + 下游是静态 per-tensor FP8 linear 时生效，否则静默走原路径。
+- **覆盖范围**：Llama / Qwen2（含 EAGLE）主干已接线；其它模型只要把 `quant_linear=` 传给 `RMSNorm` 即可复用。
+- **不融合的情况**：`cast_x_before_out_mul`（HF 语义）、`variance_size_override`、非 per-tensor（block/mxfp8/marlin）FP8 linear、非静态输入 scale、flashinfer 不可用。
+- **易踩的坑**：预量化路径若不带 `orig_dtype`，GEMM 默认 bf16，在 FP16 模型上会引发 attention q/k dtype 不匹配——这正是 `test_prequant_output_dtype` 守护的点。
+
+> 环境备注：`sglang_sipu` 在容器 `sipu-dev` 内挂载为 `/share/users/like/package/sglang_sipu -> /sgl-workspace/sglang`（workdir 同），镜像 `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0`；包名仍为 `sglang`（editable 安装）。
