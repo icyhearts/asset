@@ -1,17 +1,18 @@
 set -x
 # sgl:
-cd /data/like/package//sglang_kernel_src/
-git push -f gitlab main-local-dep
+cd /share/users/like/package//sglang_kernel_src/
+git push -f gitlab release/v0.5.18-local-dep
+
 # cutlass
-cd /data/like/package/cutlass/
+cd /share/users/like/package//cutlass
 git push -f gitlab like
 
 # asset
 cd /softhome/like/asset && bash temp/add.sh && git commit -m "update"  && git push gitlab master
 
 # cute-gemm reed
-cd /data/like/package/cute-gemm
+cd /share/users/like/package//cute-gemm
 git push -f gitlab like
 
-cd /data/like/package/hpc-ops
+cd /share/users/like/package//hpc-ops
 git push -f gitlab like
