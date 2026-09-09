@@ -2450,3 +2450,76 @@ y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
 ### 39.5 与第 38 节的衔接
 
 第 38 节里 `_fp8_static_input_scale`（`layernorm.py:370`）读的 `linear.input_scale`，正是这个从 safetensors 加载、再 `.max()` 归约后的 per-tensor 标量。RMSNorm + FP8 量化融合 kernel 只是**复用它**传给 FlashInfer，并不会重新计算——这也正是 `_fp8_static_input_scale` 要求 `input_scale.numel() == 1` 的原因。
+
+---
+
+## 40. Engine 的 `attention_backend="sipu"` 与 `device="sipu"` 分别作用在哪里？
+
+### 40.1 `attention_backend="sipu"`：最终实现在哪
+
+**调用链（Engine → 实现）**：
+
+1. `Engine::__init__`（`python/sglang/srt/entrypoints/engine.py:232`）是 `def __init__(self, **kwargs)`，把 kwargs 原样构造成 `ServerArgs`（`engine.py:251`），所以 `attention_backend="sipu"` 直接落进 `ServerArgs`。
+2. `ServerArgs.attention_backend` 字段（`python/sglang/srt/server_args.py:1701`）。`ServerArgs::_run_resolution_pipeline`（`server_args.py:3591`）在 `server_args.py:3670` 调用 `ServerArgs::_handle_sipu_backends`（定义在 `server_args.py:4390`）。
+3. 运行时装配：`ModelRunner::init_attention_backends`（`python/sglang/srt/model_executor/model_runner.py:931`）
+   → `resolve_attention_backend_strs`（`python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py:158`）
+   → `build_attention_backends`（`attention_backend_setup.py:69`）
+   → `_build_resolved_backend`（`:181`）→ `_build_backend_from_str`（`:238`）→ `_build_full_attention_backend_from_str`（`:251`）
+   → `ATTENTION_BACKENDS[backend_str](model_runner)`（`attention_backend_setup.py:257`）。
+4. 注册表：`register_attention_backend`（`python/sglang/srt/layers/attention/attention_registry.py:34-39`）把名字写进 `ATTENTION_BACKENDS`（`:31`）；`"sipu"` 对应 `create_sipu_backend`（`attention_registry.py:133`）。
+
+**最终实现**：`create_sipu_backend`（`attention_registry.py:133`）按「模型里是否存在 `indexer` 子模块」二选一：
+
+- 有 `indexer`（DSA / 稀疏 MLA 类模型）→ `SIPUDSAAttnBackend`，实际类体是 `DeepseekSparseAttnBackend`（`python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:244`，文件末尾 `:1618` 起了别名 `SIPUDSAAttnBackend = DeepseekSparseAttnBackend`）。
+- 无 `indexer`（本次 smoke 用的 Llama-3.1-8B-4layer 就是这种）→ **`SIPUAttnBackend`**（`python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:95`）。
+
+`SIPUAttnBackend` 的关键成员（相对路径 + 行号 + `类::方法`）：
+
+| 成员 | 行号 | 作用 |
+|---|---|---|
+| `SIPUAttnBackend::__init__` | `.../sipu_flashattention_backend.py:113` | 持有 `model_runner.device`、`token_to_kv_pool`、`req_to_token`、`page_size` 等 |
+| `SIPUAttnBackend::init_forward_metadata` | `:384` | 构造 `SIPUAttentionMetadata`（`:43`，含 `page_table` / `cache_seqlens_int32` / `cu_seqlens_q/k` / `scheduler_metadata`） |
+| `SIPUAttnBackend::forward_extend` | `:798` | prefill / extend |
+| `SIPUAttnBackend::forward_decode` | `:1297` | decode |
+| `SIPUAttnBackend::init_cuda_graph_state` | `:1609` | CUDA graph 状态 |
+| `SIPUAttentionMultiStepBackend` | `:2803` | 投机解码 draft worker 用 |
+
+底层算子来自 `sgl_kernel`：`flash_attn_varlen_func` / `flash_attn_with_kvcache` / `merge_state_v2`（import 在 `sipu_flashattention_backend.py:33-37`）。也就是说，`attention_backend="sipu"` 最终落到 **sipu 定制版的 flash-attention backend**（把 FA3 风格的 metadata / page-table 逻辑接到 sipu 设备，底层调 sikernel 的 flash attention）。
+
+### 40.2 `device="sipu"`：影响哪些 tensor 的分配
+
+`ServerArgs.device`（`server_args.py:1214`）→ `ModelRunner.device = server_args.device`（`python/sglang/srt/model_executor/model_runner.py:309`）。
+
+**结论：模型权重和 KV cache 都受它控制**，此外还有一批配套组件。
+
+**(1) 模型权重 —— 受控**
+
+`ModelRunner::load_model`（`model_runner.py:1061`）→ `load_model_with_memory_saver(device=self.device, ...)`（`model_runner.py:1111-1119`）→ `DeviceConfig(device, gpu_id)`（`python/sglang/srt/model_executor/model_runner_components/load_model_utils.py:305`）→ `DeviceConfig::__init__` 里 `self.device = torch.device(self.device_type)`（`python/sglang/srt/configs/device_config.py:17-23`；`"sipu"` 在 `SUPPORTED_DEVICES`，`device_config.py:10`）→ loader 用 `with torch.device(device_config.device):` 把权重直接建在 sipu 上（`python/sglang/srt/model_loader/loader.py:1664`、`:1792`、`:3175`、`:3332`、`:3639`）。
+
+**(2) KV cache —— 受控**
+
+`ModelRunner::init_kv_cache_configurator`（`model_runner.py:587-590`）把 `device=self.device` 传给 `KVCacheConfigurator`（`python/sglang/srt/mem_cache/kv_cache_configurator.py:213`），再由它传给各 pool 构造函数：
+
+- `KVCacheConfigurator::_build_oot_mha_kv_pool`（`kv_cache_configurator.py:1175`，`device=self.device` 在 `:1186`）
+- `KVCacheConfigurator::_build_mha_kv_pool`（`:1570`，`device=self.device` 在 `:1596`）
+- `KVCacheConfigurator::_build_default_req_pool`（`:924`，`device=self.device` 在 `:943`，即 `req_to_token_pool`）
+
+这些 pool 在 `python/sglang/srt/mem_cache/memory_pool.py` 内用 `device=device` / `device=self.device` 建 `torch.empty` / `torch.zeros`（例如 `memory_pool.py:540`、`:556`、`:582`、`:1266`、`:1273`、`:1300`）。
+
+**(3) 其它同样受 `device` 影响的分配 / 行为**
+
+- 当前设备切换：`torch.get_device_module(self.device).set_device(ps.gpu_id)`（`model_runner.py:386`）。
+- 分布式后端选择：`_DEVICE_TO_DISTRIBUTED_BACKEND["sipu"] = "gloo"`（`python/sglang/srt/platforms/device_mixin.py:95`）。
+- 其它组件：`WeightUpdater`（`model_runner.py:538-549`）、`NgramEmbeddingManager`（`:577-585`）、`RoutedExpertsCapturer`（`:1006-1021`）、indexer capturer（`:1023-1031`）、`init_torch_distributed`（`:1041-1050`）。
+- 平台默认参数：`ServerArgs::_handle_sipu_backends`（`server_args.py:4390`）调 `set_default_server_args`（`python/sglang/srt/hardware_backend/sipu/utils.py:30-34`，目前只设 `page_size=32`），并把 prefill 的 `tc_compiler` 强制为 `"eager"`（`server_args.py:4396-4402`）。
+
+**(4) 取值与自动探测**
+
+不传 `device` 时由 `get_device()`（`python/sglang/srt/utils/common.py:916`）自动探测，只有 `is_sipu()`（`utils/common.py:194`，判据是 `hasattr(torch, "sipu")` 且 `torch.sipu.is_available()`）为真才返回 `"sipu"`（`utils/common.py:942-945`）；显式传参则跳过探测（`server_args.py:4265-4268`）。
+
+### 40.3 一句话总结
+
+- `attention_backend="sipu"`：经 `ServerArgs.attention_backend` → `ATTENTION_BACKENDS["sipu"]`（`attention_registry.py:133`）分发，无 `indexer` 的模型最终用 `SIPUAttnBackend`（`python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:95`），底层是 `sgl_kernel` 的 flash attention 算子。
+- `device="sipu"`：经 `ModelRunner.device`（`model_runner.py:309`）扩散，**模型权重**（`DeviceConfig` + `with torch.device(...)`）和 **KV cache / req_to_token_pool**（`KVCacheConfigurator` → `memory_pool.py` 的 `torch.empty(device=...)`）都由它决定，分布式后端也随之选为 gloo。
+
+> 附注（与上面两问无直接关系，但和本次 env 有关）：`temp/env-offlie-infer.sh` 里设了 `SGLANG_PLUGINS="mywhite"`。`Engine::__init__` 在构造 `ServerArgs` 前会调 `load_plugins()`（`engine.py:240`），而 `load_plugins_by_group`（`python/sglang/srt/plugins/__init__.py:35`）会用该白名单过滤（`:97-99`）。在该容器里 `entry_points(group="sglang.srt.plugins")` 只有 `sglang_simo_extensions -> simo.extensions.sglang_simo:register_simo_extensions` 一个，名字不等于 `mywhite`，因此会被跳过。若本意是启用 simo 扩展，白名单值可能需要改成 `sglang_simo_extensions`（或置空）。
