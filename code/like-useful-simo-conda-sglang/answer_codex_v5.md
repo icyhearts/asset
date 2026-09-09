@@ -2549,6 +2549,10 @@ per-tensor FP8 activation quant 的融合，以及预量化激活到 FP8 Linear 
    全部受 `device` 控制”的答案是**否**；“主 KV cache 是否受它控制”的答案是**是，
    但 host 副本和 bookkeeping 例外**。
 
+这里要分清两个参数的职责：`attention_backend="sipu"` 只决定 attention 的实现和
+kernel 分派；tensor 放在哪个设备，主要由 `device="sipu"` 及各模块显式的
+`device`/CPU 保留策略决定。
+
 ### 15.2 `attention_backend="sipu"` 如何被解析
 
 入口脚本在 `temp/sipu_offline_infer.py:4-17（main）` 将两个参数传给
@@ -2560,6 +2564,15 @@ per-tensor FP8 activation quant 的融合，以及预量化激活到 FP8 Linear 
 白名单处理；它决定哪些通用/平台插件被加载，不是 `attention_backend` 注册表本身。
 `sipu` 的内置注册仍由 `python/sglang/srt/layers/attention/attention_registry.py:133-150（create_sipu_backend）`
 提供。
+
+本次容器中已安装的 SIMO 通用插件 entry-point 名称是
+`sglang_simo_extensions`（相对 SIMO code base 的
+`pyproject.toml:29-30（project.entry-points["sglang.srt.plugins"]）`）。由于白名单只有
+`mywhite`，`python/sglang/srt/plugins/__init__.py:95-99（load_plugins_by_group）` 会跳过
+该 entry-point；因此本次给出的 Llama smoke 日志没有启用 SIMO 的 attention/KV-pool
+替换，使用的是 SGLang 原生 `SIPUAttnBackend` 和原生 MHA KV pool。若将来把
+`sglang_simo_extensions` 加入白名单，扩展可以替换 pool/backend 类，但不会改变
+`device=self.device` 这一层设备参数传播规则。
 
 `python/sglang/srt/server_args.py:1701-1709（ServerArgs::attention_backend）` 的
 choices 包含 `sipu`；完整列表位于
@@ -2594,6 +2607,8 @@ temp/sipu_offline_infer.py:4-17（main）
   -> Scheduler::init_model_worker / Scheduler::init_all_attention_backends
        python/sglang/srt/managers/scheduler.py:993-1006（Scheduler::init_model_worker）
        -> python/sglang/srt/managers/scheduler.py:981-985（Scheduler::init_all_attention_backends）
+  -> TpModelWorker::init_attention_backends
+       python/sglang/srt/managers/tp_worker.py:418-422（TpModelWorker::init_attention_backends）
   -> ModelRunner::init_attention_backends
        python/sglang/srt/model_executor/model_runner.py:931-951（ModelRunner::init_attention_backends）
   -> resolve_attention_backend_strs -> build_attention_backends
@@ -2655,6 +2670,9 @@ AttentionBackend::forward
 `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:384-796（SIPUAttnBackend::init_forward_metadata）`
 根据当前 batch 的 `seq_lens.device` 创建 `cache_seqlens`、`cu_seqlens`、page table
 等 metadata。普通 MHA 的两个执行函数是：
+
+backend 初始化时，`python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:113-145（SIPUAttnBackend::__init__）`
+把 `model_runner.device` 保存为 `self.device`，并持有两个 KV pool 的引用。
 
 - `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:798-1295（SIPUAttnBackend::forward_extend）`：先在
   `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:820-865（SIPUAttnBackend::forward_extend）` 将新 K/V 写入 `token_to_kv_pool`，普通 paged MHA 在 `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:1038-1058（SIPUAttnBackend::forward_extend）`
@@ -2809,7 +2827,9 @@ host/offload 副本不属于这条“主 KV cache”结论。
 
 ### 15.7 2026-09-09 日志与源码的对应关系
 
-`temp/off.log.2026_09_09___14_42_55` 提供了实际运行证据：
+容器内日志为 `/sgl-workspace/sglang/temp/off.log.2026_09_09___14_42_55`；由于
+`/sgl-workspace/sglang` 是宿主机 SGLang checkout 的 bind mount，下面用相对路径
+`temp/off.log.2026_09_09___14_42_55` 标注同一个文件。它提供了实际运行证据：
 
 - `temp/off.log.2026_09_09___14_42_55:74-115` 是首次 prefill 的
   `flash_attn_with_kvcache`。`q=(13,32,128)`，
