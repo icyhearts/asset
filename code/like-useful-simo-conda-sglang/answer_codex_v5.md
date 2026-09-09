@@ -2650,6 +2650,13 @@ temp/sipu_offline_infer.py:4-17（main）
 model-specific override 也可能把最终的 prefill/decode backend 解析成专用的
 `dsv4`，不能只看构造函数参数就跳过解析流程。
 
+构建过程中虽然会经过
+`python/sglang/srt/layers/attention/attention_registry.py:335-515（attn_backend_wrapper）`，
+但该 wrapper 对普通 dense Llama 在
+`python/sglang/srt/layers/attention/attention_registry.py:515（attn_backend_wrapper）`
+返回原始 `full_attn_backend`，所以本次没有
+再套一层 hybrid/mamba attention wrapper。
+
 ### 15.3 从 Llama 层到 SIPU attention kernel 的调用链
 
 在本次脚本的 `disable_cuda_graph=True` eager 路径，调用关系如下：
@@ -2796,7 +2803,7 @@ ServerArgs.device = "sipu"
 | request-to-token page table | `python/sglang/srt/mem_cache/kv_cache_configurator.py:761-789（KVCacheConfigurator::_build_req_to_token_pool）`、`python/sglang/srt/mem_cache/kv_cache_configurator.py:924-946（KVCacheConfigurator::_build_default_req_pool）`；`python/sglang/srt/mem_cache/memory_pool.py:262-290（ReqToTokenPool::__init__）` | `req_to_token` 主表用传入 device 分配，通常为 `sipu:0`；但同一构造函数中的 `req_generation`（`python/sglang/srt/mem_cache/memory_pool.py:289（ReqToTokenPool::__init__）`）没有 device 参数，属于 CPU bookkeeping。 |
 | 请求长度、page table、cu-seqlens 等 forward metadata | `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:384-493（SIPUAttnBackend::init_forward_metadata）`；`python/sglang/srt/model_executor/forward_batch_info.py:809-848（ForwardBatch::init_new）` | 由 `seq_lens.device` 或 `model_runner.device` 创建，正常 eager SIPU forward 中在 `sipu:0`。 |
 | `input_ids`、`seq_lens_cpu`、CPU 镜像和 pinned staging | `python/sglang/srt/managers/schedule_batch.py:2401-2411（ScheduleBatch::prepare_for_extend）`；`python/sglang/srt/mem_cache/allocation.py:303-315（alloc_for_extend）` | 明确保留 CPU/pinned CPU 版本，再异步或显式拷贝到 SIPU；它们不是 `device` 失效，而是调度设计的一部分。 |
-| paged allocator 的临时索引计算 | `python/sglang/srt/mem_cache/allocator/paged.py:190-257（PagedTokenToKVPoolAllocator::alloc_extend）`、`python/sglang/srt/mem_cache/allocator/paged.py:259-307（PagedTokenToKVPoolAllocator::alloc_decode）` | 输出 `out_indices` 先在 SIPU 分配，但 `python/sglang/srt/mem_cache/allocator/paged.py:215-232（PagedTokenToKVPoolAllocator::alloc_extend）`、`python/sglang/srt/mem_cache/allocator/paged.py:275-284（PagedTokenToKVPoolAllocator::alloc_decode）` 因 Triton allocator 会 hang，先在 CPU 用 naive allocator 计算，再 copy 回 SIPU。 |
+| paged allocator 的页表与临时索引 | `python/sglang/srt/mem_cache/allocator/paged.py:379-387（PagedTokenToKVPoolAllocator::clear）`、`python/sglang/srt/mem_cache/allocator/paged.py:190-257（PagedTokenToKVPoolAllocator::alloc_extend）`、`python/sglang/srt/mem_cache/allocator/paged.py:259-307（PagedTokenToKVPoolAllocator::alloc_decode）` | `free_pages`/`release_pages` 和输出 `out_indices` 先在 SIPU 分配；但 `python/sglang/srt/mem_cache/allocator/paged.py:215-232（PagedTokenToKVPoolAllocator::alloc_extend）`、`python/sglang/srt/mem_cache/allocator/paged.py:275-284（PagedTokenToKVPoolAllocator::alloc_decode）` 因 Triton allocator 会 hang，先在 CPU 用 naive allocator 计算，再 copy 回 SIPU。 |
 | host/offload/层级 cache 副本 | 由 `cpu_offload_gb`、weights CPU backup、HiCache/disaggregation 等独立配置控制 | 可能在 CPU 或远端 host；这是副本/迁移策略，不改变主 SIPU pool 的目标 device。 |
 
 ### 15.6 “模型权重、KV cache 都受它控制吗？”的直接回答
