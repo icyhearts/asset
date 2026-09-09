@@ -273,6 +273,9 @@ python/sglang/srt/layers/layernorm.py:858-915
 - 调用 _flashinfer_rmsnorm_quant 或 _flashinfer_fused_add_rmsnorm_quant；
 - 返回 (fp8_out, scale, orig_dtype)（有 residual 时再带 residual）。
 
+这里的 scale 是调用者传入的既有 tensor，函数只是把同一个 scale 放进
+返回 tuple，并没有分配或计算一个新的 scale 输出。
+
 然后 python/sglang/srt/layers/quantization/fp8.py:1035-1061
 (Fp8LinearMethod::apply, 11d03eaeef) 识别这个 tuple，
 python/sglang/srt/layers/quantization/fp8_utils.py:1741-1772
@@ -370,13 +373,13 @@ RMSNorm/quant kernel 中的 register/shared 数据不会保留给它；FP8 activ
 
 这个提交的目标架构是 CUDA SM90/SM100/SM120。当前 SIPU 路径
 python/sglang/srt/layers/layernorm.py:575-614
-(RMSNorm::forward_sipu) 在收到 quantized quant_linear 时会直接抛出
+(RMSNorm::forward_sipu) 在收到量化的 quant_linear 时会直接抛出
 NotImplementedError("RMSNorm with quant_linear is not supported on SIPU")，
 随后只调用普通 SIPU rmsnorm/fused_add_rmsnorm。因此在 sglang_sipu
 上不能把 11d03eaeef 的 CUDA FlashInfer fusion 当作已经生效；SIPU 的
 fp8_scaled_mm 和 sgl_per_token_quant_fp8 仍是独立接口
 （sgl-kernel-sipu/sgl_kernel/gemm.py:56-64 (fp8_scaled_mm)、
-:150-155 (sgl_per_token_quant_fp8)）。
+sgl-kernel-sipu/sgl_kernel/gemm.py:150-155 (sgl_per_token_quant_fp8)）。
 
 ## 5.8 最终回答
 

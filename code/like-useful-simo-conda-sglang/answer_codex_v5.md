@@ -2552,7 +2552,7 @@ per-tensor FP8 activation quant 的融合，以及预量化激活到 FP8 Linear 
 ### 15.2 `attention_backend="sipu"` 如何被解析
 
 入口脚本在 `temp/sipu_offline_infer.py:4-17（main）` 将两个参数传给
-`sgl.Engine`。`python/sglang/srt/entrypoints/engine.py:232-284（Engine::__init__）`
+`sgl.Engine`。`python/sglang/srt/entrypoints/engine.py:232-323（Engine::__init__）`
 先把 kwargs 构造成 `ServerArgs`，然后启动 scheduler 子进程。
 
 命令中的 `SGLANG_PLUGINS="mywhite"` 由
@@ -2565,7 +2565,7 @@ per-tensor FP8 activation quant 的融合，以及预量化激活到 FP8 Linear 
 choices 包含 `sipu`；完整列表位于
 `python/sglang/srt/server_args.py:182-211（ATTENTION_BACKEND_CHOICES）`。
 `python/sglang/srt/server_args.py:3588-3590（ServerArgs::__post_init__）` 调用
-`python/sglang/srt/server_args.py:3591-3692（ServerArgs::_run_resolution_pipeline）`。
+`python/sglang/srt/server_args.py:3591-3792（ServerArgs::_run_resolution_pipeline）`。
 其中：
 
 - `python/sglang/srt/server_args.py:4260-4268（ServerArgs::_handle_missing_default_values）`
@@ -2587,10 +2587,10 @@ choices 包含 `sipu`；完整列表位于
 ```text
 temp/sipu_offline_infer.py:4-17（main）
   -> Engine::__init__
-       python/sglang/srt/entrypoints/engine.py:232-284（Engine::__init__）
+       python/sglang/srt/entrypoints/engine.py:232-323（Engine::__init__）
   -> ServerArgs::__post_init__ / ServerArgs::_run_resolution_pipeline
        python/sglang/srt/server_args.py:3588-3590（ServerArgs::__post_init__）
-       -> python/sglang/srt/server_args.py:3591-3692（ServerArgs::_run_resolution_pipeline）
+       -> python/sglang/srt/server_args.py:3591-3792（ServerArgs::_run_resolution_pipeline）
   -> Scheduler::init_model_worker / Scheduler::init_all_attention_backends
        python/sglang/srt/managers/scheduler.py:993-1006（Scheduler::init_model_worker）
        -> python/sglang/srt/managers/scheduler.py:981-985（Scheduler::init_all_attention_backends）
@@ -2629,11 +2629,7 @@ model-specific override 也可能把最终的 prefill/decode backend 解析成�
 ```text
 ModelRunner::_forward_raw
   python/sglang/srt/model_executor/model_runner.py:1658-1669（ModelRunner::_forward_raw）
-  建立 ForwardContext(attn_backend=self.attn_backend)
-      |
-      v
-get_attn_backend
-  python/sglang/srt/model_executor/forward_context.py:46-67（get_attn_backend）
+  在没有现存 context 时建立 ForwardContext(attn_backend=self.attn_backend)
       |
       v
 LlamaDecoderLayer::forward
@@ -2644,6 +2640,10 @@ LlamaDecoderLayer::forward
       v
 RadixAttention::forward
   python/sglang/srt/layers/radix_attention.py:150-287（RadixAttention::forward）
+      |
+      v
+get_attn_backend
+  python/sglang/srt/model_executor/forward_context.py:46-67（get_attn_backend）
       |
       v
 AttentionBackend::forward
@@ -2665,7 +2665,9 @@ AttentionBackend::forward
 
 MLA 模型会走同一 Python 类中的 MLA 分支（`python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:1095-1295（SIPUAttnBackend::forward_extend）`、
 `python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:1521-1607（SIPUAttnBackend::forward_decode）`），参数中会额外出现 `qv`/`k_rope`；有 `indexer` 的
-DSA 模型则走 `sipu_dsa_backend.py`，不能把它和当前 dense Llama 路径混为一谈。
+DSA 模型则走
+`python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1151-1248（DeepseekSparseAttnBackend::forward_extend）` 或
+`python/sglang/srt/hardware_backend/sipu/attention/sipu_dsa_backend.py:1250-1334（DeepseekSparseAttnBackend::forward_decode）`，不能把它和当前 dense Llama 路径混为一谈。
 
 #### Python wrapper、C++ bridge 和 SiKernel
 
@@ -2700,11 +2702,11 @@ DSA 模型则走 `sipu_dsa_backend.py`，不能把它和当前 dense Llama 路�
 
 ```text
 SGLang backend object:
-  python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py
+  python/sglang/srt/hardware_backend/sipu/attention/sipu_flashattention_backend.py:95-1607（SIPUAttnBackend）
 native dispatch bridge:
-  sgl-kernel-sipu/csrc/attention/flash_attn.cpp::mha_fwd
+  sgl-kernel-sipu/csrc/attention/flash_attn.cpp:51-529（mha_fwd）
 actual device kernel:
-  sgl-kernel-sipu/sikernel/source/source_builtin/attention/.../*.su
+  sgl-kernel-sipu/sikernel/source/source_builtin/attention/.../*.su（各 kernel 函数）
 ```
 
 `SIPUAttnBackend` 是 backend 的最终 Python 选择结果；`flash_attn_with_kvcache`
@@ -2741,7 +2743,9 @@ ServerArgs.device = "sipu"
    `with target_device:` 中调用 `_initialize_model`；随后
    `python/sglang/srt/model_loader/loader.py:1007-1009（DefaultModelLoader::load_model）` 调用
    `load_weights_and_postprocess(..., target_device)`。因此未被模型代码特别标记的
-   普通参数和 buffer 会在 SIPU device context 中构造，权重也加载到这些目标参数。
+   普通参数和 buffer 会在 SIPU device context 中构造；默认权重写入路径
+   `python/sglang/srt/model_loader/weight_utils.py:1495-1510（default_weight_loader）`
+   对这些目标参数执行 `param.data.copy_(loaded_weight)`。
 5. `python/sglang/srt/model_loader/loader.py:151-160（device_loading_context）`
    对 SIPU 特意直接 `yield module`，没有执行通用的
    `p.data.to(target_device)`；注释说明 bulk move 会让 cmodel hang。这正是为什么
@@ -2809,8 +2813,9 @@ host/offload 副本不属于这条“主 KV cache”结论。
 
 - `temp/off.log.2026_09_09___14_42_55:74-115` 是首次 prefill 的
   `flash_attn_with_kvcache`。`q=(13,32,128)`，
-  `k_cache/v_cache=(9,32,8,128)`，page table 为 `(1,5)`，q/k/v 和 metadata 都是
-  BF16 `device=sipu:0`；`temp/off.log.2026_09_09___14_42_55:109-112` 打印
+  `k_cache/v_cache=(9,32,8,128)`，page table 为 `(1,5)`；q/k/v 为 BF16，metadata
+  （cache lengths、page table、cu-seqlens）为 int32，且均为
+  `device=sipu:0`；`temp/off.log.2026_09_09___14_42_55:109-112` 打印
   `Selected Config: Config_128_128`，与
   `kernel_mha_fwd_paged.su` 的 paged prefill 配置选择一致。
 - `temp/off.log.2026_09_09___14_42_55:389-424` 是首次 decode，`q=(1,32,128)`、`max_seqlen_q=1`、page table 为
