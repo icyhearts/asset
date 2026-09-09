@@ -118,6 +118,7 @@ def main():
     tile_shape_config([1024,32], 6)
     tile_shape_config([1024,16], 6)
     tile_shape_config([1024,8], 6)
+    tile_shape_config([1024,1], 6)
 
     tile_shape_config([1000,1024], 6)
     tile_shape_config([1000,32], 6)
