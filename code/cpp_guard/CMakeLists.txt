@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(kgp kgp.cpp)
 add_executable(kgp_wl kgp_wl.cpp)
+add_executable(mydd mydd.cpp)
 
 target_compile_options(kgp PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(kgp_wl PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(mydd PRIVATE -Wall -Wextra -Wpedantic)
