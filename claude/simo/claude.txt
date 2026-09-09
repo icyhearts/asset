@@ -4202,3 +4202,21 @@ SGLANG_PLUGINS="mywhite" python /sgl-workspace/sglang/temp/sipu_offline_infer.py
 
 把答案追加到 like-useful/answer_codex_v5.md
 }
+
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sglang_sipu 代码位于 /share/users/like/package/sglang_sipu. sglang_sipu 需要的 docker contianer name=sipu-dev, docker mount目录情况需要你自己查看.
+sglang_sipu 在 docker 环境内部仍旧以 editable 方式安装, 包名仍旧是 sglang
+
+
+sglang_sipu code base 提交 11d03eaeef, 实现的功能，真的减少了 kernel launch吗？
+原来的 rmsnorm + Fp8LinearMethod , Fp8LinearMethod 的  apply, activation input = bf16, weith = fp8, 如果是 把 activation bf16 -> fp8的量化 + fp8 tensorcore mma 计算，放在一个 kernel里面做，11d03eaeef这个提交完全没有意义啊. bf16 -> fp8 量化，产出的  scale 会进入 globale memory 吗 ？如果把 产出的  scale  放在 register或者 shared memory, 然后把 fp8 weight加载 进 shared memory或者 register, 完全不会有 scale 向 global memory写的开销.
+我的核心问题:  11d03eaeef 这个提交前， Fp8LinearMethod 里面 activation bf16 -> fp8 量化，产出的  scale 会进入 globale memory 吗?
+讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。
+
+把答案追加到 like-useful/answer_codex_v6.md
+}

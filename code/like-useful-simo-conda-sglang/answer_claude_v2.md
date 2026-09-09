@@ -2523,3 +2523,84 @@ y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
 - `device="sipu"`：经 `ModelRunner.device`（`model_runner.py:309`）扩散，**模型权重**（`DeviceConfig` + `with torch.device(...)`）和 **KV cache / req_to_token_pool**（`KVCacheConfigurator` → `memory_pool.py` 的 `torch.empty(device=...)`）都由它决定，分布式后端也随之选为 gloo。
 
 > 附注（与上面两问无直接关系，但和本次 env 有关）：`temp/env-offlie-infer.sh` 里设了 `SGLANG_PLUGINS="mywhite"`。`Engine::__init__` 在构造 `ServerArgs` 前会调 `load_plugins()`（`engine.py:240`），而 `load_plugins_by_group`（`python/sglang/srt/plugins/__init__.py:35`）会用该白名单过滤（`:97-99`）。在该容器里 `entry_points(group="sglang.srt.plugins")` 只有 `sglang_simo_extensions -> simo.extensions.sglang_simo:register_simo_extensions` 一个，名字不等于 `mywhite`，因此会被跳过。若本意是启用 simo 扩展，白名单值可能需要改成 `sglang_simo_extensions`（或置空）。
+
+---
+
+## 41. 提交 11d03eaeef 真的减少 kernel launch 吗？量化产出的 scale 会写 global memory 吗？
+
+> 行号基于当前工作区（HEAD `72f9ec9d7`）。第 38/39 节用的是提交 11d03eaeef 自身的行号，`fp8_utils.py` 有约 +130 行偏移；`fp8.py` 无偏移。
+
+### 41.1 核心问题的直接回答
+
+**要分两种情况，结论相反：**
+
+| 路径 | 提交前 bf16→fp8 量化，产出的 scale 会写 global memory 吗 | 依据 |
+|---|---|---|
+| **静态 per-tensor**（本提交唯一覆盖的路径） | **不会 —— 严格说根本没有「产出的 scale」**。scale 是 checkpoint 加载的 per-tensor 常量，kernel 只**读**它。只有 `REPEAT_SCALE=True` 时才会把 `(M,1)` 的副本写回 global memory | `_static_quant_fp8`(`python/sglang/kernels/ops/quantization/fp8_kernel.py:851`)：`y_s = tl.load(y_s_ptr)`(`:889`) 读 scale；`tl.store(y_q_ptr + cols, ...)`(`:897`) 写 fp8；`if REPEAT_SCALE: tl.store(y_s_repeat_ptr, y_s)`(`:898-899`) 条件写 scale |
+| **动态 per-token**（本提交**不**覆盖） | **会**。kernel 现场 reduce max 算出 scale 并 `output_s[token_id] = scale` 写回 global memory | `per_token_quant_fp8_warp_kernel`(`python/sglang/kernels/jit/csrc/gemm/per_token_quant_fp8.cuh:20`)：`:51` 算 `scale = reduce_max(...)/FP8_E4M3_MAX`，`:53` 写 `output_s[token_id]` |
+
+**所以：你问的「产出的 scale 进 global memory」，在静态 per-tensor 这条路上本来就不存在「产出」——它是常量；真正进 global memory 的是 fp8 激活本身。而「现场算 scale 并写回 global memory」那种情况（动态 per-token），这个提交根本没碰。**
+
+换句话说：`static_quant_fp8`(`fp8_kernel.py:902`) 这个函数名里的 "static" 就说明 scale 是外部给定（checkpoint）而非计算所得；它 `repeat_scale=False` 时直接把入参 scale 原样返回（`fp8_kernel.py:957`）。
+
+### 41.2 kernel launch：3 → 2，省掉的是 bf16 往返，不是 fp8 往返
+
+**提交前**（静态 per-tensor FP8 linear）：
+
+```
+1. RMSNorm kernel（sgl_kernel 的 rmsnorm / fused_add_rmsnorm）
+      └─ 写 bf16 激活 ──► global memory
+2. static_quant_fp8（triton，fp8_kernel.py:851）
+      └─ 读 bf16，写 fp8 激活（+ 条件写 scale）
+3. fp8_scaled_mm（cutlass，python/sglang/kernels/ops/gemm/__init__.py:86）
+      └─ 读 fp8 激活 + scales
+= 3 个 kernel
+```
+
+**提交后**：
+
+```
+1. rmsnorm_quant / fused_add_rmsnorm_quant（flashinfer，layernorm.py:957 / :949）
+      └─ 读 bf16，写 fp8 激活
+2. fp8_scaled_mm
+      └─ 读 fp8 激活 + scales
+= 2 个 kernel
+```
+
+所以：
+- ✅ **少 1 次 kernel launch**（3→2），这是真实的。
+- ✅ 少 1 次 **bf16 激活**的 global memory 写 + 读（norm 的输出不再落地）。
+- ❌ **fp8 激活仍然要写 global memory 再被 GEMM 读**（量化产物仍然落地）。
+- ❌ scale 仍然在 global memory 里（见 41.1），并没有被"省掉"。
+
+### 41.3 你说对的部分：这个提交没有把 quant 融进 GEMM
+
+你的设想「bf16→fp8 量化 + fp8 tensorcore MMA 放进一个 kernel，scale 留在 register/SMEM」在原理上确实更优——能同时省掉 fp8 激活的往返和 scale 的 global memory 访问。**但 sglang 现有的 GEMM 后端不做量化，所以这个提交做不到这件事：**
+
+- `fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None)`（`python/sglang/kernels/ops/gemm/__init__.py:86`）要求 `mat_a` 已经是 fp8。
+- 连 flashinfer 的 bmm 路径也是两步：`apply_fp8_linear_bmm_flashinfer`（`python/sglang/srt/layers/quantization/fp8_utils.py:1827`）先 `static_quant_fp8(...)`(`:1837`) 再 `flashinfer_bmm_fp8(qinput, ...)`(`:1838`)。
+- 要把量化塞进 GEMM，需要给 CUTLASS/tensorcore GEMM 写 A 的 prologue（load bf16 → 乘 scale → 转 fp8 → 进 SMEM），那是改 GEMM kernel 本身，工作量和风险大得多。
+
+这个提交选的是上游更容易的一刀：flashinfer 已经提供 `rmsnorm_quant` / `fused_add_rmsnorm_quant`，把 **norm 和 quant** 合成一个 kernel，与现有所有 GEMM 后端正交组合。它是「3 个 kernel 里合并掉 2 个」的**部分**优化，不是「量化+MMA 全融」的**完全**优化。
+
+### 41.4 但"完全没有意义"不成立
+
+- 对 decode（M 很小）场景，quant kernel 是 launch-latency 主导，少一次 launch 的收益是可测的；同时省掉一次 bf16 激活的 HBM 往返。
+- 它还顺带修了 `pre_quant_output_dtype` 的 dtype 传播问题（见 38.5 的回归测试：FP16 模型上硬编码 bf16 会导致 attention q/k dtype 不匹配）。
+- **真正的局限**：它只覆盖静态 per-tensor（`_fp8_static_input_scale` 要求 `input_scale.numel() == 1`，`python/sglang/srt/layers/layernorm.py:375`），所以对动态 per-token 零收益——那里 scale 必须现场算，除非把量化融进 GEMM（正是你设想的那条路）。
+- 顺带一提，`fp8_utils.py:1915-1918` 的注释点出了另一条思路：compressed-tensors 路径在 `tc_compiler="inductor"` 时用纯 PyTorch 的 `(input * scale.reciprocal()).clamp().to(fp8)`，靠 inductor 把它和周围 RMSNorm/residual 融合掉，效果与这个提交类似（都是消除一次 launch，但 fp8 仍落地）。
+
+### 41.5 一个容易忽略的细节：`repeat_scale`
+
+在 SM90/SM100/SM120 之外（或 GEMM epilogue 不支持 scalar-A），`native_scalar_a_scale=False`（`fp8_utils.py:1898`），于是：
+
+- **提交前**：`static_quant_fp8(..., repeat_scale=channelwise_cutlass and not native_scalar_a_scale)`（`fp8_utils.py:1954`），在 triton kernel 里**写一份 `(M,1)` 的 scale** 到 global memory。
+- **提交后**：融合 kernel 不写 scale，但 `apply_fp8_linear` 的预量化分支里 `x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)`（`fp8_utils.py:1907`）——**又用一次 torch 算子把 `(M,1)` 物化出来**（`Tensor.repeat` 本身也是一次 kernel launch）。
+
+所以在非 SM90/100/120 上，这个提交省下的 launch 数可能被 `.repeat()` 部分抵消。这也解释了提交标题为什么强调 **SM90 / SM100 / SM120**：只有这些平台 `native_scalar_a_scale=True`（`fp8_utils.py:1898-1900`），scalar-A 才能原样交给 CUTLASS，才真正省下 scale 的物化。
+
+### 41.6 结论
+
+1. **减少 kernel launch：真的减了，但只有 1 次（3→2）**，省掉的是 RMSNorm→quant 之间的 bf16 激活往返；**fp8 激活仍然往返 global memory**。
+2. **提交前静态 per-tensor 的量化不写 scale**（scale 是 checkpoint 常量，只读）；**动态 per-token 才写 scale**，而那个路径本提交不覆盖。
+3. 你的批评在「没把量化融进 GEMM、因此没能把 scale 留在 register/SMEM」这一点上成立；但「完全没有意义」不成立——省一次 launch + 省一次 bf16 往返 + 修 dtype 传播，对 decode 是有实际收益的，只是它不是最优融合。
