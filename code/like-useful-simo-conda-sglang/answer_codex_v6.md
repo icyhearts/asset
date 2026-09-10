@@ -398,3 +398,133 @@ sgl-kernel-sipu/sgl_kernel/gemm.py:150-155 (sgl_per_token_quant_fp8)）。
 它把 RMSNorm + static quant 合并，留下 FP8 GEMM 为独立 kernel，因此在
 适用的 CUDA 静态路径上确实少一次 launch 和一轮 BF16 中间结果的 global
 memory traffic，而不是消除了 quant+MMA 之间的全部 global hand-off。
+
+## 6.1 结论
+
+`/share/users/like/audit.log:2-5` 是 `auditctl -l` 的规则列表，不是已经发生
+的 audit 事件。根据这四条规则，当前机器只为以下 syscall 建立了显式的
+`always,exit` 规则：
+
+- `execve`、`execveat`，key 为 `gpu-monitor-exec`；
+- `rename`、`renameat`、`renameat2`、`unlink`、`unlinkat`、`rmdir`，key 为
+  `gpu-monitor-file`。
+
+`mydd` 构建产物是 x86-64 ELF，因此正常运行时匹配 `arch=b64` 规则；
+`arch=b32` 规则不适用于这个二进制。
+
+直接结论是：
+
+1. **启动 `mydd` 会被发现。** 正常启动可执行文件需要 `execve` 或
+   `execveat`，会产生 key=`gpu-monitor-exec` 的事件。
+2. **`mydd` 清空了哪些文件，当前规则不会发现。** 真正清空文件的是
+   `ftruncate(fd, 0)`，但规则中没有 `ftruncate` 或 `truncate`。
+3. **遍历、检查、打开和关闭文件也不会被这组规则记录。** 对应的
+   `openat`、`getdents64`、`newfstatat`、`close` 等 syscall 均不在规则中。
+4. **`gpu-monitor-file` 不会被 `mydd` 命中。** `mydd` 不删除、不重命名文件，
+   也不删除目录；将文件长度改为零不等于 `unlink`。
+
+所以 audit 能看到“某个用户在某个工作目录以某个阈值运行了 `mydd`”，但
+仅凭现有规则不能看到“哪些文件被它截断、截断前多大，以及每个截断是否
+成功”。
+
+## 6.2 逐项对照 mydd 的运行时操作
+
+下面路径均相对于 `/softhome/like/asset/code/cpp_guard`。
+
+| 源码位置和函数 | 操作 | 本机实际 syscall/行为 | 当前规则是否记录 |
+| --- | --- | --- | --- |
+| 程序进入 `mydd.cpp:192-215 (main)` 之前 | 启动 `mydd` 进程映像 | `execve`（也可能由启动方使用 `execveat`） | **是**，`gpu-monitor-exec` |
+| `mydd.cpp:192-204 (main)`、`mydd.cpp:40-57 (parse_options)` | 检查参数、解析 MiB、检查整数溢出 | 用户态计算 | 否 |
+| `mydd.cpp:154-185 (scan_current_directory)` | 打开目录并递归枚举目录项 | `openat(O_DIRECTORY)`、`getdents64`、`newfstatat`、`close` | 否 |
+| `mydd.cpp:167-175 (scan_current_directory)` | `symlink_status` 判断目录项类型 | 本机 libstdc++/glibc 使用 `newfstatat(..., AT_SYMLINK_NOFOLLOW)` | 否 |
+| `mydd.cpp:79-97 (truncate_file)` | `lstat`、判断普通文件并比较大小 | 本机 glibc 将 `lstat` 实现为 `newfstatat(..., AT_SYMLINK_NOFOLLOW)` | 否 |
+| `mydd.cpp:99-109 (truncate_file)` | 以 `O_WRONLY\|O_CLOEXEC\|O_NOFOLLOW` 打开待处理文件 | 本机 glibc 使用 `openat` | 否 |
+| `mydd.cpp:111-132 (truncate_file)` | 用已打开的 fd 再次确认类型和大小 | 本机 glibc 使用 `newfstatat(fd, "", ..., AT_EMPTY_PATH)` 实现 `fstat` | 否 |
+| `mydd.cpp:134-140 (truncate_file)` | 把文件长度设为零 | `ftruncate(fd, 0)` | **否，这是最关键的审计缺口** |
+| `mydd.cpp:115-146 (truncate_file)` | 关闭文件描述符 | `close` | 否 |
+| `mydd.cpp:59-63 (report_errno)`、`mydd.cpp:148-150 (truncate_file)`、`mydd.cpp:208-213 (main)` | 输出 warning、被截断文件名和汇总 | `write` 到 stdout/stderr | 否 |
+| `mydd.cpp:214-215 (main)` | 退出进程 | `exit_group` | 否 |
+
+动态链接器在 `main` 之前还会用 `openat`、`read`、`mmap`、`mprotect`、
+`newfstatat` 和 `close` 加载 libc/libstdc++ 等动态库；这些也不在当前规则中。
+
+我在临时目录中用当前构建的 `mydd 0` 做了 syscall 验证。可见一次
+`execve`；每个实际清空的文件依次出现 `newfstatat`、`openat`、
+`newfstatat`、`ftruncate`、`close`；没有出现 `rename`、`renameat*`、
+`unlink`、`unlinkat` 或 `rmdir`。测试只操作临时测试文件。
+
+## 6.3 audit 实际会留下什么信息
+
+命中 `gpu-monitor-exec` 后，Linux Audit 通常会把同一个事件拆成
+`SYSCALL`、`EXECVE`、`CWD`、`PATH`、`PROCTITLE` 等记录。因此通常可以看到：
+
+- executable 路径；
+- `argv[0]` 和 `argv[1]`，也就是 `mydd` 路径和 MiB 阈值；
+- cwd；
+- pid/ppid、uid/euid、auid、session、terminal；
+- `execve` 是否成功。
+
+因为这两条 exec 规则没有 `exe`、`path`、`uid` 或 `dir` 过滤器，它们会
+匹配系统中相应架构的所有 `execve`/`execveat`，不只匹配 `mydd`。可以按
+key 查询，例如：
+
+```bash
+sudo ausearch -k gpu-monitor-exec -x mydd -i
+```
+
+但这个执行事件只证明程序被启动。即使 `argv[1]=0`，也不能由它证明目录中
+每个普通文件均成功执行了 `ftruncate`；文件可能在遍历期间消失、变更类型，
+也可能因权限等原因打开或截断失败。
+
+## 6.4 两组容易混淆的操作
+
+### 6.4.1 `ftruncate` 不等于 `unlink`
+
+`mydd.cpp:135 (truncate_file)` 的 `ftruncate(file_descriptor, 0)` 保留目录项
+和 inode，只把 `st_size` 变成零。当前 `gpu-monitor-file` 规则只监控删除目录项
+或重命名相关 syscall，所以不会因为文件内容被清空而触发。
+
+### 6.4.2 `open(O_WRONLY)` 不等于 `open(O_TRUNC)`
+
+`mydd.cpp:99-104 (truncate_file)` 打开文件时没有传 `O_TRUNC`；真正改变文件
+长度的是后面的独立 `ftruncate`。不过即使改为 `open(..., O_TRUNC)`，当前规则
+也仍然没有监控 `open`/`openat`，同样看不到文件内容被清空。
+
+符号链接也不会被误认为已审计的删除操作：
+`mydd.cpp:169 (scan_current_directory)` 使用 `symlink_status` 跳过它，
+`mydd.cpp:100-102 (truncate_file)` 又用 `O_NOFOLLOW` 保护打开阶段；无论成功
+跳过还是因竞态返回 `ELOOP`，都不会触发当前的 rename/unlink 规则。
+
+## 6.5 编译和启动命令的边界
+
+如果把“所有操作”也扩展到 CMake 编译过程，那么 `cmake`、构建工具、
+编译器、assembler 和 linker 等每一次新进程启动都会命中全局 exec 规则。
+编译产生 `.o` 和 `mydd` 二进制时使用的普通 `openat`/`write` 本身不会命中；
+如果某个构建工具实际调用了 `rename` 或 `unlink` 置换、清理文件，则那些调用
+会命中 `gpu-monitor-file`。这是构建工具的行为，不是 `mydd.cpp` 的运行时行为。
+
+同样，shell 的输出重定向（例如 `./mydd 10 > result.log`）通常通过
+`openat(..., O_TRUNC)` 创建或清空日志文件；现有规则也不会记录这次日志截断。
+
+## 6.6 若目标是审计 mydd 的截断行为
+
+至少需要把 `ftruncate` 加入 64 位 syscall 规则；如果还要覆盖其它程序使用
+路径形式的截断，以及 32 位兼容程序，还需要相应覆盖 `truncate` 和 32 位
+变体。概念上最小的 64 位补充是：
+
+```bash
+sudo auditctl -a always,exit -F arch=b64 -S ftruncate,truncate \
+  -F key=gpu-monitor-truncate
+```
+
+不过 `ftruncate` 的 syscall 参数只有 fd 和新长度，单靠 syscall 记录不一定
+能稳定给出便于阅读的目标绝对路径。若要求可靠回答“哪个目录下的哪个文件
+被改写”，还应按实际保护目录增加 Audit 文件系统 watch/`dir` 规则，并经过
+本机 audit 版本验证 PATH 记录。还要审计 `open(..., O_TRUNC)`、普通写入或
+内存映射写入时，则需分别覆盖 `open/openat/openat2`、`write/pwrite*`、
+`mmap` 等行为；只加 `ftruncate` 不能构成完整的文件内容修改审计。
+
+以上结论仅基于 `/share/users/like/audit.log` 中列出的规则。`auditctl -l` 不显示
+audit daemon 的运行状态、backlog 丢失情况，也不包含 SELinux/AppArmor AVC
+等可能独立产生的安全事件；因此“规则应当匹配”与“事件最终已经持久化到
+audit 日志”是两个不同判断。
