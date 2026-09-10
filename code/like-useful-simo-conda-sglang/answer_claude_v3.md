@@ -233,11 +233,11 @@ layer 3 ──(dst←1)────────────────►  laye
 |---|---|
 | `package/vllm-for-conda-simo/build-src-bjh-*`（保留当前在用的 v0.27.1，删其余 5 个） | ≈ 33G | # d  one
 | `package/onnxruntime/build`（Debug 构建） | 22G | # done
-| `qemu_demo/` 中的旧快照：`yubo/ctk.copy.qcow2` 16.1G + `yubo/ctk.qcow2` 12.8G + `yubo_scp/ctk.qcow2` 12.8G + 根目录 `ctk.copy2.qcow2` 14.4G（保留 `yubo/ctk.copy2.qcow2` 与 `ci/CI.qcow2`） | ≈ 56G |
-| `package/cuda/*.run`（5 个安装包，安装已完成） | 22G |
-| `package/dev-ubuntu-24.04.tar` | 15.6G |
+| `qemu_demo/` 中的旧快照：`yubo/ctk.copy.qcow2` 16.1G + `yubo/ctk.qcow2` 12.8G + `yubo_scp/ctk.qcow2` 12.8G + 根目录 `ctk.copy2.qcow2` 14.4G（保留 `yubo/ctk.copy2.qcow2` 与 `ci/CI.qcow2`） | ≈ 56G | # done
+| `package/cuda/*.run`（5 个安装包，安装已完成） | 22G | # done
+| `package/dev-ubuntu-24.04.tar` | 15.6G | done
 | `sipu_sdk_debug/*.tar.bz2` 4.0G + `package/.../sipu_sdk_rel.tar` 13.4G（与已解压的 `sipu_sdk_rel/` 目录 14G 重复，tar 与目录只需留一份） | 17.4G |
-| `package/h100/package/old`（4 个历史 build） | 4.0G |
+| `package/h100/package/old`（4 个历史 build） | 4.0G | done
 | **小计** | **≈ 172G** |
 
 **第三梯队 —— 需要人工确认的（conda/venv 冗余，≈ 80G）**
