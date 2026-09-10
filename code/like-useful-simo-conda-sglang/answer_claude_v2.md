@@ -3223,3 +3223,119 @@ Filesystem            Size  Used Avail Use% Mounted on
 - NFS 上遍历极慢（8.7T 级目录需十几分钟）。`/share/users/` 下**所有 60+ 个用户目录的总大小均已测出**，其中 `bokangz`、`yangrunlin`、`ziheng`、`byy` 等少数用户的二级明细为后补。
 - `/share/huayicong/proj` 在两次测量间从 817G 变为 359G，推断期间有文件被删除（统计值是**当时快照**）。
 - 9 个用户中最占空间的类别依次是：**数据集 ≈ 8T**、**模型权重/checkpoint ≈ 10T**、**cache/tmp ≈ 0.8T**、**conda 环境 ≈ 0.7T**。
+
+---
+
+## 44. 为什么 `du` 变小了、`df` 空间却没释放？—— 存储端快照（snapshot）钉住了已删数据
+
+### 44.1 现象
+
+```
+$ du -sh /share/liwang/VLM_projects/Griffon/GThinker /share/liwang/VLM_projects/ml-fastvlm
+43M   /share/liwang/VLM_projects/Griffon/GThinker      # 原本 4.3T
+37M   /share/liwang/VLM_projects/ml-fastvlm           # 原本 683G
+
+$ df -Th /share
+10.97.128.245:/share nfs4   78T   77T  930G  99% /share   # 仍几乎 100%，没降下来
+```
+
+删了约 5T，`df` 却几乎不动。
+
+### 44.2 根因
+
+**`/share` 所在的 NAS 启用了存储端快照（snapshot）。被 `rm` 掉的数据仍被快照引用，存储无法回收这些数据块，所以 `df` 不降。**
+
+这是 NetApp 风格的 `.snapshot` 目录，**在每一层目录下都可见**：
+
+```
+/share/.snapshot/
+├── 2-hourly.2026-09-10_1015
+├── 2-hourly.2026-09-10_1215
+├── daily.2026-09-10_0010
+├── weekly.2026-09-06_0015
+├── hourly.2026-07-30_1605
+└── hourly.2026-07-30_1705
+```
+
+（`/share/liwang/.snapshot`、`/share/liwang/VLM_projects/.snapshot`、`…/GThinker/.snapshot` 等各层同样存在。）
+
+### 44.3 证据链
+
+**(1) 同一路径：live 已空、快照仍在**
+
+| 路径 | 大小 |
+|---|---|
+| **live**：`…/GThinker/EasyR1/checkpoints_RL` | **18M**（只剩 `checkpoint_tracker.json` / `experiment_log.jsonl` 等小文件，大权重已删） |
+| **快照**：`…/GThinker/.snapshot/2-hourly.2026-09-10_1015/EasyR1/checkpoints_RL` | **2.3T**（`fastvlm-1.5B`、`fastvlm-1.5B-stabel`、`fastvlm-1.5B-stable-opt1`、`Qwen2.5_vl_7B` 都还在） |
+
+**(2) 6 个快照全部仍含这份数据** → 只要还有任一快照引用这些块，存储就不回收：
+
+| 快照 | 是否含 `checkpoints_RL/fastvlm-1.5B` |
+|---|---|
+| `hourly.2026-07-30_1605` | 有 |
+| `hourly.2026-07-30_1705` | 有 |
+| `weekly.2026-09-06_0015` | 有 |
+| `daily.2026-09-10_0010` | 有 |
+| `2-hourly.2026-09-10_1015` | 有 |
+| `2-hourly.2026-09-10_1215` | 有 |
+
+**(3) `df` 趋势稳定**：连续采样 3 次（间隔 20s）均为 `77T used / ~930G avail`，排除"删除仍在进行中"。
+
+### 44.4 量化对比：删了 5.0T，只释放 0.93T
+
+`/share/liwang` 删除前后（live 树）：
+
+| 目录 | Sep 9 测得 | Sep 10 测得 | 变化 |
+|---|---|---|---|
+| `VLM_projects` | 5.0T | **28G** | **−4.97T** |
+| `Benchmark` | 101G | 80G | −21G |
+| 其余（nim-cache\*、.conda、.cache 等） | ~76G | ~66G | −10G |
+| `Projects` / `JD_evaluation` / `envs` | 2.6T / 384G / 161G | 不变 | — |
+| **合计** | **≈ 8.3T** | **≈ 3.3T** | **≈ −5.0T** |
+
+对应的 `df`：
+
+| 时间 | `/share` avail |
+|---|---|
+| Sep 8（最初） | 2.3G |
+| Sep 10 | ~930G |
+| **实际释放** | **≈ 0.93T** |
+
+> **live 树删了 ≈ 5.0T，`df` 只释放了 ≈ 0.93T，差额 ≈ 4T 被快照钉住**（再叠加集群里其它用户的正常读写）。
+
+### 44.5 机制
+
+```
+rm 删除文件
+   │
+   ├─ live 目录树：名字消失 ──► du 变小            ✅（看到的现象）
+   │
+   └─ 数据块：仍被 snapshot 引用 ──► 存储不能回收 ──► df 不变   ❌（看到的现象）
+```
+
+- `du` 只看 live 目录树，**不进入 `.snapshot`**（实测 `du -sh GThinker` = 43M，而其快照内容 ≥ 2.3T），所以目录"看起来很小"。
+- `df` 报告的是**整个卷的真实占用**，包含被快照钉住的数据块，所以降不下来。
+- **只要快照还在，`df` 就不会降；快照过期/被删后，空间才自动释放。**
+
+### 44.6 怎么办
+
+1. **找存储管理员删除相关快照**，或确认保留策略的轮转周期。
+2. 只删最老的一两个快照通常就能释放绝大部分被钉住的空间——但要先确认这些快照没有恢复需求。
+3. 最老的三个是 `hourly.2026-07-30_1605`、`hourly.2026-07-30_1705`、`weekly.2026-09-06_0015`；若保留策略要等它们自然过期，可能还要很久。
+4. **自己重复 `rm` 是没用的**——快照存在期间，只会让 `du` 更小，`df` 纹丝不动。
+
+### 44.7 排查中排除的其它原因
+
+| 假设 | 检查 | 结论 |
+|---|---|---|
+| 删除后仍被进程持有（deleted-but-open） | gpu005、node33 上 `lsof +L1 \| grep /share` | 无 |
+| NFS silly-rename 残留 | `find … -name '.nfs*'`（VLM_projects 全量） | 无 |
+| 被移进回收站 | `/share/.Trash-*`（4 个）、各层 `*trash*` | 均为空/不存在 |
+| 删除仍在进行 | gpu005/node33 上 `ps \| grep rm/shred`；`df` 连续采样 | 无进程，df 稳定 |
+| 被 `mv` 到同文件系统别处 | 重新测 `/share/liwang` 顶层 | 总量确实 −5.0T，非移动 |
+
+### 44.8 注意事项（坑）
+
+- **`.snapshot` 让 `du` 与 `df` 天然不一致**：做空间统计时，`du` 反映的是 live 树，`df` 反映的是含快照的卷占用，两者对不上是正常的。
+- 被清空目录的 `mtime` 显示为 **4 月/5 月**（如 `checkpoints_RL` = 2026-04-30、`fastvlm-1.5B` = 2026-04-08），而非删除当天；gpu005 和 node33 两节点 `stat` 结果一致，排除客户端 attr 缓存。这与普通客户端 `rm` 的行为不符，更像**存储侧操作（快照/管理员删除）留下的痕迹**；但不影响上面的结论——live 与快照的直接对比已确凿证明数据已从 live 树移除。
+- 这次排查**全程只读**（`du` / `find` / `lsof` / `stat`），未删除、未修改任何快照或文件。
