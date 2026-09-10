@@ -399,6 +399,495 @@ sgl-kernel-sipu/sgl_kernel/gemm.py:150-155 (sgl_per_token_quant_fp8)）。
 适用的 CUDA 静态路径上确实少一次 launch 和一轮 BF16 中间结果的 global
 memory traffic，而不是消除了 quant+MMA 之间的全部 global hand-off。
 
+---
+
+# sglang_sipu 代码库 `scripts/ci/sipu_ci_exec.sh` 逐行讲解
+
+> 代码库根目录:`/share/users/like/package/sglang_sipu`(git HEAD `3fe7ff93b`)。
+> 本文件内所有“相对 code base 路径 + 行号 + 函数名”均指该仓库内的脚本。
+> 普通函数用函数名,类的成员函数用 `类::函数名` 形式(本套脚本全为 bash 函数)。
+> 注释不做逐行讲解;只讲会执行的语句。
+
+## 0. 一句话总结
+
+`sipu_ci_exec.sh` 是 SIPU 精度 CI 的**宿主机侧入口**:先在宿主机上用
+`sipu-ci-builder` 容器把 `sgl-kernel-sipu`(及 `deepep`、`siorigin_triton_kernels`、
+`siorigin_tilelang_kernels`、`triton_ops`)打成 wheel,再把单个用例或整个 suite
+分发到**本机直跑**(archmodel)或 **QEMU 虚拟机**(qemu)里执行 `sipu_ci_run.sh`,
+最后由 `sipu_ci_summary.py` 汇总判题。
+
+## 1. `scripts/ci/sipu_ci_exec.sh` 逐行讲解
+
+### 1.1 初始化(第 13-30 行)
+
+- `scripts/ci/sipu_ci_exec.sh:13` — `set -eo pipefail`:任何命令非 0 退出立即终止,
+  管道中任一环节失败也视为失败。
+- `scripts/ci/sipu_ci_exec.sh:15` — 取脚本自身所在目录(绝对路径),存 `SCRIPT_DIR`。
+- `scripts/ci/sipu_ci_exec.sh:16` — `SGLANG="$(cd "$SCRIPT_DIR/../.." && pwd)"`:
+  由 `scripts/ci` 上溯两级得到代码库根 `/share/users/like/package/sglang_sipu`。
+- `scripts/ci/sipu_ci_exec.sh:17` — `KERNEL="$SGLANG/sgl-kernel-sipu"`:子模块路径。
+- `scripts/ci/sipu_ci_exec.sh:18` — `SUITES_YAML`:suite 定义文件
+  `scripts/ci/sipu_ci_suites.yaml`。
+- `scripts/ci/sipu_ci_exec.sh:20` — `IMAGE`:CI 容器镜像,默认
+  `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0`,可被
+  `SIPU_CI_IMAGE` 覆盖。
+- `scripts/ci/sipu_ci_exec.sh:21` — `CI_USER`:默认 `acndd`,决定 CUDA golden 目录。
+- `scripts/ci/sipu_ci_exec.sh:22` — `CI_ROOT`:CI 日志根,默认
+  `<repo>/ci_logs`。
+- `scripts/ci/sipu_ci_exec.sh:23` — `HOST_UID="$(id -u)"`;第 24 行
+  `HOST_GID="$(id -g)"`:用于把容器产物 chown 回宿主机用户。
+- `scripts/ci/sipu_ci_exec.sh:25` — `CONTAINER_KERNEL=/sgl-workspace/sglang/sgl-kernel-sipu`:
+  wheel 构建容器内挂载的 kernel 源码路径。
+- `scripts/ci/sipu_ci_exec.sh:27` — `SIPU_CI_CUDA_DUMP`:CUDA golden 根目录,默认
+  `/share_data/sglang_sipu/accuracy_verify/$CI_USER`。
+- `scripts/ci/sipu_ci_exec.sh:28` — `SIPU_CI_DUMP`:本次 SIPU 精度 dump 根,默认
+  `<cwd>/ci_dumps`。
+- `scripts/ci/sipu_ci_exec.sh:29` — `SIPU_CI_WHEEL_DIR`:wheel 输出目录,默认
+  `<cwd>/ci_wheels`。
+- `scripts/ci/sipu_ci_exec.sh:30` — `SIPU_CI_QUEUE_DIR`:用例队列目录,默认
+  `<cwd>/ci_queues`。
+
+### 1.2 `usage` 与参数解析(第 32-77 行)
+
+- `scripts/ci/sipu_ci_exec.sh:32` — `usage()`:打印两种用法并 `exit 1`。
+- `scripts/ci/sipu_ci_exec.sh:42` — `CONFIG_YAML="" LAUNCH_CONFIG="" TEST_CASE=""
+  TIMEOUT="30m"`:单用例参数初始值。
+- `scripts/ci/sipu_ci_exec.sh:43` — `TEST_SUITES=""`。
+- `scripts/ci/sipu_ci_exec.sh:44` — `PLATFORM=""`。
+- `scripts/ci/sipu_ci_exec.sh:45` — `MODE="eager"`。
+- `scripts/ci/sipu_ci_exec.sh:46` — `MODE_SET=0`:记录 `--mode` 是否被显式给出。
+- `scripts/ci/sipu_ci_exec.sh:47` — `SIPU_CI_TMP_SGL_KERNEL_SIPU`:环境变量覆盖值,
+  默认为空。
+- `scripts/ci/sipu_ci_exec.sh:48` — `RUN_ARGS=()`:收集单用例模式要透传给
+  `sipu_ci_run.sh` 的参数。
+- `scripts/ci/sipu_ci_exec.sh:50` — `while [[ $# -gt 0 ]]` 开始参数循环。
+- `scripts/ci/sipu_ci_exec.sh:51` — `case "$1" in` 按参数名分发。
+- `scripts/ci/sipu_ci_exec.sh:52` — `--config-yaml`:保存路径并原样追加进
+  `RUN_ARGS`。
+- `scripts/ci/sipu_ci_exec.sh:53` — `--launch-config`:同上。
+- `scripts/ci/sipu_ci_exec.sh:54` — `--test-case`:同上。
+- `scripts/ci/sipu_ci_exec.sh:55` — `--timeout`:保存超时并透传。
+- `scripts/ci/sipu_ci_exec.sh:56` — `--test-suites`:保存 suite 列表(逗号分隔)。
+- `scripts/ci/sipu_ci_exec.sh:57` — `--mode`:保存 `MODE` 并置 `MODE_SET=1`;
+  第 60-62 行校验只能是 `eager|compile|graph`。
+- `scripts/ci/sipu_ci_exec.sh:64` — `--platform`:保存 `PLATFORM`;第 66-68 行校验
+  只能是 `archmodel|qemu`。
+- `scripts/ci/sipu_ci_exec.sh:70` — `--tmp-sgl-kernel-sipu`:记录跳过
+  submodule init 与 wheel 构建的目录;第 71 行要求非空。
+- `scripts/ci/sipu_ci_exec.sh:74` — `-h|--help` 调 `usage()`。
+- `scripts/ci/sipu_ci_exec.sh:75` — 未知参数报错并调 `usage()`。
+
+### 1.3 参数互斥校验(第 79-89 行)
+
+- `scripts/ci/sipu_ci_exec.sh:79` — 若给了 `--test-suites`:
+- `scripts/ci/sipu_ci_exec.sh:80` — 第 80-81 行:单用例参数与 suite 参数不能混用。
+- `scripts/ci/sipu_ci_exec.sh:82` — 第 82-83 行:suite 模式不允许 `--platform`
+  (platform 由 yaml 决定)。
+- `scripts/ci/sipu_ci_exec.sh:84` — 否则单用例三参数缺一即调 `usage()`。
+- `scripts/ci/sipu_ci_exec.sh:86` — 第 86-88 行:单用例模式不允许 `--mode`
+  (单用例用 `--launch-config`,compile/graph 只属于 suite)。
+
+### 1.4 加载公共函数与清理 trap(第 91-104 行)
+
+- `scripts/ci/sipu_ci_exec.sh:92` — source `scripts/ci/sipu_ci_single_case.sh`
+  (只取其中的 `detect_current_platform`、`setup_docker_args`、`run_container`、
+  `reclaim_host_ownership` 等函数)。
+- `scripts/ci/sipu_ci_exec.sh:93` — 调 `detect_current_platform()`:宿主机没有
+  `/dev/sipu`,所以 `SIPU_CURRENT_PLATFORM=host`。
+- `scripts/ci/sipu_ci_exec.sh:95` — 创建 `ci_dumps`、`ci_wheels`、`ci_queues`。
+- `scripts/ci/sipu_ci_exec.sh:96` — `cleanup()`:退出时依次
+  `sipu_ci_qemu.sh stop` 停 QEMU、`reclaim_host_ownership()` 归还文件属主、
+  删除 `ci_queues`、按 `SIPU_CI_KEEP_WHEELS` 决定是否删 `ci_wheels`。
+- `scripts/ci/sipu_ci_exec.sh:104` — `trap cleanup EXIT`:保证任何退出路径都清理。
+
+### 1.5 `use_tmp_kernel` / `init_submodule` / `build_wheels`(第 106-140 行)
+
+- `scripts/ci/sipu_ci_exec.sh:106` — `use_tmp_kernel()`:校验临时 kernel 目录存在
+  且有 `Makefile`,然后导出 `SIPU_CI_TMP_SGL_KERNEL_SIPU`(第 108-112 行)。
+- `scripts/ci/sipu_ci_exec.sh:115` — `init_submodule()`:在仓库根执行
+  `git submodule update --init sgl-kernel-sipu`(第 117 行,仅当
+  `$KERNEL/Makefile` 不存在时);第 118-119 行再检查一次,失败即退出。
+- `scripts/ci/sipu_ci_exec.sh:122` — `build_wheels()`:宿主机侧 wheel 构建。
+- `scripts/ci/sipu_ci_exec.sh:124` — 调 `run_container sipu-ci-builder ...`:起一个
+  名为 `sipu-ci-builder` 的一次性容器(镜像即 `IMAGE`),在其中依次执行:
+- `scripts/ci/sipu_ci_exec.sh:126` — `cd $CONTAINER_KERNEL`。
+- `scripts/ci/sipu_ci_exec.sh:127` — `bash scripts/init_submodules.sh` 初始化
+  kernel 子模块。
+- `scripts/ci/sipu_ci_exec.sh:128` — `source setup.sh` 加载 SIPU SDK 环境。
+- `scripts/ci/sipu_ci_exec.sh:129` — `unset TORCH_DEVICE_BACKEND_AUTOLOAD`。
+- `scripts/ci/sipu_ci_exec.sh:130` — `make clean`。
+- `scripts/ci/sipu_ci_exec.sh:131` — `make install-kernels` 编译安装 kernel。
+- `scripts/ci/sipu_ci_exec.sh:132` — `pip wheel . --no-deps --no-build-isolation`:
+  打 `sgl-kernel-sipu` wheel 到 `$SIPU_CI_WHEEL_DIR`。
+- `scripts/ci/sipu_ci_exec.sh:133` — `pip wheel ./deepep ...`。
+- `scripts/ci/sipu_ci_exec.sh:134` — `pip wheel ./siorigin_triton_kernels ...`。
+- `scripts/ci/sipu_ci_exec.sh:135` — `pip wheel ./siorigin_tilelang_kernels ...`。
+- `scripts/ci/sipu_ci_exec.sh:136` — `pip wheel ./triton_ops ...`。
+- `scripts/ci/sipu_ci_exec.sh:137` — `ls -la $SIPU_CI_WHEEL_DIR` 打印产物。
+- `scripts/ci/sipu_ci_exec.sh:139` — `reclaim_host_ownership()`:把容器内 root
+  产生的文件 chown 回 `HOST_UID:HOST_GID`。
+
+### 1.6 主流程前半段(第 142-150 行)
+
+- `scripts/ci/sipu_ci_exec.sh:142` — 若设置了 `SIPU_CI_TMP_SGL_KERNEL_SIPU`,调
+  `use_tmp_kernel()`;否则(第 145 行)调 `init_submodule()`。
+- `scripts/ci/sipu_ci_exec.sh:147` — `setup_docker_args()`:按
+  `SIPU_CURRENT_PLATFORM` 组装后续 `run_container` 要用的 `docker_args`(挂载与
+  环境变量;qemu 内还会加 `--net=host` 与 `/dev/sipu` 设备)。
+- `scripts/ci/sipu_ci_exec.sh:148` — 非临时 kernel 模式才调 `build_wheels()`。
+
+### 1.7 `suite_raw` / `run_local` / `run_on_qemu` / `dispatch`(第 152-190 行)
+
+- `scripts/ci/sipu_ci_exec.sh:152` — `suite_raw()`:用
+  `scripts/ci/sipu_ci_cases.py --suites-yaml ... --suite <name>` 把 suite 展开成
+  `#key=value` 注释行 + 每行一个 `family|model|config|launch|case|timeout` 用例。
+- `scripts/ci/sipu_ci_exec.sh:156` — `run_local()`:直接在本机
+  `bash scripts/ci/sipu_ci_run.sh "$@"`(archmodel 模式)。
+- `scripts/ci/sipu_ci_exec.sh:161` — `run_on_qemu()`:qemu 模式。
+- `scripts/ci/sipu_ci_exec.sh:162` — `qemu_run="${SIPU_CI_QEMU_RUN_DIR:-$PWD/qemu_run}"`,
+  `rc=0`。
+- `scripts/ci/sipu_ci_exec.sh:164` — `bash scripts/ci/sipu_ci_qemu.sh start`:准备
+  qcow2、挑 12xxx 端口、启动 `qemu-system-x86_64`,等 guest SSH 就绪。
+- `scripts/ci/sipu_ci_exec.sh:165` — 从 `qemu_run/ssh.port` 读 SSH 端口。
+- `scripts/ci/sipu_ci_exec.sh:167` — `sipu_ci_qemu.sh ssh "..."`:在 guest 内导出
+  `SIPU_CI_USER/CUDA_DUMP/DUMP/WHEEL_DIR/QUEUE_DIR/IMAGE/KEEP_DUMPS/CI_ROOT/TMP_SGL_KERNEL_SIPU`
+  (第 168-176 行),然后 `cd $SGLANG && bash scripts/ci/sipu_ci_run.sh <原参数>`
+  (第 177 行);失败码记入 `rc`。
+- `scripts/ci/sipu_ci_exec.sh:178` — 无论成败都 `sipu_ci_qemu.sh stop` 停 VM。
+- `scripts/ci/sipu_ci_exec.sh:179` — `return "$rc"`。
+- `scripts/ci/sipu_ci_exec.sh:182` — `dispatch()`:导出 `SIPU_CI_PLATFORM`;按
+  `qemu` 与否分别调 `run_on_qemu()` 或 `run_local()`(第 185-189 行)。
+
+### 1.8 `dispatch_suite`(第 192-215 行)
+
+- `scripts/ci/sipu_ci_exec.sh:192` — `dispatch_suite()`:展开并分发一个 suite。
+- `scripts/ci/sipu_ci_exec.sh:194` — `suite_raw "$suite"` 拿原始展开。
+- `scripts/ci/sipu_ci_exec.sh:195` — 用 `sed` 提取 `#include=...`。
+- `scripts/ci/sipu_ci_exec.sh:196` — 有 include 时,第 197-203 行:逗号拆分后逐个
+  递归 `dispatch_suite` 子 suite,任一失败置 `overall=1`(第 202 行),然后返回。
+- `scripts/ci/sipu_ci_exec.sh:206` — 提取 `#platform=`。
+- `scripts/ci/sipu_ci_exec.sh:207` — `run_args=(--test-suites "$suite")`。
+- `scripts/ci/sipu_ci_exec.sh:210` — 仅当显式给了 `--mode` 才追加 `--mode`(第 211 行)。
+- `scripts/ci/sipu_ci_exec.sh:213` — 打印分发信息。
+- `scripts/ci/sipu_ci_exec.sh:214` — `dispatch "$platform" "${run_args[@]}"`。
+
+### 1.9 主流程收尾(第 217-228 行)
+
+- `scripts/ci/sipu_ci_exec.sh:217` — `overall=0`。
+- `scripts/ci/sipu_ci_exec.sh:218` — suite 模式:逗号拆分,逐个
+  `dispatch_suite`,失败置 `overall=1`(第 219-224 行)。
+- `scripts/ci/sipu_ci_exec.sh:226` — 否则单用例模式:`dispatch
+  "${PLATFORM:-archmodel}" "${RUN_ARGS[@]}"`(第 226 行)。
+- `scripts/ci/sipu_ci_exec.sh:228` — `exit "$overall"`:0 为全过。
+
+## 2. 依赖脚本讲解(执行链上会真正跑到的)
+
+### 2.1 `scripts/ci/sipu_ci_single_case.sh`
+
+- `scripts/ci/sipu_ci_single_case.sh:10` — `detect_current_platform()`:看
+  `/dev/sipu` 是否存在,置 `SIPU_CURRENT_PLATFORM=qemu|host`。
+- `scripts/ci/sipu_ci_single_case.sh:18` — `sipu_ci_init_paths()`:补全路径变量,
+  再调 `detect_current_platform()`(第 31 行)。
+- `scripts/ci/sipu_ci_single_case.sh:34` — `setup_docker_args()`:组装 docker 参数。
+  - 第 36-53 行:传 `PYTHONUNBUFFERED` 与各 `SIPU_CI_*` 环境变量;挂载
+    `$SGLANG:/sgl-workspace/sglang:rw`、`ci_wheels`、`ci_logs`、SDK、cmodel、
+    `tiny-models`、`torch_sipu`、`triton`、`tilelang` 等。
+  - 第 54-57 行:`SIPU_CI_DUMP` 单独以 rw 挂载。
+  - 第 58 行:`$HOME/.ssh` 只读挂进 `/root/.ssh`。
+  - 第 59-64 行:临时 kernel 模式下额外挂载
+    `$SIPU_CI_TMP_SGL_KERNEL_SIPU:/sgl-workspace/sglang/sgl-kernel-sipu:rw`。
+  - 第 65-86 行:qemu guest 内追加 `SIRT_SHIM_NAME=ksipu`、`--net=host`、
+    `/opt/siorigin` 与 4 个 `/dev/sipu/usipu*` 设备(第 71-78 行,缺设备即报错
+    退出);第 80-85 行把 `/dev/dri/*` 字符/块设备也挂进去。
+- `scripts/ci/sipu_ci_single_case.sh:89` — `run_container()`:先 `docker rm -f`
+  同名容器(第 96 行),`docker run --name <name> ${docker_args[@]} <IMAGE> bash -lc
+  "<cmd>"`(第 97 行),退出后再次 `docker rm -f`(第 98 行),返回 rc。
+- `scripts/ci/sipu_ci_single_case.sh:104` — `reclaim_host_ownership()`:qemu
+  guest 内直接返回(第 107 行);宿主机上对 dump/wheels/ci_root 等目录起一个
+  root 容器统一 `chown -R $HOST_UID:$HOST_GID`(第 114-115 行,失败不致命)。
+- `scripts/ci/sipu_ci_single_case.sh:118` — `run_one_case()`:按
+  `|` 拆分一行用例(第 122 行),`setup_docker_args()`(第 123 行),组装
+  `cmd`(第 126-130 行)为
+  `/bin/bash /sgl-workspace/sglang/scripts/ci/sipu_ci_test.sh --config-yaml ...`,
+  容器名 `sipu-ci-<cid>-$$`(第 131 行),按 `SIPU_CI_LIVE_LOG` 决定是否显示日志
+  (第 132-136 行),`reclaim_host_ownership()`(第 137 行),把 rc 写入
+  `ci_queues/status/<cid>`(第 138-139 行);`SIPU_CI_FAIL_FAST=1` 时若失败调
+  `sipu_ci_summary.py --check` 决定是否 `exit 255`(第 141-147 行)。
+
+### 2.2 `scripts/ci/sipu_ci_run.sh`
+
+- `scripts/ci/sipu_ci_run.sh:21` — `run_dir_for()`:nightly 用
+  `/share_data/sglang_sipu/nightly/<date>`;否则 `ci_logs/<suite>[/<mode>]/<date>`。
+- `scripts/ci/sipu_ci_run.sh:72` — `section_id()`:把任意字符串转成
+  `[A-Za-z0-9_]` 片段。
+- `scripts/ci/sipu_ci_run.sh:74` — `section_start()`:`section_id()` 生成 id 后
+  输出 GitLab CI 风格的 `section_start:<ts>:<id>[collapsed=true]` 控制序列
+  (第 78-82 行)。
+- `scripts/ci/sipu_ci_run.sh:85` — `section_end()`:输出对应的 `section_end` 序列。
+- `scripts/ci/sipu_ci_run.sh:89` — 参数校验:suite 与单用例互斥、缺参则
+  `usage()`(第 90-97 行)。
+- `scripts/ci/sipu_ci_run.sh:100` — `cleanup()`:`reclaim_host_ownership()`、删
+  `ci_queues`、按 `SIPU_CI_KEEP_DUMPS` 删 `ci_dumps`(第 101-105 行);
+  `trap cleanup EXIT`(第 107 行)。
+- `scripts/ci/sipu_ci_run.sh:109` — `compgen -G "$SIPU_CI_WHEEL_DIR"/*.whl`:
+  **找不到宿主机构建的 wheel 直接 exit 1**(第 110-111 行)。
+- `scripts/ci/sipu_ci_run.sh:114` — `replay_case_logs()`:live-log 模式直接返回
+  (第 116 行);否则按 `ci_queues/cases` 逐条回放 sipu/compare 日志,用
+  `sipu_ci_summary.py --check` 决定折叠(第 117-133 行)。
+- `scripts/ci/sipu_ci_run.sh:136` — `run_cases()`:按 suite 计算
+  `SIPU_CI_RUN_DIR`(第 139 行),`parallel>1` 时关 live log(第 140-144 行),建
+  compare/logs/status 目录(第 145 行),打印统计(第 147-150 行),第 152-153 行
+  `xargs -P <parallel>` 并行调 `sipu_ci_single_case.sh`(失败不中断),最后
+  `sipu_ci_summary.py` 汇总(第 157-161 行)并 `replay_case_logs()`。
+- `scripts/ci/sipu_ci_run.sh:166` — `run_named_suite()`:调 `sipu_ci_cases.py` 展开
+  suite(第 175 行),解析 `#parallel=` 与 `#continue_on_fail=`(第 176-177 行),
+  清 status、把非注释行写入 `ci_queues/cases`(第 178-179 行),再 `run_cases()`。
+- `scripts/ci/sipu_ci_run.sh:192` — 单用例模式:置 `SIPU_CI_FAIL_FAST=1`,把
+  `family|model|config|launch|case|timeout` 一行写入 `ci_queues/cases`
+  (第 193-195 行),然后 `run_cases single 1`。
+
+### 2.3 `scripts/ci/sipu_ci_qemu.sh`
+
+- `scripts/ci/sipu_ci_qemu.sh:24` — `port_in_use()`:`ss -ltn` 判断端口是否被占。
+- `scripts/ci/sipu_ci_qemu.sh:30` — `pick_free_port()`:从 12000-12999 里挑空闲
+  端口(跳过已占用的第一个参数端口)。
+- `scripts/ci/sipu_ci_qemu.sh:44` — `resolve_cmodel()`:读
+  `sgl-kernel-sipu/sipu_sdk_path.txt` 第一行得到 SDK setup 脚本(第 48 行),推导
+  `SI_CMODEL_ROOT=.../sipu1.5_cmodel`(第 51 行),校验其中的
+  `bin/qemu-system-x86_64` 与 `sipu_cmodel_setup.sh`(第 52-55 行)。
+- `scripts/ci/sipu_ci_qemu.sh:58` — `qemu_ssh()`:要求 `sshpass`(第 59-62 行),
+  用密码 `123456` 以 root ssh 到 `127.0.0.1:$SSH_PORT`(第 63-66 行)。
+- `scripts/ci/sipu_ci_qemu.sh:69` — `guest_ssh_ok()`:`qemu_ssh 'true'` 探活。
+- `scripts/ci/sipu_ci_qemu.sh:76` — `prepare_guest()`:guest 内 9p 挂载
+  `/share_data` 与 `/local_data`(第 79-91 行),`modprobe sipu`(第 92 行),最多
+  等 20 秒直到出现 `/dev/sipu`(第 93-98 行)。
+- `scripts/ci/sipu_ci_qemu.sh:102` — `load_ports()`:从 `qemu_run/ssh.port` 与
+  `gdb.port` 读端口。
+- `scripts/ci/sipu_ci_qemu.sh:108` — `cmdline_of()`:读 `/proc/<pid>/cmdline`。
+- `scripts/ci/sipu_ci_qemu.sh:113` — `is_our_qemu()`:进程 cmdline 必须同时含
+  `qemu-system-x86_64`、本 job 的 `hostfwd=tcp::${SSH_PORT}-:22` 与
+  `$QCOW2_DST`(第 117-119 行)——避免误杀别人家的 QEMU。
+- `scripts/ci/sipu_ci_qemu.sh:123` — `find_our_qemu()`:扫 `/proc/[0-9]*` 找匹配
+  qemu(第 125-128 行);0 个返回 1,多个报错返回 2(第 129-135 行)。
+- `scripts/ci/sipu_ci_qemu.sh:139` — `record_qemu_pid()`:把唯一 pid 写入
+  `qemu.pid`。
+- `scripts/ci/sipu_ci_qemu.sh:150` — `status()`:端口与 ssh 都通输出 `up`。
+- `scripts/ci/sipu_ci_qemu.sh:159` — `stage_qemu_dir()`:校验
+  `run_qemu.sh`、`archmodel.toml`、qcow2 存在(第 160-165 行),拷贝到
+  `qemu_run/`(第 167-168 行),把 29G 的 `torch_sipu.overlay.qcow2` 拷到本地
+  (第 169-174 行,除非 `SIPU_CI_SKIP_QCOW2_COPY=1`)。
+- `scripts/ci/sipu_ci_qemu.sh:177` — `start()`:已起则直接
+  `prepare_guest` + `record_qemu_pid`(第 178-183 行);否则
+  `resolve_cmodel`(第 185 行)、`stage_qemu_dir`(第 186 行)、挑 SSH/GDB 端口并
+  写文件(第 187-190 行),后台 `sg kvm -c './run_qemu.sh'` 启动(第 193-200 行),
+  循环最多 90 次、每次 5 秒等 guest 起来(第 202-211 行),超时打印日志返回 1
+  (第 212-215 行)。
+- `scripts/ci/sipu_ci_qemu.sh:218` — `wait_gone()`:轮询 `/proc/$pid` 消失。
+- `scripts/ci/sipu_ci_qemu.sh:227` — `stop()`:找不到 qemu 则返回(第 229-232 行);
+  先 `qemu_ssh 'poweroff'`(第 244 行,失败忽略),等 20 秒(第 245 行),再
+  SIGTERM(第 255 行)、SIGKILL(第 266 行)逐级关闭,每一步都先
+  `is_our_qemu()` 复核(第 250/261 行)。
+
+### 2.4 容器内真正跑测试的 `scripts/ci/sipu_ci_test.sh`
+
+- `scripts/ci/sipu_ci_test.sh:10` — `SGLANG=/sgl-workspace/sglang`(宿主机挂进来的
+  代码树);第 13 行 `KERNEL=$SGLANG/sgl-kernel-sipu`;第 14 行
+  `SIPU=$SGLANG/test/srt/sipu`。
+- `scripts/ci/sipu_ci_test.sh:15` — `DUMP/CUDA_DUMP/WHEEL_DIR/RUN_DIR` 都必须已
+  由环境传入(第 15-18 行)。
+- `scripts/ci/sipu_ci_test.sh:20` — `PYTHONPATH=$SGLANG/python:$SIPU/test_utils`。
+- `scripts/ci/sipu_ci_test.sh:28` — 解析 `--config-yaml/--launch-config/--test-case/
+  --timeout`(第 30-37 行),缺参 `usage()`(第 38 行)。
+- `scripts/ci/sipu_ci_test.sh:40` — `cd "$KERNEL"`;第 43-47 行 source
+  `setup.sh`、`setup_triton.sh`、`setup_tilelang.sh`;第 49 行
+  `unset TORCH_DEVICE_BACKEND_AUTOLOAD`;第 50 行追加 `/opt/siorigin/lib` 到
+  `LD_LIBRARY_PATH`。
+- `scripts/ci/sipu_ci_test.sh:52` — 相对路径的 config 前补 `$SIPU/`(第 53 行),
+  即 `test/srt/sipu/<config-yaml>`。
+- `scripts/ci/sipu_ci_test.sh:58` — `case_uses_custom_deepep()`:用内嵌 python
+  读 yaml 的 `launch_configs.<launch>.test_env.<case>.SGLANG_SIPU_USE_CUSTOM_DEEPEP`
+  (第 59-77 行),为真退出码 0、为假 1、读不了 2。
+- `scripts/ci/sipu_ci_test.sh:80` — 开启 `nullglob`;第 81-94 行按退出码决定
+  `install_deepep=1`(第 86-88 行)或跳过(第 89-90 行)。
+- `scripts/ci/sipu_ci_test.sh:95` — 需要 custom deep_ep 但 wheel 目录没有
+  `deep_ep*.whl` 时报错退出(第 95-98 行)。
+- `scripts/ci/sipu_ci_test.sh:99` — 第 99-106 行:遍历 `$WHEEL_DIR/*.whl`,
+  `deep_ep*` 且不需要时跳过(第 101-104 行),其余
+  `pip install --force-reinstall --no-deps`(第 105 行)。
+- `scripts/ci/sipu_ci_test.sh:107` — 打印 `sgl_kernel.__file__` 验证安装。
+- `scripts/ci/sipu_ci_test.sh:109` — `model`/`family` 从 config 文件名推得
+  (第 109-110 行);compare 日志路径 `RUN_DIR/compare/<model>_<launch>_<case>.log`
+  (第 111 行);sipu 运行日志 `RUN_DIR/logs/<family>/..._sipu.log`(第 115 行),
+  并建目录(第 116 行)。
+- `scripts/ci/sipu_ci_test.sh:122` — `is_compile`:`launch_config` 以 `_compile`
+  结尾置 1(第 122-123 行)。
+- `scripts/ci/sipu_ci_test.sh:125` — compile 模式:开 3 个 tiled 环境变量
+  (第 127-130 行),CUDA golden 用去掉 `_compile/_graph` 后缀的 launch 名
+  (第 131-132 行)。
+- `scripts/ci/sipu_ci_test.sh:138` — CUDA golden 在
+  `$CUDA_DUMP/$model/$cuda_launch/$TEST_CASE/cuda`(第 138 行);第 140-143 行
+  不存在直接失败;第 144-147 行在
+  `$DUMP/$model/$LAUNCH_CONFIG/$TEST_CASE/cuda` 处做符号链接指向 golden。
+- `scripts/ci/sipu_ci_test.sh:150` — 第 150-154 行:`timeout --foreground
+  --kill-after=30s $TIMEOUT` 包裹
+  `python3 -u $SIPU/test_utils/run_test_job.py --config-yaml ... --device sipu
+  --dump-base $DUMP --log-base $RUN_DIR/logs`,输出 `tee` 到 sipu 日志。
+- `scripts/ci/sipu_ci_test.sh:156` — compile 模式检查
+  `compile_runner.json` 契约(第 157-185 行),非
+  `sipu_inductor_compile_only/inductor/graph_capture=false` 判 FAIL。
+- `scripts/ci/sipu_ci_test.sh:188` — 第 188-197 行:调
+  `analyse_utils/compare_cuda_sipu.py --dump-base $DUMP --launch-config ...` 比对
+  CUDA/SIPU 精度 dump,输出到 compare 日志。
+
+### 2.5 辅助脚本
+
+- `scripts/ci/sipu_ci_cases.py:34` — `main()`:读 yaml、按 suite 展开;qemu 平台
+  强制 `parallel=1`(第 51 行);输出 `#parallel/#continue_on_fail/#platform`
+  (第 52-54 行);有 include 只输出 `#include=`(第 55-57 行);否则按 mode 过滤
+  case,逐行输出 `parent|stem|config_yaml|launch|case|timeout`(第 58-76 行)。
+- `scripts/ci/sipu_ci_summary.py`(docstring):判题门限
+  `COS_SIM_MIN=0.999`、`MEAN_ATOL_MAX=0.05`;eager 要求退出 0 且每 pass
+  `cos_sim>=0.999`、`mean_atol<=0.05`;compile 还要满足
+  `compile_runner.json` 契约。写 `summary.tsv`/`summary.log`,有失败返回 1。
+
+## 3. 本命令 `... --config-yaml configs/deepseek/ds_v3_2layer.yaml --launch-config
+deepep_deepgemm_dp_ep --test-case text-only --platform qemu` 的执行动作
+
+参数解析结果:`CONFIG_YAML=configs/deepseek/ds_v3_2layer.yaml`、
+`LAUNCH_CONFIG=deepep_deepgemm_dp_ep`、`TEST_CASE=text-only`、
+`PLATFORM=qemu`、`TIMEOUT=30m`(默认)、`TEST_SUITES=` 空、`MODE=eager`。
+
+### 3.1 前置阶段(宿主机)
+
+1. `scripts/ci/sipu_ci_exec.sh:79-89` 校验通过:单用例三参数齐全、无 `--mode`。
+2. `scripts/ci/sipu_ci_exec.sh:92-93` source 单用例脚本并
+   `detect_current_platform()` → `host`。
+3. `scripts/ci/sipu_ci_exec.sh:95` 建 `ci_dumps/ci_wheels/ci_queues`。
+4. `scripts/ci/sipu_ci_exec.sh:142-146` 无临时 kernel → `init_submodule()`:
+   当前 `sgl-kernel-sipu` 已检出,跳过 clone。
+5. `scripts/ci/sipu_ci_exec.sh:147` `setup_docker_args()`:宿主机分支,组装
+   `$SGLANG:/sgl-workspace/sglang:rw` 等挂载,不传 `/dev/sipu`。
+6. `scripts/ci/sipu_ci_exec.sh:148-150` `build_wheels()`:起 `sipu-ci-builder`
+   容器,依次 `init_submodules.sh` → `setup.sh` → `make clean` →
+   `make install-kernels` → 打 `sgl-kernel-sipu`、`deepep`、
+   `siorigin_triton_kernels`、`siorigin_tilelang_kernels`、`triton_ops` 共 5 个
+   wheel 到 `ci_wheels`;完成后 `reclaim_host_ownership()`。
+
+### 3.2 分发与 QEMU 启动
+
+7. `scripts/ci/sipu_ci_exec.sh:217-226` 单用例分支 →
+   `dispatch qemu --config-yaml ... --launch-config ... --test-case ...`(第 226 行)。
+8. `scripts/ci/sipu_ci_exec.sh:185-186` `SIPU_CI_PLATFORM=qemu` →
+   `run_on_qemu()`。
+9. `scripts/ci/sipu_ci_exec.sh:164` `sipu_ci_qemu.sh start`:
+   - `resolve_cmodel()`:读 `sgl-kernel-sipu/sipu_sdk_path.txt` → SDK
+     `/share_data/sicx_sdk/release/260827`,得到
+     `sipu1.5_cmodel`(含 `qemu-system-x86_64`)。
+   - `stage_qemu_dir()`:校验并把
+     `/share_data/sglang_sipu/qemu_ci/torch_sipu.overlay.qcow2`(约 29G)拷到
+     `<repo>/torch_sipu.overlay.qcow2`,同时拷 `run_qemu.sh`、`archmodel.toml`。
+   - 挑 12xxx 空闲 SSH/GDB 端口,`sg kvm -c './run_qemu.sh'` 后台起 4 个
+     `sipu1.5_cmodel` 设备(见 `archmodel.toml` 的 `sipu_num=4`)。
+   - 轮询等 guest SSH;起来后 `prepare_guest()`:guest 内 9p 挂载
+     `/share_data`、`/local_data`,`modprobe sipu`,等 `/dev/sipu` 出现。
+10. `scripts/ci/sipu_ci_exec.sh:167-177` `sipu_ci_qemu.sh ssh ...`:把
+    `SIPU_CI_*`、`CI_ROOT`、`SIPU_CI_IMAGE` 等导出到 guest,然后在
+    `/sgl-workspace/sglang`(9p 共享的同一代码树)里执行
+    `bash scripts/ci/sipu_ci_run.sh --config-yaml ... --launch-config ... --test-case ...`。
+
+### 3.3 guest 内 `sipu_ci_run.sh`(单用例路径)
+
+11. `scripts/ci/sipu_ci_run.sh:109-111` 检查 `ci_wheels/*.whl` 存在(guest 内
+    9p 可见)。
+12. `scripts/ci/sipu_ci_run.sh:192-196` 写 `ci_queues/cases` 一行:
+    `deepseek|ds_v3_2layer|configs/deepseek/ds_v3_2layer.yaml|deepep_deepgemm_dp_ep|text-only|30m`,
+    然后 `run_cases single 1`。
+13. `scripts/ci/sipu_ci_run.sh:139` `run_dir_for()`:单用例走 eager 分支 →
+    `ci_logs/single/<yyyyMMdd>`。
+14. `scripts/ci/sipu_ci_run.sh:152-153` `xargs -P 1` 调
+    `sipu_ci_single_case.sh 'deepseek|ds_v3_2layer|...|30m'`。
+
+### 3.4 用例容器内 `sipu_ci_single_case.sh` + `sipu_ci_test.sh`
+
+15. `sipu_ci_single_case.sh:122` 拆分用例;
+    `sipu_ci_single_case.sh:65-86` guest 分支给 docker 加
+    `SIRT_SHIM_NAME=ksipu`、`--net=host`、4 个 `/dev/sipu/usipu*` 设备。
+16. `sipu_ci_single_case.sh:126-130` 组装命令并
+    `run_container "sipu-ci-ds_v3_2layer_deepep_deepgemm_dp_ep_text-only-<pid>"`:
+    `docker run --name <name>` 起 `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0`
+    执行 `/bin/bash /sgl-workspace/sglang/scripts/ci/sipu_ci_test.sh --config-yaml
+    configs/deepseek/ds_v3_2layer.yaml --launch-config deepep_deepgemm_dp_ep
+    --test-case text-only --timeout 30m`,跑完再 `docker rm -f` 删除
+    (`run_container()` 第 96-98 行)。
+17. `sipu_ci_test.sh` 内:
+    - `sipu_ci_test.sh:43-47` 加载 SDK/triton/tilelang 环境;
+    - `sipu_ci_test.sh:58-94` 检测到 `test_env.text-only.SGLANG_SIPU_USE_CUSTOM_DEEPEP=1`
+      → 需要 custom deep_ep wheel;
+    - `sipu_ci_test.sh:99-106` 把 `ci_wheels` 里所有 wheel
+      `pip install --force-reinstall --no-deps`(deep_ep 只装 custom 版);
+    - `sipu_ci_test.sh:138-147` 检查 CUDA golden
+      `/share_data/sglang_sipu/accuracy_verify/acndd/ds_v3_2layer/deepep_deepgemm_dp_ep/text-only/cuda`
+      存在,并在 `ci_dumps` 下做软链;
+    - `sipu_ci_test.sh:150-154` `timeout 30m` 跑 `run_test_job.py --device sipu`:
+      按 yaml 用 **2 个相同 prompt、TP=2/DP=2/EP=2、`attention_backend=sipu`、
+      `moe_runner_backend=deep_gemm`、`moe_a2a_backend=deepep`、
+      `enable_dp_attention=true`、`base_gpu_id=0 gpu_id_step=2`** 在 4 个
+      `sipu1.5_cmodel` 上做 SIPU 前向,把 tensor dump 写到 `ci_dumps`;
+    - `sipu_ci_test.sh:188-197` `compare_cuda_sipu.py` 比对 CUDA golden 与 SIPU
+      dump,输出 `ci_logs/single/<date>/compare/ds_v3_2layer_deepep_deepgemm_dp_ep_text-only.log`。
+18. `sipu_ci_single_case.sh:137-139` chown 回宿主机用户,把 rc 写
+    `ci_queues/status/<cid>`。
+19. `sipu_ci_run.sh:157-161` `sipu_ci_summary.py` 判题:要求退出 0 且每个
+    pass `cos_sim>=0.999`、`mean_atol<=0.05`。
+20. `sipu_ci_exec.sh:178` 退出前 `sipu_ci_qemu.sh stop` 关 VM;
+    `sipu_ci_exec.sh:96-104` cleanup 收尾。脚本退出码:全过 0,任一失败 1。
+
+## 4. 本机是否具备执行条件
+
+### 4.1 已具备(实测)
+
+- 代码与镜像:仓库在 `/share/users/like/package/sglang_sipu`;
+  `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0` 已 pull;
+  **`sipu-dev` 容器正在运行**(Up 8 days),且 sglang 以 editable 方式装在
+  `/sgl-workspace/sglang/python/sglang`(包名 sglang 0.5.18),`sgl-kernel-sipu`
+  子模块已检出并含 `Makefile`、`sipu_sdk_path.txt`。
+- 挂载:代码目录 `<repo> → /sgl-workspace/sglang`(rw);`/share_data/sicx_sdk`(ro)、
+  `/share_data/arch_cmodel_release`(ro)、`/share_data/torch_sipu`(ro)、
+  `/share_data/sglang_sipu`(rw)、`/share2`、`/softhome`、`/data_gpu` 等都挂进
+  `sipu-dev`。
+- QEMU 资源:SDK 含
+  `/share_data/sicx_sdk/release/260827/sipu1.5_cmodel/bin/qemu-system-x86_64` 与
+  `sipu_cmodel_setup.sh`;`/share_data/sglang_sipu/qemu_ci/` 有 `run_qemu.sh`、
+  `archmodel.toml`(sipu_num=4)和约 29G 的 `torch_sipu.overlay.qcow2`。
+- 系统:当前用户 `like` 在 `kvm` 组、`docker` 组;`/dev/kvm` 存在;12xxx 端口
+  空闲;工作区可写;磁盘 `/share` 剩约 11T。
+- 权限:`id -un` 为 `like`,与容器绑定的宿主用户一致,`chown`/读写均可行。
+
+### 4.2 缺失/风险点(实测缺,需补或规避)
+
+- **宿主机与 guest 都缺 `sshpass`**:`sipu_ci_qemu.sh:58-62` 的 `qemu_ssh()`
+  会直接失败。需 `apt install sshpass`(guest 内的 `prepare_guest` 流程不受影响,
+  但 `start` 的探活、`ssh`、`stop` 全依赖它)。
+- **qcow2 拷贝开销**:`stage_qemu_dir()` 默认把 29G 的 qcow2 拷到仓库根
+  (`$PWD/torch_sipu.overlay.qcow2`)。耗时大;可设
+  `SIPU_CI_SKIP_QCOW2_COPY=1` 复用已拷好的文件(前提路径匹配
+  `is_our_qemu()` 的 `$QCOW2_DST` 检查)。
+- 机器名/并发:多 job 并发需 12xxx 端口足够;本机当前空闲。
+- 注意:本脚本自建的 `sipu-ci-builder`/`sipu-ci-*` 容器与常驻的 `sipu-dev`
+  是**不同容器**;脚本不直接用 `sipu-dev`,只是利用同一镜像和同一批共享挂载。
+
+### 4.3 结论
+
+- 代码层面:该命令的参数组合**合法**,会走
+  `qemu 平台 + 单用例 + eager(默认)` 的完整链路;
+- 本机**基本具备**执行条件(镜像、SDK、cmodel、qcow2、kvm、挂载、磁盘全齐),
+  唯一硬性缺口是 **`sshpass` 未安装**,装上后即可直接跑;
+- 若只想先验证代码本身,建议先跑 archmodel 单用例
+  (`--platform archmodel` + `--launch-config deepep_deepgemm_text`),可跳过
+  QEMU;要跑 `deepep_deepgemm_dp_ep`(DP/EP 分布式用例)则必须 qemu 平台
+  (见 `scripts/ci/sipu_ci_suites.yaml:320-335`,`distributed` suite 指定
+  `platform: qemu`)。
+
 ## 6.1 结论
 
 `/share/users/like/audit.log:2-5` 是 `auditctl -l` 的规则列表，不是已经发生
