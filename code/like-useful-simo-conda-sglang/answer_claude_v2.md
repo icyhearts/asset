@@ -2995,6 +2995,7 @@ Filesystem            Size  Used Avail Use% Mounted on
 
 | 目录 | 大小 |
 |---|---|
+| `/share/users/zhouziyi/models` | **442G** |
 | `/share/users/chenzhizhen/Qwen3-Next-80B-A3B-Instruct` | **153G** |
 | `/share/users/huyoufu/DeepSeek-V2-Lite-Chat` | 30G |
 | `/share/users/huyoufu/Llama-3.2-1B-Instruct` | 7.3G |
@@ -3008,6 +3009,7 @@ Filesystem            Size  Used Avail Use% Mounted on
 |---|---|
 | `/share/users/zhaosiwei/transformer-pytorch/dataset` | — |
 | `/share/users/chenzhizhen/dataset` | 8.3G |
+| `/share/users/ziheng/data` | 37G |
 | `/share/users/tangdehua/huggingface/datasets` | （含在 12G 内） |
 
 > `/share/users/` 下数据集类目录整体不大，主要是代码仓库、conda 环境和缓存。
@@ -3100,6 +3102,39 @@ Filesystem            Size  Used Avail Use% Mounted on
 /share/users/xieyi  101G
 ├── anaconda3/ 48G, code/ 40G, downloads/ 9.1G, .codex/ 1.3G,
 ├── cache/ 932M（ccache）, to_be_deleted/ 767M, backup/ 730M, .tilelang/ 84M
+
+/share/users/zhouziyi  766G   ← /share/users 下最大
+├── models/ 442G           ← 模型权重
+├── softwares/ 138G
+├── projects/ 75G
+├── experiments/ 64G
+├── builds/ 43G
+└── .vscode-server/ 2.3G, .npm/ 1.9G, .nvm/ 1.1G, papers/ 569M
+
+/share/users/bokangz  384G
+├── project/ 269G
+├── anaconda3/ 71G
+├── .cache/ 23G            ← cache
+├── agent-os-private-images/ 17G
+├── agent-os-private-deployment/ 4.1G
+└── tmp/（含 hf-cache、flashinfer-cache）, probe-live/gocache
+
+/share/users/yangrunlin  278G
+├── learn/ 246G
+├── tool-home/ 23G
+├── codex-home/ 3.0G, arxiv/ 3.0G, .local/ 1.7G, quant/ 1.5G
+└── .npm-stale-codex-20260909/ 260M, .agentos/ 191M
+
+/share/users/ziheng  169G
+├── codes/ 110G
+├── data/ 37G              ← 数据集
+├── software/ 22G
+└── workspace-20260906-112706/ 480M, service_desk/ 440M
+
+/share/users/byy  69G
+├── workspace-202606121028/ 61G
+├── .agentos/ 8.4G
+└── workspace-202606121012/ 81M, .cache/ 832K
 ```
 
 ---
@@ -3185,6 +3220,6 @@ Filesystem            Size  Used Avail Use% Mounted on
 ### 43.5 备注
 
 - 全部为**只读**操作（`du` / `find`），未删除、未移动任何文件。
-- NFS 上遍历极慢（8.7T 级目录需十几分钟），部分 `du` 因 `timeout` 或并行调度未跑完，`zhouziyi`(766G)、`bokangz`(384G)、`yangrunlin`(278G)、`ziheng`(169G)、`byy`(69G) 只拿到**总大小**，未展开二级明细。
+- NFS 上遍历极慢（8.7T 级目录需十几分钟）。`/share/users/` 下**所有 60+ 个用户目录的总大小均已测出**，其中 `bokangz`、`yangrunlin`、`ziheng`、`byy` 等少数用户的二级明细为后补。
 - `/share/huayicong/proj` 在两次测量间从 817G 变为 359G，推断期间有文件被删除（统计值是**当时快照**）。
 - 9 个用户中最占空间的类别依次是：**数据集 ≈ 8T**、**模型权重/checkpoint ≈ 10T**、**cache/tmp ≈ 0.8T**、**conda 环境 ≈ 0.7T**。
