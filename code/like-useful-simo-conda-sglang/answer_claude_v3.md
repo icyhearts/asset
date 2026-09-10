@@ -194,7 +194,7 @@ layer 3 ──(dst←1)────────────────►  laye
 | `package/h100/package.h100.tar.bz2` | 3.8G | |
 | `sipu_sdk_debug/sipu_sdk_rel.tar.bz2` | 4.0G | 与 13.4G 的 `.tar` 内容重复 |
 | `package/sipu_sw.tar` | 2.8G | |
-| `package/rocm-terminal.tar` | 2.8G | |
+| `package/rocm-terminal.tar` | 2.8G | | done
 | `package/h100/package/{cutlass 5.4G, TensorRT-LLM 1.8G, ARM-software 960M, cutlass-v3 662M, triton-lang 631M, nccl 577M, cmake 437M}` | ~10G | 第三方源码/依赖 |
 | `.git/objects/pack` 大包 | 3.1G | TensorRT-LLM 1.6G + onnxruntime 1.5G |
 
