@@ -4301,3 +4301,20 @@ run scripts/ci/sipu_ci_exec.sh --config-yaml configs/deepseek/ds_v3_2layer.yaml 
 
 把答案追加到 like-useful/answer_codex_v6.md
 }
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sglang_sipu 代码位于 /share/users/like/package/sglang_sipu. sglang_sipu 需要的 docker contianer name=sipu-dev, docker mount目录情况需要你自己查看.
+sglang_sipu 在 docker 环境内部仍旧以 editable 方式安装, 包名仍旧是 sglang
+
+
+对sglang_sipu code base  ./scripts/ci/sipu_ci_exec.sh 脚本 进行逐行讲解，注释不用管.
+run scripts/ci/sipu_ci_exec.sh --config-yaml configs/deepseek/ds_v3_2layer.yaml --launch-config deepep_deepgemm_dp_ep --test-case text-only --platform qemu 如此传参，会执行什么动作?
+ 
+讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。
+
+把答案追加到 like-useful/answer_codex_v6.md
+}
