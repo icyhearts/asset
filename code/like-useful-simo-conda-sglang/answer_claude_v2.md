@@ -2784,3 +2784,407 @@ Filesystem            Size  Used Avail Use% Mounted on
 - 本次所有统计均为**只读操作**（`du` / `find`），未删除、未移动任何文件。
 - NFS 上 `du` 很慢（大量小文件 + 网络 stat），单目录 5T 级遍历耗时数分钟到十几分钟。
 - 未发现 `tmp` / `temp` 目录；最大的「缓存类」目录是 `Benchmark/.cache`(28G)、`JV-Adas/.sam3d-cache`(21G)、`nim-cache*`(46G)。
+
+---
+
+## 43. `/share/` 下 9 个用户 + `/share/users/` 的空间占用统计
+
+### 43.0 背景与方法
+
+```
+$ df -h /share
+Filesystem            Size  Used Avail Use% Mounted on
+10.97.128.245:/share   78T   78T  2.3G 100% /share     # NFS4.2, 已 100% 满
+```
+
+统计方式：`du -sh` / `du -h --max-depth=1`；查找 cache/temp/tmp/数据集/权重类目录用 `find -maxdepth 3`。**全程只读**（`du` / `find`），未删除、未移动任何文件。
+
+---
+
+### 43.1 `/share/{yufne,gyzhou,weihongyang,guorui,pengkunfu,caolujing,mtang,huayicong,songzun}`
+
+#### 总览（按大小排序）
+
+| 用户目录 | 总大小 |
+|---|---|
+| `/share/yufne` | **8.7T** |
+| `/share/weihongyang` | **4.0T** |
+| `/share/guorui` | **3.7T** |
+| `/share/pengkunfu` | **1.6T** |
+| `/share/caolujing` | **1.6T** |
+| `/share/mtang` | **1.4T** |
+| `/share/huayicong` | **1.2T** |
+| `/share/songzun` | **502G** |
+| `/share/gyzhou` | 12K（基本为空） |
+| **合计** | **≈ 21.7T** |
+
+#### (A) 模型权重 / checkpoints
+
+| 目录 | 大小 |
+|---|---|
+| `/share/guorui/投机解码训练/SpecForge` | **1.7T** |
+| `/share/weihongyang/JDJV` | **1.2T** |
+| `/share/weihongyang/ml-fastvlm/output` | **1.2T** |
+| `/share/pengkunfu/JDJV/GaussianOcc` | **1.1T** |
+| `/share/mtang/work/JD` | **430G** |
+| `/share/mtang/work/Gen` | **353G** |
+| `/share/guorui/SpecForge`（workspace 内） | 80G |
+| `/share/huayicong/proj`（含 torch_sipu 73G、onnxruntime-ep 49G） | 359G（合计） |
+| `/share/yufne/Moore-AnimateAnyone` | 308G |
+| `/share/yufne/AnyEdit` | 279G |
+| `/share/yufne/Open-AnimateAnyone` | 223G |
+| `/share/yufne/Qwen3-VL-30B-A3B-Instruct` | 58G |
+| `/share/weihongyang/ml-fastvlm/checkpoints` | 40G |
+
+#### (B) 数据集
+
+| 目录 | 大小 |
+|---|---|
+| `/share/yufne/UltraEdit` | **1.5T** |
+| `/share/yufne/Senorita` | **1.5T** |
+| `/share/yufne/JourneyDB` | **1.5T**（其 `data/` 1.5T） |
+| `/share/yufne/ShareGPT4Video` | **1.4T** |
+| `/share/yufne/Animate_project` | 758G |
+| `/share/caolujing/data` | **587G**（`images` 245G、`imagenet` 151G、`vae-sd` 50G） |
+| `/share/yufne/dataset` | 516G |
+| `/share/yufne/LLaVA-Video-178K` | 465G |
+| `/share/yufne/M4-Instruct-Data` | 219G |
+| `/share/guorui/datasets` | 149G |
+| `/share/weihongyang/JDJV-SIMO-Qwen3-VL` | 101G |
+| `/share/yufne/pixmo-docs` | 52G |
+| `/share/yufne/OmniVideo11B` | 47G |
+| `/share/caolujing/work/guided-diffusion/datasets` | — |
+| `/share/yufne/Bagel/data/interleave_datasets` | — |
+
+#### (C) cache / temp / tmp
+
+| 目录 | 大小 | 说明 |
+|---|---|---|
+| `/share/mtang/.cache` | **344G** | 本次 9 用户中最大的 cache（含 vllm / nvidia / nim / huggingface） |
+| `/share/weihongyang/evalscope_latest` | **651G** | 评测工作副本（含缓存） |
+| `/share/weihongyang/evalscope` | 115G | |
+| `/share/guorui/home_cache` | 79G | 含 `tvm-ffi/` `sgl_kernel_jit_*`、`deep_gemm/`、`vllm/torch_compile_cache` |
+| `/share/guorui/model_cache` | 71G | |
+| `/share/guorui/hf_cache` | 60G | HuggingFace 数据集缓存 |
+| `/share/guorui/.cache` | 29G | |
+| `/share/guorui/conda_cache` | 12G | |
+| `/share/guorui/.codex/cache`, `.codex/plugins/cache` | — | |
+| `/share/songzun/uv-cache-sz` | 80G | uv 包缓存 |
+| `/share/huayicong/.cache` | 20G | 含 `ccache/` |
+| `/share/huayicong/.codex-local/*/tmp` | 867 个 tmp 目录 | 每个都是小目录，总计 ~6G（`find` 命中 867 处） |
+| `/share/songzun/.codex/tmp`, `cosmos-*/__pycache__` | — | |
+| `/share/weihongyang/tmp` | 145M | 含 `cutlass_python_cache`、`simo_debug_cache` |
+| `/share/weihongyang/.cache_home` | 1.5G | |
+| `/share/caolujing/.cache` | 2.4G | 含 `hub/checkpoints` |
+| `/share/pengkunfu/.triton/cache`, `/share/pengkunfu/.cache` | 36M / 4K | |
+| **temp/tmp 类** | — | `weihongyang/tmp`(145M)、`songzun/.codex/tmp`、`huayicong/.codex*/*/tmp`(867个)、`pengkunfu/tmp`(4K)、`guorui/.codex/tmp`、`mtang/work/tmp`(95M)、`mtang/.cache/nim/tmp`、`caolujing` 无 |
+
+#### (D) conda 环境 / 解释器（非 cache，但占空间）
+
+| 目录 | 大小 |
+|---|---|
+| `/share/weihongyang/miniconda3` | 379G |
+| `/share/guorui/envs` | 100G |
+| `/share/yufne/miniconda3` | 59G |
+| `/share/pengkunfu/anaconda3` | 43G |
+| `/share/caolujing/miniconda3` | 37G |
+| `/share/huayicong/miniconda3` | 34G |
+| `/share/mtang/miniforge3` | 27G |
+| `/share/songzun/miniconda3` | 17G |
+
+#### (E) 各用户完整明细（Top 分支）
+
+```
+/share/yufne  8.7T
+├── UltraEdit/ 1.5T        数据集
+├── Senorita/ 1.5T         数据集
+├── JourneyDB/ 1.5T        数据集
+├── ShareGPT4Video/ 1.4T   数据集
+├── Animate_project/ 758G  模型权重
+├── dataset/ 516G          数据集
+├── LLaVA-Video-178K/ 465G 数据集
+├── Moore-AnimateAnyone/ 308G
+├── AnyEdit/ 279G
+├── Open-AnimateAnyone/ 223G
+├── M4-Instruct-Data/ 219G
+├── Qwen3-VL-30B-A3B-Instruct/ 58G
+├── miniconda3/ 59G
+└── pixmo-docs/ 52G, OmniVideo11B/ 47G, …
+
+/share/weihongyang  4.0T
+├── ml-fastvlm/ 1.4T （output/ 1.2T, checkpoints/ 40G）
+├── JDJV/ 1.2T             ← 模型权重
+├── evalscope_latest/ 651G ← 评测工作副本/缓存
+├── miniconda3/ 379G
+├── evalscope/ 115G
+├── JDJV-SIMO-Qwen3-VL/ 101G
+├── JD_Project/ 59G, simo-Qwen3-VL/ 58G, LMUData/ 32G, .agentos/ 24G, tmp/ 145M
+
+/share/guorui  3.7T
+├── 投机解码训练/ 1.8T （SpecForge/ 1.7T, SpecForge_new/ 108G）
+├── workspace/ 642G （早期注入/ 290G, 动态锚点/ 163G, sd/ 118G, tgl/ 65G）
+├── 投机解码优化/ 173G
+├── datasets/ 149G         ← 数据集
+├── envs/ 100G
+├── SpecForge/ 80G
+├── home_cache/ 79G        ← cache（tvm-ffi/deep_gemm/torch_compile）
+├── model_cache/ 71G       ← cache
+├── qwen3-next/ 61G
+├── hf_cache/ 60G          ← cache
+├── claude/ 49G
+├── .cache/ 29G, .codex/ 17G, DSA实现-backup/ 13G, conda_cache/ 12G
+
+/share/pengkunfu  1.6T
+├── JDJV/ 1.2T （GaussianOcc/ 1.1T, datasets/ 46G, OPUS/ 11G）
+├── edge_llm_models/ 124G  ← 模型权重
+├── vlmevalkit_selftest/ 117G （含 LMUData/datasets）
+├── VLM_eval/ 45G
+├── anaconda3/ 43G
+├── silero_test/ 31G, tensorRT/ 6.5G, papers/ 895M
+
+/share/caolujing  1.6T
+├── work/ 919G （REPA/ 783G, DiT/ 134G）
+├── data/ 587G （images/ 245G, imagenet/ 151G, vae-sd/ 50G）
+├── miniconda3/ 37G, .cache/ 2.4G, arxivsearch/ 1.1G
+
+/share/mtang  1.4T
+├── work/ 996G （JD/ 430G, Gen/ 353G, LLM_Bench/ 193G, perf/ 20G, tmp/ 95M）
+├── .cache/ 344G           ← 最大的 cache
+├── miniforge3/ 27G, .devin-server/ 3.5G, .agentos/ 3.2G, .codex/ 952M
+
+/share/huayicong  1.2T
+├── proj/ 359G （torch_sipu/ 73G, onnxruntime-ep/ 49G, torch-branch-a/ 113G, …）
+├── code/ 51G, miniconda3/ 34G, .cache/ 20G, .codex-local/ 5.9G
+├── tensorrt-sdk-11.1-cuda12.9/ 4.7G, Qwen3-VL-2B-*-onnx-opset27/ 4.6G×2, tmp_migrated_20260805/ 1.5G
+
+/share/songzun  502G
+├── closed_sim_new/ 316G （cosmos-framework/ 87G, WorldEngine/ 61G, closed-sim/ 52G, cosmos-transfer2.5/ 42G, Tersim/ 20G, …）
+├── uv-cache-sz/ 80G       ← cache
+├── cosmos/ 22G, cosmos-transfer2.5/ 19G, miniconda3/ 17G, huggingface/ 15G
+├── flashdreams/ 5.7G, TeraSim/ 4.0G, perf_ui/ 4.0G, huggingface/cache/ 
+```
+
+---
+
+### 43.2 `/share/users/`
+
+`/share/users/` 下共 60+ 个用户目录，**合计约 5.4T**。
+
+#### 总览（Top 30，按大小排序）
+
+| 目录 | 大小 | 目录 | 大小 |
+|---|---|---|---|
+| `zhouziyi` | **766G** | `xieyi` | 101G |
+| `like` | **565G** | `al` | 97G |
+| `bzhan` | **520G** | `hmx` | 87G |
+| `aima` | **387G** | `lishuyuan` | 80G |
+| `bokangz` | **384G** | `zhengbao` | 71G |
+| `chenzhizhen` | **355G** | `byy` | 69G |
+| `tangdehua` | **297G** | `lizi` | 37G |
+| `yangrunlin` | **278G** | `txdrg` | 25G |
+| `huyoufu` | **232G** | `guopengju` | 19G |
+| `zhaosiwei` | 184G | `xiedebin` | 7.6G |
+| `zlxu` | 172G | `sunzhongao` | 6.0G |
+| `ziheng` | 169G | `kuangwanda` | 4.7G |
+| `wangyu` | 160G | `zhubokang` | 4.3G |
+| `yuliang` | 146G | `jiale` | 3.7G |
+| `luman` | 121G | `xuzelong` | 3.4G |
+| （其余 20+ 个 < 3G） | | | |
+
+#### (A) 模型权重
+
+| 目录 | 大小 |
+|---|---|
+| `/share/users/chenzhizhen/Qwen3-Next-80B-A3B-Instruct` | **153G** |
+| `/share/users/huyoufu/DeepSeek-V2-Lite-Chat` | 30G |
+| `/share/users/huyoufu/Llama-3.2-1B-Instruct` | 7.3G |
+| `/share/users/huyoufu/Meta-Llama-3-8B` | 602M |
+| `/share/users/zlxu/model` | 16G |
+| `/share/users/chenzhizhen/Qwen3.6` | 52G |
+
+#### (B) 数据集
+
+| 目录 | 大小 |
+|---|---|
+| `/share/users/zhaosiwei/transformer-pytorch/dataset` | — |
+| `/share/users/chenzhizhen/dataset` | 8.3G |
+| `/share/users/tangdehua/huggingface/datasets` | （含在 12G 内） |
+
+> `/share/users/` 下数据集类目录整体不大，主要是代码仓库、conda 环境和缓存。
+
+#### (C) cache / tmp / temp（`find -maxdepth 3` 命中，按大小）
+
+| 目录 | 大小 |
+|---|---|
+| `/share/users/aima/cache`（含 `pip_cache`） | **69G** |
+| `/share/users/like/.cache` | **39G** |
+| `/share/users/wangyu/.cache` | **29G** |
+| `/share/users/zhengbao/.pip_cache` | **17G** |
+| `/share/users/tangdehua/huggingface` | 12G |
+| `/share/users/al/triton_cacheexport` | **8.5G** |
+| `/share/users/huyoufu/workspace_node38/uv-cache` | 5.4G |
+| `/share/users/yuliang/.triton` | 5.2G |
+| `/share/users/zhengbao/conda_pkgs` | 4.7G |
+| `/share/users/like/huggingface_cache` | 3.5G |
+| `/share/users/like/temp` | 2.6G |
+| `/share/users/al/triton_cache` | 1.7G |
+| `/share/users/zhengbao/tmp` | 1.4G |
+| `/share/users/wangyu/.npm` | 1.4G |
+| `/share/users/xieyi/cache`（含 `ccache`） | 932M |
+| `/share/users/bzhan/tmp` | 669M |
+| `/share/users/bzhan/.cache` | 296M |
+| `/share/users/bzhan/torch_cache/torch_compile_cache` | 274M |
+| `/share/users/like/package/temp`、`package/tmp`、`qemu_demo/temp` | — |
+| `/share/users/like/.conda`、`xieyi/.conda`、`zhouziyi/.conda`、`backup/.conda` | — |
+| `/share/users/zhouziyi/.cache`, `.npm/_cacache`, `.nvm/.cache`, `.claude/cache` | — |
+| `/share/users/like/package/temp` / `tmp`（同 like） | — |
+| `/share/users/zhaosiwei/tmp`, `.cache`, `vidur-servingsim/cache`, `hasp/tmp` | — |
+| `/share/users/bokangz/tmp`（含 `hf-cache`, `flashinfer-cache`）, `probe-live/gocache`, `.cache` | — |
+| `/share/users/wangyu/.claude/cache`, `.codex/tmp`, `.nvm/.cache`, `harness/cache`, `dcsm/.cache` | — |
+| `/share/users/lishuyuan/temp`、`xieyi/code/tmp`、`al/tmp`、`nanhua/uv/cache` | — |
+
+#### (D) 各用户 Top 分支明细
+
+```
+/share/users/like  565G
+├── package/ 252G
+├── miniconda3/ 99G
+├── qemu_demo/ 96G
+├── .cache/ 39G          ← cache
+├── bench-io/ 26G
+├── opt/ 23G
+├── docker-image/ 5.5G, sipu_sdk_debug/ 4.1G, huggingface_cache/ 3.5G, temp/ 2.6G, build/ 2.2G
+
+/share/users/aima  387G
+├── workspace/ 297G （含 .cache）
+├── cache/ 69G           ← cache（pip_cache）
+├── miniconda3/ 17G
+└── temp/ 1.3M
+
+/share/users/bzhan  520G
+├── vidur-e2e-combo-accuracy-20260729/ 196G
+├── vidur-profile-replay-audit-20260722/ 66G
+├── env/ 60G
+├── gpu-frequency-diagnostic-20260728/ 29G
+├── vidur-servingsim-origin-main-async-20260624/ 27G
+├── dsv3l16_reprofile_*（3 个）/ 12–15G
+└── tmp/ 669M, torch_cache/ 274M, .cache/ 296M
+
+/share/users/chenzhizhen  355G
+├── Qwen3-Next-80B-A3B-Instruct/ 153G   ← 模型权重
+├── Qwen3.6/ 52G, .git/ 44G, qwen-runtime/ 30G, uv/ 19G, .cache/ 17G,
+├── reproduce_kvcache/ 14G, marconi/ 13G, dataset/ 8.3G
+
+/share/users/tangdehua  297G
+├── project/ 229G
+├── miniconda3/ 49G
+├── huggingface/ 12G     ← cache
+└── llm_wights/ 8.9G
+
+/share/users/huyoufu  232G
+├── qemu/ 66G, workspace_node38/ 52G（含 uv-cache 5.4G）, miniconda3/ 37G,
+├── workspace_gpu/ 31G, DeepSeek-V2-Lite-Chat/ 30G, Llama-3.2-1B-Instruct/ 7.3G
+
+/share/users/zhaosiwei  184G
+├── .miniconda/ 43G, torch_sipu/ 26G, qemu/ 23G, pytorch/ 23G,
+├── transformer-pytorch/ 22G, hasp-ws/ 16G, tracetto/ 14G, home/ 6.8G
+
+/share/users/zlxu  172G
+├── anaconda/ 62G, .agentos/ 31G, model/ 16G, mineru/ 14G, SimpleRAG/ 13G,
+├── agent-os*/（多个）/ 2.7–8.6G, agentos-private-images/ 2.7G
+
+/share/users/zhengbao  71G
+├── miniconda3/ 29G, .pip_cache/ 17G ← cache, code/ 9.9G, conda_pkgs/ 4.7G ← cache,
+├── huggingface/ 4.5G, conda_envs/ 3.8G, .pipcache/ 1.7G, tmp/ 1.4G
+
+/share/users/xieyi  101G
+├── anaconda3/ 48G, code/ 40G, downloads/ 9.1G, .codex/ 1.3G,
+├── cache/ 932M（ccache）, to_be_deleted/ 767M, backup/ 730M, .tilelang/ 84M
+```
+
+---
+
+### 43.3 按类别的全局汇总
+
+#### 🔴 模型权重 / checkpoints（最大头，约 10T+）
+
+| 目录 | 大小 | 用户 |
+|---|---|---|
+| `weihongyang/JDJV` | 1.2T | weihongyang |
+| `guorui/投机解码训练/SpecForge` | 1.7T | guorui |
+| `weihongyang/ml-fastvlm/output` | 1.2T | weihongyang |
+| `pengkunfu/JDJV/GaussianOcc` | 1.1T | pengkunfu |
+| `mtang/work/JD` + `work/Gen` | 430G + 353G | mtang |
+| `huayicong/proj` | 359G | huayicong |
+| `yufne/Moore-AnimateAnyone` / `AnyEdit` / `Open-AnimateAnyone` | 308G / 279G / 223G | yufne |
+| `chenzhizhen/Qwen3-Next-80B-A3B-Instruct` | 153G | chenzhizhen |
+
+#### 🟠 数据集（约 8T）
+
+| 目录 | 大小 | 用户 |
+|---|---|---|
+| `yufne/UltraEdit` / `Senorita` / `JourneyDB` | 各 1.5T | yufne |
+| `yufne/ShareGPT4Video` | 1.4T | yufne |
+| `caolujing/data` | 587G | caolujing |
+| `yufne/dataset` | 516G | yufne |
+| `yufne/LLaVA-Video-178K` | 465G | yufne |
+| `yufne/M4-Instruct-Data` | 219G | yufne |
+| `guorui/datasets` | 149G | guorui |
+| `weihongyang/JDJV-SIMO-Qwen3-VL` | 101G | weihongyang |
+
+#### 🟡 cache / temp / tmp（约 800G+）
+
+| 目录 | 大小 | 用户 |
+|---|---|---|
+| `weihongyang/evalscope_latest` | 651G | weihongyang |
+| `mtang/.cache` | 344G | mtang |
+| `pengkunfu/edge_llm_models`（权重） | 124G | pengkunfu |
+| `weihongyang/evalscope` | 115G | weihongyang |
+| `songzun/uv-cache-sz` | 80G | songzun |
+| `guorui/home_cache` / `model_cache` / `hf_cache` | 79G / 71G / 60G | guorui |
+| `aima/cache`（`users/`） | 69G | aima |
+| `like/.cache`（`users/`） | 39G | like |
+| `guorui/.cache` | 29G | guorui |
+| `wangyu/.cache`（`users/`） | 29G | wangyu |
+| `huayicong/.cache` | 20G | huayicong |
+| `zhengbao/.pip_cache`（`users/`） | 17G | zhengbao |
+| `guorui/conda_cache` | 12G | guorui |
+| `al/triton_cacheexport`（`users/`） | 8.5G | al |
+| `guorui`.codex/cache`、`songzun/.codex/tmp`、`huayicong/.codex-local/*/tmp`（867 个） | — | — |
+
+#### 🔵 conda 环境
+
+`weihongyang/miniconda3` 379G、`guorui/envs` 100G、`yufne/miniconda3` 59G、`pengkunfu/anaconda3` 43G、`caolujing/miniconda3` 37G、`huayicong/miniconda3` 34G、`mtang/miniforge3` 27G、`songzun/miniconda3` 17G。
+
+---
+
+### 43.4 可清理候选（仅列出，**未执行任何删除**）
+
+按「回收空间 / 风险」排序：
+
+| 候选 | 大小 | 说明 |
+|---|---|---|
+| `guorui/投机解码训练/SpecForge` | 1.7T | 训练中间 checkpoint，确认后可删 |
+| `yufne/UltraEdit`、`yufne/Senorita`、`yufne/JourneyDB` | 各 1.5T | 数据集，若可重新下载 |
+| `yufne/ShareGPT4Video` | 1.4T | 数据集 |
+| `weihongyang/JDJV` + `pengkunfu/JDJV` | 1.2T + 1.2T | 同名项目，疑似重复，建议比对 |
+| `weihongyang/ml-fastvlm/output` | 1.2T | 训练输出 |
+| `pengkunfu/JDJV/GaussianOcc` | 1.1T | |
+| `weihongyang/evalscope_latest` | 651G | 评测工作副本，可重建 |
+| `caolujing/data/images` + `imagenet` | 245G + 151G | 数据集 |
+| `mtang/.cache` | 344G | 可 `rm -rf` 后重建 |
+| `guorui/home_cache`（tvm-ffi/deep_gemm/torch_compile） | 79G | 可重建 |
+| `songzun/uv-cache-sz` | 80G | `uv cache clean` 可回收 |
+| `guorui/model_cache` / `hf_cache` | 71G / 60G | HF 缓存，可重新下载 |
+| `huayicong/.codex-local/*/tmp`（867 个） | ~6G | 大量陈旧 tmp |
+| `weihongyang/evalscope_latest` 内的 `.cache` | — | |
+| `users/` 下各类 `.cache` / `pip_cache` / `triton_cache` | `aima` 69G、`like` 39G、`wangyu` 29G、`zhengbao` 17G、`al` 8.5G 等 | 均可重建 |
+
+**注意**：`/share` 总盘 78T 已 100% 满。本次统计的两个范围（9 个用户 ≈ 21.7T + `/share/users/` ≈ 5.4T）**合计约 27T**，其余空间在 `/share/` 下其它用户目录中，本次未覆盖。
+
+### 43.5 备注
+
+- 全部为**只读**操作（`du` / `find`），未删除、未移动任何文件。
+- NFS 上遍历极慢（8.7T 级目录需十几分钟），部分 `du` 因 `timeout` 或并行调度未跑完，`zhouziyi`(766G)、`bokangz`(384G)、`yangrunlin`(278G)、`ziheng`(169G)、`byy`(69G) 只拿到**总大小**，未展开二级明细。
+- `/share/huayicong/proj` 在两次测量间从 817G 变为 359G，推断期间有文件被删除（统计值是**当时快照**）。
+- 9 个用户中最占空间的类别依次是：**数据集 ≈ 8T**、**模型权重/checkpoint ≈ 10T**、**cache/tmp ≈ 0.8T**、**conda 环境 ≈ 0.7T**。
