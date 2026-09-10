@@ -248,3 +248,75 @@ layer 3 ──(dst←1)────────────────►  laye
 - `package/jdjv/kokoro_clean-old/`（1.6G，另一份 `kokoro_clean` 已存在）。
 
 **附带发现**：`/share` 整体 99% 占用，但 `/share/users/like` 只占 565G —— 说明绝大部分空间是**其他用户**占用的，本目录的清理能腾出约 200~250G，对整盘缓解有限，建议同步推动其他用户排查。
+
+---
+
+## 4. 用 `mydd.cpp` truncate `/share/liwang/VLM_projects/.snapshot` 能真正释放空间吗？
+
+**结论：不能。** 有两层独立原因，任一层都足以否定这个做法。
+
+### 4.1 先明确 `mydd.cpp` 做什么
+
+`/softhome/like/asset/code/cpp_guard/mydd.cpp`（187 行）是一个「递归截断」工具：
+
+- `main`（`mydd.cpp:164`）接收一个参数 `max_file_size_mib`；`parse_options`（`:40`）把 `0` 解释为**无条件截断**（`truncate_unconditionally = true`，`:56`）。
+- `scan_current_directory`（`:126`）用 `fs::recursive_directory_iterator` 递归遍历**当前目录**（`. `，`:129`），`skip_permission_denied`。
+- 对每个普通文件调 `truncate_file`（`:79`）：先 `lstat`（`:85`），非普通文件跳过（`:90`）；满足阈值时用 `open(path, O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW)`（`:102-107`）把文件**截断为 0 字节**。
+
+即：它的作用范围就是**当前工作目录**，把其中的普通文件清零。
+
+### 4.2 原因一：`.snapshot` 是存储端只读视图，`O_TRUNC` 会直接失败
+
+只读检查（未做任何写入）：
+
+```
+W_OK=False   /share/liwang/VLM_projects/.snapshot
+W_OK=False   /share/liwang/VLM_projects/.snapshot/2-hourly.2026-09-10_1015
+W_OK=True    /share/liwang/VLM_projects
+```
+
+`.snapshot` 目录的权限位是 `drwxrwxrwx`（777），但对它做**写权限判定返回 False** —— 说明拒绝来自 **NAS 服务端**，而不是本地权限位。NetApp 的 `.snapshot` 命名空间按设计就是只读的。
+
+因此在 `.snapshot` 里跑 mydd，每个文件都会走到 `open(O_TRUNC)` 失败分支（`:108-112`），刷出一堆
+
+```
+[WARNING] open(O_TRUNC) '...' failed: Read-only file system
+```
+
+最终输出 `truncated 0 file(s)` —— **一个字节都不会变**。
+
+### 4.3 原因二：即使能写，也释放不了空间（概念性错误）
+
+真正"钉住"那 ~5T 的是**存储端的快照对象**（ONTAP snapshot），它持有被删数据块的引用。
+
+- 快照是**只读的 COW 时点镜像**，不是一块你可以进去"清理"的磁盘区域。
+- 要释放空间，必须让**快照本身消失**（删除快照对象，或等保留策略轮转过期），而不是透过 `.snapshot` 去改文件。
+- 退一步，即便某实现允许"写入"快照视图，写入也只会走 COW **新分配块**，而快照仍引用旧块 —— 空间不降反升。
+
+一句话：**要删的是「快照」这个对象，不是「快照里的文件」。**
+
+### 4.4 正确做法
+
+1. 找**存储管理员删除相关快照**（最老的是 `hourly.2026-07-30_1605`、`hourly.2026-07-30_1705`、`weekly.2026-09-06_0015`）。
+2. 或**等待保留策略**（2-hourly / daily / weekly）自然轮转。
+3. 快照释放后 `df` 才会降；在此之前重复 `rm` 或 truncate **都无效**。
+
+### 4.5 重要风险提示（比"无效"更严重）
+
+- `mydd` 传 `0` 是**无条件截断**；而 `recursive_directory_iterator`（`:128`）默认**会进入 `.snapshot`**，同时也会递归进当前目录下所有子目录。
+- 所以：
+  - 在 `.snapshot` 里跑：只会满屏 EROFS 警告，**无害但完全无效**。
+  - **在 live 目录（例如 `/share/liwang/VLM_projects` 或任何真实数据目录）里跑：会把该目录下所有普通文件全部截成 0 字节**，这是**不可逆的数据破坏**。切勿在生产数据目录执行。
+- 本次**未执行** `mydd`（按你的要求：只写答案，未对其他任何文件做写操作）。
+
+### 4.6 小结
+
+| 做法 | 能释放空间吗 | 原因 |
+|---|---|---|
+| 用 mydd truncate `.snapshot` | ❌ 不能 | 快照只读，`open(O_WRONLY\|O_TRUNC)` 被服务端拒绝（EROFS） |
+| 假设"能写"快照 | ❌ 不能 | 快照是只读 COW 镜像，空间由**快照对象**持有；写只会新分配块 |
+| 请管理员删除快照本身 | ✅ 能 | 解除对已删数据块的引用 |
+| 等保留策略轮转过期 | ✅ 能 | 同上 |
+| 在 live 数据目录跑 mydd | ❌ **灾难** | 会把真实数据全部清零，不可逆 |
+
+**核心结论：释放空间要靠「删快照」，不是「truncate 快照里的文件」；后者既写不进去，写进去也没用。**

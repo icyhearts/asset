@@ -4278,3 +4278,6 @@ argv[1] 是 max_file_size ,单位是 MiB.
 
 把答案追加到 like-useful/answer_codex_v6.md
 }
+
+答案追加到 like-useful/answer_claude_v3.md 里面,只写答案，对其他文件不允许进行写操作。
+使用 /softhome/like/asset/code/cpp_guard/mydd.cpp 对  /share/liwang/VLM_projects/.snapshot 这个快照进行 truncate，可以解真正释放空间吗?
