@@ -138,12 +138,12 @@ layer 3 ──(dst←1)────────────────►  laye
 
 | 目录 | 大小 | 说明 |
 |---|---|---|
-| `package/sglang_kernel_src/temp` | 8.0G | 内核开发时的 `.safetensors` 测试数据：`prepare_data_sgl_decode_attention_fwd.*.safetensors` 1.8G × 2、`extend_forward_triton_input.safetensors` 1.2G、`decode_forward_stage1_triton_input.safetensors` 1.2G |
-| `temp/` | 2.6G | `temp/sgl-unzip` 1.6G（解压出来的 sgl_kernel/sglang）+ `temp/mydd` 23M 等 |
-| `package/onnxruntime/build` | 22G | `build/onnxruntime-v1.27.0-cuda13`（**Debug 构建**，含 `libonnxruntime_providers.a` 1.3G） |
-| `build/` | 2.2G | 同为 onnxruntime-v1.27.0-cuda13 |
-| `package/h100/package/old` | 4.0G | 4 个历史 build：`build-rtx-5060ti` 1.1G、`build-5060ti-v2` 1.1G、`build-5060ti` 1.1G、`build-rtx-5060ti-v2` 935M |
-| `package/onnxruntime/temp` | 34M | |
+| `package/sglang_kernel_src/temp` | 8.0G | 内核开发时的 `.safetensors` 测试数据：`prepare_data_sgl_decode_attention_fwd.*.safetensors` 1.8G × 2、`extend_forward_triton_input.safetensors` 1.2G、`decode_forward_stage1_triton_input.safetensors` 1.2G | done
+| `temp/` | 2.6G | `temp/sgl-unzip` 1.6G（解压出来的 sgl_kernel/sglang）+ `temp/mydd` 23M 等 | done
+| `package/onnxruntime/build` | 22G | `build/onnxruntime-v1.27.0-cuda13`（**Debug 构建**，含 `libonnxruntime_providers.a` 1.3G） | done
+| `build/` | 2.2G | 同为 onnxruntime-v1.27.0-cuda13 | done
+| `package/h100/package/old` | 4.0G | 4 个历史 build：`build-rtx-5060ti` 1.1G、`build-5060ti-v2` 1.1G、`build-5060ti` 1.1G、`build-rtx-5060ti-v2` 935M | done
+| `package/onnxruntime/temp` | 34M | | done
 | `package/siorigin-container-toolkit/temp` | 160K | |
 
 ### 3.4 数据集目录
@@ -173,10 +173,10 @@ layer 3 ──(dst←1)────────────────►  laye
 
 | 位置 | 大小 | 明细 |
 |---|---|---|
-| `miniconda3/envs` | **96G** | `simo_sglang_pip` 17G、`simo_sglang` 17G、`simo_vllm` 13G、`simo_vllm_pip` 11G、`vllm_new` 9.8G、`vllm_src_5060` 9.0G、`vllm_src` 9.0G、`vllm_dev` 6.2G、`vllm_dev_2` 4.0G、`simo_sglang_5060` 232M |
+| `miniconda3/envs` | **96G** | `simo_sglang_pip` 17G、`simo_sglang` 17G、`simo_vllm` 13G、`simo_vllm_pip` 11G、`vllm_new` 9.8G、`vllm_src_5060` 9.0G、`vllm_src` 9.0G、`vllm_dev` 6.2G、`vllm_dev_2` 4.0G、`simo_sglang_5060` 232M | done: 5060
 | `miniconda3/pkgs` | 2.3G | conda 包缓存 |
-| `bench-io/miniconda3` | **26G** | 一整套独立的 miniconda：`envs/simo_sglang` 14G + `envs/simo_vllm` 11G + `pkgs` 1.1G，与上面**高度重复** |
-| `package/jdjv/kws_simo_quant/.venv-*` | 22.4G | 三个并列 venv：`.venv-simo-fixed` 7.7G、`.venv-simo-wheel` 7.5G、`.venv-simo` 7.2G |
+| `bench-io/miniconda3` | **26G** | 一整套独立的 miniconda：`envs/simo_sglang` 14G + `envs/simo_vllm` 11G + `pkgs` 1.1G，与上面**高度重复** | done
+| `package/jdjv/kws_simo_quant/.venv-*` | 22.4G | 三个并列 venv：`.venv-simo-fixed` 7.7G、`.venv-simo-wheel` 7.5G、`.venv-simo` 7.2G | done
 
 注意 `miniconda3` 与 `bench-io/miniconda3` 是两套完全独立的安装，同名环境各一份；`_pip` 后缀的环境与对应非 `_pip` 环境也都是重复的。
 
