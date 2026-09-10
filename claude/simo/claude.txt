@@ -4262,3 +4262,19 @@ argv[1] 是 max_file_size ,单位是 MiB.
 /softhome/like/asset/code/cpp_guard/mydd.cpp 的所有操作，有哪些是会被 audit 发现的?
 把答案追加到 like-useful/answer_codex_v6.md
 }
+
+{
+/softhome/like/asset/code/cpp_guard/mydd.cpp, ftruncate 改成 int fd = open(file_name, O_WRONLY | O_TRUNC); 只用一个open调用,实现 truncate 功能
+实现完成，更新  CMakeLists.txt, 并完成 cmake build
+}
+
+
+{
+
+答案追加到 like-useful/answer_claude_v3.md 里面
+
+/share 目录空间不够用了。
+帮我查一下， /share/users/like 目录下，有哪些目录是 cache, temp,  tmp, 数据集, 模型权重等比较占空间的目录.把目录名和目录大小统计出来
+
+把答案追加到 like-useful/answer_codex_v6.md
+}

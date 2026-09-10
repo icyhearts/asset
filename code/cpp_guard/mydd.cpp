@@ -96,46 +96,18 @@ bool truncate_file(const fs::path &path, const Options &options,
     return true;
   }
 
-  int open_flags = O_WRONLY | O_CLOEXEC;
+  // O_TRUNC performs the size change as part of this single open operation.
+  // O_NOFOLLOW prevents a raced regular-file path from redirecting the write
+  // to a symbolic-link target; O_CLOEXEC avoids leaking the descriptor.
+  int open_flags = O_WRONLY | O_TRUNC | O_CLOEXEC;
 #ifdef O_NOFOLLOW
   open_flags |= O_NOFOLLOW;
 #endif
 
   const int file_descriptor = ::open(path.c_str(), open_flags);
   if (file_descriptor < 0) {
-    report_errno(path, "open");
+    report_errno(path, "open(O_TRUNC)");
     ++statistics.failures;
-    return false;
-  }
-
-  struct stat file_stat {};
-  if (::fstat(file_descriptor, &file_stat) != 0) {
-    report_errno(path, "fstat");
-    ++statistics.failures;
-    (void)::close(file_descriptor);
-    return false;
-  }
-
-  if (!S_ISREG(file_stat.st_mode)) {
-    // The directory entry may have been replaced after the filesystem scan.
-    (void)::close(file_descriptor);
-    return true;
-  }
-
-  if (!should_truncate(file_stat, options)) {
-    if (::close(file_descriptor) != 0) {
-      report_errno(path, "close");
-      ++statistics.failures;
-      return false;
-    }
-    return true;
-  }
-
-  const auto old_size = file_stat.st_size;
-  if (::ftruncate(file_descriptor, 0) != 0) {
-    report_errno(path, "ftruncate");
-    ++statistics.failures;
-    (void)::close(file_descriptor);
     return false;
   }
 
@@ -146,7 +118,7 @@ bool truncate_file(const fs::path &path, const Options &options,
   }
 
   ++statistics.truncated_files;
-  std::cout << "truncated '" << path.string() << "' (" << old_size
+  std::cout << "truncated '" << path.string() << "' (" << path_stat.st_size
             << " bytes)\n";
   return true;
 }
