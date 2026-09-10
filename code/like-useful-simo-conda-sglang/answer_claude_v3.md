@@ -236,7 +236,7 @@ layer 3 ──(dst←1)────────────────►  laye
 | `qemu_demo/` 中的旧快照：`yubo/ctk.copy.qcow2` 16.1G + `yubo/ctk.qcow2` 12.8G + `yubo_scp/ctk.qcow2` 12.8G + 根目录 `ctk.copy2.qcow2` 14.4G（保留 `yubo/ctk.copy2.qcow2` 与 `ci/CI.qcow2`） | ≈ 56G | # done
 | `package/cuda/*.run`（5 个安装包，安装已完成） | 22G | # done
 | `package/dev-ubuntu-24.04.tar` | 15.6G | done
-| `sipu_sdk_debug/*.tar.bz2` 4.0G + `package/.../sipu_sdk_rel.tar` 13.4G（与已解压的 `sipu_sdk_rel/` 目录 14G 重复，tar 与目录只需留一份） | 17.4G |
+| `sipu_sdk_debug/*.tar.bz2` 4.0G + `package/.../sipu_sdk_rel.tar` 13.4G（与已解压的 `sipu_sdk_rel/` 目录 14G 重复，tar 与目录只需留一份） | 17.4G | # done
 | `package/h100/package/old`（4 个历史 build） | 4.0G | done
 | **小计** | **≈ 172G** |
 
@@ -244,8 +244,8 @@ layer 3 ──(dst←1)────────────────►  laye
 
 - `miniconda3/envs` 中的 `vllm_new`(9.8G)、`vllm_src_5060`(9.0G)、`vllm_src`(9.0G)、`vllm_dev`(6.2G)、`vllm_dev_2`(4.0G) —— 5 个 `vllm_*` 环境疑似同一用途的不同时间点副本，保留最新一个即可回收约 38G。
 - `simo_sglang_pip`(17G) / `simo_vllm_pip`(11G) 与 `simo_sglang`(17G) / `simo_vllm`(13G) 成对，`_pip` 版疑似安装方式不同的副本，可回收约 28G。
-- `package/jdjv/kws_simo_quant/.venv-simo{,-fixed,-wheel}` 三个 venv 共 22.4G，保留一个即可回收约 15G。
-- `package/jdjv/kokoro_clean-old/`（1.6G，另一份 `kokoro_clean` 已存在）。
+- `package/jdjv/kws_simo_quant/.venv-simo{,-fixed,-wheel}` 三个 venv 共 22.4G，保留一个即可回收约 15G。 done
+- `package/jdjv/kokoro_clean-old/`（1.6G，另一份 `kokoro_clean` 已存在）。 done
 
 **附带发现**：`/share` 整体 99% 占用，但 `/share/users/like` 只占 565G —— 说明绝大部分空间是**其他用户**占用的，本目录的清理能腾出约 200~250G，对整盘缓解有限，建议同步推动其他用户排查。
 
