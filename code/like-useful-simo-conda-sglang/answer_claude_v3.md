@@ -76,3 +76,175 @@ layer 3 ──(dst←1)────────────────►  laye
 - **跳过不需要的层**：例如把 dense 层与 MoE/混合层交错时，只挑「类型合适」的源层放到对应位置。`smoke_trim.py` 中 `layer_group_size` / `layer_types` 相关注释强调：混合模型里某目标槽位需要 linear/full-attn 的特定权重布局，`layer_map` 选取的源层类型必须与之匹配。
 - **跨边界重编号**：像 DeepSeek 这类模型 `first_k_dense_replace` 之后是 MoE 层，取子集时层号会错位，用 `layer_map` 把稀疏的源层号对齐回连续的 `0..dst_layers-1`（`build_layer_map()` 就是为此生成此类映射）。
 - 本质上 `layer_map` 是一个「**裁剪器 + 重排器**」：决定砍谁、留谁、留给它哪个槽位。
+
+---
+
+## 3. `/share/users/like` 空间占用排查（2026-09-10）
+
+**背景**：`/share`（NFS `10.97.128.245:/share`）78T 已用 77T，仅剩 **1.1T（99%）**。本次排查对象 `/share/users/like`，`du -x -sh`（同文件系统，不计子挂载点）总计 **565G**。
+
+**一句话结论**：占空间的大头不是数据集或模型权重（这两类加起来不到 10G），而是**重复的 conda 环境 / 构建产物 / 缓存 / 虚拟机磁盘镜像**四类。其中 `.cache`(39G)、`qemu_demo` 的 qcow2 镜像(96G)、`bench-io/miniconda3`(26G，与主 miniconda3 完全重复)、`/share/users/like/package` 下 6 份历史 `build-src-*`(38.8G) 和 ONNX Runtime 的 Debug 构建目录(22G) 属于**几乎零风险**的可回收项，按 3.9 的清单可安全回收 **约 260G**。
+
+### 3.1 顶层目录占用总览
+
+| 目录 | 大小 | 性质 |
+|---|---|---|
+| `package/` | 252G | 源码仓库 + 构建产物 + 打包 tar（最大头） |
+| `miniconda3/` | 99G | conda 环境（envs 96G） |
+| `qemu_demo/` | 96G | qcow2 虚拟机磁盘镜像 |
+| `.cache/` | 39G | 各类工具缓存（pip 24G） |
+| `bench-io/` | 26G | 另一套完整 miniconda3（重复） |
+| `opt/` | 23G | 3 套 CUDA 安装（12.8 / 13.0 / 13.1） |
+| `docker-image/` | 5.5G | 单个镜像 tar |
+| `sipu_sdk_debug/` | 4.1G | sdk_rel.tar.bz2 |
+| `huggingface_cache/` | 3.5G | **数据集** |
+| `temp/` | 2.6G | 临时文件 |
+| `build/` | 2.2G | onnxruntime-v1.27.0-cuda13 构建目录 |
+| `go-install/` | 1.2G | Go 工具链 |
+| `vim-docker-compile-22.04/` | 1.1G |  |
+| `wheel/` | 1018M |  |
+| `shareVR/` | 530M |  |
+| `vim-go/` | 467M |  |
+| `arch/`、`bash-bin/`、`.bash_history_sessions/`、`private/`、`.ac_ssh_config/`、`.conda/`、`cron-jobs/`、`.pip/`、`from-h100/` | 均 < 100M |  |
+
+顶层散落的大文件（不在任何子目录里，容易漏掉）：
+
+| 文件 | 大小 |
+|---|---|
+| `.cache.tar` | 9.6G |
+| `vim-go.tar` | 740M |
+| `other.tar.bz2` | 429M |
+| `ac.tar` | 140K |
+
+### 3.2 缓存类目录（cache）
+
+**`/share/users/like/.cache` — 39G**
+
+| 子目录 | 大小 | 说明 |
+|---|---|---|
+| `.cache/pip` | 24G | pip HTTP 缓存（`http-v2` 24G + `wheels` 50M），可 `pip cache purge` |
+| `.cache/vllm` | 12G | `torch_compile_cache` 11G（其中 `torch_aot_compile` 5.7G） |
+| `.cache/sglang` | 1008M | |
+| `.cache/huggingface` | 756M | `hub/datasets--anon8231489123--ShareGPT_Vicuna_unfiltered` 645M、`datasets--cais--mmlu` 101M |
+| `.cache/flashinfer` | 554M | |
+| `.cache/jedi` | 373M | vim/YouCompleteMe 的 Python 补全缓存 |
+| `.cache/pre-commit` | 224M | |
+| `.cache/go-build` | 177M | |
+| 其余（tvm-ffi 63M、deep_gemm 32M、clangd 23M、virtualenv 22M、tracker3 17M、sgl_eval 15M 等） | < 100M | |
+
+**另有一份 2025-12-09 的整目录备份 `.cache.tar` = 9.6G**，内容与 `.cache` 高度重叠，属于纯冗余。
+
+### 3.3 临时 / 中间产物目录（temp、tmp、build）
+
+| 目录 | 大小 | 说明 |
+|---|---|---|
+| `package/sglang_kernel_src/temp` | 8.0G | 内核开发时的 `.safetensors` 测试数据：`prepare_data_sgl_decode_attention_fwd.*.safetensors` 1.8G × 2、`extend_forward_triton_input.safetensors` 1.2G、`decode_forward_stage1_triton_input.safetensors` 1.2G |
+| `temp/` | 2.6G | `temp/sgl-unzip` 1.6G（解压出来的 sgl_kernel/sglang）+ `temp/mydd` 23M 等 |
+| `package/onnxruntime/build` | 22G | `build/onnxruntime-v1.27.0-cuda13`（**Debug 构建**，含 `libonnxruntime_providers.a` 1.3G） |
+| `build/` | 2.2G | 同为 onnxruntime-v1.27.0-cuda13 |
+| `package/h100/package/old` | 4.0G | 4 个历史 build：`build-rtx-5060ti` 1.1G、`build-5060ti-v2` 1.1G、`build-5060ti` 1.1G、`build-rtx-5060ti-v2` 935M |
+| `package/onnxruntime/temp` | 34M | |
+| `package/siorigin-container-toolkit/temp` | 160K | |
+
+### 3.4 数据集目录
+
+全部数据集加起来只有约 7G，**不是空间问题的主因**。
+
+| 目录 / 文件 | 大小 |
+|---|---|
+| `huggingface_cache/other.tar` | 1.5G |
+| `huggingface_cache/mit-han-lab___pile-val-backup` | 1.3G |
+| `huggingface_cache/cais___mmlu` | 326M |
+| `huggingface_cache/NeelNanda___pile-10k` | 212M |
+| `huggingface_cache/wikitext` | 66M |
+| `huggingface_cache/EleutherAI___wikitext_document_level` | 13M |
+| `huggingface_cache/TIGER-Lab___mmlu-pro` | 8.7M |
+| `huggingface_cache/{openai___gsm8k,gsm8k}` | 4.6M × 2 |
+| `.cache/huggingface/hub/datasets--anon8231489123--ShareGPT_Vicuna_unfiltered` | 645M |
+| `.cache/huggingface/hub/datasets--cais--mmlu` | 101M |
+| `package/jdjv/kokoro_clean{,-old}/data/seedtts_testset.tar` | 1.2G × 2（两份内容相同） |
+| **合计** | **≈ 7G** |
+
+### 3.5 模型权重
+
+**该目录下没有大模型权重**（llama3.1 之类都在 `/data_gpu/modelzoo`，不在 `/share/users/like`）。唯一与权重沾边的是内核开发留下的测试用 safetensors（见 3.3 的 `package/sglang_kernel_src/temp`，约 6G），可随 temp 一起清。
+
+### 3.6 conda 环境 —— 最大的单一可回收项（≈ 145G）
+
+| 位置 | 大小 | 明细 |
+|---|---|---|
+| `miniconda3/envs` | **96G** | `simo_sglang_pip` 17G、`simo_sglang` 17G、`simo_vllm` 13G、`simo_vllm_pip` 11G、`vllm_new` 9.8G、`vllm_src_5060` 9.0G、`vllm_src` 9.0G、`vllm_dev` 6.2G、`vllm_dev_2` 4.0G、`simo_sglang_5060` 232M |
+| `miniconda3/pkgs` | 2.3G | conda 包缓存 |
+| `bench-io/miniconda3` | **26G** | 一整套独立的 miniconda：`envs/simo_sglang` 14G + `envs/simo_vllm` 11G + `pkgs` 1.1G，与上面**高度重复** |
+| `package/jdjv/kws_simo_quant/.venv-*` | 22.4G | 三个并列 venv：`.venv-simo-fixed` 7.7G、`.venv-simo-wheel` 7.5G、`.venv-simo` 7.2G |
+
+注意 `miniconda3` 与 `bench-io/miniconda3` 是两套完全独立的安装，同名环境各一份；`_pip` 后缀的环境与对应非 `_pip` 环境也都是重复的。
+
+### 3.7 构建产物与打包文件
+
+| 目录 / 文件 | 大小 | 说明 |
+|---|---|---|
+| `package/vllm-for-conda-simo/build-src-bjh-*`（6 个） | **38.8G** | v0.11.2 7.0G、v0.13.0 7.2G、v0.15.0 7.2G、v0.17.0 6.3G、v0.20.0 5.8G、v0.27.1 5.3G；每个都含一份 1.2~1.3G 的 `_vllm_fa3_C.abi3.so` |
+| `package/vllm-for-conda-simo/.deps` + `.deps-back` | 4.4G | 依赖预编译产物 |
+| `package/h100/package/other/vllm` | 31G | 同上，含 2.3G / 2.2G / 1.2G 三个 `_vllm_fa3_C.abi3.so` |
+| `package/dev-ubuntu-24.04.tar` | **15.6G** | 基础镜像 tar |
+| `package/siorigin-container-toolkit/sipu_sdk_rel.tar` | **13.4G** | |
+| `package/cuda/*.run`（5 个） | **22G** | cuda 12.8.0 5.0G、12.8.1 5.0G、13.0.2 4.0G、13.1.2 4.0G、13.0.0 4.0G —— 安装包，装完即可删 |
+| `opt/cuda-{12.8,13.0,13.1}` | 23G | 已安装的 3 套 CUDA：8.8G + 7.2G + 7.1G，若只用一套可删另外两套 |
+| `package/h100/package.h100.tar.bz2` | 3.8G | |
+| `sipu_sdk_debug/sipu_sdk_rel.tar.bz2` | 4.0G | 与 13.4G 的 `.tar` 内容重复 |
+| `package/sipu_sw.tar` | 2.8G | |
+| `package/rocm-terminal.tar` | 2.8G | |
+| `package/h100/package/{cutlass 5.4G, TensorRT-LLM 1.8G, ARM-software 960M, cutlass-v3 662M, triton-lang 631M, nccl 577M, cmake 437M}` | ~10G | 第三方源码/依赖 |
+| `.git/objects/pack` 大包 | 3.1G | TensorRT-LLM 1.6G + onnxruntime 1.5G |
+
+### 3.8 虚拟机 / 容器镜像（qcow2、docker tar）
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `qemu_demo/yubo/ctk.copy2.qcow2` | 29.6G | 2025-11-24 |
+| `qemu_demo/yubo/ctk.copy.qcow2` | 16.1G | 2025-10-23 |
+| `qemu_demo/yubo/ctk.qcow2` | 12.8G | 2025-10-20 |
+| `qemu_demo/ctk.copy2.qcow2` | 14.4G | 2025-10-20 |
+| `qemu_demo/yubo_scp/ctk.qcow2` | 12.8G | |
+| `qemu_demo/ci/CI.qcow2` | 9.2G | 2025-09-08 |
+| `docker-image/dcsmbuild-x86_64-like-v1.tar` | 5.5G | 2025-10-14 |
+| **`qemu_demo/` 合计** | **96G** | 其中 `ctk*` 系列是同源镜像的多个副本，`yubo/ctk.copy2.qcow2`(29.6G) 与 `yubo/ctk.copy.qcow2`(16.1G)、`yubo/ctk.qcow2`(12.8G) 极可能是同一份镜像的连续快照 |
+
+### 3.9 建议清理优先级
+
+**第一梯队 —— 纯缓存，删了会自动重建（≈ 87G）**
+
+| 项目 | 可回收 |
+|---|---|
+| `rm -rf ~/.cache/pip` 或 `pip cache purge` | 24G |
+| `rm -f ~/.cache.tar` | 9.6G |
+| `rm -rf ~/.cache/vllm/torch_compile_cache` | 11G |
+| `rm -rf ~/bench-io/miniconda3`（整份重复的 conda） | 26G |
+| `rm -rf ~/package/sglang_kernel_src/temp/*` | 8.0G |
+| `rm -rf ~/.cache/{sglang,flashinfer,jedi,pre-commit,go-build}` | ~2.3G |
+| `rm -rf ~/build ~/temp` | 4.8G |
+| `rm -f ~/vim-go.tar ~/other.tar.bz2` | 1.2G |
+| **小计** | **≈ 87G** |
+
+**第二梯队 —— 历史构建产物 / 重复打包文件，确认无回滚需求即可删（≈ 172G）**
+
+| 项目 | 可回收 |
+|---|---|
+| `package/vllm-for-conda-simo/build-src-bjh-*`（保留当前在用的 v0.27.1，删其余 5 个） | ≈ 33G |
+| `package/onnxruntime/build`（Debug 构建） | 22G |
+| `qemu_demo/` 中的旧快照：`yubo/ctk.copy.qcow2` 16.1G + `yubo/ctk.qcow2` 12.8G + `yubo_scp/ctk.qcow2` 12.8G + 根目录 `ctk.copy2.qcow2` 14.4G（保留 `yubo/ctk.copy2.qcow2` 与 `ci/CI.qcow2`） | ≈ 56G |
+| `package/cuda/*.run`（5 个安装包，安装已完成） | 22G |
+| `package/dev-ubuntu-24.04.tar` | 15.6G |
+| `sipu_sdk_debug/*.tar.bz2` 4.0G + `package/.../sipu_sdk_rel.tar` 13.4G（与已解压的 `sipu_sdk_rel/` 目录 14G 重复，tar 与目录只需留一份） | 17.4G |
+| `package/h100/package/old`（4 个历史 build） | 4.0G |
+| **小计** | **≈ 172G** |
+
+**第三梯队 —— 需要人工确认的（conda/venv 冗余，≈ 80G）**
+
+- `miniconda3/envs` 中的 `vllm_new`(9.8G)、`vllm_src_5060`(9.0G)、`vllm_src`(9.0G)、`vllm_dev`(6.2G)、`vllm_dev_2`(4.0G) —— 5 个 `vllm_*` 环境疑似同一用途的不同时间点副本，保留最新一个即可回收约 38G。
+- `simo_sglang_pip`(17G) / `simo_vllm_pip`(11G) 与 `simo_sglang`(17G) / `simo_vllm`(13G) 成对，`_pip` 版疑似安装方式不同的副本，可回收约 28G。
+- `package/jdjv/kws_simo_quant/.venv-simo{,-fixed,-wheel}` 三个 venv 共 22.4G，保留一个即可回收约 15G。
+- `package/jdjv/kokoro_clean-old/`（1.6G，另一份 `kokoro_clean` 已存在）。
+
+**附带发现**：`/share` 整体 99% 占用，但 `/share/users/like` 只占 565G —— 说明绝大部分空间是**其他用户**占用的，本目录的清理能腾出约 200~250G，对整盘缓解有限，建议同步推动其他用户排查。
