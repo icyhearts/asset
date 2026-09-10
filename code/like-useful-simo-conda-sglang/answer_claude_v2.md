@@ -3339,3 +3339,169 @@ rm 删除文件
 - **`.snapshot` 让 `du` 与 `df` 天然不一致**：做空间统计时，`du` 反映的是 live 树，`df` 反映的是含快照的卷占用，两者对不上是正常的。
 - 被清空目录的 `mtime` 显示为 **4 月/5 月**（如 `checkpoints_RL` = 2026-04-30、`fastvlm-1.5B` = 2026-04-08），而非删除当天；gpu005 和 node33 两节点 `stat` 结果一致，排除客户端 attr 缓存。这与普通客户端 `rm` 的行为不符，更像**存储侧操作（快照/管理员删除）留下的痕迹**；但不影响上面的结论——live 与快照的直接对比已确凿证明数据已从 live 树移除。
 - 这次排查**全程只读**（`du` / `find` / `lsof` / `stat`），未删除、未修改任何快照或文件。
+
+---
+
+## 45. `scripts/ci/sipu_ci_exec.sh` 解析
+
+> code base: `/share/users/like/package/sglang_sipu`
+
+### 45.1 一句话
+
+`sipu_ci_exec.sh` 是 **sipu 精度 CI 的宿主机入口**：先在宿主机上把 sgl-kernel 系列 wheel 编出来，再把「一个 case」或「一个 suite」分派到本机容器（archmodel）或 QEMU 客户机里执行，最后汇总评分。
+
+脚本头注释（`scripts/ci/sipu_ci_exec.sh:2-12`）写明了两种用法：
+
+```
+sipu_ci_exec.sh --config-yaml <path> --launch-config <name> --test-case <name> [--platform qemu]   # 单 case
+sipu_ci_exec.sh --test-suites nightly[,<suite>...] [--mode compile|graph]                          # suite
+```
+
+### 45.2 脚本分段讲解
+
+**(1) 常量与路径**（`:15-30`）
+`SCRIPT_DIR` / `SGLANG`（仓库根）/ `KERNEL`（`sgl-kernel-sipu` 子模块）/ `SUITES_YAML`；镜像 `IMAGE` 默认 `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0`；并导出 `SIPU_CI_DUMP` / `SIPU_CI_WHEEL_DIR` / `SIPU_CI_QUEUE_DIR` 等。
+
+**(2) 参数解析** `sipu_ci_exec.sh` 内联的 `while` 循环（`:50-77`）
+- `--config-yaml` / `--launch-config` / `--test-case` / `--timeout`（`:52-55`）→ 存进变量 **并追加进 `RUN_ARGS`**，原样透传给下层。
+- `--test-suites`（`:56`）、`--mode eager|compile|graph`（`:57-63`）、`--platform archmodel|qemu`（`:64-69`）、`--tmp-sgl-kernel-sipu`（`:70-73`）。
+- 互斥校验（`:79-89`）：`--test-suites` 与单 case 参数不能同时给；`--mode` 只能配 `--test-suites`。
+
+**(3) 公共函数来自 `sipu_ci_single_case.sh`**（`source` 在 `:92`）
+- `detect_current_platform`（`scripts/ci/sipu_ci_single_case.sh:10`）：有 `/dev/sipu` → `qemu`，否则 `host`。
+- `setup_docker_args`（`sipu_ci_single_case.sh:34`）：拼 docker 参数（挂载 `$SGLANG:/sgl-workspace/sglang`、wheel 目录、CI_ROOT、`/share_data/*` 多个只读目录、`$HOME/.ssh`；qemu 时再加 `--device /dev/sipu/usipu*` 与 `SIRT_SHIM_NAME=ksipu`）。
+- `run_container`（`:89`）、`reclaim_host_ownership`（`:104`，把容器写出的文件 chown 回宿主 UID/GID）。
+
+**(4) 清理钩子** `cleanup`（`:96-103`）+ `trap cleanup EXIT`（`:104`）：退出时停 qemu、回收属主、删 `ci_queues`，并按 `SIPU_CI_KEEP_WHEELS` 决定是否删 `ci_wheels`。
+
+**(5) 准备 sgl-kernel 子模块**（`:142-146`）：没给 `--tmp-sgl-kernel-sipu` 就走 `init_submodule`（`:115`），必要时 `git submodule update --init sgl-kernel-sipu`。
+
+**(6) 编 wheel** `build_wheels`（`:122-140`）：起 `sipu-ci-builder` 容器，在 `$CONTAINER_KERNEL` 里 `source setup.sh` → `make clean` → `make install-kernels` → `pip wheel` 出 **5 个 wheel**（sgl-kernel 本体、`deepep`、`siorigin_triton_kernels`、`siorigin_tilelang_kernels`、`triton_ops`）。给了 `--tmp-sgl-kernel-sipu` 则整段跳过（`:148-150`）。
+
+**(7) 分派** `dispatch`（`:182-190`）：`SIPU_CI_PLATFORM=qemu` → `run_on_qemu`（`:161`，`sipu_ci_qemu.sh start` 起虚拟机、ssh 进去跑 `sipu_ci_run.sh`）；否则 `run_local`（`:156`）→ 直接 `bash scripts/ci/sipu_ci_run.sh "$@"`。
+
+**(8) suite 分支** `dispatch_suite`（`:192-215`）：调 `suite_raw`（`:152`）→ `python3 scripts/ci/sipu_ci_cases.py --suites-yaml ... --suite ...` 展开 suite；支持 `#include=` 递归子 suite、`#platform=` 覆盖平台。
+
+**(9) 主入口**（`:217-228`）：有 `--test-suites` 就逐个 `dispatch_suite`；否则 `dispatch "${PLATFORM:-archmodel}" "${RUN_ARGS[@]}"`（`:226`），最后 `exit $overall`。
+
+### 45.3 传入 `--config-yaml configs/qwen3/qwen3_0.6b_4layer.yaml --launch-config general_text_tp_custom_ar --test-case text-only` 会做什么
+
+走的是**单 case**分支（没有 `--test-suites`），`PLATFORM` 未给 → 平台 `archmodel`（本机容器）。完整动作链：
+
+**第 1 步：宿主机（`sipu_ci_exec.sh`）**
+1. 解析出 `CONFIG_YAML=configs/qwen3/qwen3_0.6b_4layer.yaml`、`LAUNCH_CONFIG=general_text_tp_custom_ar`、`TEST_CASE=text-only`、`TIMEOUT=30m`（默认）。三个必填项齐全，校验通过（`:84-85`）。
+2. `detect_current_platform`（`:93`）→ `host`。
+3. 建 `ci_dumps` / `ci_wheels` / `ci_queues`（`:95`），挂 `trap cleanup EXIT`（`:104`）。
+4. 没有 `--tmp-sgl-kernel-sipu` → `init_submodule`（`:145`）。
+5. `setup_docker_args`（`:147`）→ `build_wheels`（`:149`）：**编 5 个 wheel** 到 `ci_wheels/`，然后 `reclaim_host_ownership`。
+6. `dispatch archmodel --config-yaml ... --launch-config ... --test-case ...`（`:226`）→ `run_local`（`:158`）→ `bash scripts/ci/sipu_ci_run.sh <三个参数>`。
+
+**第 2 步：`sipu_ci_run.sh`（仍在宿主机）**
+7. 校验参数、检查 `$SIPU_CI_WHEEL_DIR/*.whl` 存在（`sipu_ci_run.sh:109`），否则直接报错退出。
+8. 走单 case 分支（`:191-196`）：`export SIPU_CI_FAIL_FAST=1`，把下面这行写进 `ci_queues/cases`：
+   ```
+   qwen3|qwen3_0.6b_4layer|configs/qwen3/qwen3_0.6b_4layer.yaml|general_text_tp_custom_ar|text-only|30m
+   ```
+   （`family|model|config|launch|test_case|timeout`，`:193-195`），然后 `run_cases single 1`（`:196`）。
+9. `run_cases`（`:136`）：`SIPU_CI_RUN_DIR=$CI_ROOT/single/<YYYYMMDD>`（`run_dir_for`，`:21`，默认 `CI_ROOT=$SGLANG/ci_logs`）；`parallel=1` → `SIPU_CI_LIVE_LOG=1`；用 `xargs -P 1 -I CASE scripts/ci/sipu_ci_single_case.sh CASE`（`:152`）跑这一条 case。
+
+**第 3 步：`sipu_ci_single_case.sh` → 起容器**
+10. `run_one_case`（`sipu_ci_single_case.sh:118`）拆出各字段，`cid = qwen3_0.6b_4layer_general_text_tp_custom_ar_text-only`，拼出容器内命令（`:126-130`）：
+    ```
+    /bin/bash /sgl-workspace/sglang/scripts/ci/sipu_ci_test.sh \
+      --config-yaml configs/qwen3/qwen3_0.6b_4layer.yaml \
+      --launch-config general_text_tp_custom_ar \
+      --test-case text-only \
+      --timeout 30m
+    ```
+11. `run_container`（`:89`）→ `docker run --name sipu-ci-<cid>-$$ <docker_args> $IMAGE bash -lc "<上面的命令>"`；跑完写 `ci_queues/status/<cid>`，并 `reclaim_host_ownership`。
+12. 回到 `run_cases`：`python3 scripts/ci/sipu_ci_summary.py ...` 汇总打分（`:157`）。
+
+**第 4 步：容器内（`sipu_ci_test.sh`）**
+13. `source setup.sh` / `setup_triton.sh` / `setup_tilelang.sh`，`unset TORCH_DEVICE_BACKEND_AUTOLOAD`，设 `LD_LIBRARY_PATH`（`sipu_ci_test.sh:43-50`）。
+14. 解析 `cfg`：相对路径拼成 `$SGLANG/test/srt/sipu/configs/qwen3/qwen3_0.6b_4layer.yaml`（`:52-53`）。
+15. `case_uses_custom_deepep`（`:58`）读 `launch_configs.general_text_tp_custom_ar.test_env.text-only.SGLANG_SIPU_USE_CUSTOM_DEEPEP` → **本 config 没设** → 不装 deep_ep wheel，保留镜像自带版本（`:89-90`、`:101-104`）。
+16. `pip install --force-reinstall --no-deps` 装 `$SIPU_CI_WHEEL_DIR/*.whl`（`:99-106`）。
+17. `is_compile=0`（名字不以 `_compile` 结尾，`:122-123`），所以不设 tiled 环境、不做 compile contract 检查。
+18. 找 CUDA golden：`$SIPU_CI_CUDA_DUMP/qwen3_0.6b_4layer/general_text_tp_custom_ar/text-only/cuda`，**不存在就 exit 1**（`:138-143`）；存在则在 `$SIPU_CI_DUMP/...` 下建同名 symlink（`:145-147`）。
+19. 跑真正的 case（`:150-154`）：
+    ```
+    timeout 30m python3 -u test/srt/sipu/test_utils/run_test_job.py \
+      --config-yaml <cfg> --launch-config general_text_tp_custom_ar --test-case text-only \
+      --device sipu --dump-base $SIPU_CI_DUMP --log-base $SIPU_CI_RUN_DIR/logs
+    ```
+    日志 tee 到 `$SIPU_CI_RUN_DIR/logs/qwen3/qwen3_0.6b_4layer_general_text_tp_custom_ar_text-only_sipu.log`。
+20. 比对（`:188-198`）：`python3 -u test/srt/sipu/analyse_utils/compare_cuda_sipu.py <cfg> --dump-base ... --launch-config ... --test-case ...`，结果 tee 到 `$SIPU_CI_RUN_DIR/compare/<cid>.log`。
+
+**第 5 步：`run_test_job.py` 里这个 case 具体跑什么**
+21. `main`（`test/srt/sipu/test_utils/run_test_job.py:482`）：
+    - `launch_cfg = cfg["launch_configs"]["general_text_tp_custom_ar"]`（`:498`）；要求同时有 `cuda` 和 `sipu` 两个块（`:504`）——本 config 满足（`configs/qwen3/qwen3_0.6b_4layer.yaml:42-75`）。
+    - `test_case` 必须在 `launch_cfg["tests"]` 里（`:508`）——本 config 是 `tests: [text-only]`（`qwen3_0.6b_4layer.yaml:44-45`）→ 通过。
+    - `TEST_REGISTRY["text-only"]` → `run_text_only`（`:514`，registry 定义在 `:475-479`）。
+    - 用时用 `_apply_test_env`（`:118`）把 `launch_configs.<name>.test_env.<case>` 里的键值写进 `os.environ`——本 launch config 会设
+      **`SGLANG_SIPU_USE_CUSTOM_ALLREDUCE=1`**（`qwen3_0.6b_4layer.yaml:46-48`）。
+22. 于是这个 case 的实际语义：用 **`sipu` 设备**、按 `sipu:` 块（`qwen3_0.6b_4layer.yaml:62-75`：`tp_size: 2`、`disable_overlap_schedule: true`、`gpu_id_step: 2`、`attention_backend: sipu`、`disable_cuda_graph: true` …）起引擎，跑 `text-only`（纯文本 prompt，`temperature=0`, `max_new_tokens=2`），**并打开 `SGLANG_SIPU_USE_CUSTOM_ALLREDUCE=1`**（这就是名字里 `tp_custom_ar` 的含义：TP + 自定义 all-reduce），dump 各层张量，再和 CUDA golden 比 `cos_sim` / `mean_atol`。
+
+**判定门槛**（`scripts/ci/sipu_ci_summary.py` 模块 docstring）：eager 模式下要求 case 退出码 0，且每个可比对的 pass 满足 `cos_sim >= 0.999`、`mean_atol <= 0.05`；结果写 `<run-dir>/summary.tsv` 与 `summary.log`。
+
+### 45.4 `--launch-config` 的合法值
+
+**没有全局枚举——合法值由 `--config-yaml` 自己决定。** 校验点在 `test/srt/sipu/test_utils/run_test_job.py:498-503`：
+
+```python
+launch_cfg = cfg["launch_configs"].get(args.launch_config)
+if not isinstance(launch_cfg, dict):
+    raise ValueError(f"{args.config_yaml}: unknown launch_config {args.launch_config!r}. "
+                     f"Available: {sorted(cfg['launch_configs'])}")
+```
+
+即：**合法值 = 该 YAML 里 `launch_configs` 的键**。另有两条附加约束：必须同时含 `cuda` 与 `sipu` 两个引擎块（`:504-507`）；`--test-case` 必须在 `launch_configs.<name>.tests` 列表里（`:508-513`）且在 `TEST_REGISTRY` 中（`:514-518`）。
+
+**(a) 对本次的 `configs/qwen3/qwen3_0.6b_4layer.yaml`，只有 2 个合法值**（`qwen3_0.6b_4layer.yaml:14-75`）：
+
+| `--launch-config` | 特点 |
+|---|---|
+| `general_text` | 基础文本路径，`tp_size` 未设（默认单卡） |
+| `general_text_tp_custom_ar` | `tp_size: 2`、`gpu_id_step: 2`、`disable_overlap_schedule: true`，并设 `test_env.text-only.SGLANG_SIPU_USE_CUSTOM_ALLREDUCE=1` |
+
+两个的 `tests` 都只有 `text-only`。
+
+**(b) 全仓库范围出现过的名字共 13 个**（对 `test/srt/sipu/configs/*/*.yaml` 的键去重统计）：
+
+| 名字 | 出现次数 | 含义 |
+|---|---|---|
+| `general_text` | 20 | 通用文本（dense）路径 |
+| `triton_moe_text` | 18 | MoE + Triton 文本路径 |
+| `deepep_deepgemm_text` | 17 | MoE + DeepEP + DeepGEMM 文本路径 |
+| `general_vision` | 16 | 通用多模态（vision）路径 |
+| `triton_moe_vision` | 10 | MoE + Triton 多模态 |
+| `deepep_deepgemm_vision` | 5 | MoE + DeepEP + DeepGEMM 多模态 |
+| `general_text_tp_siccl` | 1 | 文本 + TP + SiCCL |
+| `general_text_tp_custom_ar` | 1 | 文本 + TP + 自定义 all-reduce（本次用的） |
+| `general_text_compile` | 1 | 文本 + torch.compile |
+| `deepep_deepgemm_text_compile` | 1 | MoE 路径 + torch.compile |
+| `deepep_deepgemm_dp_ep` | 1 | DeepEP 的 DP/EP 变体 |
+| `triton_text` | 1 | Triton 文本路径 |
+| `triton_vision` | 1 | Triton 多模态路径 |
+
+> 命名规律：`<attention_backend>_<moe_backend>_<modal>[_<并行/编译变体>]`，例如 `general_text`、`triton_moe_vision`、`deepep_deepgemm_text_compile`。
+
+**(c) 命名后缀约定**：名字以 `_compile` 结尾时进入 compile 模式——`sipu_ci_test.sh:122-123` 用 `[[ "$LAUNCH_CONFIG" == *_compile ]]` 判定 `is_compile`，随后打开 tiled 环境变量并把用来找 CUDA golden 的名字去掉 `_compile` / `_graph` 后缀（`:125-134`）。所以「合法值」还包括各 config 里按这个约定命名的 `*_compile` 键（如 `general_text_compile`、`deepep_deepgemm_text_compile`）。
+
+**(d) suite 路径下的取值**：`--test-suites` 走 `scripts/ci/sipu_ci_cases.py::main`（`:34`），从 `scripts/ci/sipu_ci_suites.yaml` 的 `suites.<name>.cases[].launch_config` 读（`:60-76`），已用到的就是上表里除 `general_text_tp_custom_ar` 之外的那些。当前 suites 有 4 个：`smoke`(3 例) / `single-rank`(77 例) / `distributed`(3 例, qemu) / `nightly`(include `single-rank`+`distributed`)。
+
+### 45.5 附：相关可调项速查
+
+| 参数 / 环境变量 | 作用 | 出处 |
+|---|---|---|
+| `--platform archmodel\|qemu` | 本机容器 or QEMU 客户机 | `sipu_ci_exec.sh:64-69`, `:185` |
+| `--tmp-sgl-kernel-sipu <dir>` | 跳过子模块初始化 + 编 wheel，改用现成目录 | `:70-73`, `:142-150` |
+| `--mode eager\|compile\|graph` | 仅配 `--test-suites` | `:57-63`, `:86-88` |
+| `SIPU_CI_KEEP_WHEELS=1` | 退出时不删 `ci_wheels` | `:100-102` |
+| `SIPU_CI_CUDA_DUMP` | CUDA golden 根目录 | `:27`，默认 `/share_data/sglang_sipu/accuracy_verify/$CI_USER` |
+| `SIPU_CI_DUMP` | 本次 dump 根目录 | `:28`，默认 `$PWD/ci_dumps` |
+| `SIPU_CI_WHEEL_DIR` | wheel 目录 | `:29`，默认 `$PWD/ci_wheels` |
+| `SIPU_CI_RUN_DIR` | 日志/比对结果目录 | `sipu_ci_run.sh:21`，单 case 为 `$CI_ROOT/single/<日期>` |
+| `SIPU_CI_IMAGE` | 容器镜像 | `:20`，默认 `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0` |
+
+**`--test-case` 的合法值**（`run_test_job.py:475-479` 的 `TEST_REGISTRY`）只有 3 个：`text-only`、`vision-with-text`、`prefix-caching`（且还要出现在所选 launch-config 的 `tests` 里）。
