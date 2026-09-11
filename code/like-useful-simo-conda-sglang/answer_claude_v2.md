@@ -4753,3 +4753,253 @@ main()
 ### 47.13 一句话总结这份 kernel 的设计哲学
 
 **用最少的同步换最大的数据局部性**：一个 PE 的两个硬件线程各拿 256 KB SRAM 缓存自己负责的整行，Pass 1 读 global 顺手写 shared，Pass 2 从 shared 读，全程**只有一条 `twait_store_share(0)` 同步指令、零 `__syncthreads`、零跨线程归约**；代价是 `norm_size` 必须 1024 B 对齐（无 tail 处理）、occupancy 固定 1 block/PE、非连续布局只支持白名单里的两个精确 shape。对 LLM 推理里 hidden size 固定且对齐的场景，这是一笔非常划算的交易。
+
+---
+
+## 48. CSR 指令详解：从 RISC-V 标量 CSR 到 Tile Core CSR
+
+**ISA 文档**：`/softhome/like/asset/code/isa/index.html` → 章节「Control Register Operation / CSR指令」
+**实证来源**：`sikernel/source/source_builtin/attention/rms_norm/build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm`
+
+第 47 节讲到 grid/block 坐标要从 CSR 里读出来，但没有展开 CSR 本身。这一节补齐。
+
+### 48.1 什么是 CSR
+
+**CSR = Control and Status Register**（控制状态寄存器）。严格说 CSR 是"一类寄存器"，CSR 指令是访问它们的那几条指令。
+
+它和普通 `ld`/`st` 的根本区别有三条：
+
+| 维度 | 普通内存 | CSR |
+| --- | --- | --- |
+| 是否在地址空间里 | 是，有虚拟/物理地址 | **否**，独立编号空间 |
+| 用什么访问 | `ld` / `st` / `lw` / `sw` … | **专用 CSR 指令**，不能用访存指令 |
+| 读写副作用 | 无（就是读写存储） | **常有**：读清、置位、清位、只写、写触发脉冲 |
+
+第三条是关键。比如本文档 48.5 节要讲到的 `tend`，手册明确写「该寄存器不可读，只会发出一个脉冲信号通知 CCS」——它不是一块存储，而是一个**控制动作**。`tmask` 则是「kernel 配置一次，全局影响所有用到 mask 的指令」，写它等于改硬件行为，不是存一个数。
+
+### 48.2 这个平台上有**两套**独立的 CSR 空间
+
+这是读下面汇编时最容易踩的坑。rms_norm 的 fatbin 里两种 CSR 指令**并排出现**，前后只差几条指令：
+
+```asm
+804000000310: 813024f3    csrr  s1, umisc_ctl      ← RV 标量核的 CSR
+804000000314: 98f1        andi  s1, s1, -0x4
+804000000316: 81349073    csrw  umisc_ctl, s1      ← 清位后写回（f16 kernel 用）
+80400000031a: 68c042fb    tcsrr.r.b64 t0, tkernelidx  ← Tile Core 的 CSR，另一条通道
+804000000326: 69004e7b    tcsrr.r.b64 t3, tkerneldims
+```
+
+| | RV 标量核 CSR | Tile Core CSR |
+| --- | --- | --- |
+| 访问指令 | `CSRRW` / `CSRRS` / `CSRRC` + `i` 变体 | `TCSRR` / `TCSRW` / `TCSRWI` |
+| 指令编码 | 标准 RISC-V，opcode `0x73`（SYSTEM） | ACE 自定义 opcode `0x7B` |
+| 编址 | 12 bit CSR 号 | 9 bit `csr_addr[10:2]`，4 B 步进 |
+| 谁写 | 软件（kernel 自己读写） | **CCS / Block Dispatch 配置**，kernel 只读 |
+| 典型例子 | `umisc_ctl`（浮点模式）、`mstatus`、`mhartid` | `tkernelidx`、`tkerneldims`、`thwid`、`tmask`、`tend` |
+
+**两张表不通用**：RV 的 `csrr` 读不到 `tkernelidx`，Tile 的 `tcsrr` 也读不到 `umisc_ctl`。两套空间、两套指令、各自独立编号。
+
+### 48.3 RISC-V 标准 CSR 指令（6 条）
+
+opcode 固定 `0x73`，由 `funct3` 区分操作：
+
+| `funct3` | 指令 | 语义 |
+| --- | --- | --- |
+| 001 | `CSRRW` | 读旧值到 rd，同时把 rs1 写入 CSR |
+| 010 | `CSRRS` | 读旧值到 rd，把 rs1 的 **1 位置位**到 CSR（`rs1=x0` 即只读） |
+| 011 | `CSRRC` | 读旧值到 rd，把 rs1 的 **1 位清位**到 CSR |
+| 101 | `CSRRWI` | 同 CSRRW，写 5 bit 立即数 |
+| 110 | `CSRRSI` | 同 CSRRS，写 5 bit 立即数 |
+| 111 | `CSRRCI` | 同 CSRRC，写 5 bit 立即数 |
+
+两条常用伪指令：
+
+- `csrr rd, csr` ≡ `csrrs rd, csr, x0` —— 只读不写
+- `csrw csr, rs1` ≡ `csrrw x0, csr, rs1` —— 只写不读
+
+**实证解码 1**：`csrr s1, umisc_ctl`，机器码 `0x813024f3`
+
+| 位域 | 值 | 含义 |
+| --- | --- | --- |
+| `[6:0]` | `0b1110011` = `0x73` | SYSTEM opcode |
+| `[11:7]` | 9 | rd = `s1` |
+| `[14:12]` | `0b010` = 2 | funct3 = CSRRS |
+| `[19:15]` | 0 | rs1 = `x0` → **不写，只读** |
+| `[31:20]` | `0x813` | CSR 号 = `umisc_ctl` |
+
+**实证解码 2**：`csrw umisc_ctl, s1`，机器码 `0x81349073`
+
+| 位域 | 值 | 含义 |
+| --- | --- | --- |
+| `[6:0]` | `0x73` | SYSTEM opcode |
+| `[11:7]` | 0 | rd = `x0` → **丢弃旧值** |
+| `[14:12]` | 1 | funct3 = CSRRW |
+| `[19:15]` | 9 | rs1 = `s1`（写入的数据） |
+| `[31:20]` | `0x813` | CSR 号 = `umisc_ctl` |
+
+对照源码 `__clang_nds_device_functions.h` 里的 `__andescore_fp_mode`，语义完全吻合——读 `umisc_ctl`、清掉 bit[1:0]、按需置 bf16 位、再写回：
+
+```c
+unsigned long long umisc_ctl = __nds__read_csr(NDS_UMISC_CTL) & ~0x3;
+if (mode == BF16) umisc_ctl |= 1;
+__nds__write_csr(umisc_ctl, NDS_UMISC_CTL);
+```
+
+汇编里的三行 `csrr` / `andi` / `csrw` 就是这个函数被内联的结果（**注意：RV 的 CSR 是软件自己读写的，和下面 Tile CSR 的"kernel 只读"完全不同**）。
+
+### 48.4 Tile Core CSR 指令（3 条）
+
+ISA 手册「Control Register Operation」一节给出的原型：
+
+| 指令 | 语法 | 作用 |
+| --- | --- | --- |
+| `TCSRR` | `tcsrr.r.b32/b64 rd, csr_addr` | 把 CSR 原有值读到 rd |
+| `TCSRW` | `tcsrw.r.b32/b64 rs1, csr_addr` | 把 rs1 的值写入 CSR |
+| `TCSRWI` | `tcsrw.i.b32/b64 imm1, csr_addr` | 写 5 bit 立即数，未用到的其余 27 bit 补 0 |
+
+三者共用同一套编码骨架（手册给出的 bitfield）：
+
+| 位域 | TCSRR | TCSRW | TCSRWI |
+| --- | --- | --- | --- |
+| `[6:0]` `ACE_op` | `1111011` | `1111011` | `1111011` |
+| `[11:7]` | `rd` | `00000` | `00000` |
+| `[14:12]` `tuop` | `100` | `100` | `100` |
+| `[19:15]` | `00000` | `rs1` | `imm_1` |
+| `[28:20]` | `csr_addr[10:2]` | `csr_addr[10:2]` | `csr_addr[10:2]` |
+| `[29]` `b64` | 0/1 | 0/1 | 0/1 |
+| `[31:30]` `rw` | `01` | `10` | `00` |
+
+**实证解码 3**：`tcsrr.r.b64 t0, tkernelidx`，机器码 `0x68c042fb`
+
+| 位域 | 值 | 含义 |
+| --- | --- | --- |
+| `[6:0]` | `0b1111011` = `0x7B` | ACE 自定义 opcode |
+| `[11:7]` | 5 | rd = `t0` |
+| `[14:12]` | `0b100` = 4 | tuop = TCSRR |
+| `[19:15]` | 0 | 保留 |
+| `[28:20]` | `0b010001100` = `0x8C` | `csr_addr[10:2]` → **0x8C << 2 = 0x230 = `tkernelidx`** ✓ |
+| `[29]` | 1 | `.b64` 模式 |
+| `[31:30]` | `0b01` | rw = 读 |
+
+三条语义细节：
+
+- **`b64` 位**：0 = 按 32 bit 访问，1 = 按 64 bit 访问。手册明确：32 bit 模式下 0x4、0x8 地址都能访问；**64 bit 模式下地址必须 64 bit 对齐，访问 0x4 属于非法**。
+- **吞吐**：读 CSR 是 cycle 0 发射命令、cycle 1 写回，throughput 0.5（两个 cycle 发一条读）；写 CSR 是 throughput 1（一个 cycle 一条）。
+- **编址宽度**：`csr_addr[10:2]` 只有 9 bit，所以整个 Tile CSR 空间是 **0x000 ~ 0x3FC、按 4 B 步进**。这和手册正文那句「0x0-0x3fc 的 CSR 寄存器都要通过以下通路进行交互」互相印证。
+
+手册还给出了完整的配置通路（原文）：
+
+> 0x0-0x3fc 的 CSR 寄存器都要都要通过以下通路进行交互。**CCS 可通过 Block Dispatch 模块配置到 Tile CSR，之后向 RV Core 发起中断启动 kernel。** 同理，在 thread 完成后，**RV Core 写 tend 寄存器**，CSR 可发起结束信号发到 Block Dispatch，BD 返回 thread-done 信号给 CCS。
+
+也就是说：**Tile CSR 的正常写入者是硬件（CCS/BD），不是 kernel 软件**。这直接决定了下面 48.6 的结论。
+
+### 48.5 CSR 列表
+
+手册「CSR列表」一节给出的完整清单：
+
+| CSR_name | CSR_addr | 属性 | 说明 |
+| --- | --- | --- | --- |
+| `tmask` | 0x0 | RW | talu 使用的配置信息，由 kernel 配置，可全局配置所有用到 tmask bit 的指令的 mask |
+| `tctrl` | 0x8 | RW | ALU 和 MMA 的 rounding / saturate / deform / MX OCP 信息，由 kernel 配置 |
+| `tcmdvalid` | 0x100 | RO | 表示目前有可执行的 kernel。BD 发任务 cmdValid 为 1，`tend` 写值后 cmdValid 改为 0 |
+| `tend` | 0x108 | **WO** | thread 完成任务需要写该寄存器，写非 0 可通知 CCS 该 thread 已经完成。**该寄存器不可读，只会发出一个脉冲信号** |
+| `thwid` | 0x180 | RO | 2 bit core_id / 2 bit pe_id / 3 bit cluster_id / 9 bit chip_id |
+| `tsynccnt` | 0x190 | RO | core_idle / mem_idle / smem_ld_cnt / smem_st_cnt / gmem_ld_cnt / cmt_group |
+| `tsmembase` | 0x200 | RW | kernel 在 share memory 使用的起始地址，由 CCS 配置，256 B 对齐，**kernel 软件无需使用** |
+| `tsmemsize` | 0x208 | RW | kernel 在 share memory 使用的地址空间范围，由 CCS 配置，256 B 对齐 |
+| `tkerneladdr` | 0x210 | RO | kernel 启动 addr，由 CCS 配置 |
+| `tparamaddr` | 0x220 | RO | kernel 启动需要的参数地址，由 CCS 配置，8 B 对齐 |
+| `tparamsize` | 0x228 | RO | kernel 启动需要的参数 size，由 CCS 配置，8 B 对齐 |
+| `tkernelidx` | 0x230 | RO | 含 tb/tbc 的 x/y/z 方向和 thread index，由 CCS 配置 |
+| `tkerneldims` | 0x240 | RO | 含 tb/tbc 的 x/y/z 方向和 thread dimension，由 CCS 配置 |
+| `tregbase` | 0x250 | RW | kernel 在 tile reg 使用的寄存器 offset，由 CCS 配置，256 B 对齐，**仅用于 debug** |
+| `tregsize` | 0x254 | RW | kernel 在 tile reg 使用的寄存器数量，由 CCS 配置，**仅用于 debug** |
+| `tprivatebase` | 0x260 | RO | kernel 在 global memory 上使用的 thread private 地址空间起始地址，256 B 对齐，**由 BD 配置** |
+| `tprivatesize` | 0x268 | RO | kernel 在 global memory 上使用的 thread private 地址空间总容量，256 B 对齐，**由 BD 配置** |
+| `ttbmap` | 0x270 | RO | 数据流模式下 tb 和 pe 的匹配表，由 CCS 配置 |
+
+两个值得注意的属性组合：
+
+- **`tkernelidx` / `tkerneldims` 都是 RO** —— 线程**无法伪造自己的身份**。这正是 `rms_norm_launch` 里敢用 `bid = tid; bid += all_threads` 做 grid-stride 循环、并假设各线程拿到的 `tid` 唯一且稳定的底气。
+- **`tend` 是 WO 且不可读** —— 它不是存储，是一个"我干完了"的脉冲通知。所以读它没有意义，手册才特别注明「不可读」。
+
+对照第 47 节：`rms_norm_kernel_bf16.hpp` 里没有出现过任何 `tcsrw`，线程结束时也不需要手动写 `tend`——`__global__` 函数的 epilogue 由编译器/运行时处理。
+
+### 48.6 rms_norm 里为什么非读 CSR 不可
+
+在 CUDA 里写 `blockIdx.x * blockDim.x + threadIdx.x` 看起来"免费"，是因为 SM 有专门的只读寄存器组。**这里没有等价物**：block/thread 的坐标是 CCS（Block Dispatch）在启动每个线程前，**逐线程**写进 `tkernelidx` / `tkerneldims` 这两个 CSR 的。所以编译器只能生成"读 CSR + 手工位运算"的代码。
+
+以 f32 kernel 的 prologue 为例（`0x4e` ~ `0x84`，已逐条核对位运算）：
+
+```asm
+80400000004e: 68c042fb       tcsrr.r.b64 t0, tkernelidx     # t0 = 我的坐标
+804000000052: 01029493       slli  s1, t0, 0x10
+804000000056: 0304d313       srli  t1, s1, 0x30            # t1 = t0[47:32] = tbc_idx_x
+80400000005a: 69004e7b       tcsrr.r.b64 t3, tkerneldims    # t3 = 网格形状
+80400000005e: 030e1493       slli  s1, t3, 0x30
+804000000062: 0344d393       srli  t2, s1, 0x34            # t2 = t3[15:4]  = tbc_dim_x
+804000000066: 02638333       mul   t1, t2, t1             # t1 = tbc_dim_x * tbc_idx_x
+80400000006a: 03029493       slli  s1, t0, 0x30
+80400000006e: 90d1           srli  s1, s1, 0x34            # s1 = t0[15:4]  = tb_idx_x
+804000000070: 9326           add   t1, t1, s1             # t1 = blockIdx.x
+804000000072: 00fe7e13       andi  t3, t3, 0xf             # t3 = t3[3:0]   = tb_dim = blockDim.x
+804000000076: 03c30333       mul   t1, t1, t3             # t1 *= blockDim.x
+80400000007a: 00f2f493       andi  s1, t0, 0xf             # s1 = t0[3:0]   = thread_idx
+80400000007e: 9326           add   t1, t1, s1
+804000000080: 080302bb       zext.w t0, t1                 # tid = blockIdx.x*blockDim.x + threadIdx.x
+```
+
+紧随其后再读一次 `tkerneldims` 求 `all_threads`（`0x94` ~ `0xa4`）：
+
+```asm
+804000000094: 027e03b3       mul   t2, t3, t2             # blockDim.x * tbc_dim_x
+804000000098: 690044fb       tcsrr.r.b64 s1, tkerneldims
+80400000009c: 04c2           slli  s1, s1, 0x10
+80400000009e: 90c1           srli  s1, s1, 0x30            # s1 = tkerneldims[47:32] = grid_dim_x
+8040000000a0: 029383b3       mul   t2, t2, s1             # all_threads = grid_dim_x*tbc_dim_x*blockDim.x
+```
+
+两个 CSR 的位域定义（手册「CSR列表」，双方都是 64 bit）：
+
+| bit | `tkernelidx` (0x230) | `tkerneldims` (0x240) |
+| --- | --- | --- |
+| `[3:0]` | `thread_idx` | `tb_dim` |
+| `[15:4]` | `tb_idx_x` | `tbc_dim_x` |
+| `[23:16]` | `tb_idx_y` | `tbc_dim_y` |
+| `[31:24]` | `tb_idx_z` | `tbc_dim_z` |
+| `[47:32]` | `tbc_idx_x` | `grid_dim_x` |
+| `[55:48]` | `tbc_idx_y` | `grid_dim_y` |
+| `[63:56]` | `tbc_idx_z` | `grid_dim_z` |
+
+于是 kernel 里的三个符号量全部落到具体位域上：
+
+| kernel 源码 | 由哪些位域合成 |
+| --- | --- |
+| `threadIdx.x` | `tkernelidx[3:0]` |
+| `blockIdx.x` | `tkerneldims[15:4] * tkernelidx[47:32] + tkernelidx[15:4]` |
+| `blockDim.x` | `tkerneldims[3:0]` |
+| `gridDim.x` | `tkerneldims[47:32] * tkerneldims[15:4]`（两级 grid 展开） |
+
+注意 grid 是**两级**的：`tbc`（thread block cluster）和 `tb`。`blockIdx.x` 是两级索引线性化后的结果（`tbc_dim_x * tbc_idx_x + tb_idx_x`），而 `gridDim.x = grid_dim_x * tbc_dim_x`。第 47.6 节里 `rms_norm_contiguous_launch` 算出的 `grid_dim = 16`、`block_dim = 2`，最终对应到硬件就是这四组字段的具体取值。
+
+需要 `thwid`（0x180）才能区分 chip / cluster / PE 的算子——比如 `semaphore.h`、`cooperative_groups.h`、`util_device.h` 里的 `get_thwid_pe_id()` / `get_thwid_cluster_id()`——**不是** rms_norm 这种"线程-行一对一、零跨线程通信"的 kernel。
+
+### 48.7 rms_norm fatbin 的 CSR 使用统计
+
+对 `librms_norm_si_fatbin.llvm.asm` 全文做指令统计：
+
+| 指令 | 出现次数 | 说明 |
+| --- | --- | --- |
+| `tcsrr.r.b64` | **52** | 其中读 `tkernelidx` 30 次、读 `tkerneldims` 22 次 |
+| `tcsrw` / `tcsrwi` | **0** | kernel 不写任何 Tile CSR |
+| `csrr` / `csrw`（RV 侧） | 6 / 6 | 全部是 `umisc_ctl`，即 3 处 `__andescore_fp_mode` 内联（f16、bf16、bf16_strided 各一次；f32 kernel 没有） |
+
+三点观察：
+
+1. **52 次 `tcsrr` 是"每个 kernel 每个线程重算一遍"的结果**——4 个 kernel，每个都有独立的 prologue，且 `tid` 与 `all_threads` 各要读一次 CSR（`grid-stride` 循环前算一次即可）。
+2. **`tcsrw` = 0**，印证 48.5 的结论：Tile CSR 由硬件配置，kernel 只读。第 47 节的 kernel 里没有线程退出通知逻辑，也不需要。
+3. **RV 侧那 6 条 `csrr`/`csrw` 全给了 `umisc_ctl`**，且都是"读—清 bit[1:0]—（按需置 1）—写回"的形态。f32 kernel 里没有，因为它不需要做 bf16 转换。这恰好和 47.7 节讲的 `__andescore_fp_mode(BF16)` / `(FP16)` 对上：**它改的是 RV 标量核的浮点模式 CSR，不是 Tile 的**。
+
+### 48.8 一句话小结
+
+**CSR 是"不在地址空间、要用专用指令访问、读写往往带副作用"的寄存器；这个平台上有两套互不相通的空间——RV 标量核的 `csrr/csrw`（软件自己读写，如 `umisc_ctl`）和 Tile Core 的 `tcsrr/tcsrw`（硬件配置、kernel 只读，如 `tkernelidx`/`tkerneldims`）。** rms_norm 之所以非读 CSR 不可，是因为 block/thread 坐标不像 CUDA 那样有专用寄存器，而是由 CCS 逐线程写进 `tkernelidx`/`tkerneldims`，kernel 只能用 `tcsrr.r.b64` 读回来再做位域拆解——这也解释了为什么每个 kernel 的 prologue 里都有一段"移位 + 乘法 + 加法"的样板代码。

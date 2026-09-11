@@ -2315,3 +2315,106 @@ tst.trir.linear.u32.global
    `vsetvli/vsetivli`。
 7. host 侧在 kernel API 返回后立即执行 D2H `sipuMemcpy`；测试依赖 runtime/cmodel
    对该 copy 的完成语义保证 output 已经可读。
+
+# SIPU C Intrinsic 的来源
+
+## 1. 结论
+
+`tld_linear_global_m1`、`tst_linear_global_m1` 不是 sikernel 自己实现的普通函数，
+而是 SIPU SDK 配套的 SiOrigin Clang intrinsic wrapper。调用链是：
+
+```text
+tld_linear_global_m1(...)
+  -> SDK header declaration
+  -> TILE_HEADER(tld_trr_linear_global_m1)
+  -> __builtin_rvv_tld_trr_linear_global_m1
+  -> SiOrigin Clang/SCC backend
+  -> tld.trir.linear.u32.global
+```
+
+`tst_linear_global_m1` 的链路相同，最终生成
+`tst.trir.linear.u32.global`。SDK 头文件提供声明和 builtin alias；真正的
+指令选择、operand lowering 和 encoding 在 SIPU 版 Clang/SCC compiler backend。
+
+## 2. 当前构建使用的 SDK
+
+执行：
+
+```bash
+cd /softhome/like/package/sikernel
+source setup.sh
+```
+
+当前实际环境为：
+
+```text
+SI_SDK_BIN  = /share_data/sicx_sdk/release/2609101917/bin
+SI_SDK_LIB  = /share_data/sicx_sdk/release/2609101917/lib
+CMODEL      = /share_data/arch_cmodel_release/sipu1.5/2609080400
+SIPU_ARCH   = 150
+```
+
+本次 CMake 输出为 `TARGET_SIPU_ARCH=150` 和 `-arch=sipu_150`。
+
+## 3. include 链路
+
+RMSNorm device 文件 `kernel/rms_norm_kernel.su:19-23` 直接包含：
+
+```cpp
+#include <riscv_vector.h>
+#include <siorigin_tile.h>
+#include <sipu_runtime.h>
+#include "sipu.h"
+```
+
+SDK 的 `SiTe.hpp:27-30` 也包含：
+
+```cpp
+#include <siorigin_tile.h>
+#include <siorigin_tile_inter.h>
+```
+
+对应文件位于：
+
+```text
+/share_data/sicx_sdk/release/2609101917/include/SiTe/SiTe.hpp
+/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/siorigin_tile.h
+/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/siorigin_tile_150g.h
+/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/siorigin_tile_inter.h
+```
+
+`siorigin_tile.h:19-26` 根据 `__riscv_xsotile150g/160g/170g` 选择架构头；
+本次 SIPU 1.5 选择 `siorigin_tile_150g.h`。
+
+## 4. 函数声明位置
+
+在 `siorigin_tile_150g.h` 中：
+
+- `tld_linear_global_m1` 约在 `3882-3902` 行。
+- `tst_linear_global_m1` 约在 `14756-14776` 行。
+
+当前 BF16 overload 是：
+
+```cpp
+TILE_HEADER(tld_trr_linear_global_m1)
+tbfloat16m1_t tld_linear_global_m1(
+    const bfloat16_t* baseAddr,
+    unsigned long offset,
+    uint32_t attr = 0);
+
+TILE_HEADER(tst_trr_linear_global_m1)
+void tst_linear_global_m1(
+    tbfloat16m1_t src,
+    bfloat16_t* baseAddr,
+    unsigned long offset,
+    uint32_t attr = 0);
+```
+
+同一文件还提供 int32、int8、fp16、fp32、FP8 等 dtype overload。
+
+`siorigin_tile_inter.h` 也有同名声明：
+
+- `tld_trr_linear_global_m1` 约在 `2318-2358` 行。
+- `tst_trr_linear_global_m1` 约在 `10390-10430` 行。
+
+它们使用 `sifmt::bfloat16` 等 SiTe 类型，是 SDK 的兼容/交互 API 声明集合。
