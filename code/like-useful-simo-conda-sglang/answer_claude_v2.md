@@ -4200,7 +4200,7 @@ typedef union {
 | `tcvt_bf16(tile, t_r32)` | `tcvt.tt.bf16.f32.r32` | 2 KB f32 → 1 KB bf16 |
 | `tmul(a, b)` / `tadd(a, b)` | `tmul.ttt.f32` / `tadd.ttt.f32` | tile 逐元素乘/加（无 fma，见 47.10） |
 | `tmv_t_f32(v)` | `tmv.trr.broadcast` | 标量 → 广播填满整个 tile 寄存器 |
-| `tmv_v_f32(tile, i)` | `tmv.vtr.e32` | 取 tile 里第 i 个 **128 B 块**（32 个 f32）到 RVV 向量寄存器 |
+| `tmv_v_f32(tile, i)` | `tmv.vtr.e32` | 取 tile 里第 i 个 **128 B 块**（32 个 f32）到 RVV 向量寄存器（**128 B 的来历见 47.7.1 末尾的专门小节**） |
 | `twait_store_share` | `twait.i.store.share` | 见上 |
 
 `t_r32` 来自 `tile_vector.h`（`const unsigned t_r32 = 0x02;`），是 `tcvt` 的**shape / 布局属性**——ISA 文档里 matrix conversion 的语法是 `tcvt.tt.<dtype>.<atype>.<shape>`，其中 shape 编码 32 行 = `r32`、16 行 = `r16`、8 行 = `r8`。反汇编中确实生成成了 `.r32` 后缀，说明它选的是"32 行"的转换布局。
@@ -4372,6 +4372,145 @@ tmv.ttrr.u128      T1, T0, 1, 1                # 拷贝 128B 块 1
 
 1. **tile 内 → RVV 向量**：`tmv_v_f32(tile, i)` 把 tile 寄存器里第 `i` 个 **128 B 块**（32 个 f32）搬进一个 `vfloat32m1_t`（RVV，1024 bit）。一个 m1 tile = 1 KB = **8 个 128 B 块**，所以循环是 `i = 0..7`。反汇编确认：`tmv.vtr.e32 v9, T1, zero` / `tmv.vtr.e32 v10, T1, s2` … 配 7 条 `vfadd.vv`。
 2. **RVV 向量内 → 标量**：先 8 个块**逐 lane 相加**（得到一个 32 lane 的部分和向量），再 `vfredosum` 做跨 lane 归约成 1 个数，最后 `vfmv.f.s` 把向量第 0 lane 搬到 `fa3`。
+
+##### 为什么是 128 B？—— 这个数的完整来源
+
+`tmv.vtr` 的第二个参数（`0U`、`i`）是**块序号**，不是字节偏移。为什么"一块"正好是 128 B，而不是 32 B、256 B？有四条独立证据交叉印证。
+
+**块大小 128 B 与元素类型无关**（这一点实测确认）：f32 和 bf16 搬的**是同一个 128 B**，只是元素个数不同——
+
+```asm
+; tmv_v_f32(t, i)  ->  vsetvli a1, zero, e32, m1, ta, ma
+;                      tmv.vtr.e32  v8, T0, a0         SEW=32 → 128/4 = 32 个 f32
+; tmv_v_bf16(t, i) ->  vsetvli a1, zero, e16, m1, ta, ma
+;                      tmv.vtr.e16  v8, T0, a0         SEW=16 → 128/2 = 64 个 bf16
+```
+
+两者指令里的 `rs2`（块序号 `a0`）语义完全一样，变的只是 `vsetvli` 设定的 `SEW`/`vl`。**"128 B"是 tile 侧的固定结构，与数据类型解耦**——这也是下面第 (2) 条算术能成立的原因。
+
+**（1）ISA 手册的规定：`rs2` 索引的粒度是 128 B。**
+
+手册在 move 类指令的字段说明里写明（`/softhome/like/asset/code/isa/index.html`，「Tile Tile to Vector」与字段表一节）：
+
+> `rs2`：64-bit 整形标量寄存器编号，tile 寄存器的 index，**可按 32B 或 128Byte 维度索引**，粒度按照操作的元素宽度设计。……在操作 **128B** 时该值**大于等于 8 是未定义行为**；在操作 32B 时该值大于等于 32 是未定义行为。
+
+以及 Tile→Vector 的语义：
+
+> **该指令将 `rs2` 指定 index 的 128Byte 的 Tile 寄存器的数据 move 到 `vd` 指定的向量寄存器。**
+
+"index ≥ 8 是未定义行为"这句话本身就是答案的一半——**只有 8 个块，所以块大小必然是 1024 B / 8 = 128 B**。内核里 `for (long i = 1; i < 8; ++i)` 的上界 8，正是从这个约束来的，不是随手写的。
+
+**（2）算术自洽：128 B × 8 = 1024 B = 一个 tile 寄存器。**
+
+```
+1 个 tile reg        = 8192 bit = 1024 B        （第 47.7.0 节的速查表）
+手册给的块数上限      = 8                          （index ≥ 8 未定义）
+=> 块大小             = 1024 B / 8 = 128 B
+```
+
+**（3）RVV 侧宽度也正好是 128 B —— 这才是"能直接搬"的原因。**
+
+这一步是**最关键的一环**：搬运的源块和目的寄存器必须等宽。这个平台的 **VLEN 是 1024 bit = 128 B**，编译器源码里写死了：
+
+```c
+// compiler-toolchain/llvm-project/llvm/lib/Target/RISCV/RISCVProcessors.td:1469-1471
+def SiOrigin_SIPU150 : SiOriginSIPUModel<"sipu150", ...,
+                                         [FeatureVendorXSOTile150G,
+                                          // sipu150 has a vlen of 1024b
+                                          FeatureStdExtZvl1024b]>;
+```
+
+注意 **150 是 1024b，而 160/170 是 256b**（同文件 `:1472-1479` 的注释："`sipu160` has a vlen of 256b"、":1478 同 170"）。**这个数字很重要，它决定了"一块 128 B 在 RVV 侧要占几个寄存器"**：
+
+| | VLEN | 一个 RVV `m1` 寄存器 | 装下 128 B 需要 |
+| --- | --- | --- | --- |
+| **150**（本 kernel 用的） | 1024 bit = **128 B** | 128 B | **1 个 m1** |
+| 160 / 170 | 256 bit = **32 B** | 32 B | **4 个 m1 → m4** |
+
+**这一差别直接体现在函数名上**，而且是 150 与 160/170 的 `tmv` 接口不兼容的原因：
+
+```c
+// 150g（siorigin_tile_150g.h:9964）——没有粒度后缀，返回 m1
+TILE_HEADER(tmv_vtr_f32) vfloat32m1_t tmv_v_f32(tfloat32m1_t src, unsigned long index);
+
+// 160g（siorigin_tile_160g.h:7294 / :7334）——粒度写进名字，返回类型跟着变
+TILE_HEADER(tmv_vtr_u128_f32) vfloat32m4_t tmv_v_u128_f32(tfloat32m1_t src, unsigned long index);
+TILE_HEADER(tmv_vtr_u32_f32)  vfloat32m1_t tmv_v_u32_f32 (tfloat32m1_t src, unsigned long index);
+```
+
+**150 上之所以没有 `u32`/`u128` 前缀，是因为它的 VLEN 恰好就是 128 B，只有一种"能一次装完"的粒度**，不需要区分。我用 `-mcpu=` 实测过三种 target：
+
+```asm
+; -mcpu=sipu150  ->  tmv.vtr.e32        v8, T0, a0   (vfloat32m1_t,  128 B)
+; -mcpu=sipu160  ->  tmv.vtr.u128.e32   v8, T0, a0   (vfloat32m4_t,  128 B)
+;                              tmv.vtr.u32.e32    v8, T0, a0   (vfloat32m1_t,   32 B)
+```
+
+`u32`/`u128` 就是**粒度的字节数**，而 LMUL 自动选成"刚好等于该粒度"的那个。这也再次印证了第 (1) 条——ISA 说的"可按 32B 或 128Byte 维度索引"，两种粒度在硬件上都存在，只是 150 的头文件只暴露了 128 B 那一种（`grep tmv_vtr_u32 150g` 命中 0 次）。
+
+**对本 kernel 的启示**：`for (i = 1; i < 8; ++i)` 这个上界、以及 `tmv_v_f32` 这个函数名，**都是 150 专属的**。要把这段归约移植到 160/170，函数名得换成 `tmv_v_u128_f32`（此时返回的是 `vfloat32m4_t`，后续 `vfadd` 也要换成 `m4`），否则根本编译不过——**不是悄悄变慢，是直接报 `use of undeclared identifier`**。
+
+---
+
+回到算术。在 150 上，f32 的情况下两边刚好都是 128 B = **32 个 f32**：
+
+| | 宽度 | f32 元素数 |
+| --- | --- | --- |
+| tile 里的一块（128 B） | 128 B | 32 |
+| 一个 RVV `vfloat32m1_t`（1×VLEN） | 128 B | 32 |
+
+**两个 32 完全吻合，所以一条 `tmv.vtr.e32` 就能把一个块整块搬进一个 RVV 寄存器**，不需要循环、不需要掩码。这也解释了代码里那个看起来突兀的 `32`——`__riscv_vfadd_vv_f32m1(temp_vec, vsum_vec, 32)` 的 `vl=32` 就是"一块的 lane 数"，而 ISA 手册对 `tmv.vtr.e32` 的要求恰好也是 `vset(i)vl(i) SEW=32, vl=32, lmul=1`（实测反汇编里就是 `vsetvli a5, zero, e32, m1, ta, ma`，而且 `vfadd.vv` 前面**没有再插 `vsetvli`**——因为 `vlmax` 对 `e32,m1` 正好是 32，两个指令的向量配置天然一致，无需切换）。
+
+**换个角度看第 (1) 条**：手册给的两种粒度，各自的上界乘出来是同一个数——`8 × 128 B = 32 × 32 B = 1024 B`，正好一个 tile 寄存器。**两种粒度殊途同归，这本身就是"tile = 1024 B"的又一次独立确认。**
+
+**（4）反汇编实测。**
+
+构建产物 `build/SipuWork.rms_norm/librms_norm_sipu_fatbin.llvm.asm` 里，索引寄存器的装载值一清二楚：
+
+```asm
+# —— 函数序言里，把"块序号 1..7"一次性装进 callee-saved 寄存器 ——
+8040000000da: 4905        li  s2, 0x1
+8040000000dc: 4989        li  s3, 0x2
+8040000000de: 4a0d        li  s4, 0x3
+8040000000e0: 4a91        li  s5, 0x4
+8040000000e2: 4b15        li  s6, 0x5
+8040000000e4: 4b99        li  s7, 0x6
+8040000000e6: 4c1d        li  s8, 0x7        # ← 到 7 为止，共 8 块
+
+# —— 归约处：1 条 vsetvli 打头，然后 8×tmv + 7×vfadd ——
+8040000001e6: vsetvli a5, zero, e32, m1, ta, ma
+8040000001ea: tmv.vtr.e32  v9,  T1, zero     # 块 0（常量 0 → 直接编成 x0）
+8040000001f2: tmv.vtr.e32  v10, T1, s2       # 块 1
+8040000001fa: vfadd.vv     v9,  v10, v9
+8040000001fe: tmv.vtr.e32  v10, T1, s3       # 块 2
+804000000206: vfadd.vv     v9,  v10, v9
+...                                          # 一直到 s8（块 7）
+80400000023a: tmv.vtr.e32  v10, T1, s8       # 块 7
+804000000242: vfadd.vv     v9,  v10, v9
+804000000246: vfredosum.vs v9,  v9,  v8
+80400000024a: vfmv.f.s     fa3, v9
+```
+
+**7 条 `li`（1..7）+ 1 条隐含的 `0` = 8 个块**，与 `1024 B / 128 B = 8` 完全对上。寄存器分配也印证了"不变的部分提前算好"：编译器把 1~7 这七个常量在**函数序言**里一次装进 `s2`-`s8`（callee-saved，跨外层 `bid` 循环复用），循环体里只剩 `tmv.vtr` + `vfadd.vv` 两条指令。
+
+**还有一处值得注意**：整段归约只有**开头一条 `vsetvli`**，后面 7 条 `vfadd.vv` 前面都没有再插——对 `e32, m1` 而言 `vlmax = VLEN/32 = 32`，正好等于代码里传的 `32`，所以向量配置一次设定后全程有效，没有多余的 `vsetvl` 切换开销。
+
+**小结这条链**：
+
+```
+ISA: rs2 索引按 128B，且 index ≥ 8 未定义
+        └─→ 隐含 8 个块
+tile reg = 1024 B（8192 bit）
+        └─→ 块大小 = 1024 / 8 = 128 B
+VLEN(150) = 1024 bit = 128 B（编译器写死 zvl1024b）
+        └─→ 1 个 m1 寄存器正好 = 1 块，一条 tmv.vtr 搬完
+128 B / 4 B = 32 个 f32
+        └─→ 循环上界 8、vl=32 全部自洽
+（旁证：另一种粒度 32 B 的上界是 32 → 32 × 32 B = 1024 B，殊途同归）
+（注意：VLEN 是 150 专属，160/170 为 256b，函数名与 LMUL 都不同）
+```
+
+**注意 `i` 的单位是"块"不是"字节"**，所以第二个参数写 `i` 而不是 `i*128`。这一点和内核里 `tld/tst` 那些按字节传 `offset` 的访存指令不同，容易混——判别方法是看手册里该字段写的是"index"还是"offset"。
 
 `RVV_UNORDER_REDUCE` 宏切换 `vfredusum`（乱序，快，结果不保证顺序）与 `vfredosum`（有序，慢，结果确定）。**当前构建没有定义这个宏**（反汇编里是 `vfredosum.vs`），所以默认走顺序归约——这是为了**跨平台/跨版本位精确可复现**，代价是慢一点。
 
