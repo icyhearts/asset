@@ -4447,3 +4447,36 @@ bash build.sh
 
 把答案追加到 like-useful/answer_codex_v6.md
 }
+
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sikernel 代码位于 /softhome/like/package/sikernel
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+
+sipu sdk 目录位于 /share_data/sicx_sdk/release/latest/
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+
+
+从sikernel code base的  source/source_builtin/attention/rms_norm/test/test_host.cpp 入手, 一个运行例子:
+运行方法是  先在 sikernel code base source setup.sh
+然后:
+cd source/source_builtin/attention/rms_norm
+bash build.sh
+./build/test_host
+运行日志 /share/users/like/package/sikernel/source/source_builtin/attention/rms_norm/run.log
+
+
+
+
+
+sipu rmsnorm device code 用到的各种 rvv intrinsic，比如:
+zero_vec = __riscv_vfredosum_vs_f32m1_f32m1(vsum_vec, zero_vec, 32) 
+rvv instrinsic 函数在哪个头文件声明的 ？
+
+把答案追加到 like-useful/answer_codex_v6.md
+}

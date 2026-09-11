@@ -6422,3 +6422,298 @@ call <[tile] 512 x bfloat> @llvm.riscv.tld.trir.linear.global.m1.tv512bf16.p0.i6
 - 最省事的修法是**再调一次 `tst` 把结果存回去**；其次 `-O0`；要 intrinsic 名就用 `-O0 -emit-llvm`（**注意 `-O2 -emit-llvm` 也会被删**）。
 - `volatile` 指针无效。
 - 第 51.1 节的探针模板本身没错，但**只对 store 类 intrinsic 开箱即用**；探 `tld` 或 ALU 类时必须让结果逃逸。
+
+---
+
+## 53. `vfredosum` 这类 RVV intrinsic 声明在哪个头文件里？
+
+**问题**：`rms_norm` device code 里用到 `__riscv_vfredosum_vs_f32m1_f32m1`、`__riscv_vfmv_v_f_f32m1`、`__riscv_vfadd_vv_f32m1` 这些 RVV intrinsic，它们的声明在哪个头文件？
+
+`source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:57-68`：
+
+```c
+vfloat32m1_t vsum_vec = tmv_v_f32(f32_sq_sum, 0U);
+vfloat32m1_t zero_vec = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+vfloat32m1_t temp_vec;
+for (long i = 1; i < 8; ++i) {
+    temp_vec =  tmv_v_f32(f32_sq_sum, i);
+    vsum_vec =  __riscv_vfadd_vv_f32m1(temp_vec, vsum_vec, 32);
+}
+zero_vec = __riscv_vfredosum_vs_f32m1_f32m1(vsum_vec, zero_vec, 32);
+sum =  __riscv_vfmv_f_s_f32m1_f32(zero_vec);
+```
+
+**答：它们不在任何头文件里声明 —— 它们是 clang 的编译器内建函数（compiler builtins），由 `#pragma clang riscv intrinsic vector` 激活，在 Sema 做名字查找时动态生成声明。**
+
+这个结论有点反直觉（毕竟源码写着 `#include <riscv_vector.h>`），所以下面把证据摆全。
+
+### 53.0 一句话结论
+
+- `#include <riscv_vector.h>` 拉进来的那份头文件，**只有 typedef、enum 和少量宏，一个 RVV intrinsic 的函数声明都没有**。
+- 真正的"声明"由 clang 自己持有：TableGen 从 `riscv_vector.td` 生成一张 builtin 名字表编译进 clang 二进制，**名字查找命中时现场造一个 `FunctionDecl` 出来**。
+- 头文件之所以必不可少，是因为它里面有一行 **`#pragma clang riscv intrinsic vector`**（`:21`）——**开这个开关才是关键，头文件内容本身几乎不做这件事**。
+- 头文件路径：**`$($CLANG -print-resource-dir)/include/riscv_vector.h`**，靠 clang 的 resource dir 机制自动找到，**不需要任何 `-I`**。
+
+### 53.1 先看"头文件里到底有什么"
+
+头文件位置（`latest` 指向当天版本，`2609111951`）：
+
+```
+/share_data/sicx_sdk/release/latest/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/riscv_vector.h
+```
+
+**全文 426 行**，构成如下：
+
+| 内容 | 行 | 数量 |
+| --- | --- | --- |
+| `#pragma clang riscv intrinsic vector` | `:21` | **1 行（关键）** |
+| `enum __RISCV_FRM` / `__RISCV_VXRM` | `:24`、`:90` | 2 个 |
+| `#define __riscv_vsetvl*` / `__riscv_vsetvlmax*` / `__riscv_vlenb` | `:32-85` | **45 行宏** |
+| `typedef __rvv_*_t v*_t;` | `:94-425` | **323 行 typedef** |
+
+**423/426 行是类型别名和宏，函数声明 0 行。** 决定性的一步——在整个 clang include 树里搜这几个名字：
+
+```bash
+$ grep -rn "__riscv_vfredosum" $CLANG_INC/     # → 无输出
+$ grep -rn "__riscv_vfadd_vv_f32m1" $CLANG_INC/  # → 无输出
+$ grep -rn "__riscv_vfmv_v_f_f32m1" $CLANG_INC/  # → 无输出
+```
+
+**整个 `include/` 目录（含所有子目录）里，这些名字一次都没出现过。** 头文件里确实没有它们的声明。
+
+作为对照，头文件里**真正**存在的 `__riscv_v*` 只有 45 行，全都是 `vsetvl` 系列的**宏**，例如：
+
+```c
+// riscv_vector.h:47
+#define __riscv_vsetvl_e32m1(avl) __builtin_rvv_vsetvli((size_t)(avl), 2, 0)
+```
+
+注意它展开到 `__builtin_rvv_vsetvli`——**`__builtin_` 前缀暴露了底下的真身**。`vfredosum` 这类没有对应宏，是直接以名字暴露给用户的。
+
+### 53.2 三个实验：定位"开关"到底是哪一行
+
+光看头文件内容不能证明"是 pragma 在起作用"。直接做减法定量验证：
+
+**实验 A —— 只给类型，不给 pragma、不 include（`t5.cpp`）：**
+
+```c
+typedef __rvv_float32m1_t vfloat32m1_t;
+vfloat32m1_t f(vfloat32m1_t a, vfloat32m1_t b){
+  return __riscv_vfredosum_vs_f32m1_f32m1(a,b,32);
+}
+```
+
+```bash
+$CLANG -S --target=riscv64 -mcpu=sipu150 -O2 t5.cpp -o -
+```
+
+```
+t5.cpp:2:56: error: use of undeclared identifier '__riscv_vfredosum_vs_f32m1_f32m1'
+```
+
+→ **编译失败**。类型够用了（`__rvv_float32m1_t` 是 clang 内建类型，见 53.5），但名字不存在。
+
+**实验 B —— 加上 pragma，依然不 include（`t6.cpp`）：**
+
+```c
+#pragma clang riscv intrinsic vector
+typedef __rvv_float32m1_t vfloat32m1_t;
+vfloat32m1_t f(vfloat32m1_t a, vfloat32m1_t b){
+  return __riscv_vfredosum_vs_f32m1_f32m1(a,b,32);
+}
+```
+
+```asm
+	li	a0, 32
+	vsetvli	zero, a0, e32, m1, ta, ma
+	vfredosum.vs	v8, v8, v9
+	ret
+```
+
+→ **编译通过，正常生成 `vfredosum.vs`。** 头文件一行没 include。
+
+**实验 C —— `#include <riscv_vector.h>`，不写 pragma（`t4.cpp`）**：同样通过（因为头文件第 21 行替你把 pragma 写了）。
+
+**三个实验合起来锁死了结论**：让 `__riscv_vfredosum_*` 从"未声明标识符"变成"可调用函数"的，**就是那一行 pragma**，跟头文件里的 323 行 typedef、45 行宏都没有关系。
+
+### 53.3 头文件是怎么被找到的：resource dir 自动发现
+
+这一点很实用——**`rms_norm` 的编译命令里没有任何指向 clang include 的 `-I`**。
+
+`source/source_builtin/attention/rms_norm/build/CMakeFiles/rms_norm.dir/build.make:84`：
+
+```
+/share_data/sicx_sdk/release/2609101917/bin/scc -arch=sipu_150 --keep-dir ... \
+  -c -fPIC -o .../rms_norm_kernel.su.o ... kernel/rms_norm_kernel.su \
+  -I/share/users/like/package/sikernel/include \
+  -I/share/users/like/package/sikernel/source/source_builtin/utils \
+  -DTARGET_SIPU_ARCH=150
+```
+
+两个 `-I` 都是 sikernel 自己的目录，**没有一个是 clang 的 include**。那份 `riscv_vector.h` 是 clang 按 resource dir 约定自己找的：
+
+```bash
+$ $CLANG -print-resource-dir
+/share_data/sicx_sdk/release/2609111951/bin/nds64le-elf-newlib-v5d/lib/clang/20
+```
+
+于是 `<riscv_vector.h>` 解析为 `<resource-dir>/include/riscv_vector.h`。两个实验印证：
+
+| 命令 | 结果 |
+| --- | --- |
+| 不传任何 `-I`，直接编译 `t4.cpp` | **通过**，生成 `vfredosum.vs`（自动发现） |
+| 加 `-nostdinc` | `fatal error: 'riscv_vector.h' file not found` |
+
+编译产物里的 `.d` 依赖文件也坐实了实际路径：
+
+```
+$ grep riscv_vector build/_SipuObj/rms_norm/kernel/rms_norm_kernel.su.d
+/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/riscv_vector.h
+```
+
+**推论**：换 SDK 版本时这个路径跟着变，**不要在脚本里硬编码**；需要时用 `$(CLANG -print-resource-dir)`。
+
+同一个 resource dir 里还有一批同族文件，都是 `clang_tablegen` 生成的：
+
+```
+siorigin_tile.h              845 B      ← 总入口
+siorigin_tile_150g.h         1.23 MB    ← 150 的全部 tile builtin
+siorigin_tile_160g.h
+siorigin_tile_170g.h
+tile_vector.h                      9.7 KB     ← tile 类型 typedef + 常量
+```
+
+### 53.4 名字从哪来：TableGen 生成、编进 clang
+
+既然头文件里没有，名字必然在编译器里。链路是这样的：
+
+**（1）TableGen 里声明。** `compiler-toolchain/llvm-project/clang/include/clang/Basic/riscv_vector.td:2392`：
+
+```c
+// 14.3. Vector Single-Width Floating-Point Reduction Instructions
+defm vfredusum : RVVFloatingReductionBuiltin;
+defm vfredosum : RVVFloatingReductionBuiltin;
+```
+
+（带舍入模式的版本在 `:2384`，用 `RVVFloatingReductionBuiltinRoundingMode`。）这些 multiclass 定义在 `riscv_vector_common.td:707`：
+
+```c
+multiclass RVVFloatingReductionBuiltin {
+  defm "" : RVVOutOp0BuiltinSet<NAME, "fd", [["vs", "vSv", "SvvSv"]]>;
+  ...
+}
+```
+
+`"vs"` 就是 `vfredosum` **`_vs`** 后缀的来源，`"fd"` 是 float/double 类型组合。
+
+**（2）生成 `.inc`。** `clang/include/clang/Basic/CMakeLists.txt:187`：
+
+```cmake
+clang_tablegen(riscv_vector_builtin_prototypes.inc -gen-riscv-vector-builtin-prototypes
+  -I ${CMAKE_CURRENT_SOURCE_DIR}/../../../../
+  SOURCE riscv_vector.td
+  TARGET ClangRISCVVectorBuiltinPrototypes)
+```
+
+Backend 实现在 `clang/utils/TableGen/RISCVVEmitter.cpp`（`TableGen.cpp:425` 注册 `gen-riscv-vector-builtin-prototypes`）。
+
+**（3）编进 clang 二进制。** 直接对 clang 可执行文件做 `strings`：
+
+```bash
+$ strings -a $CLANG | grep vfredosum
+vfredosum_vs            ← TableGen 里的记录名
+vfredosum.vs            ← 汇编助记符
+llvm.riscv.vfredosum    ← LLVM intrinsic 名
+```
+
+**这三个字符串就是全部答案**——名字表以字符串形式烧进了 clang，运行时按需匹配。
+
+### 53.5 pragma 到 Sema 的完整链路
+
+`#pragma clang riscv intrinsic vector` 只做一件事：**置一个 bool**。
+
+**（1）解析 pragma。** `compiler-toolchain/llvm-project/clang/lib/Parse/ParsePragma.cpp:4163` `PragmaRISCVHandler::HandlePragma`，关键在 `:4193`：
+
+```c
+if (II->isStr("vector"))
+  Actions.RISCV().DeclareRVVBuiltins = true;          // ← 就这一行
+else if (II->isStr("sifive_vector"))
+  Actions.RISCV().DeclareSiFiveVectorBuiltins = true;
+```
+
+这个 bool 声明在 `clang/include/clang/Sema/SemaRISCV.h:49`，默认 `false`。
+
+**（2）名字查找时拦截。** `clang/lib/Sema/SemaLookup.cpp:951`：
+
+```c
+if (RISCV().DeclareRVVBuiltins || RISCV().DeclareSiFiveVectorBuiltins) {
+  if (!RISCV().IntrinsicManager)
+    RISCV().IntrinsicManager = CreateRISCVIntrinsicManager(*this);
+
+  RISCV().IntrinsicManager->InitIntrinsicList();
+
+  if (RISCV().IntrinsicManager->CreateIntrinsicIfFound(R, II, PP))
+    return true;                                       // ← 找到了，当 builtin 处理
+}
+```
+
+**这就是"头文件里找不到声明却能编译"的机制**：正常的标识符查找会失败，但 Sema 在查找流程里插了一段——**只要 pragma 开过，就先问一问 RVV builtin 表里有没有这个名字**。
+
+**（3）动态造声明。** `clang/lib/Sema/SemaRISCV.cpp`：
+
+- `:518` `RISCVIntrinsicManagerImpl::InitIntrinsicList()` —— 遍历全部 `RVVIntrinsicRecords`，按类型/LMUL 展开（`:522` 调 `ConstructRVVIntrinsics`）
+- `:672` `RISCVIntrinsicManagerImpl::CreateIntrinsicIfFound(...)` —— 用当前查的那个名字去匹配，**命中就现场造一个 `FunctionDecl` 塞进查找结果**
+
+**注意 `ConstructedRISCVVBuiltins` 这个幂等标志**（`:520`）——builtin 表是**懒构造**的，第一次真正用到某个 RVV 名字时才展开，不是每个 TU 都白付这个代价。
+
+### 53.6 类型又是从哪来：`__rvv_*` 是 clang 内建类型
+
+上面实验 A/B 都用了 `__rvv_float32m1_t` 却**没有 include 任何头文件**，说明它不是头文件 typedef。它定义在 `clang/include/clang/Basic/RISCVVTypes.def:151`：
+
+```c
+RVV_VECTOR_TYPE_FLOAT("__rvv_float32m1_t", RvvFloat32m1, RvvFloat32m1Ty, 2,  32, 1)
+```
+
+`.def` 文件经 X-macro 展开成 clang 的 `BuiltinType`。头文件 `riscv_vector.h:361` 只是给它起了个短名字：
+
+```c
+typedef __rvv_float32m1_t vfloat32m1_t;
+```
+
+**所以 `vfloat32m1_t`（能用、要 include）和 `__rvv_float32m1_t`（用的同一个类型、不用 include）是同一个东西的两个名字。** 写探针时用后者可以少 include 一个头——当然练手之外不建议。
+
+### 53.7 对照：本项目里三种不同的"名字来源"机制
+
+值得放在一起对比，因为 rms_norm kernel 里三种都用到了：
+
+| 名字 | 机制 | 声明在哪 |
+| --- | --- | --- |
+| `__riscv_vfredosum_vs_f32m1_f32m1` | **pragma 激活的 compiler builtin** | 无头文件，Sema 动态生成（53.5） |
+| `__riscv_vsetvl_e32m1` | **真·宏** | `riscv_vector.h:47`，展开到 `__builtin_rvv_vsetvli` |
+| `tmv_v_f32` / `tld_linear_global_m1` / `tmul` | **`clang_builtin_alias`** | `siorigin_tile.h` + `siorigin_tile_150g.h` |
+
+第三种（tile intrinsic，第 49–52 节反复打交道的那些）机制又不一样，它**确实是头文件声明的**，但不是普通函数——`siorigin_tile.h:15-18` 这几行宏是全部机关：
+
+```c
+#define __rvv_generic \
+    static inline __device__ __attribute__((__always_inline__, __nodebug__))
+#if defined(__SIPU_ARCH__) && (__SIPU_ARCH__ >= 100)
+#define TILE_HEADER(T) __rvv_generic __attribute__((clang_builtin_alias(__builtin_rvv_##T)))
+```
+
+`siorigin_tile_150g.h:9964` 展开后就是：
+
+```c
+static inline __device__ __attribute__((__always_inline__, __nodebug__))
+__attribute__((clang_builtin_alias(__builtin_rvv_tmv_vtr_f32)))
+vfloat32m1_t tmv_v_f32(tfloat32m1_t src, unsigned long index);
+```
+
+`clang_builtin_alias` 把用户可见的 `tmv_v_f32` 绑到 `__builtin_rvv_tmv_vtr_f32` 上——**最后还是落到 clang 内建**。所以三种机制殊途同归，只是包装层次不同。
+
+### 53.8 实操推论
+
+1. **要查某个 RVV intrinsic 的精确签名，别翻 `riscv_vector.h`** ——里面没有。查 `compiler-toolchain/.../clang/Basic/riscv_vector.td`（声明处）和 `riscv_vector_common.td`（签名模板 `[["vs", "vSv", "SvvSv"]]`），或者直接编译一个探针让编译器报错告诉你签名。
+2. **写探针/RVV 小例子时，`#pragma clang riscv intrinsic vector` 或 `#include <riscv_vector.h>` 二选一，必须有。** 只 include `siorigin_tile.h` 是不够的——它的 include 链里虽然间接带了 `riscv_vector.h`（`siorigin_tile.h:11`），但那只是因为 tile 头本身要用 `vbfloat16m1_t` 之类的 RVV 类型，**不能想当然认为"include 了 tile 头就能用 RVV intrinsic"**。
+3. **头文件路径不要硬编码**，用 `$(CLANG -print-resource-dir)/include`。实测 `latest` 是软链（当前指向 `2609111951`），而 `build.make:84` 里写死的是 `2609101917`，两者并存。
+4. **`__riscv_*` 是保留前缀**：写业务代码时如果出现"未声明标识符"但看着语法没问题，先想想是不是漏了 pragma/include；反过来，如果自己定义了以 `__riscv_` 开头的符号，很可能撞上 builtin 表。
