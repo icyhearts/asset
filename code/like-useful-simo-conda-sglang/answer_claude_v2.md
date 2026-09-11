@@ -5612,3 +5612,337 @@ kernel/rms_norm_kernel_bf16.hpp:56
 - 内建的**名字**由 TableGen 拼成（`MemLinearConfig.IntrinsicStr` → `"_share_m1"`，再前缀 `tst_linear`）；**指令编码**定义在 `RISCVInstrInfoXSOTile150GMemory.td:198`，位域在 `RISCVInstrFormatsXSOTile.td:110`。
 - 最终汇编是 `tst.trir.linear.u32.share T4, (s1), 0x0, s10`，机器码 `0x8204907b 91a0607b`，**15 个编码字段已逐位核对全部吻合**。
 - 助记符里看不到 `.m1` 是因为 `toAsmStrWithType` 显式把 `.m1` 替换为空——m1 是默认 LMUL；真正的 LMUL 编码在 `Inst{54:52}`。
+
+---
+
+## 51. 通用方法：从 `siorigin_tile_150g.h` 的函数名反查它的功能
+
+**问题**：`siorigin_tile_150g.h` 里几千条 intrinsic 全无注释，`tst_linear_share_m1(...)` 这种名字只能靠猜。有没有**通用办法**，从一个函数名反推出它对应 ISA 手册里哪条指令、LLVM intrinsic 是什么、汇编助记符是什么？
+
+**SDK**：`/share_data/sicx_sdk/release/latest/`（→ `2609101917`）
+**编译器**：`/share/users/like/package/compiler-toolchain/`
+**ISA 文档**：`/softhome/like/asset/code/isa/index.html`
+
+### 51.0 结论先行：四种办法，按"是否需要动手"排序
+
+| # | 办法 | 命令/位置 | 得到什么 | 成本 |
+| --- | --- | --- | --- | --- |
+| **1** | 直接编译探针 | 一条 `clang -S` | **汇编助记符**（需 `__shared__` + 变量偏移才准） | 最低，10 秒 |
+| **2** | 反汇编已构建产物 | `llvm-objcopy` + `llvm-objdump` | 汇编助记符 + 实际寻址代码 | 低，产物已在 |
+| **3** | 查自动生成的编译器测试 | `grep` 测试目录 | 助记符 + 类型重载全表 | 最低，纯 grep |
+| **4** | 读 TableGen 命名规则 | 编译器源码 | **名字每一段的含义**（唯一能给出"为什么"的办法） | 高，但一次学会终身受用 |
+
+**没有注释不是疏漏，是设计**：这些名字是 TableGen 从结构化配置**机械生成**的（见 51.4）。所以名字本身就是一份编码过的文档——只要知道解码表，任何一条都能反查。
+
+四条路对 `tst_linear_share_m1` 的答案一致：**`tst.trir.linear.u32.share`**，ISA 手册章节「Tile Unit-stride Share Memory Store」。
+
+---
+
+### 51.1 办法 1：直接编译一个探针文件（推荐首选）
+
+**思路**：`siorigin_tile_150g.h` 里的函数都是 `clang_builtin_alias` 包装（见第 50 节），写一个最小函数调用它，让编译器把汇编打出来。
+
+新建 `/tmp/probe.cpp`：
+
+```c
+#include <tile_vector.h>
+#include "siorigin_tile.h"
+
+__shared__ bfloat16_t sbuf[512];          // 必须真的建在 shared memory 上
+
+void probe(tbfloat16m1_t s, long off) {   // 偏移用变量，才能拿到 trir 形态
+  tst_linear_share_m1(s, sbuf, off);
+}
+```
+
+用 SDK 里的 clang 编译（`-S` 出汇编，`-DLAZYLOAD` 让函数走 `__tile_*` 内建路径）：
+
+```bash
+CLANG=/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/bin/clang
+$CLANG -S --target=riscv64 -mcpu=si150 \
+  -mllvm --si-disable-reuse-legalize \
+  -mllvm --si-default-threading-mode=single-thread \
+  -DLAZYLOAD -fno-inline \
+  -I$SDK/bin/nds64le-elf-newlib-v5d/lib/clang/20/include \
+  probe.cpp -o -
+```
+
+**实测输出**（只截取目标那行）：
+
+```asm
+_Z5probeu19__tile_bfloat16m1_tl:
+	tst.trii.linear.u32.global	T0, (a0), 0, 0   # 栈上溢出，噪声
+	...
+	tst.trir.linear.u32.share	T0, (a0), 0, a1  ← 目标
+```
+
+一行就拿到了助记符。再拿 `tst.trir.linear.u32.share` 去 ISA 文档里搜，就能定位到「Tile Unit-stride Share Memory Store」章节。
+
+**两个必须注意的点**（我第一次探针就踩了，拿到的是 `.global`）：
+
+1. **第二个参数必须真的指向 shared memory**。写 `bfloat16_t* p` 这种普通指针参数，编译器会生成 `tst.trir.linear.u32.global`——因为普通指针的地址空间是 global。必须声明成 `__shared__` 数组，或者用 `__shared__` 修饰的指针，才能得到 `.share`。
+2. **偏移要用变量，不能用字面量 `0`**。常量会走立即数编码 `trii`，变量才走寄存器编码 `trir`（见 51.6）。
+
+**`-fno-inline` 带来的噪声**：输出里会有若干条 `tst.trii.linear.u32.global` 的 "1024-byte Folded Spill"——那是 ABI 把 tile 寄存器溢出到栈上保存，**不是你要找的调用**。看最后那条、且空间后缀匹配的即可。想更干净可以省略 `-fno-inline`，或把探针写成 `__device__` 函数。
+
+**为什么 `-DLAZYLOAD` 有用**：`riscv_siorigin_xsotile_memory.td` 里两套名字并存——`tile_150g.h` 用的是 `TILE_HEADER(tst_trr_linear_share_m1)`（编译器内建名），而 `-DLAZYLOAD` 走 `__tile_` 前缀的 lazy 路径。两者生成的汇编相同，但 lazy 路径编译更快、不需要完整的 arch feature 集合。
+
+**变体：只想要 LLVM intrinsic 名**，把 `-S` 换成 `-S -emit-llvm`：
+
+```bash
+$CLANG -S -emit-llvm ... probe.cpp -o -
+```
+
+**实测输出**：
+
+```llvm
+call void @llvm.riscv.tst.trir.linear.share.m1.tv512bf16.p0.i64.i64.i32(
+    <[tile] 512 x bfloat> %5, ptr %6, i64 0, i64 0, i32 0)
+```
+
+名字里的 `tv512bf16` 就是 `tbfloat16m1_t`（512 个 bfloat 元素的 tile 向量），后缀 `p0.i64.i64.i32` 是参数类型签名。
+
+---
+
+### 51.2 办法 2：反汇编已构建的产物
+
+如果算子已经构建过，`build/` 下就有 fatbin 对象，不用重新编译。
+
+`sikernel/source/source_builtin/attention/rms_norm/build/` 里的产物分两层：
+
+**（a）直接看已生成的 `.llvm.asm`**（最省事）：
+
+```bash
+grep -n "tst.trir.linear.u32.share" \
+  source/source_builtin/attention/rms_norm/build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm
+```
+
+**（b）自己从 `.su.o` 里重新提取**——这个配方来自 `mma_dte_tile_tensor/CMakeLists.txt:238-243` 的 `add_custom_command`（`OBJCOPY`/`OBJDUMP` 在 `:215-216` 定义），是构建系统生成 `.llvm.asm` 的原始命令：
+
+```bash
+BIN=/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/bin
+OBJ=source/source_builtin/attention/rms_norm/build/siObj/rms_norm/kernel/rms_norm_kernel.su.o
+
+# 1) 抽出 fatbin 段
+$BIN/llvm-objcopy -O binary --only-section=__si__fatbin "$OBJ" /tmp/fb.bin
+
+# 2) 反汇编
+$BIN/llvm-objdump --mattr=+m,+c,+f,+a,+xsotile150g -zCDS /tmp/fb.bin
+```
+
+**实测输出**（与 `.llvm.asm` 完全一致）：
+
+```
+8040000001dc: 91a0607b 8204907b   tst.trir.linear.u32.share   T4, (s1), 0x0, s10
+80400000027c: 91a0607b 8185007b   tst.trir.linear.u32.global  T3, (a0), 0x0, s10
+804000000560: 91a0607b 8304907b   tst.trir.linear.u32.share   T6, (s1), 0x0, s10
+```
+
+**坑**：段名是 `__si__fatbin`（占位符还原后带前缀）。如果不确定，先用 `llvm-readelf -S` 列出来再复制，别手写。
+
+---
+
+### 51.3 办法 3：查编译器自带的映射表（纯 grep，零编译）
+
+编译器仓库里有一批**自动生成**的测试，每一条 intrinsic 都写明了它生成的汇编。这就是官方维护的"函数名 → 助记符"对照表：
+
+`compiler-toolchain/llvm-project/clang/test/CodeGen/RISCV/xsotile150g/autogenerated/`
+
+共 **101 个**测试文件，按指令族命名（`xsotile_tld_linear_gpr_test.cpp`、`xsotile_tst_linear_imm_test.cpp`、`xsotile_tadd_3op_ttt_test.cpp`、…）。
+
+直接 grep 函数名：
+
+```bash
+grep -n "tst_linear_share_m1" \
+  compiler-toolchain/llvm-project/clang/test/CodeGen/RISCV/xsotile150g/
+```
+
+**实测输出**（`xsotile_tst_linear_imm_test.cpp:3048-3050`）：
+
+```c
+// CHECK: tst.trii.linear.u32.share
+void __rvv_tst_trr_linear_share_m1(tint32m1_t op0, int32_t * op1) {
+   return TILE_FUNC(tst_linear_share_m1)(op0, op1, 0);
+}
+```
+
+`// CHECK:` 那行就是答案。
+
+**注意**：这个测试里是 `tst.trii`（imm 版），而 rms_norm 内核里生成的是 `tst.trir`（GPR 版）——因为测试传的第三个参数是立即数 `0`，而内核传的是变量 `i*tile_size`。**同一个 C 函数名，参数是常量还是变量，会产生不同的助记符**。这一点如果只查测试文件会看漏，要结合办法 1/2 一起看。
+
+---
+
+### 51.4 办法 4：读懂命名规则（唯一能给出"为什么"的办法）
+
+前三个办法都是"查表"，遇到表里没有的名字就卡住。真正通用的办法是理解**名字是怎么被机械拼出来的**——拼装规则在 TableGen 里，是可读的源码。
+
+#### 51.4.1 名字的四段结构
+
+`tst_linear_share_m1` 拆成四段，每段来源不同：
+
+```
+  tst      _linear      _share        _m1
+   │           │            │           │
+ 指令族     访存模式     访存空间     LMUL
+   │           │            │           │
+riscv_si_    MemLinear    MemNameStr   TileNameStr
+xsotile_     Config       ("_SHARE")   ("_M1")
+memory.td    .td          同上          同上
+   │           │            │           │
+   └───────────┴────────────┴───────────┘
+                    ↓
+        PseudoStr = MemNameStr # remote_name # TileNameStr # MaskNameStr
+        IntrinsicStr = !tolower(PseudoStr)
+```
+
+拼装核心在 `compiler-toolchain/llvm-project/llvm/include/llvm/IR/IntrinsicsRISCVXSOTileFuncType.td:264-287` 的 `MemLinearConfig`：
+
+```c
+class MemLinearConfig<int tile_size, int mem_idx, int tmask_idx,
+                      string remote_name> : MemBasicConfig {
+  let MemNameStr  = !if(!eq(mem_idx, 0), "_GLOBAL", "_SHARE");       // :275
+  let MaskNameStr = !if(!eq(tmask_idx, 0), "", "_TM");               // :281
+  let TileNameStr = "_M"#!cond(!eq(tile_size, 1) : "1", ...);        // :272
+  let PseudoStr    = MemNameStr#remote_name#TileNameStr#MaskNameStr; // :284
+  let IntrinsicStr = !tolower(PseudoStr);                            // :285
+}
+```
+
+对 `mem_idx=1`、`tile_size=1`、`tmask_idx=0`、`remote_name=""`：
+
+```
+PseudoStr = "_SHARE" + "" + "_M1" + ""  =  "_SHARE_M1"
+IntrinsicStr = tolower("_SHARE_M1")     =  "_share_m1"
+```
+
+再前缀操作名（`riscv_siorigin_xsotile_memory.td:299` 的 `defm tst_trr_linear : TStoreLinearBuiltin_m<"0sPeu", "tst_linear", ...>`），合成 **`tst_linear` + `_share_m1` = `tst_linear_share_m1`**。
+
+#### 51.4.2 查名字各段含义的"字典"
+
+有了规则，就能反查任意一段。以下字典全部可从源码机械提取：
+
+**（a）操作名前缀** —— 来自 `riscv_siorigin_xsotile_memory.td` 里的 `defm` 名：
+
+| 前缀 | 含义 | 定义位置 |
+| --- | --- | --- |
+| `tld` | Tile LoaD | `xsotile_memory.td` |
+| `tst` | Tile STore | `xsotile_memory.td` |
+| `tmul` / `tadd` / `tsub` | tile 逐元素乘/加/减 | `riscv_siorigin_xsotile_alu.td` |
+| `tcvt` | Tile ConVerT（类型转换） | `xsotile_alu.td` |
+| `tmv` | Tile MoVe（tile↔RVV 搬移） | `riscv_siorigin_xsotile_mov.td` |
+| `tmma` / `tmva` | Tile Matrix Multiply / MAtrix-vector | `riscv_siorigin_xsotile_mma.td` |
+| `tacp` | Tile Asynchronous CoPy | `xsotile_memory.td` |
+| `tcsrr` / `tcsrw` | Tile CSR 读/写 | `riscv_siorigin_xsotile_tcsr.td` |
+
+**（b）访存模式** —— 决定 `_linear` / `_stride` / `_index` / `_blk` 这几段：
+
+| 名字里出现 | ISA 章节 | 含义 |
+| --- | --- | --- |
+| `linear` | Tile Unit-stride Load/Store | 单位步长（连续） |
+| `stride` | Tile Strided Load | 带步长 |
+| `index` | Tile Indexed Load | 索引向量寻址（gather/scatter） |
+| `blk` | Tile Block Load | 块状 |
+
+**（c）访存空间** —— `MemNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:275`）：
+
+| 名字里出现 | `mem_idx` | 含义 |
+| --- | --- | --- |
+| `global` | 0 | global memory |
+| `share` | 1 | **share memory**（kernel 的 `__shared__`） |
+
+**（d）操作数类型 `trir` 这类字母串** —— `t`=tile reg，`r`=标量 GPR，`i`=立即数，按操作数顺序排列。例如 `trir` = `Ts1`(tile) + `rs1`(GPR) + `imm1`(imm) + `rs3`(GPR)。这个在 `IntrinsicsRISCVXSOTileFuncType.td` 的 `TLSU*ParamNames` 里定义。
+
+**（e）元素类型字母** —— 这是**唯一需要查表**的一段（不是自解释的）。表在 `RISCVInstrInfoXSOTile.td` 的 `SiType` 定义里（`:66` 起的 `class SiType<string typename, string typecode, ...>`）。我把它机械提取出来：
+
+| 字母 | 类型 | 字母 | 类型 |
+| --- | --- | --- | --- |
+| `c` | S8 | `m` | F8E4M3 |
+| `x` | **F16** | `n` | F8E5M2 |
+| `y` | **BF16** | `t` | **TF32** |
+| `f` | **F32** | `g` | MXI4 |
+| `i` | S32 | `e` | MXI8 |
+| `l` | S64 | `a` | MXF8E5M2 |
+| `h` | S4 | `b` | MXF8E4M3 |
+| `j` | MXF6E3M2 | `k` | MXF6E2M3 |
+| `p` | MXF4 | | |
+
+（字母来自 `IntrinsicsRISCVXSOTileFuncType.td:401-405` 的 `Basic_type_common = ["i","c","x","y","f","m","n","t","l"]`；类型码来自 `RISCVInstrInfoXSOTile.td` 的 `SiType` 表。）
+
+**（f）LMUL** —— `_m1` / `_m2` / `_m4` / `_m8` / `_mf2` / `_mf4` / `_mf8`，来自 `TileNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:272-279`）。
+
+**（g）`.tm` 后缀** —— tile mask，`tmask_idx=1` 时才有（`IntrinsicsRISCVXSOTileFuncType.td:281`）。
+
+#### 51.4.3 从名字到 ISA 章节
+
+名字段与 ISA 手册章节的对应是**一一映射**的。把 (b) 和 (c) 两段的取值组合起来，正好是手册里的章节标题：
+
+| 名字片段 | ISA 手册章节名 |
+| --- | --- |
+| `tld_linear_global` | Tile Unit-stride Global Memory **Load** |
+| `tst_linear_global` | Tile Unit-stride Global Memory **Store** |
+| `tld_linear_share` | Tile Unit-stride Share Memory **Load** |
+| **`tst_linear_share`** | **Tile Unit-stride Share Memory Store** ← `tst_linear_share_m1` 落在这 |
+| `tld_stride_global` | Tile Strided Global Memory Load |
+| `tst_index_share` | Tile Indexed Share Memory Store |
+| `tst_blk_global` | Tile Block Global Memory Store |
+
+（章节名清单可直接在 ISA 文档里 grep 到，例如搜 `Tile Unit-stride` 会返回上面这四类。）
+
+---
+
+### 51.5 以 `tst_linear_share_m1` 为例，走一遍四条路
+
+| 办法 | 操作 | 结果 |
+| --- | --- | --- |
+| 1. 编译探针 | `clang -S ... probe.cpp`（`__shared__` + 变量偏移） | `tst.trir.linear.u32.share` |
+| 2. 反汇编 | `llvm-objdump` on fatbin | `tst.trir.linear.u32.share T4, (s1), 0x0, s10` |
+| 3. 查测试 | `grep tst_linear_share_m1 .../xsotile150g/` | `// CHECK: tst.trii.linear.u32.share`（**imm 版**，与内核的 trir 不同） |
+| 4. 命名规则 | 查 TableGen | `tst`(存) + `linear`(连续) + `share`(共享内存) + `m1` |
+
+**四条路的结果互相印证，唯一差异是办法 3 给的是 `trii`（测试里传字面量），内核实际是 `trir`（传变量）——这正是 51.6 要说的事。**
+
+**名字逐段解释**：
+
+| 段 | 取值 | 含义 | 来源 |
+| --- | --- | --- | --- |
+| `tst` | Tile STore | 写内存 | `xsotile_memory.td` 的 `defm tst_trr_linear` |
+| `linear` | — | unit-stride（连续地址） | `TStoreLinearBuiltin_m` 的 `MemoryOpKind::LINEAR` |
+| `share` | `mem_idx=1` | 写 **share memory** | `MemNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:275`） |
+| `m1` | LMUL=1 | 一个 tile register（1 KB） | `TileNameStr`（`:272`） |
+
+**一句话功能**：把 tile 寄存器 `src` 里的 1 KB 数据，以单位步长写进 **share memory** 的 `baseAddr + offset` 处。
+
+**ISA 手册对应**：`/softhome/like/asset/code/isa/index.html` → 搜 `tst.trir.linear.u32.share` → 章节「**Tile Unit-stride Share Memory Store**」，手册原型：
+
+```
+tst.trir.linear.u32.share.[m2/m4/m8/mf2/mf4/mf8].[tm]  Ts1, (rs1), imm1, rs3
+```
+
+注意手册原型里 `m1` 也是省略的（默认 LMUL），和实际生成的助记符一致。
+
+---
+
+### 51.6 一个补充：`trir` vs `trii` 是参数决定的，不是函数名决定的
+
+这是最容易踩的坑。同一个 `tst_linear_share_m1`，**第三个参数写常量还是变量，生成的助记符不同**。实测（`__shared__` 基址下）：
+
+| 源码 | 实测助记符 | 编码 |
+| --- | --- | --- |
+| `tst_linear_share_m1(s, sb, 0)` | **`tst.trii.linear.u32.share`** | `i` = immediate，偏移是编译期常量 |
+| `tst_linear_share_m1(s, sb, off)` | **`tst.trir.linear.u32.share`** | `r` = register，偏移是运行时变量 |
+
+**所以查办法 3 的测试文件时，默认看到的是 `trii`（测试里大多传字面量 `0`），而内核里实际生成的可能是 `trir`**——rms_norm 的 `kernel/rms_norm_kernel_bf16.hpp:56` 传的是 `i*tile_size`，所以是 `trir`。要确认自己代码里的形态，用办法 1 或 2。
+
+两者在 TableGen 里是**分开注册的两条 builtin**（`riscv_siorigin_xsotile_memory.td` 的 `defm tst_trr_linear` 与 `defm tst_tri_linear`），C 层靠重载 + 常量折叠决定走哪条，`__builtin_rvv_tst_trr_linear_share_m1` 和 `__builtin_rvv_tst_tri_linear_share_m1` 是两个不同的内建。
+
+---
+
+### 51.7 小结
+
+- **首选办法 1**（编译探针）——一条命令、10 秒、结果最准，且能反映你自己代码的实际参数形态。
+- **办法 2**（反汇编）适合已经构建过的算子，不用重编。
+- **办法 3**（查测试）纯 grep，适合快速浏览某个指令族的全部变体。
+- **办法 4**（读 TableGen）是唯一能解释"为什么叫这个名字"的办法，也是遇到查不到的名字时唯一的出路。命名规则完全机械：`操作名 + 模式 + 空间 + LMUL`，各段的字典都能从 `IntrinsicsRISCVXSOTileFuncType.td` 和 `RISCVInstrInfoXSOTile.td` 里机械提取。
+- 名字段到 ISA 手册章节是**一一映射**的：`tst_linear_share` → 「Tile Unit-stride Share Memory Store」，直接拿助记符去 ISA 文档里搜即可。
+- 唯一不自解释的一段是**元素类型字母**（`c`=S8、`x`=F16、`y`=BF16、`f`=F32、`t`=TF32、`h`=S4…），这张表在 51.4.2(e) 里给出了。
+- 最后提醒：`trii`/`trir` 由参数是常量还是变量决定，**别只看测试文件就下结论**。
