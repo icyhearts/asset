@@ -1098,3 +1098,1220 @@ uid/euid/auid 以及 syscall 成功状态。用 `sudo ausearch -k gpu-monitor-ex
 
 以上判断只依据 `/share/users/like/audit.log` 的规则列表；规则被选中不等于
 事件一定已写入持久化日志，后者还取决于 audit 状态、backlog 和日志服务运行情况。
+
+# sikernel RMSNorm 实现与调用链
+
+本文从
+`/softhome/like/package/sikernel/source/source_builtin/attention/rms_norm/test/test_host.cpp`
+开始，结合当前源码、SIPU ISA 文档
+`/softhome/like/asset/code/isa/index.html` 和实际生成的 device 汇编，说明
+RMSNorm 的 host 入口、wrapper dispatch、SIPU device kernel 以及测试验证流程。
+
+## 1. 先给出结论
+
+对输入的每一行 `x`，当前实现计算的是：
+
+```text
+sum  = sum_i(x[i] * x[i])
+mean = sum / original_normalized_size
+if eps_opt != 0:
+    mean = mean + eps
+rstd = 1 / sqrt(mean)
+out[i] = x[i] * rstd
+if weight_opt != 0:
+    out[i] = out[i] * weight[i]
+```
+
+这是真正的 RMSNorm，不做 LayerNorm 中的 `x - mean(x)`。实现有两个特点：
+
+1. normalized 维度按 1024B tile 处理，没有 tail，因此 wrapper 要求
+   `normalized_size * sizeof(T)` 是 1024B 对齐的。
+2. `bf16`/`fp16` 输入先转成 `fp32`，平方、累加、归约和缩放都使用 `fp32`，
+   最后再转回原始 dtype；`fp32` 路径直接在 `fp32` tile 上运算。
+
+本次测试的 `DATATYPE` 是 `sifmt::bfloat16`，所以实际主路径是
+`rms_norm_bf16_kernel`，实际的非连续输入路径是
+`rms_norm_bf16_strided_input_kernel`。
+
+## 2. 文件和调用链
+
+### 2.1 文件职责
+
+| 文件 | 职责 |
+| --- | --- |
+| `test/test_host.cpp` | 分配 host/device buffer、构造 tensor metadata、调用 API、计算 golden、比较结果 |
+| `kernel/rms_norm_kernel.su` | host-side wrapper；检查 metadata、选择 kernel、配置 grid/block、发起 device launch |
+| `kernel/rms_norm_kernel_bf16.hpp` | `bf16` 连续 kernel 和 `bf16` strided-input kernel |
+| `kernel/rms_norm_kernel_f16.hpp` | `fp16` 连续 kernel |
+| `kernel/rms_norm_kernel_f32.hpp` | `fp32` 连续 kernel |
+| `kernel/legacy_api.su` | 兼容旧裸指针接口，将裸指针包装为 `sikernel::tensor<T>` |
+| `CMakeLists.txt` | 用 `scc_add_library` 编译 `.su` device/library，编译并链接 `test_host` |
+| `README.md` | API、对齐条件和非连续布局的约束说明 |
+
+### 2.2 总调用链
+
+默认执行 `./build/test_host` 时，调用关系如下：
+
+```text
+test_host.cpp::main
+├── run_case(16, 7168, 7168, false, false)
+│   ├── malloc host_A/host_B/host_D/host_G
+│   ├── sipuMalloc bo_A/bo_B/bo_D
+│   ├── sipuMemcpy host -> device
+│   ├── 构造 input_tensor/output_tensor/weight_tensor
+│   ├── rms_norm<bfloat16>(tensor API)
+│   │   └── rms_norm_launch<T>
+│   │       ├── check_rms_norm_tensor_metadata
+│   │       ├── is_contiguous_layout(input/output/weight)
+│   │       └── rms_norm_contiguous_launch<T>
+│   │           └── rms_norm_bf16_kernel<<<grid=8, cluster=1, block=2>>>
+│   ├── sipuMemcpy device -> host
+│   ├── golden(...)
+│   └── 逐元素误差比较
+└── run_strided_case(33, 512)
+    ├── 构造 input stride=(2176, 1)
+    ├── rms_norm<bfloat16>(tensor API)
+    │   └── rms_norm_launch<T>
+    │       ├── 连续性判断失败
+    │       ├── 命中 bf16 特殊 stride case
+    │       └── rms_norm_bf16_strided_input_kernel
+    ├── sipuMemcpy device -> host
+    ├── golden_strided_input(...)
+    └── 逐元素误差比较
+```
+
+如果外部用户调用公共头文件中的旧裸指针接口，则还有一条不被本测试直接走到
+的兼容链：
+
+```text
+legacy_api.su::rms_norm(const void* ...)
+└── 创建 output_tensor/input_tensor/weight_tensor
+    └── 调用 tensor 版本 rms_norm<T>(...)
+        └── rms_norm_launch<T>(...)
+```
+
+### 2.3 构建链
+
+```text
+cd /softhome/like/package/sikernel
+source setup.sh
+└── 设置 SIKERNEL_ROOT_DIR
+└── 加载 SIPU SDK
+└── 加载 SIPU CMODEL
+└── 默认设置 SIPU_ARCH=150
+
+cd source/source_builtin/attention/rms_norm
+bash build.sh
+└── cmake -B build ./
+    ├── scc_add_library(rms_norm SHARED ...)
+    │   ├── kernel/rms_norm_kernel.su
+    │   └── kernel/legacy_api.su
+    └── add_executable(test_host test/test_host.cpp)
+        └── 链接 librms_norm.so、sipurt、sipu
+```
+
+这里的 `.su` 不是普通 host C++ 源文件，而是由 SiCrossCompiler 面向 SIPU
+架构编译。实际构建输出显示目标架构为 `sipu_150`。
+
+## 3. test_host.cpp 入口和测试逻辑
+
+### 3.1 类型和形状
+
+`test_host.cpp:44-50` 定义了：
+
+```cpp
+#define K  7168
+#define VK 7168
+#define M  16
+#define DATATYPE sifmt::bfloat16
+```
+
+因此默认连续 case 是：
+
+```text
+batch_size              = 16
+normalized_size         = 7168
+original_normalized_size= 7168
+dtype                   = bf16
+```
+
+每行大小为 `7168 * 2 = 14336B`，即 `14` 个 1024B tile。
+
+`K` 和 `VK` 当前相同，所以测试没有实际 padding 差异；接口仍然保留
+`original_normalized_size`，用于表示均值分母中的原始长度。
+
+### 3.2 golden 函数
+
+`golden` 在 `test_host.cpp:52-69` 中执行 host 参考计算：
+
+1. 外层 `j` 遍历 batch 中的行。
+2. 内层 `i` 遍历 `normalized_size` 个物理元素并计算平方和。
+3. 用 `original_normalized_size` 作除数得到 `mean`。
+4. `eps_opt` 非零时加入 `eps`。
+5. 用 `sqrt` 和倒数得到 `rstd`。
+6. 每个元素乘以 `rstd`，`weight_opt` 非零时再乘 `weight[i]`。
+
+注意一个容易忽略的语义：当前 `golden` 的分子循环长度是
+`normalized_size`，分母却是 `original_normalized_size`。因此当两者不同时，
+物理 padding 区域仍会参与平方和，只是分母使用原始长度。device kernel 也保持
+同样行为。若调用者希望 padding 不参与分子，需要在输入中把 padding 显式置零，
+或者修改 kernel 的有效元素处理逻辑。
+
+`golden_strided_input` 在 `test_host.cpp:71-90` 中按
+`row = pin + j * input_stride0` 取得每行起点，然后对逻辑上的
+`normalized_size` 个连续元素计算参考值，输出按紧凑布局写入。
+
+### 3.3 连续 case 的 host 流程
+
+`run_case` 在 `test_host.cpp:171-302`：
+
+- `nIn0 = normalized_size * batch_size`：输入物理元素数。
+- `nIn1 = normalized_size`：weight 元素数。
+- `nOut = normalized_size * batch_size`：输出元素数。
+- `host_A`、`host_B` 随机初始化；输入分布为 `[-10, 100]`，weight 分布为
+  `[-1, 1]`。
+- `sipuMalloc` 分配三个 device buffer，两个 `sipuMemcpy` 将输入和 weight
+  拷贝到 device。
+- `sikernel::tensor` 的 initializer-list 构造函数自动生成 contiguous stride：
+  对 shape `(batch_size, normalized_size)`，stride 是
+  `(normalized_size, 1)`；weight shape `(normalized_size)` 的 stride 是 `(1)`。
+- `input_tensor.data`、`output_tensor.data`、`weight_tensor.data` 被设置成
+  device buffer 地址。
+- 非 emulation 模式调用 `rms_norm<DATATYPE>(...)`。
+- 拷回 output 后释放 device buffer，再执行 golden 和误差比较。
+
+默认 `weight_opt=1`、`eps_opt=1`、`eps=1e-6`，所以 device 侧会执行 weight
+乘法和 epsilon 加法。
+
+### 3.4 strided case 的 host 流程
+
+`run_strided_case(33, 512)` 在 `test_host.cpp:92-169`：
+
+```text
+input shape        = (33, 512)
+input stride       = (2176, 1)
+output shape       = (33, 512)
+output stride      = (512, 1)
+weight shape       = (512)
+weight stride      = (1)
+```
+
+输入分配的物理长度是 `33 * 2176` 个 bf16，而不是 `33 * 512`。这表示每行
+有间隔，但行内 normalized 维度仍然连续。输出是紧凑的 `33 * 512`。
+
+该 case 传入 `rms_norm` 后，wrapper 不能走 contiguous kernel，因而命中
+`rms_norm_bf16_strided_input_kernel`。device kernel 需要同时维护：
+
+```text
+input_batch_offset  = bid * input_stride0 * sizeof(bfloat16_t)
+output_batch_offset = bid * normalized_size * sizeof(bfloat16_t)
+```
+
+所以读输入按 2176 元素跳行，写输出按 512 元素紧密排列。
+
+### 3.5 main 的两种模式
+
+`test_host.cpp:304-340` 有两种入口：
+
+- 普通模式要求 `argc == 1`，依次运行 `(16,7168)` 连续 case 和
+  `(33,512)` strided case。
+- `--emu-multi <case_size>:<hidden_size> ...` 模式支持批量 emulation case，
+  可以关闭 compare 并重复测量；每个 case 的 kernel 名称为
+  `rms_norm_<hidden_size>`。
+
+emulation 测量模式中，`rms_norm_timed` 仍然进入同一个
+`rms_norm_launch`，只是传入时间戳和 perf event 输出参数。公共测试工具在
+`repeat_count > 1` 时把第一次作为 warmup，不计入平均值，然后将结果写入
+`dsv3_op_result_rms_norm.log`。
+
+## 4. rms_norm_kernel.su：wrapper 和 dispatch
+
+### 4.1 contiguous 判断
+
+`is_contiguous_layout` 位于 `rms_norm_kernel.su:36-49`：
+
+1. 要求 `dim` 非零，`sizes` 和 `strides` 的长度等于 `dim`。
+2. 从最后一维开始，期望 stride 初始为 1。
+3. 每一维检查 size 为正且实际 stride 等于期望值。
+4. 下一维的期望 stride 乘上当前维度 size。
+
+对于 2D `(M,K)`，只有 `(K,1)` 被认为 contiguous；对于 1D weight，只有
+`(1)` 被认为 contiguous。
+
+### 4.2 metadata 检查
+
+`check_rms_norm_tensor_metadata` 位于 `rms_norm_kernel.su:51-81`，检查：
+
+- output/input data 非空；weight 开启时 weight data 非空。
+- input 和 output 必须是 2D。
+- `sizes` 和 `strides` 必须有两个元素。
+- input 的两个 size 必须为正。
+- output shape 必须等于 input shape。
+- `normalized_size * sizeof(T) % 1024 == 0`。
+- `0 < original_normalized_size <= normalized_size`。
+- weight 开启时必须是 1D，长度等于 normalized size。
+
+该检查是 kernel 没有 tail 处理的前置条件。对 bf16/fp16，它等价于
+normalized size 是 512 元素对齐；对 fp32，它等价于 256 元素对齐。
+
+### 4.3 grid、cluster、block
+
+`rms_norm_contiguous_launch` 在 `rms_norm_kernel.su:83-160` 中设置：
+
+```cpp
+uint32_t block_dim = 1;
+uint32_t cluster_dim = 1;
+uint32_t grid_dim = 1;
+
+if (batch_size >= 2)
+    block_dim = 2;
+if (batch_size >= 32)
+    grid_dim = 16;
+else
+    grid_dim = (batch_size + 1) / 2;
+```
+
+因此：
+
+- batch 为 1 时使用 1 个 thread。
+- batch 为 2 到 31 时使用 2 threads/block，并用足够多的 block 覆盖 batch。
+- batch 大于等于 32 时固定 16 blocks、每 block 2 threads，共 32 threads。
+- cluster 维度固定为 1。
+
+对于默认 `batch_size=16`，launch 维度是 `grid=8, cluster=1, block=2`，总共
+16 个 thread，通常每个 thread 负责一行。对于 strided `batch_size=33`，维度
+是 `grid=16, block=2`，总共 32 个 thread，最后一个 thread 通过 row loop
+处理 `bid=32`。
+
+SIPU 的 launch 形式是：
+
+```cpp
+kernel<<<grid, cluster, block, 0, stream>>>(...);
+```
+
+第四个参数是动态 shared memory 大小，本实现传 0，因为 shared memory 是由
+device kernel 中的静态 `__shared__` 数组声明的；最后一个参数是 SIPU stream。
+
+### 4.4 dtype dispatch
+
+`rms_norm_contiguous_launch` 用 `if constexpr` 根据 `T` 选择：
+
+- `sifmt::float32` -> `rms_norm_f32_kernel`
+- `sifmt::float16` -> `rms_norm_f16_kernel`
+- `sifmt::bfloat16` -> `rms_norm_bf16_kernel`
+
+当 `kernel_elapsed_ms != nullptr` 时，wrapper 在 kernel launch 两侧包围
+`SIKERNEL_PERF_EVENT_START/STOP`，同时用 `record_host_timestamp` 记录 API
+launch 时间。普通模式两个指针都是空，不走 perf event。
+
+### 4.5 non-contiguous dispatch
+
+`rms_norm_launch` 在 `rms_norm_kernel.su:204-240` 中执行：
+
+1. 先做 metadata 检查。
+2. 取 `batch_size=input.sizes[0]`、`normalized_size=input.sizes[1]`。
+3. 检查 input/output/weight 是否 contiguous。
+4. 三者都连续时直接走 `rms_norm_contiguous_launch`。
+5. 如果 `T=bf16`，进一步要求：
+   - normalized size 只能是 512 或 1536；
+   - `original_normalized_size == normalized_size`；
+   - input stride 必须精确是 `(2176,1)`；
+   - output stride 必须是 `(normalized_size,1)`；
+   - weight 开启时 weight stride 必须是 `(1)`。
+6. 命中后调用 `rms_norm_bf16_strided_input_launch`。
+7. 其它非连续布局直接 `sipu::check(false, ...)` 报错。
+
+这里的限制不是 ISA 的一般 strided load 能力，而是当前 RMSNorm wrapper 只
+实现并验证了这两个固定输入布局。
+
+## 5. SIPU ISA 中 tile 的关键概念
+
+### 5.1 tile 大小和 element 数
+
+SIPU ISA 文档的 unit-stride tile load/store 以 1024B 的完整 tile 为基本单位：
+
+- `m1` = 1024B
+- `m2` = 2048B
+- `m4` = 4096B
+- `m8` = 8192B
+- `mf2` = 512B
+- `mf4` = 256B
+- `mf8` = 128B
+
+因此一个 `m1` 中的元素数取决于 dtype：
+
+| dtype | 一个 m1 的元素数 |
+| --- | ---: |
+| fp32 | 1024 / 4 = 256 |
+| fp16 | 1024 / 2 = 512 |
+| bf16 | 1024 / 2 = 512 |
+
+这正好对应源码中的：
+
+```cpp
+// f32
+norm_tile_num = norm_size / 256;
+
+// f16/bf16
+norm_tile_num = norm_size / 512;
+```
+
+### 5.2 offset 是 byte offset
+
+ISA 文档中 unit-stride load/store 的地址由 base 加上 offset 构成；源码把
+`batch_offset` 写成：
+
+```cpp
+bid * norm_size * sizeof(dtype)
+```
+
+并把每个 tile 的增量固定为 `1024`。生成的 device 汇编也显示动态 offset
+放在寄存器中，例如：
+
+```text
+tld.trir.linear.u32.global T7, (a1), 0x0, s11
+tst.trir.linear.u32.global T18, (a0), 0x0, s10
+```
+
+因此这里 `tld_linear_global_m1(ptr, offset)` 和
+`tst_linear_global_m1(tile, ptr, offset)` 的 offset 应按 byte 理解；
+`1024` 表示下一个 1024B tile，而不是下一个 1024 个 bf16 元素。
+
+### 5.3 本实现用到的 intrinsic 对照
+
+| C++ intrinsic | device 汇编/ISA 类别 | 作用 |
+| --- | --- | --- |
+| `tld_linear_global_m1` | `tld.trir.linear.u32.global` | 从 global memory 连续加载 1 个 1024B tile |
+| `tst_linear_global_m1` | `tst.trir.linear.u32.global` | 把 1 个 tile 连续写回 global memory |
+| `tst_linear_share_m1` | `tst.trir.linear.u32.share` | 把 1 个 tile 写入 shared memory |
+| `tld_linear_share_m1` | `tld.trir.linear.u32.share` | 从 shared memory 连续读取 1 个 tile |
+| `tmv_t_f32(scalar)` | `tmv.trr.broadcast` | 把 scalar 广播到完整 tile |
+| `tcvt_f32(bf16_tile,t_r32)` | `tcvt.tt.f32.bf16.r32` | bf16 -> fp32，元素宽度扩大，m1 -> m2 |
+| `tcvt_bf16(f32_tile,t_r32)` | `tcvt.tt.bf16.f32.r32` | fp32 -> bf16，元素宽度缩小，m2 -> m1 |
+| `tmul(a,b)` | `tmul.ttt.f32` | tile 级逐元素乘法 |
+| `tadd(a,b)` | `tadd.ttt.f32` | tile 级逐元素加法 |
+| `tmv_v_f32(tile,index)` | `tmv.vtr.e32` | 取 tile 的一个 128B segment 到 RVV 向量寄存器 |
+| `twait_store_share(0)` | `twait.i.store.share 0` | 等待 shared-memory store 请求全部完成 |
+
+ISA 文档对 `tmv.vtr.e32` 的要求是 RVV 设置为 `SEW=32, vl=32, lmul=1`。
+源码没有手写 `vsetvl`，但当前编译器在生成汇编中插入了：
+
+```text
+vsetivli zero, 0x1, e32, m1, ta, ma
+vsetvli  a5, zero, e32, m1, ta, ma
+```
+
+随后才发出 `tmv.vtr.e32` 和 `vfredosum.vs`。所以源代码层面依赖 SiCrossCompiler
+对 RVV intrinsic 的 VTYPE/VL 管理；如果改用其它编译器或手写汇编，应显式满足
+ISA 的这个前置条件。
+
+## 6. bf16 contiguous device kernel 逐行讲解
+
+源码文件：
+`kernel/rms_norm_kernel_bf16.hpp:25-112`。
+
+### 6.1 函数签名和局部状态：25-47 行
+
+```cpp
+25  __global__ void rms_norm_bf16_kernel(
+       sifmt::bfloat16* pout,
+       sifmt::bfloat16* pin,
+       sifmt::bfloat16* weight,
+       float eps,
+       int64_t batch_size,
+       int64_t norm_size,
+       int64_t original_norm_size,
+       int weight_opt,
+       int eps_opt) {
+```
+
+- `__global__` 表示这是 device kernel，host 通过 triple-chevron launch。
+- `pout`、`pin`、`weight` 是 global memory 地址。
+- `eps` 是 epsilon；`batch_size` 是行数；`norm_size` 是物理 normalized 长度。
+- `original_norm_size` 只用于均值分母。
+- `weight_opt`、`eps_opt` 是运行时开关，而不是编译期模板参数。
+
+```cpp
+29  const int tile_size = 1024;
+```
+
+一个 unit-stride `m1` tile 固定 1024B；后面的 offset 以 byte 为单位。
+
+```cpp
+30  __andescore_fp_mode(BF16);
+```
+
+告诉 Andes/SIPU 编译器和 device 浮点执行环境：当前输入/输出的低精度格式
+是 BF16。它不是 RMSNorm 数学操作，而是为 BF16 tile 操作选择正确的 FP mode。
+
+```cpp
+31  tbfloat16m1_t bf16_din;
+32  tbfloat16m1_t bf16_wgt;
+```
+
+- `bf16_din` 保存从输入加载的一个 BF16 `m1` tile。
+- `bf16_wgt` 保存一个 weight tile。
+- 每个 tile 是 1024B，即 512 个 bf16 元素。
+
+```cpp
+33  tfloat32m2 f32_din;
+34  tfloat32m2 f32_wgt;
+35  tfloat32m2 f32_sq;
+36  tfloat32m2 f32_sq_sum;
+```
+
+BF16 转 FP32 后，每个元素从 2B 变成 4B，所以一个 BF16 m1 的 1024B
+数据会变成 2048B，需要一个 FP32 `m2`。`m2` 包含两个 FP32 m1 部分，源码
+通过 `.m1e0`、`.m1e1` 分别访问这两个部分：
+
+- `f32_din`：转换后的输入。
+- `f32_wgt`：转换后的 weight。
+- `f32_sq`：输入平方。
+- `f32_sq_sum`：跨 tile 累加的平方和。
+
+```cpp
+37  tfloat32m1_t tile_rsqrt;
+38  float sum;
+39  float mean;
+40  float sqrt;
+41  tfloat32m2 f32_out;
+42  tbfloat16m1_t bf16_out;
+```
+
+- `tile_rsqrt` 是广播后的 `rstd`，每个 FP32 元素都相同。
+- `sum`、`mean`、`sqrt` 是 scalar FP32，用于最终归约和开根。
+- `f32_out` 是 FP32 中间输出，仍然是 m2。
+- `bf16_out` 是转回 BF16 的 m1 输出。
+
+```cpp
+43  int64_t norm_tile_num = norm_size / 512;
+```
+
+一个 BF16 m1 包含 512 个元素；对齐检查已经保证这里没有余数，因此该值是
+每一行必须处理的完整 tile 数。默认 `7168 / 512 = 14`。
+
+```cpp
+44  const int shared_buffer_size =
+        512*1024/sizeof(bfloat16_t)/2;
+```
+
+计算每个 `shared_buff[threadIdx.x]` 可容纳的 BF16 元素数：
+
+```text
+512 KiB / 2B / 2 threads = 131072 bf16 elements
+131072 * 2B = 256 KiB per thread
+```
+
+```cpp
+45  __shared__ bfloat16_t shared_buff[2][shared_buffer_size];
+```
+
+为 block 的两个 thread 各分配一块 shared memory。当前 launch 逻辑保证
+`blockDim.x` 最大为 2，所以第一维用 `threadIdx.x` 不会越界。整个数组占：
+
+```text
+2 * 131072 * 2B = 524288B = 512 KiB
+```
+
+生成的 `.llvm.resource` 也显示该 kernel 的 `.sram = 524288`。这里的第一维
+是 thread 私有区域，不是两个 ping-pong buffer。
+
+```cpp
+46  unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+47  unsigned int all_threads = gridDim.x * blockDim.x;
+```
+
+- `tid` 是整个 grid 中的线性 thread id。
+- `all_threads` 是 grid 中的总 thread 数。
+- kernel 采用 grid-stride loop，让每个 thread 以 `all_threads` 为步长领取多行。
+
+### 6.2 行分工和第一遍：48-64 行
+
+```cpp
+48  for (long bid = tid; bid < batch_size;
+        bid += all_threads) {
+```
+
+每次循环处理一整行 `bid`。当 batch 大于总 thread 数时，同一个 thread 会在
+后续迭代处理 `bid + all_threads`。
+
+```cpp
+49  int64_t batch_offset =
+        bid * norm_size * sizeof(bfloat16_t);
+```
+
+计算该行在 global memory 中的 byte 起点。连续布局下第 `bid` 行紧跟在前一行
+之后，所以 stride 是 `norm_size * 2` bytes。
+
+```cpp
+50  f32_sq_sum.m1e0 = tmv_t_f32(0U);
+51  f32_sq_sum.m1e1 = tmv_t_f32(0U);
+```
+
+将两个 FP32 m1 累加器都广播初始化为 0。`tmv_t_f32` 属于 scalar-to-tile
+move/broadcast；这两行把整个 `f32_sq_sum` m2 的所有 lanes 清零。
+
+```cpp
+52  for (int64_t i = 0; i < norm_tile_num; ++i) {
+53      int64_t offset = batch_offset + i * tile_size;
+```
+
+遍历当前行的每个 1024B tile：
+
+```text
+第 i 个 tile 的 global byte offset = 行起点 + i * 1024
+```
+
+```cpp
+54  bf16_din = tld_linear_global_m1(
+        (bfloat16_t*)pin, offset);
+```
+
+从 global memory 连续加载 1024B BF16 tile。ISA 类别是
+`tld.trir.linear.u32.global`；`linear` 表示 unit-stride，`m1` 表示一个完整
+1024B tile。
+
+```cpp
+55  if (i < shared_buffer_size / 512) {
+56      tst_linear_share_m1(
+            bf16_din,
+            shared_buff[threadIdx.x],
+            i * tile_size);
+57  }
+```
+
+`shared_buffer_size / 512 = 256`，所以前 256 个 tile 会同时写入 shared memory。
+
+- `shared_buff[threadIdx.x]` 选择当前 thread 的私有行缓存。
+- `i * tile_size` 是 shared memory 中的 byte offset。
+- `tst_linear_share_m1` 是 unit-stride shared-memory store。
+- 当前默认行只有 14 个 tile，全部会被缓存；如果 normalized 维度超过
+  `256 * 512 = 131072` 个 BF16 元素，超出部分不会缓存。
+
+```cpp
+59  f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);
+```
+
+把 BF16 m1 转成 FP32 m2，转换布局参数是 `t_r32`。由于元素宽度扩大一倍，
+1024B BF16 数据变成 2048B FP32 数据，因此返回值必须是 m2。生成汇编对应：
+
+```text
+tcvt.tt.f32.bf16.r32 T10, T6
+```
+
+源码字段名是 `.m2e0`，表示把转换得到的两个 FP32 m1 部分作为一个 m2 视图
+存放。
+
+```cpp
+60  f32_sq.m1e0 = tmul(f32_din.m1e0, f32_din.m1e0);
+61  f32_sq.m1e1 = tmul(f32_din.m1e1, f32_din.m1e1);
+```
+
+分别对 m2 的两个 FP32 m1 部分做逐元素平方。ISA 对应两个
+`tmul.ttt.f32` tile ALU 操作。
+
+```cpp
+62  f32_sq_sum.m1e0 = tadd(
+        f32_sq_sum.m1e0, f32_sq.m1e0);
+63  f32_sq_sum.m1e1 = tadd(
+        f32_sq_sum.m1e1, f32_sq.m1e1);
+```
+
+把当前 tile 的平方结果加到跨 tile 累加器中。每个 thread 独立处理一行，
+不需要 thread 间共享归约，也没有 `tsync`。
+
+```cpp
+64  }
+```
+
+第一遍结束后，`f32_sq_sum` 中包含当前行所有 `norm_size` 个物理元素的平方和，
+但它仍然是按 tile/segment 分布在寄存器中的形式。
+
+### 6.3 FP32 tile 到 RVV 的归约：65-78 行
+
+```cpp
+65  f32_sq_sum.m1e0 = tadd(
+        f32_sq_sum.m1e0,
+        f32_sq_sum.m1e1);
+```
+
+把 m2 的两个 FP32 m1 部分先合并成一个 m1。此时一个 m1 有 256 个 FP32
+元素，正好对应一整行的一个“归约输入 tile”中的 256 个平方值。
+
+```cpp
+66  vfloat32m1_t vsum_vec =
+        tmv_v_f32(f32_sq_sum.m1e0, 0U);
+```
+
+SIPU tile 的一个 m1 是 1024B，但 `tmv.vtr.e32` 一次把其中一个 128B
+segment 搬到 RVV vector，因此 `index=0` 取出前 32 个 FP32 元素。
+
+ISA 文档中 `tmv.vtr.e32` 的含义是：取 tile 指定 index 的 128B 数据到 RVV
+向量寄存器。对 FP32 来说，128B / 4B = 32 lanes。
+
+```cpp
+67  vfloat32m1_t zero_vec =
+        __riscv_vfmv_v_f_f32m1(0.0f, 1U);
+68  vfloat32m1_t temp_vec;
+```
+
+- `zero_vec` 的 lane 0 作为 reduction seed，值为 0。
+- `vl=1` 足够，因为 `vfredosum.vs` 使用 seed vector 的标量首元素。
+- `temp_vec` 保存后续 tile segment。
+
+```cpp
+69  for (long i = 1; i < 8; ++i) {
+70      temp_vec = tmv_v_f32(
+            f32_sq_sum.m1e0, i);
+71      vsum_vec = __riscv_vfadd_vv_f32m1(
+            temp_vec, vsum_vec, 32);
+72  }
+```
+
+一个 FP32 m1 有 `1024 / 128 = 8` 个 128B segment：
+
+- 第 66 行得到 segment 0。
+- `i=1..7` 依次得到 segment 1 到 7。
+- `vfadd.vv` 对 32 个 lanes 做逐 lane 相加。
+
+执行完后，`vsum_vec[lane]` 等于 tile 中相隔 128B 的 8 个元素之和；32 个
+lane 共同覆盖原 m1 的 256 个 FP32 元素。
+
+生成的汇编正是 7 次 `tmv.vtr.e32` 加 `vfadd.vv`。
+
+```cpp
+73  #ifdef RVV_UNORDER_REDUCE
+74      zero_vec = __riscv_vfredusum_vs_f32m1_f32m1(
+            vsum_vec, zero_vec, 32);
+75  #else
+76      zero_vec = __riscv_vfredosum_vs_f32m1_f32m1(
+            vsum_vec, zero_vec, 32);
+77  #endif
+```
+
+把 32 个 RVV lanes 做标量求和：
+
+- `vfredusum.vs` 是 unordered reduction，允许更自由的结合顺序。
+- `vfredosum.vs` 是 ordered reduction，结果更接近固定顺序累加。
+- 当前构建的汇编显示 `vfredosum.vs`，说明本次没有定义
+  `RVV_UNORDER_REDUCE`。
+- reduction 的初始值来自 `zero_vec[0] = 0`，结果也放在 `zero_vec[0]`。
+
+```cpp
+78  sum = __riscv_vfmv_f_s_f32m1_f32(zero_vec);
+```
+
+把 reduction 结果的 lane 0 取回 scalar `float`，得到当前行平方和。
+
+### 6.4 计算 rstd：79-88 行
+
+```cpp
+79  mean = sum / original_norm_size;
+80  if (eps_opt) mean += eps;
+```
+
+得到 RMSNorm 的分母项：
+
+```text
+mean = sum(x[i]^2) / original_normalized_size + eps (可选)
+```
+
+注意分子在第一遍按 `norm_size` 个物理元素累加，分母使用传入的
+`original_norm_size`。
+
+```cpp
+81  asm volatile (
+82      "fsqrt.s %0, %1"
+83      : "=f"(sqrt)
+84      : "f"(mean)
+85  );
+```
+
+通过 inline assembly 发出 RISC-V `fsqrt.s`，对 scalar FP32 `mean` 开平方。
+这里没有使用 tile SFU，而是先把归约结果变成 scalar，再用 scalar FP 指令。
+
+```cpp
+86  sqrt = 1.0 / sqrt;
+```
+
+把标准差形式的 `sqrt(mean)` 变成 RMSNorm 需要的倒数
+`rstd = 1/sqrt(mean)`。
+
+```cpp
+87  tile_rsqrt = tmv_t_f32(sqrt);
+```
+
+把 scalar `rstd` 广播到完整 FP32 m1 tile，后面用同一个 tile 乘数对输入做
+逐元素缩放。生成汇编对应 `tmv.trr.broadcast`。
+
+```cpp
+88  twait_store_share(0);
+```
+
+这是本 kernel 中最重要的同步点之一。第一遍中的
+`tst_linear_share_m1` 是 tile LSU 的 shared-memory store；ISA 文档中
+`twait.i.store.share cnt` 的 `cnt=0` 表示等待剩余 shared store 数量降到 0，
+即保证前面写入 shared buffer 的 tile 已经可被第二遍读取。
+
+它不是 thread block barrier：
+
+- 本 kernel 每个 thread 只读写自己的 `shared_buff[threadIdx.x]`。
+- 没有 thread 之间的数据交换。
+- 因此不需要 `tsync` 或 `__syncthreads` 来等待另一个 thread 的数据。
+
+当前 device 汇编确认生成了：
+
+```text
+twait.i.store.share 0x0
+```
+
+### 6.5 第二遍：归一化、weight、写回：89-112 行
+
+```cpp
+89  for (int64_t i = 0; i < norm_tile_num; ++i) {
+90      int64_t offset = i * tile_size;
+91      int64_t g_offset = batch_offset + offset;
+```
+
+第二遍再次遍历所有 tile：
+
+- `offset` 是当前行内部的 byte offset。
+- `g_offset` 是 global input/output 的绝对 byte offset。
+
+```cpp
+92  if (i < shared_buffer_size / 512) {
+93      bf16_din = tld_linear_share_m1(
+            shared_buff[threadIdx.x], offset);
+94  } else {
+95      bf16_din = tld_linear_global_m1(
+            (bfloat16_t*)pin, g_offset);
+96  }
+```
+
+前 256 个 tile 从 shared memory 读，超出 shared capacity 的 tile 从 global
+memory 重读。默认 7168 维只有 14 个 tile，所以默认 case 的第二遍完全走
+`tld_linear_share_m1`，避免再次访问输入 global memory。
+
+```cpp
+97  f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);
+```
+
+把当前 BF16 tile 再次转成 FP32 m2，因为 `tile_rsqrt` 和后续 ALU 都是 FP32
+tile。此处与第一遍第 59 行相同。
+
+```cpp
+98  f32_out.m1e0 = tmul(
+        f32_din.m1e0, tile_rsqrt);
+99  f32_out.m1e1 = tmul(
+        f32_din.m1e1, tile_rsqrt);
+```
+
+对 m2 的两个 FP32 m1 部分执行逐元素乘法：
+
+```text
+f32_out = f32_din * rstd
+```
+
+```cpp
+100 if (weight_opt) {
+101     bf16_wgt = tld_linear_global_m1(
+            (bfloat16_t*)weight, offset);
+102     f32_wgt.m2e0 = tcvt_f32(
+            bf16_wgt, t_r32);
+103     f32_out.m1e0 = tmul(
+            f32_out.m1e0, f32_wgt.m1e0);
+104     f32_out.m1e1 = tmul(
+            f32_out.m1e1, f32_wgt.m1e1);
+105 }
+```
+
+weight 是一维、按 normalized 维度复用的 scale，不随 batch 变化，因此 offset
+只使用 `i * 1024`，不加 `batch_offset`。
+
+- 第 101 行从 weight global memory 读取与当前输入 tile 对齐的 BF16 weight tile。
+- 第 102 行将 weight 转成 FP32 m2。
+- 第 103-104 行分别完成两半的逐元素乘法。
+- `weight_opt=0` 时整个分支跳过，输出只做 RMS 缩放。
+
+这几行之后，数学结果是：
+
+```text
+f32_out[i] = input[i] * rstd * weight[i]
+```
+
+```cpp
+106 bf16_out = tcvt_bf16(
+        f32_out.m2e0, t_r32);
+```
+
+把 FP32 m2 按 `t_r32` 转回 BF16 m1。这里的 `m2e0` 是包含两个 FP32 m1
+部分的 m2 视图，转换后数据量从 2048B 缩回 1024B。
+
+```cpp
+107 tst_linear_global_m1(
+        bf16_out,
+        (bfloat16_t*)pout,
+        g_offset);
+```
+
+将 BF16 m1 以 unit-stride 方式写回输出的当前行位置。ISA 对应
+`tst.trir.linear.u32.global`，写回 1024B。
+
+```cpp
+109 }
+111 }
+112 }
+```
+
+- 第 109 行结束第二遍 tile loop。
+- 第 111 行结束 batch/grid-stride row loop。
+- 第 112 行结束 device kernel。
+
+因此一个 thread 对一行的完整执行顺序是：
+
+```text
+global load BF16 tile
+-> optional shared store
+-> BF16 to FP32
+-> square
+-> FP32 tile accumulation
+-> RVV horizontal reduction
+-> scalar sqrt and reciprocal
+-> wait shared stores
+-> shared/global reload
+-> BF16 to FP32
+-> multiply rstd
+-> optional load/convert/multiply weight
+-> FP32 to BF16
+-> global store
+```
+
+## 7. bf16 strided-input device kernel 逐行讲解
+
+源码文件：
+`kernel/rms_norm_kernel_bf16.hpp:114-201`。
+
+这个 kernel 的计算和连续 kernel 完全相同，唯一的核心差异是 input 和 output
+的行地址分开计算。
+
+### 7.1 签名和局部变量：114-134 行
+
+```cpp
+114 __global__ void rms_norm_bf16_strided_input_kernel(
+        sifmt::bfloat16* pout,
+        sifmt::bfloat16* pin,
+        sifmt::bfloat16* weight,
+        float eps,
+        int64_t batch_size,
+        int64_t norm_size,
+        int64_t original_norm_size,
+        int64_t input_stride0,
+        int weight_opt,
+        int eps_opt) {
+```
+
+新增的 `input_stride0` 是 input 第 0 维的 stride，单位是元素数。当前 wrapper
+只允许它等于 2176。
+
+```cpp
+116 const int tile_size = 1024;
+117 __andescore_fp_mode(BF16);
+118-129 与 contiguous kernel 相同的 tile 类型声明
+130 int64_t norm_tile_num = norm_size / 512;
+131 const int shared_buffer_size =
+        512*1024/sizeof(bfloat16_t)/2;
+132 __shared__ bfloat16_t shared_buff[2][shared_buffer_size];
+133 unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+134 unsigned int all_threads = gridDim.x * blockDim.x;
+```
+
+这些行与连续 kernel 的第 29-47 行含义完全一致：仍然是 BF16 m1、FP32 m2、
+每 thread 256KiB shared cache、最大 2 threads/block 和 grid-stride row loop。
+
+### 7.2 第一遍地址计算和缓存：135-153 行
+
+```cpp
+135 for (long bid = tid; bid < batch_size;
+        bid += all_threads) {
+136     int64_t input_batch_offset =
+        bid * input_stride0 * sizeof(bfloat16_t);
+137     int64_t output_batch_offset =
+        bid * norm_size * sizeof(bfloat16_t);
+```
+
+这里是整个 strided kernel 的关键：
+
+- input 行起点按 `input_stride0` 计算，因此第 `bid` 行与上一行相隔
+  `2176 * 2 = 4352B`。
+- output 是 contiguous，行起点按 `norm_size * 2` 计算；对 `norm_size=512`，
+  输出行间距为 1024B。
+
+```cpp
+138 f32_sq_sum.m1e0 = tmv_t_f32(0U);
+139 f32_sq_sum.m1e1 = tmv_t_f32(0U);
+```
+
+初始化 FP32 m2 平方和累加器为零，与连续 kernel 第 50-51 行相同。
+
+```cpp
+140 for (int64_t i = 0; i < norm_tile_num; ++i) {
+141     int64_t offset = i * tile_size;
+142     int64_t input_offset = input_batch_offset + offset;
+143     bf16_din = tld_linear_global_m1(
+        (bfloat16_t*)pin, input_offset);
+```
+
+`offset` 是当前行内部的 tile byte offset；`input_offset` 是带 stride 的真实
+输入 byte 地址。因此虽然每行间有 padding，行内仍然可以用 unit-stride m1 load。
+
+```cpp
+144 if (i < shared_buffer_size / 512) {
+145     tst_linear_share_m1(
+        bf16_din, shared_buff[threadIdx.x], offset);
+146 }
+```
+
+把逻辑输入 tile 紧凑地缓存到 shared memory。shared cache 不复制输入行之间的
+padding，只保存 normalized 区域，所以第二遍使用的是逻辑 offset `offset`。
+
+```cpp
+148 f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);
+149 f32_sq.m1e0 = tmul(f32_din.m1e0, f32_din.m1e0);
+150 f32_sq.m1e1 = tmul(f32_din.m1e1, f32_din.m1e1);
+151 f32_sq_sum.m1e0 = tadd(
+        f32_sq_sum.m1e0, f32_sq.m1e0);
+152 f32_sq_sum.m1e1 = tadd(
+        f32_sq_sum.m1e1, f32_sq.m1e1);
+153 }
+```
+
+完成 BF16 -> FP32、平方和跨 tile 累加。因为 `input_stride0` 只影响 load 地址，
+数学计算与连续 kernel 不变。
+
+### 7.3 归约和 rstd：154-177 行
+
+```cpp
+154 f32_sq_sum.m1e0 = tadd(
+        f32_sq_sum.m1e0, f32_sq_sum.m1e1);
+155 vfloat32m1_t vsum_vec =
+        tmv_v_f32(f32_sq_sum.m1e0, 0U);
+156 vfloat32m1_t zero_vec =
+        __riscv_vfmv_v_f_f32m1(0.0f, 1);
+157 vfloat32m1_t temp_vec;
+158 for (long i = 1; i < 8; ++i) {
+159     temp_vec = tmv_v_f32(f32_sq_sum.m1e0, i);
+160     vsum_vec = __riscv_vfadd_vv_f32m1(
+        temp_vec, vsum_vec, 32);
+161 }
+162 #ifdef RVV_UNORDER_REDUCE
+163 zero_vec = __riscv_vfredusum_vs_f32m1_f32m1(
+        vsum_vec, zero_vec, 32);
+164 #else
+165 zero_vec = __riscv_vfredosum_vs_f32m1_f32m1(
+        vsum_vec, zero_vec, 32);
+166 #endif
+167 sum = __riscv_vfmv_f_s_f32m1_f32(zero_vec);
+168 mean = sum / original_norm_size;
+169 if (eps_opt) mean += eps;
+170 asm volatile (
+171     "fsqrt.s %0, %1"
+172     : "=f"(sqrt)
+173     : "f"(mean)
+174 );
+175 sqrt = 1.0 / sqrt;
+176 tile_rsqrt = tmv_t_f32(sqrt);
+177 twait_store_share(0);
+```
+
+这段逐行含义与连续 kernel 第 65-88 行完全一致：
+
+1. 合并两个 FP32 m1 累加器。
+2. 每个 128B segment 通过 `tmv.vtr.e32` 送进 RVV。
+3. 用 7 次 lane-wise `vfadd` 合并 8 个 segment。
+4. 用 `vfredosum.vs` 汇总 32 个 lanes。
+5. 除以 `original_norm_size`，可选加入 epsilon。
+6. 用 `fsqrt.s` 开方，再取倒数并广播成 tile。
+7. 等待 shared-memory store 完成。
+
+strided case 的 wrapper 强制 `original_norm_size == norm_size`，因此测试中均值
+分母就是 512；但 kernel 本身仍接收该参数，并按参数执行。
+
+### 7.4 第二遍读写：178-201 行
+
+```cpp
+178 for (int64_t i = 0; i < norm_tile_num; ++i) {
+179     int64_t offset = i * tile_size;
+180     int64_t input_offset = input_batch_offset + offset;
+181     int64_t output_offset = output_batch_offset + offset;
+```
+
+同时计算输入和输出地址：
+
+- `input_offset` 保留原始输入 stride。
+- `output_offset` 使用紧凑输出 stride。
+
+```cpp
+182 if (i < shared_buffer_size / 512) {
+183     bf16_din = tld_linear_share_m1(
+        shared_buff[threadIdx.x], offset);
+184 } else {
+185     bf16_din = tld_linear_global_m1(
+        (bfloat16_t*)pin, input_offset);
+186 }
+```
+
+前 256 个 tile 从按逻辑位置排列的 shared cache 读取，超出容量才从带 stride
+的 global input 读取。对于 `normalized_size=512`，只有一个 tile，直接从 shared
+memory 读取。
+
+```cpp
+187 f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);
+188 f32_out.m1e0 = tmul(
+        f32_din.m1e0, tile_rsqrt);
+189 f32_out.m1e1 = tmul(
+        f32_din.m1e1, tile_rsqrt);
+```
+
+再次转为 FP32，并应用 `rstd`。
+
+```cpp
+190 if (weight_opt) {
+191     bf16_wgt = tld_linear_global_m1(
+        (bfloat16_t*)weight, offset);
+192     f32_wgt.m2e0 = tcvt_f32(bf16_wgt, t_r32);
+193     f32_out.m1e0 = tmul(
+        f32_out.m1e0, f32_wgt.m1e0);
+194     f32_out.m1e1 = tmul(
+        f32_out.m1e1, f32_wgt.m1e1);
+195 }
+```
+
+按逻辑 normalized offset 读取 contiguous weight，转 FP32 并逐元素相乘。
+weight 不带 batch stride。
+
+```cpp
+196 bf16_out = tcvt_bf16(
+        f32_out.m2e0, t_r32);
+197 tst_linear_global_m1(
+        bf16_out,
+        (bfloat16_t*)pout,
+        output_offset);
+```
+
+FP32 m2 转回 BF16 m1，然后按 compact output offset 写回。和连续 kernel 的
+差别只有最后使用 `output_offset` 而非 `g_offset`。
+
+```cpp
+199 }
+200 }
+201 }
+```
+
+依次结束 tile loop、batch row loop 和 kernel。由此可见，strided kernel 并没有
+实现通用二维 stride；它只实现“每行有固定间隔、行内连续、输出紧凑”的输入布局。
+
+## 8. fp32 和 fp16 device kernel 的差异
+
+### 8.1 fp32：`rms_norm_kernel_f32.hpp:25-98`
+
+fp32 kernel 的整体结构与 BF16 相同，但不需要 dtype conversion：
+
+- `tfloat32m1_t f32_din` 直接接收 global m1 load。
+- `norm_tile_num = norm_size / 256`，因为 fp32 一个 m1 是 256 元素。
+- `f32_sq_sum` 是单个 `tfloat32m1_t`，不需要 `.m1e0/.m1e1` 两半。
+- 直接 `tmul(f32_din, f32_din)` 和 `tadd(f32_sq_sum, f32_sq)`。
+- 第二遍直接乘 `tile_rsqrt`，weight 若开启则直接读取 fp32 m1 并相乘。
+- 不需要最后的 `tcvt_bf16`，直接 global store fp32 m1。
+
+但归约仍然把一个 1024B FP32 m1 拆成 8 个 128B segment，使用同样的
+`tmv_v_f32`、`vfadd.vv` 和 `vfredosum.vs`。
+
+### 8.2 fp16：`rms_norm_kernel_f16.hpp:25-112`
+
+fp16 kernel 与 BF16 kernel 的 tile 宽度和 FP32 accumulator 组织基本相同：
+
+- 第 26 行设置 `__andescore_fp_mode(FP16)`。
+- 一个 fp16 m1 也是 512 元素，因此 `norm_tile_num = norm_size / 512`。
+- fp16 m1 通过 `tcvt_f32(..., t_r32)` 转成 fp32 m2。
+- 平方和、归约和 rstd 计算使用 fp32。
+- 第二遍把 fp16 转 fp32 后缩放和乘 weight。
+- 最后用 `tcvt_f16` 转回 fp16，再 global store。
+
+所以三种 dtype 的主要设计是：
+
+```text
+fp32:  fp32 load -> fp32 arithmetic -> fp32 store
+fp16:  fp16 load -> fp32 arithmetic -> fp16 store
+bf16:  bf16 load -> fp32 arithmetic -> bf16 store
+```
+
+## 9. 本次运行日志和结果
+
+按用户给出的方式执行：
+
+```bash
+cd /softhome/like/package/sikernel
+source setup.sh
+cd source/source_builtin/attention/rms_norm
+bash build.sh
+./build/test_host
+```
+
+在 2026-09-11 实际执行成功，进程返回码为 `0`。构建环境为：
+
+```text
+SIPU SDK  : /share_data/sicx_sdk/release/2609101917
+CMODEL    : /share_data/arch_cmodel_release/sipu1.5/2609080400
+TARGET    : sipu_150
+```
+
+提供的 `/share/users/like/package/sikernel/source/source_builtin/attention/rms_norm/run.log`
+显示了以下顺序：
+
+```text
+argc:1
+kernel to launch!
+kernel return!
+in golden function !!!
+strided kernel to launch, batch_size=33, normalized_size=512
+strided kernel return!
+in strided golden function !!!
+PASS banner
+```
+
+其中第一段 `kernel to launch!` 对应连续 `(16,7168)` case，第二段带有
+`strided kernel` 文本，对应 `(33,512)` case。当前工作区的 `test_host.cpp`
+还保留了用户已有的 debug 输出，因此重新执行时会额外打印 batch、shape、
+`argc` 等字段；这些 debug 改动未被本次说明修改。
+
+生成 device 汇编
+`source/source_builtin/attention/rms_norm/build/_SipuWork.rms_norm/librms_norm_sipu_fatbin.llvm.asm`
+验证了关键 lowering：
+
+```text
+tcvt.tt.f32.bf16.r32
+tmul.ttt.f32
+tadd.ttt.f32
+tmv.vtr.e32
+vfredosum.vs
+twait.i.store.share 0x0
+tcvt.tt.bf16.f32.r32
+tst.trir.linear.u32.global
+```
+
+因此运行日志证明的是 host/device 调用和数值比较通过，汇编则进一步证明了
+源码中 SIPU tile intrinsic 到 ISA 指令的对应关系。
+
+## 10. 需要记住的实现边界
+
+1. 当前 kernel 没有 tail 处理，normalized byte size 必须 1024B 对齐。
+2. 非连续输入只支持 bf16 的 `(num_tokens,512)` 或 `(num_tokens,1536)`，
+   stride 必须是 `(2176,1)`。
+3. `original_normalized_size` 是分母参数，不会自动阻止 padding 元素参与分子。
+4. `shared_buff[2][...]` 依赖 block 最大 2 threads；若修改 launch block size，
+   必须同步修改 shared buffer 设计。
+5. `twait_store_share(0)` 只等待 shared-memory store 完成，不是通用 block barrier。
+6. RVV 归约依赖 `e32/m1/vl=32` 的向量设置；当前由编译器生成对应的
+   `vsetvli/vsetivli`。
+7. host 侧在 kernel API 返回后立即执行 D2H `sipuMemcpy`；测试依赖 runtime/cmodel
+   对该 copy 的完成语义保证 output 已经可读。
