@@ -5004,3 +5004,260 @@ ISA 手册「Control Register Operation」一节给出的原型：
 ### 48.8 一句话小结
 
 **CSR 是"不在地址空间、要用专用指令访问、读写往往带副作用"的寄存器；这个平台上有两套互不相通的空间——RV 标量核的 `csrr/csrw`（软件自己读写，如 `umisc_ctl`）和 Tile Core 的 `tcsrr/tcsrw`（硬件配置、kernel 只读，如 `tkernelidx`/`tkerneldims`）。** rms_norm 之所以非读 CSR 不可，是因为 block/thread 坐标不像 CUDA 那样有专用寄存器，而是由 CCS 逐线程写进 `tkernelidx`/`tkerneldims`，kernel 只能用 `tcsrr.r.b64` 读回来再做位域拆解——这也解释了为什么每个 kernel 的 prologue 里都有一段"移位 + 乘法 + 加法"的样板代码。
+
+---
+
+## 49. `tbfloat16m1_t` 是什么、在哪里定义；以及 32 位浮点有没有 tile 类型
+
+**SDK**：`/share_data/sicx_sdk/release/latest/`
+**编译器**：`/share/users/like/package/compiler-toolchain/`
+**ISA 文档**：`/softhome/like/asset/code/isa/index.html`
+**源码出处**：`source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp`
+
+第 47 节逐行讲了 bf16 kernel，但把 `tbfloat16m1_t` 当成"天生就有的类型"用了过去。这一节回答两个问题：它到底在哪定义、`m1` 意味着什么；以及 32 位浮点在这个平台上有没有对应的 tile format。
+
+### 49.0 一句话答案
+
+- `tbfloat16m1_t` **不是** SDK 里的普通 `typedef`，而是 **clang 编译器内建的 tile 寄存器类型**（builtin type）。`tile_vector.h:123` 那行 `typedef __tile_bfloat16m1_t tbfloat16m1_t;` 只是把一个双下划线内建名**换个名字**，真正的定义在编译器的 `RISCVTileTypes.def:220`，是编译器前端认识的一等类型。
+- 32 位浮点**有两个** tile 类型：`tfloat32m1_t`（真 f32/单精度）和 `ttfloat32m1_t`（TF32，19 位有效位）。**rms_norm 的 f32 kernel 用的是前者**（`tfloat32m1_t`），不是 TF32。
+
+### 49.1 `tbfloat16m1_t` 的完整定义链
+
+名字的构成是 `t` + `bfloat16` + `m1` + `_t`：
+
+| 片段 | 含义 |
+| --- | --- |
+| `t` | **T**ile register（区别于 RVV 向量寄存器的 `v` 前缀） |
+| `bfloat16` | 元素类型是 bfloat16 |
+| `m1` | **LMUL = 1**，占 1 个 tile register |
+| `_t` | C 类型命名惯例（`_t` 后缀） |
+
+完整的定义链，从源码到编译器：
+
+```
+rms_norm_kernel_bf16.hpp:31        tbfloat16m1_t bf16_din;
+        │
+        ├─ 包含 <siorigin_tile.h>            ← 这里的 "siorigin_" 是占位符
+        │       │
+        │       ├─ #include <tile_vector.h>        ← 名字映射层
+        │       │       tile_vector.h:123
+        │       │       typedef __tile_bfloat16m1_t tbfloat16m1_t;
+        │       │               │
+        │       │               └─→ __tile_bfloat16m1_t 是 clang builtin type
+        │       │                   编译器里的定义：
+        │       │                   RISCVTileTypes.def:220
+        │       │                   TILE_VECTOR_TYPE_FLOAT("__tile_bfloat16m1_t",
+        │       │                       TileBFloat16m1, TileBFloat16m1Ty, 512, 16, true, false)
+        │       │
+        │       └─ #include "siorigin_tile_150g.h"  ← 指令原型层（arch=150 时）
+        │               tbfloat16m1_t tld_linear_global_m1(const sifmt::bfloat16*, ...);
+        │               ...（几千条 TILE_HEADER 声明）
+        │
+        └─ 这一层还依赖 #include <riscv_vector.h>（RVV 类型）和 "SiTe.hpp"（标量 sifmt 类型）
+```
+
+**关键点**：`tile_vector.h` 只是**别名层**。逐行看它做了什么：
+
+```c
+// tile_vector.h:120-128（节选）
+typedef __tile_bfloat16mf8_t tbfloat16mf8_t;
+typedef __tile_bfloat16mf4_t tbfloat16mf4_t;
+typedef __tile_bfloat16mf2_t tbfloat16mf2_t;
+typedef __tile_bfloat16m1_t  tbfloat16m1_t;    // ← 第 123 行
+typedef __tile_bfloat16m2_t  tbfloat16m2_t;
+...
+```
+
+左边是给用户写的短名，右边是 clang 认得的真名。**没有任何 `struct`/`union` 定义**——因为这些类型由编译器直接实现，不是库文件里的数据结构。这也解释了为什么写 `tbfloat16m1_t x;` 不需要链接任何东西。
+
+### 49.2 编译器里的权威定义：`RISCVTileTypes.def`
+
+打开 `/share/users/like/package/compiler-toolchain/llvm-project/clang/include/clang/Basic/RISCVTileTypes.def`，第 220 行：
+
+```c
+TILE_VECTOR_TYPE_FLOAT("__tile_bfloat16m1_t", TileBFloat16m1, TileBFloat16m1Ty, 512, 16, true, false)
+```
+
+对照文件开头宏的说明（`RISCVTileTypes.def:19-34`），各字段是：
+
+| 位置 | 值 | 名称 | 含义 |
+| --- | --- | --- | --- |
+| 1 | `"__tile_bfloat16m1_t"` | Name | builtin type 的名字 |
+| 2 | `TileBFloat16m1` | Id | 类型枚举 |
+| 3 | `TileBFloat16m1Ty` | SingletonId | 全局单例 |
+| 4 | **`512`** | **NumEls** | **元素个数** |
+| 5 | **`16`** | **ElBits** | **每个元素 16 bit（SEW）** |
+| 6 | `true` | IsBF | 是 bfloat16 |
+| 7 | `false` | IsTF | 不是 tfloat32 |
+
+**`NumEls = 512` 是理解 `m1` 的钥匙**：512 个元素 × 16 bit = 8192 bit = **1024 字节**。这正好是第 47 节讲的「一个 tile register 是 8192 bit / 1024 B」。所以 `m1` 的定义就是"一个满载的 tile register"。
+
+宏展开后 `TILE_VECTOR_TYPE_FLOAT` 还有几个固定参数（`RISCVTileTypes.def:72-77`）：
+
+```c
+#define TILE_VECTOR_TYPE_FLOAT(Name, Id, SingletonId, NumEls, ElBits, IsBF, IsTF) \
+  TILE_VECTOR_TYPE(Name, Id, SingletonId, NumEls, ElBits, 1, false, true,          \
+                   IsBF, IsTF, false, false, false)
+//                                                  ↑          ↑     ↑
+//                                              IsSigned=false, IsFP=true, IsMX=false
+```
+
+所以 bf16 tile 的完整属性是：512 元素 / 16 bit / NF=1 / 有符号 / 浮点 / 是 BF16 / 非 TF32 / 非 MX。
+
+### 49.3 同一族的所有类型：元素数表
+
+把 `RISCVTileTypes.def:207-235` 里 32 位浮点和 16 位浮点全列出来，可以清楚看到 `NumEls` 的规律：
+
+**bfloat16（`RISCVTileTypes.def:217-225`）—— 每元素 16 bit，`m1` = 512 个**
+
+| 类型 | NumEls | ElBits | 字节数 |
+| --- | --- | --- | --- |
+| `__tile_bfloat16mf8_t` | 64 | 16 | 128 |
+| `__tile_bfloat16mf4_t` | 128 | 16 | 256 |
+| `__tile_bfloat16mf2_t` | 256 | 16 | 512 |
+| **`__tile_bfloat16m1_t`** | **512** | **16** | **1024** |
+| `__tile_bfloat16m2_t` | 1024 | 16 | 2048 |
+| `__tile_bfloat16m4_t` | 2048 | 16 | 4096 |
+| `__tile_bfloat16m8_t` | 4096 | 16 | 8192 |
+| `__tile_bfloat16m16_t` | 8192 | 16 | 16384 |
+| `__tile_bfloat16m32_t` | 16384 | 16 | 32768 |
+
+规律：**`mf8` 的字节数 = 128 B，之后每级翻倍**。`mf8/mf4/mf2/m1/m2/m4/m8` 对应 128/256/512/1024/2048/4096/8192 字节。这也和第 47 节说的「tile 内部最小操作粒度 128 B」对上了——`mf8` 就是一个 128 B 的分数寄存器。
+
+注意 `m16`/`m32` 的字节数（16 KB/32 KB）**超过了一个 tile register 的 1 KB 容量**，它们表示的是"多寄存器组"（占 16/32 个 tile reg），用于 MMA 的矩阵操作数。
+
+### 49.4 第 47 节的 kernel 实际用了哪些
+
+`rms_norm_kernel_bf16.hpp` 的类型使用统计：
+
+| 类型 | 出现次数 | 用途 |
+| --- | --- | --- |
+| `tbfloat16m1_t` | 6 | `bf16_din` / `bf16_wgt` / `bf16_out`（输入、权重、输出） |
+| `tfloat32m1_t` | 2 | `tile_rsqrt`（**注意：是 f32 不是 bf16**） |
+
+其中 `bf16_din` 的诞生过程（`rms_norm_kernel_bf16.hpp:31`、`:49`）：
+
+```c
+tbfloat16m1_t bf16_din;                                  // 声明
+bf16_din = tld_linear_global_m1(pin, offset);            // 从 global 加载，返回 tbfloat16m1_t
+```
+
+`tld_linear_global_m1` 的返回类型由**指针的标量类型**决定。编译器里同一个名字有多个重载（`__tile_inter.h:2330` 起）：
+
+```c
+tbfloat16m1_t tld_linear_global_m1(const sifmt::bfloat16 * baseAddr, ...);  // :2330
+tfloat32m1_t  tld_linear_global_m1(const sifmt::float32  * baseAddr, ...);  // :2334
+ttfloat32m1_t tld_linear_global_m1(const sifmt::tfloat32 * baseAddr, ...);  // :2346
+```
+
+这里是**引用 49.5 的关键**：三个重载分别把 `sifmt::bfloat16*` / `sifmt::float32*` / `sifmt::tfloat32*` 映射到 `tbfloat16m1_t` / `tfloat32m1_t` / `ttfloat32m1_t`。
+
+底层的 builtin 层面完全一致——`RISCVTileTypes.def` 里 `__tile_float32m1_t` 和 `__tile_tfloat32m1_t` 的参数**逐位相同**：
+
+```c
+TILE_VECTOR_TYPE_FLOAT("__tile_float32m1_t",  TileFloat32m1,  TileFloat32m1Ty,  256, 32, false, false)  // :210
+TILE_VECTOR_TYPE_FLOAT("__tile_tfloat32m1_t", TileTFloat32m1, TileTFloat32m1Ty, 256, 32, false, true)   // :230
+//                                                                                        ↑     ↑
+//                                                                                    IsBF=false, IsTF
+```
+
+区别**只有最后一个 `IsTF` 标志位**：`false` 是普通 f32，`true` 是 TF32。256 元素 × 32 bit = 8192 bit = 1 KB，两者一样大。
+
+### 49.5 32 位浮点的两个 tile 类型：`tfloat32m1_t` vs `ttfloat32m1_t`
+
+**问题：`sipu` 有没有定义 tfloat32 类型的 tile format？**
+**答：有，而且有两个，语义完全不同。**
+
+| | `tfloat32m1_t` | `ttfloat32m1_t` |
+| --- | --- | --- |
+| 名字前缀 | `t` + `float32` | `t` + `tfloat32`（双 t） |
+| 编译器内建名 | `__tile_float32m1_t` | `__tile_tfloat32m1_t` |
+| `IsTF` 标志 | `false` | **`true`** |
+| 元素格式 | **IEEE 单精度 f32**（8 指数 / 23 尾数） | **TF32**（8 指数 / 10 尾数） |
+| `NumEls` × `ElBits` | 256 × 32 = 8192 bit（1 KB） | 256 × 32 = 8192 bit（1 KB） |
+| 存储宽度 | 32 bit | 32 bit（**值只用 19 bit**） |
+| 支持的操作 | 全部（load/store/ALU/MMA） | **只有 load/store/MMA/GEMV** |
+| 典型用途 | rms_norm f32 kernel | 矩阵乘的 A/B 操作数 |
+
+**TF32 的位布局**（来自 SDK 的量化实现，`sifmt/quantize/define.hpp:73-77`）：
+
+```c
+constexpr uint8_t  EXP_BITS_TF32  = 8;
+constexpr uint8_t  MANT_BITS_TF32 = 10;
+constexpr uint32_t MASK_TF32_UI   = 0x7FFFF;      // 19 位
+```
+
+从读写函数可以反推出位序（`define.hpp:657-673`）：
+
+```c
+signTF32UI(a)  →  a >> 18                     // bit 18        = 符号
+expTF32UI(a)   →  (a >> 10) & 0xFF            // bit 17:10     = 指数(8)
+fracTF32UI(a)  →  a & 0x3FF                   // bit  9:0      = 尾数(10)
+packToTF32UI(sign, exp, sig)
+               →  (sign << 18) + (exp << 10) + sig
+```
+
+即 **TF32 是"右对齐的 19 位"**：`[18]` 符号、`[17:10]` 指数、`[9:0]` 尾数，存在一个 32 bit 容器里，高 13 位是 0。这和 NVIDIA 在 tensor core 里用的 TF32 **位序不同**（那边是左对齐、砍掉 f32 的低 13 位尾数），能不能互相直接搬数据要小心——**这个平台是右对齐 19 位，两边不能 memcpy 混用**。
+
+`tf32_to_f32` 的实现也印证了这一点（`nonmx.hpp:697`）：
+
+```c
+uiA = a.v & 0x7FFFF;      // ← 只取低 19 位，高 13 位直接丢弃
+```
+
+**另一个关键差异：TF32 tile 没有逐元素算术。** 我把 arch-150 头文件里所有提到 `ttfloat32` 的 intrinsic 按前缀分类，结果只有四类：
+
+| 前缀 | 数量 | 说明 |
+| --- | --- | --- |
+| `tld_*` | 若干 | 加载 |
+| `tst_*` | 若干 | 存储 |
+| `tmma_*` | 大量 | 矩阵乘（如 `tmma_ttt_f32_tf32_tf32_r8_m4`） |
+| `tmva_*` | 若干 | 矩阵-向量乘（GEMV） |
+
+`tmul` / `tadd` / `tsub` / `tcvt` / `tmv` / `tmax` / `tmin` / `trelu` **对 `ttfloat32m1_t` 一个都没有**。而 `tfloat32m1_t`（真 f32）全都有，例如：
+
+```c
+TILE_HEADER(tmul_ttt_f32) tfloat32m1_t tmul(tfloat32m1_t src1, tfloat32m1_t src2, uint32_t attr = 0);
+TILE_HEADER(tadd_ttt_f32) tfloat32m1_t tadd(tfloat32m1_t src1, tfloat32m1_t src2, uint32_t attr = 0);
+```
+
+**为什么会这样**：TF32 在这个平台上是**为 MMA 的 A/B 操作数准备的存储格式**，不是通用的计算类型。乘法器直接吃 TF32 输入、产出 f32 累加（ISA 文档「运算模式」表里 `Index 0` 那行：`.tf32 .tf32 → .f32`，Compute Mode = Normal P0）。要做 TF32 的逐元素乘加，得先转成 f32。
+
+**回到 rms_norm**：`rms_norm_kernel_f32.hpp:30-38` 声明的 `tfloat32m1_t f32_din / f32_wgt / f32_sq / f32_sq_sum / tile_rsqrt / f32_out` 全部是**真 f32**。这也符合它的算法需求——RMSNorm 要做 `x*x`、求和、`rsqrt`、逐元素缩放，这些在 TF32 上根本不存在。所以：
+
+> **rms_norm 的 f32 kernel 走的是完整单精度路径，完全没有用到 TF32。**
+
+### 49.6 名字容易混淆的三个层次
+
+同一个"f32"在这个平台上出现在三个不同层次，写代码时容易串：
+
+| 层次 | 类型名 | 定义位置 | 用途 |
+| --- | --- | --- | --- |
+| **标量**（C++ 类） | `sifmt::float32` / `sifmt::bfloat16` / `sifmt::tfloat32` | `SiTe/sifmt/sifmt_fp.hpp:277-280` | 指针类型、host 端数据 |
+| | `float` / `bfloat16_t` / `tfloat32_t` | clang builtin（`TokenKinds.def:708`） | 编译器关键字类型 |
+| **RVV 向量** | `vfloat32m1_t` | `riscv_vector.h` | RVV 标量核向量寄存器 |
+| **Tile** | `tfloat32m1_t` / `tbfloat16m1_t` / `ttfloat32m1_t` | `tile_vector.h` + `RISCVTileTypes.def` | tile 寄存器 |
+
+三者的对应关系靠**函数重载**串起来：传 `sifmt::float32*` 进 `tld_linear_global_m1`，出来的就是 `tfloat32m1_t`。`sifmt::float32` 本身的定义（`sifmt_fp.hpp:279`）：
+
+```c
+using float32 = SiFpBase<8, 23, uint32_t, sifmt::f32::toFloat, sifmt::f32::fromFloat<uint32_t>>;
+//               ↑  ↑   ↑
+//            指数8 尾数23 存储 uint32_t
+```
+
+而 `tfloat32`（`:280`）的宿主类型**也是 `uint32_t`**，只是指数尾数变成 `8, 10`：
+
+```c
+using tfloat32 = SiFpBase<8, 10, uint32_t, sifmt::tf32::toFloat, sifmt::tf32::fromFloat<uint32_t>>;
+```
+
+两者在 C++ 层面**字节数相同**（都是 4 字节），但语义不同，`void*` 互转是编译得过、结果错的经典陷阱。
+
+### 49.7 小结
+
+- `tbfloat16m1_t` 是 **clang builtin type** 的别名，不是库里的结构体。定义在编译器的 `RISCVTileTypes.def:220`，SDK 侧 `tile_vector.h:123` 只做 `__tile_bfloat16m1_t` → `tbfloat16m1_t` 的名字映射。
+- 名字里的 `m1` 表示 LMUL=1，对应 **512 个 bf16 元素 = 1024 字节 = 一个 tile register**。`mf8`(128 B) 到 `m32` 的变化规律是字节数逐级翻倍。
+- **32 位浮点有两个 tile 类型**：`tfloat32m1_t`（IEEE f32，`IsTF=false`）和 `ttfloat32m1_t`（TF32，`IsTF=true`）。两者都是 256 元素 × 32 bit = 1 KB。
+- TF32 是**右对齐 19 位**（符号 1 / 指数 8 / 尾数 10），值不占满 32 bit。**只支持 load/store/MMA/GEMV，没有逐元素 ALU**——它是给矩阵乘准备的输入格式，不是通用计算类型。
+- rms_norm 的 f32 kernel 用的是 `tfloat32m1_t`（真 f32），不是 TF32。对 RMSNorm 这种需要逐元素乘/加/开方的算法，TF32 在指令层面就不可用。
