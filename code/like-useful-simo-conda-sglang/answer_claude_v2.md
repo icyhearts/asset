@@ -4662,6 +4662,7 @@ $ ./build/test_host
 ```
 [SIRT] Library:0.4.2.3ec8ff9.Release @ /share_data/sicx_sdk/release/2609101917/lib/libsi150.so.0
 argc:1
+,batch_size:16,normalized_size:7168,original_normalized_size:7168,emu_test_mode:0,no_compare:0,repeat_count:1
 [SIRT] Environment Shim: auto, detected Shim: swemusp, version: .../si1.5/2609080400/lib/libarchmodel.so
 kernel to launch!
 kernel return!
@@ -4680,6 +4681,7 @@ in strided golden function !!!
 | --- | --- |
 | `[SIRT] Library ...` | 运行时（SIRT）加载 `libsi150.so` |
 | `argc:1` | 无参数 → 走默认用例 |
+| `,batch_size:16,...` | `run_case` 开头的 `// like_debug` 调试打印（本地未提交改动），非必要输出 |
 | `... detected Shim: swemusp` | 用 `swemusp` shim 跑 **archmodel（cmodel）**而非真实硬件 |
 | `kernel to launch!` / `kernel return!` | `run_case` 里 launch 前后的打印 |
 | `in golden function !!!` | `golden()` 被调用 → 说明**逐元素比对全部通过**（有失败会打 stderr 的 `Error at index:`） |
@@ -4689,12 +4691,9 @@ in strided golden function !!!
 
 **没有任何 `Error at index:` 输出**，两个用例（连续 bf16 7168、非连续 bf16 512/stride 2176）均通过。
 
-> **本地工作区提醒**：`test/test_host.cpp` 当前有一处未提交的调试改动（`run_case` 开头多打了一行 `,batch_size:...` 日志），其中把变量写错成了 `emu_test`（正确名是 `emu_test_mode`）：
-> ```cpp
-> std::cout << ",batch_size:" << batch_size << ...
->     << ",emu_test:" << emu_test << ",no_compare:" << no_compare << ...;   // ← emu_test 未定义
-> ```
-> 这会导致 `bash build.sh` 直接编译失败（`error: 'emu_test' was not declared in this scope`）。上面的实测是在一份改回 `emu_test_mode` 的副本上跑通的；要恢复本仓库的构建，需要把这处改回 `emu_test_mode`（或删掉这行调试打印）。
+**关于工作区里那两处 `// like_debug` 调试打印**：`main()` 开头和 `run_case()` 开头各有一行 `std::cout` 调试输出（`argc:...` 和 `,batch_size:...`），是未提交的本地改动。上面的实测就是在**带这两行打印的工作区原样**上跑通的，`bash build.sh` 返回 0、`./build/test_host` 返回 0。
+
+> 本文早期版本曾记录这里有一处 `emu_test`（正确名 `emu_test_mode`）的编译错误 —— **该问题已修复**，当前工作区第 175 行是 `<< ",emu_test_mode:" << emu_test_mode << ...`，可以正常编译。上面 `run.log` 里多出来的 `,batch_size:16,...` 那一行就是这两处调试打印的产物。运行时若直接 `./build/test_host` 报 `cannot open shared object file: libsi150.so.0`，是因为没 `source setup.sh`——`LD_LIBRARY_PATH` 不跨 shell 保留，需在同一条命令里先 source。
 
 `--emu-multi` 路径（EMU 性能测试用）：
 
