@@ -3639,3 +3639,1117 @@ scripts/ci/sipu_ci_exec.sh \
 - 判定同 eager 门槛：case 退出码 0 且每个可比 pass `cos_sim >= 0.999`、`mean_atol <= 0.05`（`scripts/ci/sipu_ci_summary.py` docstring），汇总写 `<run-dir>/summary.tsv` / `summary.log`；结果目录为 `$CI_ROOT/single/<YYYYMMDD>`。
 
 > 补充：`sipu_ci_suites.yaml` 里的 `distributed` suite（3 个 case）就是 `platform: qemu`，所以这条路径也正是 suite 模式下 `distributed` 的执行方式。
+---
+
+## 47. sikernel `rms_norm` 全链路解析：从 `test_host.cpp` 到 device kernel
+
+**代码位置**：`/share/users/like/package/sikernel/source/source_builtin/attention/rms_norm/`
+**ISA 文档**：`/softhome/like/asset/code/isa/index.html`（Tile Core Extension 指令集手册）
+**运行方式**：`source setup.sh` → `cd source/source_builtin/attention/rms_norm` → `bash build.sh` → `./build/test_host`
+
+### 47.0 一句话结论
+
+这个 kernel 是**一行一个 thread（thread-per-row）的 RMSNorm**：每个 thread 负责 `(batch_size, normalized_size)` 矩阵的一整行，分两趟（two-pass）处理——**Pass 1** 把整行的 `x²` 累加求和得到 `mean`、开方取倒数得到 `rsqrt`；**Pass 2** 重新读一遍这一行，乘 `rsqrt`、可选乘 `weight`，写回输出。
+
+关键设计有两点：
+
+1. **Tile 寄存器 + 1024 字节定长切片**。`normalized_size` 被切成 `1024/sizeof(T)` 个元素一块的 tile（f32→256 元素，f16/bf16→512 元素），每块用一条 `tld`/`tst` 搬进/搬出 tile 寄存器。所以 wrapper 里那条"`normalized_size * sizeof(T) % 1024 == 0`"的对齐要求不是随便定的——**它是 kernel 没有 tail 处理所直接推导出来的约束**。
+2. **shared memory 当 cache 用**。Pass 1 读进来的行数据顺手存进 `__shared__`，Pass 2 优先从 shared 读，避免把整行从 global 再读一遍。每 thread 独占 256 KB，两个 thread 合计 512 KB，正好吃满一颗 PE 的 SRAM。
+
+### 47.1 目录与构建
+
+```
+rms_norm/
+├── CMakeLists.txt                  # 两个 scc 编译单元 + 一个 g++ 测试可执行文件
+├── build.sh                        # cmake -B build ./ && cmake --build build
+├── run.sh                          # rm -rf build && build.sh && ./build/test_host
+├── kernel/
+│   ├── rms_norm_kernel.su          # ★ host 侧 wrapper：校验 / dispatch / launch
+│   ├── legacy_api.su               # 裸指针兼容层（旧 ABI）
+│   ├── rms_norm_kernel_f32.hpp     # ★ device kernel：f32
+│   ├── rms_norm_kernel_f16.hpp     # ★ device kernel：f16
+│   └── rms_norm_kernel_bf16.hpp    # ★ device kernel：bf16（含 strided-input 版本）
+└── test/
+    └── test_host.cpp               # ★ host 测试 + golden 参考实现
+```
+
+**构建断点**：`CMakeLists.txt` 把 `rms_norm_kernel.su` + `legacy_api.su` 编成 `librms_norm.so`（`scc -arch=si150`），再把 `test_host.cpp` 用**宿主 g++**编成可执行文件并链接这个 `.so`、`libsisirt` 与 `libsi150`：
+
+```cmake
+scc_add_library(rms_norm SHARED kernel/rms_norm_kernel.su kernel/legacy_api.su)
+scc_target_compile_definitions(rms_norm PRIVATE TARGET_SIPU_ARCH=${TARGET_SIPU_ARCH})
+add_executable(test_host test/test_host.cpp)
+target_link_libraries(test_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/librms_norm.so sisirt si150)
+```
+
+实际编译命令（`build/CMakeFiles/rms_norm.dir/build.make`）：
+
+```
+scc -arch=si150 --keep-dir build/siWork.rms_norm -c -fPIC -o .../rms_norm_kernel.su.o \
+    -I<sikernel>/include -I<sikernel>/source/source_builtin/utils \
+    -DTARGET_SIPU_ARCH=150 kernel/rms_norm_kernel.su
+```
+
+`.su` 是"含 device 代码的编译单元"的后缀：`scc` 会把 `__global__` 函数编成 fatbin 塞进 `.so`，host 侧的普通 C++ 函数编成普通 ELF 符号。`build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm` 就是 device 代码的反汇编，本文后面用它来对照 ISA。
+
+### 47.2 调用链总览
+
+```
+test/test_host.cpp
+│
+├─ main(argc, argv)                                     test_host.cpp:main
+│   ├─ [--emu-multi 路径] parse_multi_case_options → run_case(..., emu_test_mode=true)
+│   ├─ run_case(16, 7168, 7168, false, false)           ←★ 默认路径：连续 bf16
+│   └─ run_strided_case(33, 512)                        ←★ 默认路径：非连续 bf16
+│
+├─ run_case(batch_size, normalized_size, original_normalized_size, ...)
+│   ├─ sikernel::tensor<bf16> input_tensor({batch_size, normalized_size})   ← 自动推 strides
+│   ├─ sipuMalloc / sipuMemcpy(H2D)
+│   ├─ rms_norm<bf16>(out, in, w, eps, orig_norm, w_opt=1, eps_opt=1)      ← host API
+│   │   └─ rms_norm_launch<bf16>(..., launch_timestamp_ns=nullptr, kernel_elapsed_ms=nullptr)
+│   │       ├─ check_rms_norm_tensor_metadata(...)    ← 20 余条 check(...)
+│   │       ├─ is_contiguous_layout(input/output/weight)
+│   │       └─ rms_norm_contiguous_launch<bf16>(...)   ← 三选一 dispatch
+│   │           └─ __global__ rms_norm_bf16_kernel<<<grid, cluster, block, 0, stream>>>(...)
+│   │                └─ 每个 thread 一行：Pass1 求 rsqrt → Pass2 缩放写回
+│   ├─ sipuMemcpy(D2H)
+│   └─ golden(...) + 逐元素相对误差比对（阈值 1%）
+│
+└─ run_strided_case(batch_size=33, normalized_size=512)
+    ├─ input_tensor.strides = {2176, 1}   ← 唯一被手动改写 strides 的地方
+    ├─ rms_norm<bf16>(...)
+    │   └─ rms_norm_launch<bf16>(...)
+    │       └─ rms_norm_bf16_strided_input_launch(...)  ← 命中非连续分支
+    │           └─ __global__ rms_norm_bf16_strided_input_kernel<<<...>>>(...)
+    └─ golden_strided_input(...) + 比对
+```
+
+一句话概括层次：**test_host（数值验证）→ rms_norm（公开 API）→ rms_norm_launch（校验+dispatch）→ xxx_launch（grid/block 配置）→ __global__ kernel（真正的算法）**。
+
+### 47.3 第 0 层：`test/test_host.cpp`
+
+#### 47.3.1 头部与测试形状
+
+```cpp
+#define K  7168      // padded size, align to 512
+#define VK 7168      // valid size
+#define M  16
+#define DATATYPE sifmt::bfloat16
+```
+
+`K` 是**补齐后**的 normalized 维长度（注释说 align to 512；bf16 下 512 元素 = 1024 B，正好一个 tile），`VK` 是"有效"长度，`M=16` 是 batch。注意默认用例里 `K == VK == 7168`，所以"补齐"这条路径在默认测试中**没有被覆盖**——后面 47.10 会讲这里藏了一个语义陷阱。
+
+`test_host.cpp` 自己**重新声明**了两个模板函数，而不是从 `sikernel.h` 拿声明：
+
+```cpp
+template <typename T>
+void rms_norm(sikernel::tensor<T>& output, sikernel::tensor<T>& input, sikernel::tensor<T>& weight,
+              const float eps, const int64_t original_normalized_size, int weight_opt, int eps_opt,
+              sipuStream_t stream);
+```
+
+这是因为 `sikernel.h` 里那个模板只在 `.so` 里做了**显式实例化**（`kernel/rms_norm_kernel.su:263-265`），头文件里没有定义，所以测试只需要一份签名一致的外部声明，链接期由 `librms_norm.so` 提供符号。C++ 模板 + `extern` 显式实例化是这套代码的通用手法。
+
+#### 47.3.2 `main` —— 三条入口
+
+```cpp
+int main(int argc, char* argv[]) {
+    std::cout << "argc:" << argc << "\n";                 // ← 本地调试时加的
+    const auto multi_options = sikernel::emu_test::parse_multi_case_options(argc, argv);
+    if (multi_options.requested) {
+        // ./test_host --emu-multi 33:7168 [--no-compare] [--repeat N]
+        for (const std::string &shape : multi_options.case_args) {
+            // 解析 "<case_size>:<hidden_size>"
+            pass = run_case(case_size, hidden_size, hidden_size, /*emu_test_mode=*/true,
+                            multi_options.no_compare, multi_options.repeat) && pass;
+        }
+        SIKERNEL_TEST_RETURN(pass);
+    }
+    if (argc != 1) { SIKERNEL_TEST_RETURN(false); }       // 默认路径要求无参数
+    bool pass = run_case(M, K, VK, false, false);         // 连续用例
+    pass = run_strided_case(33, 512) && pass;             // 非连续用例
+    SIKERNEL_TEST_RETURN(pass);
+}
+```
+
+`SIKERNEL_TEST_RETURN(cond)`（`include/sikernel_test.h:47`）负责打印 ASCII 艺术字 **PASS**/**FAIL** 并返回 `0` / `-1`——run.log 末尾那个八角星图案就是它打的。
+
+`--emu-multi` 模式下走的是另一条路：`run_case(..., emu_test_mode=true, ...)` 会改用 `rms_norm_timed`，用 `sipuEvent` 量 kernel 时间、用 `host_timestamp_ns()` 量 launch 前后的 host 时间，并把结果 append 到 CSV（`dsv3_op_result_rms_norm.log`），供 EMU 性能测试脚本消费。`SIKERNEL_EMU_TEST_SKIP_CSV=1` 可以关掉写盘。
+
+#### 47.3.3 `run_case` —— 连续路径
+
+```cpp
+bool run_case(int batch_size, int normalized_size, int original_normalized_size,
+              bool emu_test_mode, bool no_compare, int repeat_count = 1) {
+    const int weight_opt = 1;
+    const int eps_opt = 1;
+    const int case_size = emu_test_mode ? batch_size : 0;
+    const std::string emu_test_kernel_name = "rms_norm_" + std::to_string(normalized_size);
+
+    size_t nIn0 = normalized_size * batch_size;   // 输入元素数
+    size_t nIn1 = normalized_size;                // weight 元素数
+    size_t nOut = normalized_size * batch_size;   // 输出元素数
+    ...
+    DATATYPE* host_A = (DATATYPE*)malloc(sizeIn0);
+    DATATYPE* host_B = (DATATYPE*)malloc(sizeIn1);
+    DATATYPE* host_D = no_compare ? nullptr : (DATATYPE*)malloc(sizeOut);   // device 结果回读
+    DATATYPE* host_G = no_compare ? nullptr : (DATATYPE*)malloc(sizeOut);   // golden
+
+    std::default_random_engine gen;
+    std::uniform_real_distribution<float> dist(-10.0f, 100.0f);   // 输入：[-10, 100)
+    std::uniform_real_distribution<float> dist1(-1.0f, 1.0f);     // weight：[-1, 1)
+
+    for (size_t i = 0; i < nIn0; i++) {
+        host_A[i] = (DATATYPE)(dist(gen));
+        if (i % normalized_size >= original_normalized_size)
+            host_A[i] = (DATATYPE)(dist(gen));      // ← 两个分支完全相同，历史遗留
+    }
+    for (size_t i = 0; i < nIn1; i++) host_B[i] = (DATATYPE)(dist1(gen));
+```
+
+那个 `if` 的两条分支写法一模一样，推测原本是想给 padding 区域填 0（早期测试用 `K > VK` 验证 padding），后来改成了随机填充但没删掉。默认用例 `K == VK` 时这个分支永远不成立，属于无害的历史残留。
+
+继续：
+
+```cpp
+    void *bo_A; void *bo_B; void *bo_D;
+    sipuMalloc(&bo_A, sizeIn0);
+    sipuMalloc(&bo_B, sizeIn1);
+    sipuMalloc(&bo_D, sizeOut);
+    sipuMemcpy(bo_A, host_A, sizeIn0, sipuMemcpyHostToDevice);
+    sipuMemcpy(bo_B, host_B, sizeIn1, sipuMemcpyHostToDevice);
+
+    sikernel::tensor<DATATYPE> input_tensor({batch_size, normalized_size});
+    sikernel::tensor<DATATYPE> output_tensor({batch_size, normalized_size});
+    sikernel::tensor<DATATYPE> weight_tensor({normalized_size});
+    input_tensor.data  = bo_A;
+    output_tensor.data = bo_D;
+    weight_tensor.data = bo_B;
+```
+
+注意这里**没有手动设置 strides**——`sikernel::tensor<T>` 的 `initializer_list` 构造函数（`include/sikernel_tensor.h:65`）会自动按行主序推 `strides = {normalized_size, 1}`（weight 是 `{1}`）。所以这条路径天然是 contiguous。
+
+```cpp
+    const float eps = 1e-6;
+    std::cout << "kernel to launch!" << std::endl;
+
+    if (emu_test_mode) {
+        // 用 rms_norm_timed 跑 repeat_count 次，丢弃第 0 次（warm-up）
+        // 统计 kernel_elapsed_ms / api_launch_ms / launch_end_ms / total_host_ms
+        const int measured_repeats = sikernel::emu_test::measured_repeat_count(repeat_count);
+        for (int repeat = 0; repeat < repeat_count; ++repeat) {
+            uint64_t launch_timestamp_ns = 0;
+            float kernel_launch_ms = 0.0f;
+            const uint64_t api_start_ns = sikernel::host_timestamp_ns();
+            launch_timestamp_ns = api_start_ns;
+            rms_norm_timed<DATATYPE>(output_tensor, input_tensor, weight_tensor, eps,
+                                     original_normalized_size, weight_opt, eps_opt, nullptr,
+                                     &launch_timestamp_ns, &kernel_launch_ms);
+            const uint64_t api_end_ns = sikernel::host_timestamp_ns();
+            if (sikernel::emu_test::repeat_counts_towards_average(repeat, repeat_count)) { ... }
+        }
+    } else {
+        rms_norm<DATATYPE>(output_tensor, input_tensor, weight_tensor, eps,
+                           original_normalized_size, weight_opt, eps_opt);   // stream 默认 nullptr
+    }
+    std::cout << "kernel return!" << std::endl;
+```
+
+`measured_repeat_count(n) = max(n-1, 1)`、`repeat_counts_towards_average(i, n) = (n == 1 || i > 0)`——即 `--repeat N` 时**第 0 次只做 warm-up，不计入平均**。
+
+```cpp
+    if (!no_compare) sipuMemcpy(host_D, bo_D, sizeOut, sipuMemcpyDeviceToHost);
+    sipuFree(bo_A); sipuFree(bo_B); sipuFree(bo_D);
+
+    int err = 0;
+    if (!no_compare) {
+        golden(host_G, host_A, host_B, eps, batch_size, normalized_size,
+               original_normalized_size, weight_opt, eps_opt);
+        for (int i = 0; i < nOut; i++) {
+            float err_rate = fabs(((float)host_G[i] - (float)host_D[i]) / (float)host_G[i]);
+            if (err_rate > 0.01f) { err = 1; std::cerr << "Error at index: " << i << ...; }
+        }
+    }
+```
+
+判据是**相对误差 < 1%**，逐元素检查。注意 `golden` 是**在 device 结果回读之后**才算的（先 Free 了 device 内存），这点和 `run_strided_case` 的顺序不同但无影响。
+
+#### 47.3.4 `golden` —— 参考实现
+
+```cpp
+void golden(DATATYPE* pout, DATATYPE* pin, DATATYPE* weight, float eps,
+            int batch_size, int normalized_size, int original_normalized_size,
+            int weight_opt, int eps_opt) {
+    for (int j = 0; j < batch_size; ++j) {
+        float sum = 0;
+        for (int i = 0; i < normalized_size; ++i)                 // ★ 求和走满 normalized_size
+            sum += pin[j * normalized_size + i] * pin[j * normalized_size + i];
+        float mean = sum / original_normalized_size;              // ★ 分母是 original_...
+        if (eps_opt) mean += eps;
+        float rsqrt = 1 / sqrt(mean);
+        for (int i = 0; i < normalized_size; ++i) {
+            float dout = rsqrt * pin[j * normalized_size + i];
+            if (weight_opt) dout = dout * weight[i];
+            pout[j * normalized_size + i] = dout;
+        }
+    }
+}
+```
+
+这段就是 RMSNorm 的定义，逐字对应 device kernel：
+`mean = Σx² / original_normalized_size`（+eps）→ `rsqrt = 1/sqrt(mean)` → `y = x * rsqrt * w`。
+
+**注意 golden 用的是双精度积累（`float sum` 是 f32 标量、但顺序是纯串行）**，而 device 侧用 tile 向量并行累加、归约顺序完全不同——两者必然有浮点级差异，所以阈值放到 1%（bf16 输入本身只有 8 位尾数）。
+
+#### 47.3.5 `run_strided_case` —— 非连续路径
+
+```cpp
+bool run_strided_case(int batch_size, int normalized_size) {
+    const int input_stride0 = 2176;      // ★ 外部约定的行 pitch
+    const int weight_opt = 1;
+    const int eps_opt = 1;
+    const float eps = 1e-6;
+
+    size_t nIn0 = input_stride0 * batch_size;   // 注意：按 stride 分配，输入缓冲区更大
+    size_t nIn1 = normalized_size;
+    size_t nOut = normalized_size * batch_size;
+    ...
+    sikernel::tensor<DATATYPE> input_tensor({batch_size, normalized_size});
+    sikernel::tensor<DATATYPE> output_tensor({batch_size, normalized_size});
+    sikernel::tensor<DATATYPE> weight_tensor({normalized_size});
+    input_tensor.data = bo_A;
+    input_tensor.strides = {input_stride0, 1};   // ★ 唯一一处手动改 strides
+    output_tensor.data = bo_D;
+    weight_tensor.data = bo_B;
+    ...
+    rms_norm<DATATYPE>(output_tensor, input_tensor, weight_tensor, eps, normalized_size,
+                       weight_opt, eps_opt, nullptr);
+```
+
+两个关键点：
+
+1. `input_tensor` 的 `sizes` 是 `{33, 512}`、`strides` 是 `{2176, 1}`——**逻辑形状和物理布局不一致**，第 j 行的起始地址是 `bo_A + j*2176`。H2D 拷贝也按 `nIn0 = 2176 * 33` 拷全量。
+2. `output_tensor` 保持默认 strides `{512, 1}`（连续），`weight` 是 `{1}`。
+
+`golden_strided_input` 对应地按 `row = pin + j * input_stride0` 取行，其余与 `golden` 一致；注意它的 `mean = sum / normalized_size`（没有 `original_normalized_size` 参数，因为 strided 分支强制要求两者相等）。
+
+`2176` 这个数字**在本仓库里 grep 不到定义**，只能确认它是**外部框架强加的行 pitch**（很可能是 KV cache / MLA 的物理布局）。可以观察到的算术关系是 `2176 = 2048 + 128`，对应 512 个 bf16（1024 B）有效数据 + 1024 B 额外间距，即行 pitch 4352 B；但这只是从数字反推，**具体来源需要查调用方（sglang/vllm 侧的 KV cache 分配逻辑）才能确认**。
+
+从 kernel 角度看，它完全不关心这个数字的来源——只是照用 `input.strides[0]`。所以设计上把它写成了"只支持精确匹配 `2176` 的两个 shape"的**白名单**，而不是通用 strided 支持：通用化需要处理任意 `stride0` 下的边界/对齐，成本高且当时没有第二个用例，白名单是性价比最高的做法。
+
+### 47.4 第 1 层：host API `rms_norm`
+
+`kernel/rms_norm_kernel.su:250-256`：
+
+```cpp
+template<typename T>
+void rms_norm(sikernel::tensor<T>& output, sikernel::tensor<T>& input, sikernel::tensor<T>& weight,
+              const float eps, const int64_t original_normalized_size, int weight_opt, int eps_opt,
+              sipuStream_t stream) {
+    rms_norm_launch<T>(output, input, weight, eps, original_normalized_size, weight_opt, eps_opt,
+                       stream, /*launch_timestamp_ns=*/nullptr, /*kernel_elapsed_ms=*/nullptr);
+}
+```
+
+它只是 `rms_norm_launch` 的一层薄封装，把计时相关的两个可选出参置空。同文件 `242-248` 还有 `rms_norm_timed`，把这两个出参透传给 launch——**测试里的 EMU 计时路径就是靠它**。
+
+文件末尾 `258-265` 是 6 条显式实例化（3 dtype × 2 API），这就是为什么头文件里只放声明也能链接成功。
+
+参数语义（与 `include/sikernel.h:1265-1277` 的 doc comment 一致）：
+
+| 参数 | 含义 | 约束 |
+| --- | --- | --- |
+| `output` | 输出，2D | shape 必须与 input 完全相同；`data != nullptr` |
+| `input` | 输入，2D `(B, N)` | `sizes[1]*sizeof(T) % 1024 == 0` |
+| `weight` | 缩放权重，1D | `weight_opt != 0` 时必填，长度 == `sizes[1]` |
+| `eps` | 数值稳定项 | `eps_opt != 0` 时加到 mean 上 |
+| `original_normalized_size` | 求 mean 时的**分母** | `0 < it <= normalized_size` |
+| `weight_opt` / `eps_opt` | 开关 | 非 0 即启用 |
+| `stream` | 启流 | 默认 `nullptr` |
+
+另有 `legacy_api.su` 提供裸指针重载：拿到 `(void* out, void* in, void* w, B, N, origN, ...)` 后，构造三个 contiguous tensor 再转调新 API。
+
+```cpp
+template<typename T>
+void rms_norm(const void* output, const void* input, const void* weight, const float eps,
+              const int64_t batch_size, const int64_t normalized_size,
+              const int64_t original_normalized_size, int weight_opt, int eps_opt,
+              sipuStream_t stream) {
+    sikernel::tensor<T> output_tensor({batch_size, normalized_size});
+    sikernel::tensor<T> input_tensor({batch_size, normalized_size});
+    sikernel::tensor<T> weight_tensor({normalized_size});
+    output_tensor.data = const_cast<void*>(output);
+    input_tensor.data  = const_cast<void*>(input);
+    weight_tensor.data = const_cast<void*>(weight);
+    rms_norm<T>(output_tensor, input_tensor, weight_tensor, eps, original_normalized_size,
+                weight_opt, eps_opt, stream);
+}
+```
+
+即老 ABI 只能表达连续布局——**非连续支持是新 API 独有的能力**。
+
+### 47.5 第 2 层：`rms_norm_launch` —— 校验与 dispatch
+
+`kernel/rms_norm_kernel.su:204-240`，整个 wrapper 的核心：
+
+```cpp
+template<typename T>
+void rms_norm_launch(sikernel::tensor<T>& output, sikernel::tensor<T>& input, sikernel::tensor<T>& weight,
+                     const float eps, const int64_t original_normalized_size, int weight_opt, int eps_opt,
+                     sipuStream_t stream, uint64_t *launch_timestamp_ns, float *kernel_elapsed_ms) {
+    check_rms_norm_tensor_metadata(output, input, weight, original_normalized_size, weight_opt);
+
+    const int64_t batch_size     = input.sizes[0];
+    const int64_t normalized_size = input.sizes[1];
+    const bool weight_contiguous = weight_opt ? is_contiguous_layout(weight) : true;
+
+    if (is_contiguous_layout(input) && is_contiguous_layout(output) && weight_contiguous) {
+        rms_norm_contiguous_launch<T>(output.data, input.data, weight.data, eps, batch_size, normalized_size,
+                                      original_normalized_size, weight_opt, eps_opt, stream,
+                                      launch_timestamp_ns, kernel_elapsed_ms);
+        return;
+    }
+
+    if constexpr (std::is_same_v<T, sifmt::bfloat16>) {
+        const bool supported_bf16_shape  = (normalized_size == 512 || normalized_size == 1536) &&
+                                            original_normalized_size == normalized_size;
+        const bool supported_input_stride  = input.strides[0] == 2176 && input.strides[1] == 1;
+        const bool supported_output_stride = output.strides[0] == normalized_size && output.strides[1] == 1;
+        const bool supported_weight_stride = !weight_opt || weight.strides[0] == 1;
+
+        if (supported_bf16_shape && supported_input_stride && supported_output_stride && supported_weight_stride) {
+            rms_norm_bf16_strided_input_launch(output.data, input.data, weight.data, eps, batch_size,
+                                               normalized_size, original_normalized_size, input.strides[0],
+                                               weight_opt, eps_opt, stream, launch_timestamp_ns, kernel_elapsed_ms);
+            return;
+        }
+    }
+
+    sipu::check(false,
+        "rms_norm non-contiguous tensors only support bf16 exact input shape/stride "
+        "(num_tokens,512)/(2176,1) or (num_tokens,1536)/(2176,1), "
+        "with contiguous matching output and weight", __FILE__, __LINE__);
+}
+```
+
+逐段拆解：
+
+**① metadata 校验**（`check_rms_norm_tensor_metadata`，`:51-79`）：
+
+| # | 检查 | 备注 |
+| --- | --- | --- |
+| 1 | `output.data != nullptr` | |
+| 2 | `input.data != nullptr` | |
+| 3 | `weight_opt` 时 `weight.data != nullptr` | |
+| 4 | `input.dim == 2` / `output.dim == 2` | 只支持 2D |
+| 5 | `sizes.size() == 2 && strides.size() == 2` | 防御 `sizes`/`strides` 与 `dim` 不一致 |
+| 6 | `input.sizes[0] > 0 && input.sizes[1] > 0` | batch_size / normalized_size 必须为正 |
+| 7 | `output.sizes == input.sizes` | 输出必须与输入同形 |
+| 8 | **`input.sizes[1] * sizeof(T) % 1024 == 0`** | ★ 1024 B 对齐——kernel 无 tail 的直接后果 |
+| 9 | `0 < original_normalized_size <= input.sizes[1]` | 分母必须落在有效区间 |
+| 10 | `weight.dim == 1`、`sizes.size()==1`、`weight.sizes[0] == input.sizes[1]` | weight 长度必须等于 normalized_size |
+
+**② 连续性判定**（`is_contiguous_layout`，`:36-49`）：
+
+```cpp
+template<typename T>
+bool is_contiguous_layout(const sikernel::Tensor<T>& tensor) {
+    if (tensor.dim == 0 || tensor.sizes.size() != tensor.dim || tensor.strides.size() != tensor.dim)
+        return false;
+    int64_t expected_stride = 1;
+    for (int64_t i = tensor.dim - 1; i >= 0; --i) {
+        if (tensor.sizes[i] <= 0 || tensor.strides[i] != expected_stride) return false;
+        expected_stride *= tensor.sizes[i];
+    }
+    return true;
+}
+```
+
+从最后一维往前推"理想 stride"（`1, N, N*M, ...`），任一维对不上就不是连续。对 `{B,N}/{N,1}` 和 `{N}/{1}` 都成立。
+
+注意 `sikernel_tensor.h` 里另有一个 `check_contiguous_tensor`，那个是**断言版**（不连续直接 `check(false)` 报错），wrapper 用的是这个**返回 bool** 的本地版本，因为它要做 dispatch 而不只是校验。
+
+**③ 三分支 dispatch**：
+
+```
+                ┌─ input/output/weight 全 contiguous ──► rms_norm_contiguous_launch  (dtype 泛化)
+非连续输入 ─────┼─ bf16 且命中 (N∈{512,1536}, stride=(2176,1),
+                │   out=(N,1), w=(1,), origN==N)      ──► rms_norm_bf16_strided_input_launch
+                └─ 其他                                ──► check(false) 直接报错
+```
+
+设计取舍很清楚：**通用性只给到连续布局**，非连续只在"有明确业务需求（KV cache 布局）的那两个精确 shape"上开洞，其余一律 fail-fast。README 里那句"非连续输入仅支持 bfloat16，并且 normalized 维度和 stride 只支持以下两个完全匹配的 case"就是这里。
+
+`supported_output_stride` 用的是 `output.strides[0] == normalized_size`（而不是显式写 1）——因为 output 要求连续，行 stride 必然等于 normalized_size。`supported_weight_stride` 在 `weight_opt == 0` 时直接为真，此时 `weight` 根本没被读。
+
+### 47.6 第 3 层：launch 配置 —— grid / block 怎么算
+
+`rms_norm_contiguous_launch`（`:83-160`）和 `rms_norm_bf16_strided_input_launch`（`:162-202`）用**完全相同的** grid/block 推导：
+
+```cpp
+uint32_t block_dim = 1;
+uint32_t cluster_dim = 1;
+uint32_t grid_dim = 1;
+
+if (batch_size >= 2)  block_dim = 2;                 // 每 block 2 个 thread
+if (batch_size >= 32) grid_dim = 16;                 // 大批量：grid 封顶 16
+else                  grid_dim = (batch_size + 1) / 2;  // 小批量：每 block 摊 2 行
+
+dim3 grid{grid_dim};
+dim3 cluster{cluster_dim};     // 恒为 1
+dim3 block{block_dim};
+```
+
+由此得到的 `blockIdx.x * blockDim.x + threadIdx.x`（即 kernel 里的 `tid`）与总线程数：
+
+| batch_size B | block_dim | grid_dim | 总线程 | 每线程处理行数 | 覆盖情况 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 1 | 1 | 1 | `bid=0`，恰好 |
+| 2 | 2 | 1 | 2 | 1 | `bid=0,1`，恰好 |
+| 3 | 2 | 2 | 4 | ≤1 | 线程 3 空转 |
+| 16（默认） | 2 | 8 | 16 | 1 | 恰好 |
+| 32 | 2 | 16 | 32 | 1 | 恰好 |
+| 33（strided 用例） | 2 | 16 | **32** | ≤2 | 线程 0 串行处理 `bid=0,32` |
+| 100 | 2 | 16 | 32 | ≤4 | 线程循环 3~4 次 |
+
+可以看到：
+- `grid_dim` 在 B ≥ 32 时**封顶 16**（16 block × 2 thread = 32 线程），此后增加 batch **不再增加并行度**，而是让每个线程串行跑多行（kernel 里的 `for (bid = tid; bid < batch_size; bid += all_threads)`）。
+- `run_strided_case(33, 512)` 正好落在"33 行 / 32 线程"这个**非整除**的边界上——第 0 号线程要跑 `bid=0` 和 `bid=32` 两行。这是有意挑选的边界测试。
+
+**thread 数为什么是 2？** 从后面 device 侧的结构就能反推：
+
+```cpp
+__shared__ bfloat16_t shared_buff[2][shared_buffer_size];   // 第一维 = 2
+...
+tst_linear_share_m1(bf16_din, shared_buff[threadIdx.x], i*tile_size);
+...
+bf16_din = tld_linear_share_m1(shared_buff[threadIdx.x], offset);
+```
+
+shared memory 的容量是 512 KB（fatbin 元数据里 `.sram = 524288` 可以印证），被 `[2]` 均分成两块 **256 KB**，用 `threadIdx.x` 选块。所以 `block_dim = 2` 不是"为了 2 路并行"那么简单——**它同时也是 shared memory 的分配维数**，写成 2 是因为 256 KB 恰好能装下 256 个 tile（256 × 1024 B = 256 KB），这是个容量最优解。如果 block_dim 改成 4，每块只剩 128 KB，能缓存的 tile 数减半。
+
+> **关于 grid/block 到硬件的映射**：device 侧拿到的 `blockIdx.x` / `blockDim.x` / `threadIdx.x` 实际上来自 CSR `tkernelidx`(0x230) 和 `tkerneldims`(0x240)（ISA 文档 §CSR列表）。反汇编里这段是：
+>
+> ```
+> tcsrr.r.b64 t0, tkernelidx
+> tcsrr.r.b64 t3, tkerneldims
+> ... mul / add ...
+> zext.w  t0, t1        # t1 = 线性 thread id
+> ```
+>
+> 即编译器把三级索引 `(tbc, tb, thread)` 线性化成 `(f(tbc_dim_x)·tbc_idx_x + tb_idx_x)·tb_dim + thread_idx` 的形式。因为 `cluster_dim` 恒为 1，cluster 那一项恒为 0，**结果退化成我们熟悉的 `blockIdx.x * blockDim.x + threadIdx.x`**。ISA 文档只给出 `tkernelidx`/`tkerneldims` 各字段的位宽，没有给出 `tb`/`tbc` 的具体形状（2D？多少 thread？），所以这里只做"语义等价于 CUDA 式三维索引"的结论，具体位域请以 SDK 头文件为准。
+
+### 47.7 第 4 层：device kernel 逐行讲解（重点）
+
+先建立 tile 寄存器的语言，后面逐行讲解才不会卡住。
+
+#### 47.7.0 前置：tile 寄存器速查表
+
+这不是 CUDA，也不是普通 RVV。这是一套**tile 扩展**：除 RV 的标量寄存器（`x0-x31` / `f0-f31`）和向量寄存器（`v0-v31`，1024 bit）之外，还有一整排 **Tile 寄存器**，每个 8192 bit = **1024 字节**。
+
+ISA 文档明确写了这几条：
+
+> 每个 Tile Reg 的容量 = **8192-bit = 1024-Byte**（1KB）；`tilesize` 编码 m1/m2/m4/m8 对应 1024B/2048B/4096B/8192B。
+> 一条指令中多个 Tile Reg 的操作数**不允许重叠**。
+> 指令无法操作编号 ≥ `tregsize`(CSR) 的 tile reg，硬上限 160。
+
+C 层的类型名和子访问是这么来的（`include/si_dev_apis/dtype/union.h`）：
+
+```c
+typedef union {
+    struct { tfloat16m1_t m1e0; tfloat16m1_t m1e1; };
+    tfloat16m2_t m2e0;
+} tfloat16m2;                     // 2 KB = 2 个 m1
+
+// tfloat32m2 同构：
+typedef union {
+    struct { tfloat32m1_t m1e0; tfloat32m1_t m1e1; };
+    tfloat32m2_t m2e0;
+} tfloat32m2;
+```
+
+即 `m2` 是**两个 `m1` 的并集**，`m1e0`/`m1e1` 是它的两个 1 KB 半区。kernel 里大量出现 `xxx.m1e0` / `xxx.m1e1`，就是在拆/合这 2 KB。
+
+于是各 dtype 下一个 tile（1 KB）装多少元素：
+
+| 类型 | 单 tile 元素数 | 类型说明 |
+| --- | --- | --- |
+| `tfloat32m1_t` | 1024 B / 4 B = **256** | 32 行 × 32 B 排布 |
+| `tfloat16m1_t` | 1024 B / 2 B = **512** | 32 行 × 32 B 排布 |
+| `tbfloat16m1_t` | 1024 B / 2 B = **512** | 同上 |
+| `tfloat32m2_t` | **512** | = 2 个 m1 |
+
+**这就是 `tile_size = 1024` 与 `norm_tile_num = norm_size/512`（bf16/f16）或 `norm_size/256`（f32）的由来**——`tile_size` 的单位是**字节**，`norm_tile_num` 是"一行切几块"：f32 每块 256 元素，bf16/f16 每块 512 元素。kernel 里所有 `offset` / `batch_offset` 也都是**字节偏移**（`bid*norm_size*sizeof(T)`）。
+
+再记住几个在 kernel 里高频出现的 intrinsic（C 层 → 汇编的映射由反汇编实证，见 47.8）：
+
+| C intrinsic | 汇编（本 kernel 反汇编实测） | 语义 |
+| --- | --- | --- |
+| `tld_linear_global_m1(ptr, off)` | `tld.trir.linear.u32.global` | 从 **global** 读 1 KB（=1 个 tile）到 tile 寄存器 |
+| `tst_linear_global_m1(t, ptr, off)` | `tst.trir.linear.u32.global` | 把 tile 寄存器 1 KB 写回 **global** |
+| `tst_linear_share_m1(t, ptr, off)` | `tst.trir.linear.u32.share` | 写 1 KB 到 **shared memory** |
+| `tld_linear_share_m1(ptr, off)` | `tld.trir.linear.u32.share` | 从 **shared memory** 读 1 KB |
+| `twait_store_share(n)` | `twait.i.store.share n` | 等待未完成的 share store 数 ≤ n（0 = 全部排空） |
+| `tcvt_f32(tile, t_r32)` | `tcvt.tt.f32.bf16.r32` | 1 KB bf16(512) → 2 KB f32(512，拆成 m1e0/m1e1) |
+| `tcvt_bf16(tile, t_r32)` | `tcvt.tt.bf16.f32.r32` | 2 KB f32 → 1 KB bf16 |
+| `tmul(a, b)` / `tadd(a, b)` | `tmul.ttt.f32` / `tadd.ttt.f32` | tile 逐元素乘/加（无 fma，见 47.10） |
+| `tmv_t_f32(v)` | `tmv.trr.broadcast` | 标量 → 广播填满整个 tile 寄存器 |
+| `tmv_v_f32(tile, i)` | `tmv.vtr.e32` | 取 tile 里第 i 个 **128 B 块**（32 个 f32）到 RVV 向量寄存器 |
+| `twait_store_share` | `twait.i.store.share` | 见上 |
+
+`t_r32` 来自 `tile_vector.h`（`const unsigned t_r32 = 0x02;`），是 `tcvt` 的**shape / 布局属性**——ISA 文档里 matrix conversion 的语法是 `tcvt.tt.<dtype>.<atype>.<shape>`，其中 shape 编码 32 行 = `r32`、16 行 = `r16`、8 行 = `r8`。反汇编中确实生成成了 `.r32` 后缀，说明它选的是"32 行"的转换布局。
+
+#### 47.7.1 `rms_norm_bf16_kernel` 逐行（`rms_norm_kernel_bf16.hpp:25-112`）
+
+这是默认用例（`sifmt::bfloat16`，M=16，K=7168）实际执行的 kernel。**下面逐行讲解。**
+
+---
+
+**① 签名（line 25）**
+
+```cpp
+__global__ void rms_norm_bf16_kernel(sifmt::bfloat16* pout, sifmt::bfloat16* pin, sifmt::bfloat16* weight,
+                                     float eps, int64_t batch_size, int64_t norm_size,
+                                     int64_t original_norm_size, int weight_opt, int eps_opt)
+```
+
+| 参数 | 值（默认用例） | 说明 |
+| --- | --- | --- |
+| `pout` / `pin` | `bo_D` / `bo_A` | device 全局指针，行主序 `(16, 7168)` |
+| `weight` | `bo_B` | 长度 7168 |
+| `eps` | `1e-6f` | |
+| `batch_size` | 16 | 逻辑行数，非 grid 维 |
+| `norm_size` | 7168 | 补齐后的行长度 |
+| `original_norm_size` | 7168 | **求 mean 的分母** |
+| `weight_opt` / `eps_opt` | 1 / 1 | |
+
+---
+
+**② 局部常量与 tile 变量（line 29-45）**
+
+```cpp
+  const int tile_size = 1024;
+  __andescore_fp_mode(BF16);
+```
+
+`tile_size = 1024` 是**字节**，即一个 tile 寄存器的大小。`__andescore_fp_mode(BF16)` 切换 core 的 16 位浮点解释模式。
+
+> 这个 intrinsic **不在 ISA 文档里**（文档只描述指令，不描述这种 core 级模式开关）。从源码看（`__clang_nds_device_functions.h`）它的实现是：
+> ```c
+> enum AndesFpMode { FP16 = 0, BF16 = 1 };
+> __device__ __attribute__((weak)) void __andescore_fp_mode(AndesFpMode mode) {
+>     unsigned long long fp_mode_mask = ~0x3;
+>     unsigned long long umisc_ctl = __nds__read_csr(NDS_UMISC_CTL) & fp_mode_mask;
+>     if (mode == BF16) umisc_ctl |= 1;
+>     __nds__write_csr(umisc_ctl, NDS_UMISC_CTL);
+> }
+> ```
+> 即把 `NDS_UMISC_CTL` 的 bit[1:0] 置成 `01`(BF16) 或 `00`(FP16)。它是一个**弱符号**，所以 f32 kernel 不调用它也不会链接失败。注意它是 `mode` 而非"当前 dtype"——f32 kernel 里完全不出现，因为 f32 无需歧义。
+
+```cpp
+  tbfloat16m1_t bf16_din;      // 1 KB bf16 = 512 个输入元素
+  tbfloat16m1_t bf16_wgt;      // 1 KB bf16 = 512 个 weight 元素
+  tfloat32m2    f32_din;       // 2 KB f32 = 512 个，由 bf16_din 转换而来，m1e0/m1e1 各 256
+  tfloat32m2    f32_wgt;       // 同上，weight 版
+  tfloat32m2    f32_sq;        // 2 KB f32 = 512 个，存 x*x
+  tfloat32m2    f32_sq_sum;    // 2 KB f32 = 512 个，跨 tile 的累加器（分两半 m1e0/m1e1）
+  tfloat32m1_t  tile_rsqrt;    // 1 KB f32 = 256 个，装广播后的 1/sqrt(mean)
+  float sum;                   // 标量归约结果
+  float mean;                  // sum / original_norm_size (+eps)
+  float sqrt;                  // fsqrt 结果
+  tfloat32m2    f32_out;       // 2 KB f32 = 512 个，Pass 2 的输出
+  tbfloat16m1_t bf16_out;      // 1 KB bf16 = 512 个，写回 global
+```
+
+整套变量就是一条流水线：`bf16 → f32(2KB) → 平方累加 → 归约成标量 → 广播回 tile → 乘 → f32 → bf16 → 写回`。
+
+```cpp
+  int64_t norm_tile_num = norm_size/512;                     // 7168/512 = 14
+  const int shared_buffer_size = 512*1024/sizeof(bfloat16_t)/2;   // = 131072
+  __shared__ bfloat16_t shared_buff[2][shared_buffer_size];
+```
+
+- `norm_tile_num = 14`：一行 7168 个 bf16，每个 tile 512 个，共 14 块。
+- `shared_buffer_size = 512*1024 / 2 / 2 = 131072`（元素数）：512 KB SRAM / sizeof(bf16)=2 B / 2（两个 thread 平分）= 131072 个 bf16 = **262144 B = 256 KB**。
+- `shared_buff[2][131072]` 总占用 `2 × 131072 × 2 B = 524288 B = 512 KB`，与 fatbin 元数据 `.sram = 524288` 完全一致。
+
+**这里就埋下了缓存容量的定义**：每个 thread 能缓存 `131072 / 512 = 256` 个 tile（256 × 1 KB = 256 KB）。对 K=7168（14 个 tile）远远够用；但如果 `norm_size > 256*512 = 131072`，超出的部分就缓存不下、只能退回 global 重读（见 Pass 2 的 `if/else`）。
+
+---
+
+**③ 线程索引与主循环（line 46-48）**
+
+```cpp
+  unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned int all_threads = gridDim.x * blockDim.x;
+  for(long bid = tid; bid < batch_size; bid += all_threads){
+```
+
+标准的 **grid-stride loop**。默认用例 B=16：`block_dim=2, grid_dim=8` → `all_threads=16`，每个线程恰好处理 1 行。strided 用例 B=33：`all_threads=32`，线程 0 要跑 `bid=0` 和 `bid=32`。
+
+**一个 thread 独占一行**是这个 kernel 的根本设计——正因如此，行内归约完全不需要跨线程通信（没有 `__syncthreads`、没有 warp shuffle、没有 shared memory reduce），只要 tile 内部和向量寄存器内部归约就够了。这也是为什么 shared memory 能放心地按 `[threadIdx.x]` 私有切分。
+
+---
+
+**④ 行首地址与累加器清零（line 49-51）**
+
+```cpp
+    int64_t batch_offset = bid*norm_size*sizeof(bfloat16_t);   // 字节偏移：bid*7168*2
+    f32_sq_sum.m1e0 = tmv_t_f32(0U);   // 用 SpecialNumber 0 初始化
+    f32_sq_sum.m1e1 = tmv_t_f32(0U);
+```
+
+`tmv_t_f32(0U)` 是"标量→tile 广播"（`tmv.trr.broadcast`），`0U` 是 `SpecialNumber::Zero` 的编码。反汇编里这段被展开成：
+
+```
+tmv.trr.broadcast  T0, s1, zero                # T0 = 全 0 的 1KB tile
+tmv.ttrr.u128      T1, T0, 0, 0                # 拷贝 128B 块 0
+tmv.ttrr.u128      T1, T0, 1, 1                # 拷贝 128B 块 1
+... 共 8 条 ...                                 # 凑满 1KB (= 8 × 128B)
+```
+
+编译器把"1 KB 广播"实现成了 8 次 128 B 的 tile→tile 拷贝——这印证了 tile 内部以 **128 B** 为最小操作粒度（也正是 `tmv.vtr` / `tmv.ttr` 的粒度和 RVV 向量寄存器 1024 bit 的宽度）。
+
+---
+
+**⑤ Pass 1：累加平方和（line 52-64）**
+
+```cpp
+    for(int64_t i=0; i<norm_tile_num; ++i){                        // i = 0..13
+      int64_t offset =  batch_offset + i*tile_size;                // 字节偏移
+      bf16_din = tld_linear_global_m1((bfloat16_t*)pin, offset);   // ① 读 1KB (512 个 bf16)
+      if(i<shared_buffer_size/512){                                // ② 顺手存 shared
+        tst_linear_share_m1(bf16_din, shared_buff[threadIdx.x], i*tile_size);
+      }
+
+      f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);                    // ③ 1KB bf16 -> 2KB f32
+      f32_sq.m1e0 = tmul(f32_din.m1e0,f32_din.m1e0);               // ④ 平方（低半）
+      f32_sq.m1e1 = tmul(f32_din.m1e1,f32_din.m1e1);               //    平方（高半）
+      f32_sq_sum.m1e0 = tadd(f32_sq_sum.m1e0,f32_sq.m1e0);         // ⑤ 累加（低半）
+      f32_sq_sum.m1e1 = tadd(f32_sq_sum.m1e1,f32_sq.m1e1);         //    累加（高半）
+    }
+```
+
+逐句：
+
+- **① `tld_linear_global_m1(pin, offset)`**：从 global 读 **1 KB = 512 个 bf16** 到 `bf16_din`。这是一个**异步的 tile 访存指令**，由 tile core 自己完成搬运，不占用 RV 标量流水线（这也是后面必须 `twait` 的原因）。
+- **② `tst_linear_share_m1(bf16_din, shared_buff[threadIdx.x], i*tile_size)`**：把刚读到的 1 KB **同时**写进本线程的 shared 区、第 `i` 个 tile 槽位。注意偏移用的是**行内相对偏移** `i*tile_size`（不是 `offset`），因为缓存区是"每线程每行"复用的，所以行首偏移 `batch_offset` **不需要**加进去。这就是 Pass 2 能省一次 global 读的全部秘密。
+  - 条件 `i < shared_buffer_size/512`（= `i < 256`）是缓存容量上限保护。当 `norm_tile_num > 256`（即 `norm_size > 131072`）时，前 256 个 tile 进缓存、后面的不缓存，Pass 2 再逐 tile 判断。
+- **③ `tcvt_f32(bf16_din, t_r32)`**：1 KB bf16（512 个）→ 2 KB f32（512 个），结果装进 `tfloat32m2` 的 `m2e0`，`m1e0` 拿前 256 个、`m1e1` 拿后 256 个。反汇编是 `tcvt.tt.f32.bf16.r32 T10, T6`，与 ISA 文档 §Tile Conversion 中 `TCVT_F32_BF16`（输入 1×1024B → 输出 2×2048B）完全对应。
+- **④⑤ `tmul` / `tadd`**：都是 `ttt` 形式（tile × tile → tile），在 f32 域做，避免 bf16 精度损失。分两次处理 `m1e0`/`m1e1` 是因为 `tadd`/`tmul` 的 m1 形式一次只吃 1 KB。
+
+**这个循环走完后**，`f32_sq_sum.m1e0 + f32_sq_sum.m1e1` 里就存着整行 7168 个元素的平方和（分成 2×256 = 512 个部分和）。
+
+---
+
+**⑥ 归约到标量（line 65-78）**
+
+```cpp
+    f32_sq_sum.m1e0 = tadd(f32_sq_sum.m1e0,f32_sq_sum.m1e1);   // 两个 256 元素半区先合并
+    vfloat32m1_t vsum_vec = tmv_v_f32(f32_sq_sum.m1e0, 0U);    // 取第 0 个 128B 块(32 个 f32)
+    vfloat32m1_t zero_vec = __riscv_vfmv_v_f_f32m1(0.0f, 1);   // 初始 0
+    vfloat32m1_t temp_vec;
+    for (long i = 1; i < 8; ++i) {                             // 剩余 7 个 128B 块
+        temp_vec =  tmv_v_f32(f32_sq_sum.m1e0, i);             // 取出第 i 个块
+        vsum_vec =  __riscv_vfadd_vv_f32m1(temp_vec, vsum_vec, 32);  // 逐 lane 相加
+    }
+#ifdef RVV_UNORDER_REDUCE
+    zero_vec = __riscv_vfredusum_vs_f32m1_f32m1(vsum_vec, zero_vec, 32);   // 乱序归约
+#else
+    zero_vec = __riscv_vfredosum_vs_f32m1_f32m1(vsum_vec, zero_vec, 32);   // 顺序归约
+#endif
+    sum =  __riscv_vfmv_f_s_f32m1_f32(zero_vec);               // 向量 -> 标量
+```
+
+这段是**两段式归约**：
+
+1. **tile 内 → RVV 向量**：`tmv_v_f32(tile, i)` 把 tile 寄存器里第 `i` 个 **128 B 块**（32 个 f32）搬进一个 `vfloat32m1_t`（RVV，1024 bit）。一个 m1 tile = 1 KB = **8 个 128 B 块**，所以循环是 `i = 0..7`。反汇编确认：`tmv.vtr.e32 v9, T1, zero` / `tmv.vtr.e32 v10, T1, s2` … 配 7 条 `vfadd.vv`。
+2. **RVV 向量内 → 标量**：先 8 个块**逐 lane 相加**（得到一个 32 lane 的部分和向量），再 `vfredosum` 做跨 lane 归约成 1 个数，最后 `vfmv.f.s` 把向量第 0 lane 搬到 `fa3`。
+
+`RVV_UNORDER_REDUCE` 宏切换 `vfredusum`（乱序，快，结果不保证顺序）与 `vfredosum`（有序，慢，结果确定）。**当前构建没有定义这个宏**（反汇编里是 `vfredosum.vs`），所以默认走顺序归约——这是为了**跨平台/跨版本位精确可复现**，代价是慢一点。
+
+```cpp
+    mean = sum/original_norm_size;
+    if(eps_opt) mean += eps;
+    asm volatile ( "fsqrt.s %0, %1" : "=f"(sqrt) : "f"(mean) );
+    sqrt = 1.0/sqrt;
+    tile_rsqrt = tmv_t_f32(sqrt);
+```
+
+- `mean = sum / original_norm_size`：★ 分母是 **`original_norm_size`（调用方给的"有效长度"）**，而分子是 `norm_size`（补齐后长度）个元素的和。默认用例两者相同。
+- `mean += eps`：eps 加在 mean 上（不是加在方差的 `+eps` 意义上，但效果等价于 `rsqrt(x²/N + eps)`）。
+- `fsqrt.s` 手写内联汇编 + `1.0/sqrt`：**没有用 `rsqrt` 近似指令**，而是精确开方再取倒数。反汇编是 `fsqrt.s fa3, fa3` 紧跟 `fdiv.s fa3, fa4, fa3`（`fa4` 是常量 1.0）。这是精度优先的选择——`rsqrt` 类近似指令在 1% 容差下其实也够，但这里没走捷径。
+- `tmv_t_f32(sqrt)`：把这个**标量**广播填满整个 1 KB tile（256 个 f32 全等于 `1/sqrt(mean)`）。反汇编是 `fmv.x.w a5, fa3` + `tmv.trr.broadcast T2, a5, zero`（标量必须先搬到整型 GPR，这是 ISA 文档明确说的："浮点寄存器需先 move 到整型寄存器"）。
+
+---
+
+**⑦ 同步点（line 88）**
+
+```cpp
+    twait_store_share(0);
+```
+
+**这是整个 kernel 唯一的同步指令**，位置在 Pass 1 与 Pass 2 之间，语义是"等待未完成的 **share memory store** 数量降到 ≤ 0"，即**排空所有挂起的 shared 写入**。
+
+为什么必须插在这里：`tst_linear_share_m1`（Pass 1 里发的）在 tile core 上是**异步执行**的，指令发射出去就返回；而 Pass 2 的 `tld_linear_share_m1` 要读同一块内存。如果没有这条 `twait`，Pass 2 可能读到尚未落盘的旧数据。反汇编里就是一条 `twait.i.store.share 0x0`。
+
+注意这里**只需要等 store**：Pass 1 的 global load 结果是通过 tile 寄存器依赖（`tcvt` 直接消费 `bf16_din`）隐式串行化的，硬件自行保证；只有 shared 写这种"通过内存传递"的依赖需要显式 fence。
+
+同时值得注意 **Pass 1 和 Pass 2 之间没有任何线程间同步**——因为每个线程只碰自己的行、自己的 shared 分区，天然无竞争。
+
+---
+
+**⑧ Pass 2：缩放并写回（line 89-109）**
+
+```cpp
+    for(int64_t i=0; i<norm_tile_num; ++i){
+      int64_t offset = i*tile_size;                 // 行内字节偏移
+      int64_t g_offset = batch_offset +offset;      // 全局字节偏移
+      if(i<shared_buffer_size/512){
+        bf16_din = tld_linear_share_m1(shared_buff[threadIdx.x], offset);   // 命中缓存
+      }else{
+        bf16_din = tld_linear_global_m1((bfloat16_t*)pin, g_offset);        // 回退 global
+      }
+      f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);      // 再次 bf16 -> f32
+      f32_out.m1e0 = tmul(f32_din.m1e0,tile_rsqrt);  // 乘 rsqrt（低半）
+      f32_out.m1e1 = tmul(f32_din.m1e1,tile_rsqrt);  // 乘 rsqrt（高半）
+      if(weight_opt){
+        bf16_wgt =  tld_linear_global_m1((bfloat16_t*)weight, offset);      // 读 1KB weight
+        f32_wgt.m2e0 = tcvt_f32(bf16_wgt, t_r32);
+        f32_out.m1e0 = tmul(f32_out.m1e0,f32_wgt.m1e0);
+        f32_out.m1e1 = tmul(f32_out.m1e1,f32_wgt.m1e1);
+      }
+      bf16_out = tcvt_bf16(f32_out.m2e0, t_r32);     // 2KB f32 -> 1KB bf16
+      tst_linear_global_m1(bf16_out,(bfloat16_t*)pout, g_offset);   // 写回 global
+
+    }
+```
+
+逐句：
+
+- **`tile_rsqrt` 复用技巧**：`tile_rsqrt` 只有 1 KB（256 个 f32），而 `f32_din.m1e0`/`m1e1` 各是 1 KB。因为 `tile_rsqrt` 里 256 个值**全部相同**（广播出来的），所以拿它分别乘两半，等价于用 512 个相同的 rsqrt 去乘 512 个输入——一次性覆盖整行的一个 tile，**省掉了一半的标量广播开销**。
+- **`tmul` 用的是精确乘法**：整条链 `bf16 → f32 → ×rsqrt → ×w → f32 → bf16` 全程在 f32 域算，只有出入口做 bf16 舍入。这保证了 bf16 输入下仍能满足 1% 判据。
+- **`weight` 每次都从 global 重新读**（14 次），没有走 shared 缓存。weight 长度与 norm_size 相同，理论上也能缓存进 shared——但 shared 已被输入行占满（256 KB/线程），所以只缓存输入、不缓存 weight。
+- **写回用 `tst_linear_global_m1`**（同样是异步），kernel 结束时由硬件保证 store 完成；这里**不需要**再补 `twait`，因为下一次循环的 `bid` 对应不同行、不同地址，无 RAW 依赖；跨 kernel 的可见性由 stream 的顺序语义保证。
+- **`norm_tile_num` 在 Pass 2 里被复用**（而不是重新计算），保证两趟的切片完全一致。
+- `#ifdef` 那段的 `printf` 注释掉了——调试残留。
+
+**⑨ 收尾（line 111）**
+
+外层 `for(bid...)` 结束，kernel 返回。
+
+---
+
+#### 47.7.2 `rms_norm_bf16_strided_input_kernel` 与连续版的差异
+
+`rms_norm_kernel_bf16.hpp:114-201`。结构与连续版**逐行同构**，只有三处不同，全部围绕"输入的行 pitch ≠ 行长度"：
+
+| 位置 | 连续版 | strided 版 |
+| --- | --- | --- |
+| 签名 | 无 `input_stride0` | 多了 `int64_t input_stride0` |
+| 行基址 | `batch_offset = bid*norm_size*sizeof(bf16)` | `input_batch_offset = bid*input_stride0*sizeof(bf16)`（**输入用 stride**）<br>`output_batch_offset = bid*norm_size*sizeof(bf16)`（**输出仍连续**） |
+| Pass 1 读 | `offset = batch_offset + i*tile_size` | `input_offset = input_batch_offset + i*tile_size` |
+| Pass 1 存缓存 | `..., i*tile_size` | `..., offset`（= `i*tile_size`，**相对偏移，不受 stride 影响**） |
+| Pass 2 读缓存 | `..., offset` | `..., offset`（同上） |
+| Pass 2 回退路径 | `g_offset` | `input_offset` |
+| Pass 2 写回 | `g_offset` | `output_offset = output_batch_offset + offset` |
+
+**要点**：
+
+1. **一套输入偏移、一套输出偏移**。输入按 `input_stride0`（=2176）跨行，输出按 `norm_size`（=512）跨行。这就是为什么 dispatch 里要单独检查 `output.strides[0] == normalized_size`。
+2. **shared 缓存完全不受影响**。缓存写入用的是行内相对偏移 `offset`（每行都从 0 开始），因此无论 stride 多大，缓存布局都一样。这是该设计最优雅的一点——**加非连续支持没有让缓存逻辑变复杂一个字节**。
+3. **其余部分（归约、rsqrt、weight、写回）逐字节相同**，包括 `mean = sum/original_norm_size` 和 `twait_store_share(0)` 的位置。
+4. 因为 dispatch 强制 `original_normalized_size == normalized_size`，strided 版里 `original_norm_size` 恒等于 `norm_size`——但从代码看它仍然把两个参数分开传，保持与连续版一致（将来若要放开这个限制，kernel 不用改）。
+
+对应实测：`run.log` 里 `strided kernel to launch, batch_size=33, normalized_size=512`，Pass 1 只跑 `norm_tile_num = 512/512 = 1` 次，缓存路径永远命中。
+
+---
+
+#### 47.7.3 `rms_norm_f16_kernel`（`rms_norm_kernel_f16.hpp:25-112`）
+
+与 bf16 版**结构 100% 一致**，只有 dtype 替换：
+
+| 项 | bf16 版 | f16 版 |
+| --- | --- | --- |
+| FP 模式 | `__andescore_fp_mode(BF16)` | `__andescore_fp_mode(FP16)` |
+| tile 类型 | `tbfloat16m1_t` | `tfloat16m1_t` |
+| 上行转换 | `tcvt_f32(bf16_din, t_r32)` | `tcvt_f32(f16_din, t_r32)` |
+| 下行转换 | `tcvt_bf16(f32_out.m2e0, t_r32)` | `tcvt_f16(f32_out.m2e0, t_r32)` |
+| `norm_tile_num` | `norm_size/512` | `norm_size/512` |
+| `shared_buffer_size` | `512*1024/sizeof(bfloat16_t)/2` | `512*1024/sizeof(float16_t)/2` |
+| 其余 | 完全相同 | |
+
+f16 和 bf16 都是 2 字节，所以切块数、shared 容量、cache 槽位数完全一致。**这两个 kernel 除了 `__andescore_fp_mode` 与 tcvt 的方向后缀外，可以认为是同一份代码**——ISA 文档里也确认了 f16↔f32 与 bf16↔f32 的转换是两套独立的 uop（`TCVT_F32_F16` vs `TCVT_F32_BF16`），不能互相替代。
+
+#### 47.7.4 `rms_norm_f32_kernel`（`rms_norm_kernel_f32.hpp:25-98`）
+
+f32 版是唯一**结构不同**的：
+
+| 项 | bf16 / f16 版 | f32 版 |
+| --- | --- | --- |
+| FP 模式 | 设 BF16 / FP16 | **不设**（f32 无歧义） |
+| 输入 tile 类型 | `tbfloat16m1_t`（512 元素） | `tfloat32m1_t`（256 元素） |
+| 上行转换 | 需要 `tcvt_f32` | **不需要**，本来就是 f32 |
+| 累加器 | `tfloat32m2`（m1e0 + m1e1，512 个） | `tfloat32m1_t`（**只有 256 个，无 m1e1**） |
+| 归约前合并 | `m1e0 = tadd(m1e0, m1e1)` | **无此步** |
+| `norm_tile_num` | `norm_size/512` | `norm_size/256` |
+| `shared_buffer_size` | `512*1024/2/2 = 131072` | `512*1024/4/2 = 65536` |
+| 输出 | `tcvt_bf16` 后 1 KB 写回 | **直接** `tst_linear_global_m1(f32_out, ...)` |
+| 运算 | `m1e0`/`m1e1` 各做一遍 | 单条 `tmul` / `tadd` |
+
+f32 版的核心循环：
+
+```cpp
+    f32_sq_sum= tmv_t_f32(0U);
+    for(int64_t i=0; i<norm_tile_num; ++i){
+      int64_t offset =  batch_offset + i*tile_size;
+      f32_din = tld_linear_global_m1(pin, offset);
+      if(i<shared_buffer_size/256){                       // 65536/256 = 256 个槽位
+        tst_linear_share_m1(f32_din, shared_buff[threadIdx.x], i*tile_size);
+      }
+      f32_sq = tmul(f32_din,f32_din);                     // 单条，无 m1e1
+      f32_sq_sum = tadd(f32_sq_sum,f32_sq);
+    }
+    // 无 m1e0/m1e1 合并，直接进 8 路 RVV 归约
+```
+
+注意 cache 槽位数的表达式：f32 是 `shared_buffer_size/256`，bf16/f16 是 `shared_buffer_size/512`——分母就是"单 tile 元素数"，写法虽不一致但语义相同，都是 **256 个槽位**。
+
+**一个反直觉的点**：f32 每个 tile 只装 256 个元素，输入数据量却是 bf16 的两倍，所以 **f32 kernel 的 global 流量反而是 bf16 的 2 倍**（同样的元素数、更宽的 dtype），且 tile 数翻倍（`norm_size/256` vs `norm_size/512`）。但省掉了两次 `tcvt`。这是典型的"带宽换算力"取舍。
+
+#### 47.7.5 四个 kernel 差异总表
+
+| | `rms_norm_f32_kernel` | `rms_norm_f16_kernel` | `rms_norm_bf16_kernel` | `..._bf16_strided_input_kernel` |
+| --- | --- | --- | --- | --- |
+| 文件 | `_f32.hpp:25` | `_f16.hpp:25` | `_bf16.hpp:25` | `_bf16.hpp:114` |
+| 行数 | 74 | 88 | 88 | 88 |
+| `__andescore_fp_mode` | — | `FP16` | `BF16` | `BF16` |
+| 单 tile 元素 | 256 | 512 | 512 | 512 |
+| `norm_tile_num` | `N/256` | `N/512` | `N/512` | `N/512` |
+| tile 寄存器用量 | 8 | 19 | 19 | 19 |
+| SRAM 用量 | 524288 | 524288 | 524288 | 524288 |
+| 上行 tcvt | 免 | `tcvt_f32` | `tcvt_f32` | `tcvt_f32` |
+| 下行 tcvt | 免 | `tcvt_f16` | `tcvt_bf16` | `tcvt_bf16` |
+| 输入跨行步长 | `norm_size` | `norm_size` | `norm_size` | **`input_stride0`** |
+| 输出跨行步长 | `norm_size` | `norm_size` | `norm_size` | `norm_size` |
+
+（`tile 寄存器用量` / `SRAM 用量` 来自 `build/siWork.rms_norm/librms_norm_si_fatbin.llvm.resource`，是编译期静态资源核算：`.treg = 8/19`、`.sram = 524288`。注意 f32 只用 8 个 tile 寄存器——因为它只需同时驻留 3 个 m1 tile，而 16 位版本要驻留 m2 中间量。）
+
+### 47.8 intrinsic → ISA 指令映射（反汇编实证）
+
+下面左列是 kernel 源码里的 C intrinsic，右列是 `librms_norm_si_fatbin.llvm.asm` 中**实际生成的汇编**（以 f32 kernel 为例），中间是 ISA 手册里的语法原型。
+
+| 源码 | 实测汇编 | ISA 手册原型 |
+| --- | --- | --- |
+| `tld_linear_global_m1(pin, off)` | `tld.trir.linear.u32.global T4, (a1), 0x0, s11` | `tld.trir.linear.u32.global.[m2..mf8].[tm] Td,(rs1),imm1,rs3` |
+| `tst_linear_global_m1(t,pout,off)` | `tst.trir.linear.u32.global T3, (a0), 0x0, s10` | `tst.trir.linear.u32.global... Ts1,(rs1),imm1,rs3` |
+| `tst_linear_share_m1(t,sh,off)` | `tst.trir.linear.u32.share T4, (s1), 0x0, s10` | `tst.trir.linear.u32.share...`（`tuop`=001） |
+| `tld_linear_share_m1(sh,off)` | `tld.trir.linear.u32.share T5, (s1), 0x0, s11` | `tld.trir.linear.u32.share...` |
+| `twait_store_share(0)` | `twait.i.store.share 0x0` | `twait.i.store.share cnt` |
+| `tmv_t_f32(v)` | `tmv.trr.broadcast T2, a5, zero` | `tmv.trr.[broadcast] Td, rs1, rs2` |
+| `tmv_v_f32(t,i)` | `tmv.vtr.e32 v9, T1, zero`（i 走 `s2..s8`） | `tmv.vtr.e32 vd, Ts1, rs2` |
+| `tcvt_f32(bf16, t_r32)` | `tcvt.tt.f32.bf16.r32 T10, T6` | `tcvt.tt.<dtype>.<atype>.<shape>` |
+| `tcvt_bf16(f32, t_r32)` | `tcvt.tt.bf16.f32.r32 ...` | 同上 |
+| `tmul(a,b)` | `tmul.ttt.f32 T6, T4, T4` | `tmul.ttt.f32...[reuse].[neg].[tm] Td,Ts1,Ts2` |
+| `tadd(a,b)` | `tadd.ttt.f32 T1, T1, T6` | `tadd.ttt.f32...` |
+| `f32_sq_sum = tmv_t_f32(0U)` | `tmv.trr.broadcast T0,s1,zero` + 8×`tmv.ttrr.u128` | 标量→tile 广播；tile→tile 128B 拷贝 |
+| `__riscv_vfredosum_*` | `vfredosum.vs v9, v9, v8` | （RVV 标准指令，非 tile 扩展） |
+| `fsqrt.s` asm | `fsqrt.s fa3, fa3` + `fdiv.s fa3, fa4, fa3` | （RV 标量浮点） |
+
+**助记符命名规则**（ISA 手册 §汇编指令命令方式）：`tld.` 是指令名，随后的 `trir`/`trii`/`trr` 描述操作数类型（`t`=tile reg、`r`=scalar GPR、`i`=immediate，按 `Td/rs1/imm/rs3` 顺序），`linear` 是 unit-stride 模式，`u32` 是 32 B 粒度，`global`/`share` 是访存空间，`[m2/m4/mf8...]` 是访问的 tile 数（**m1 省略不写**），`[tm]` 是 tile mask。
+
+**128 B 粒度的证据链**：ISA 手册说 `tmv.vtr.e32` 是把 tile 里 **128 Byte** 的数据搬到 RVV 向量寄存器；反汇编里"清零 1 KB tile"被展开成 8 条 `tmv.ttrr.u128`（8 × 128 B = 1024 B）；`tmv.vtr` 的循环正好是 `i = 0..7`（8 × 32 个 f32 = 256 = 一个 m1）。三条独立证据互相印证 tile 内部以 128 B 为最小操作单元。
+
+**grid/block 的 CSR 来源**：反汇编开头
+
+```
+tcsrr.r.b64 t0, tkernelidx      # 读 kernel 索引 CSR
+tcsrr.r.b64 t3, tkerneldims     # 读 kernel 维度 CSR
+slli/srli/mul/add ...           # 线性化
+zext.w  t0, t1                  # 得到 tid
+```
+
+`tkernelidx`(0x230) / `tkerneldims`(0x240) 是 ISA 手册 §CSR列表 里的只读寄存器，由 CCS 在 kernel 启动前配置、kernel 用 `tcsrr` 读回。文档给出的 `tkernelidx` 位域是 `[3:0]=thread_idx, [15:4]=tb_idx_x, [23:16]=tb_idx_y, [31:24]=tb_idx_z, [47:32]=tbc_idx_x, ...`，`tkerneldims` 是 `[3:0]=tb_dim, [15:4]=tbc_dim_x, ...`。硬件层级是 **Chip → PEC(cluster) → PE**（`thwid` = 2 bit core_id / 2 bit pe_id / 3 bit cluster_id / 9 bit chip_id），全机最大线程规模在 Memory Barrier 一节给出：`256 chip × 16 cluster × 4 PE × 2 thread = 32768`——**每 PE 2 个 thread**，这正好解释了为什么 `block_dim` 的最大值是 2、为什么 `shared_buff[2][...]` 的第一维是 2：**它就是每 PE 的硬件线程数**。
+
+### 47.9 shared memory 缓存机制小结
+
+把三件事串起来看，能看出这块 512 KB SRAM 的设计意图：
+
+| 事实 | 出处 |
+| --- | --- |
+| 每 PE 的 tile SRAM = 512 KB | fatbin 元数据 `.sram = 524288` |
+| 每 PE = 2 个硬件线程 | ISA 文档 memory barrier 上限算式 `4 PE × 2 thread` |
+| `__shared__ T shared_buff[2][512*1024/sizeof(T)/2]` | 源码，恰好 2 × 256 KB |
+| 每线程缓存 256 个 tile（256 KB） | `shared_buffer_size / 单tile元素数 = 256` |
+| 单行最多 256 个 tile → `norm_size ≤ 131072`（bf16）时全命中 | 推导 |
+
+**缓存的有效性边界**：`norm_size ≤ 256 × 512 = 131072`（bf16/f16），或 `≤ 256 × 256 = 65536`（f32）时，**整行全部命中缓存，Pass 2 零 global 读**。典型 LLM 的 hidden size（4096 / 7168 / 8192）都远小于这个阈值，所以**实际线上场景 100% 命中**。超过阈值时，前 256 个 tile 命中、其余回退 global 重读——功能仍正确，只是退化为"两趟都读 global"。
+
+**成本/收益**：Pass 1 多写一次 shared（1 KB/ tile），Pass 2 省一次 global 读（1 KB/tile）。因为 shared 带宽远高于 global、且写入与计算重叠，这是净赚的。代价是 512 KB SRAM 被这张 kernel 独占，**同 PE 上不能并发跑第二个 block 的同一 kernel**（occupancy = 1 block/PE）。
+
+### 47.10 数值语义与三个容易踩的坑
+
+#### 坑 1：`original_normalized_size` 的隐含契约——**padding 区必须填 0**
+
+```cpp
+mean = sum / original_norm_size;    // ← 分母是 original
+// 而 sum 是 norm_size 个元素的平方和 ← ← 分子是 padded 长度
+```
+
+当 `norm_size > original_normalized_size`（存在 padding）时，求和**仍然覆盖 padding 区**，但分母只用有效长度：
+
+```
+mean = ( Σ_{i < norm_size} x_i² ) / original_norm_size       ← 实际行为
+     = ( Σ_{i < origN}     x_i² + Σ_{padding} x_i² ) / origN
+```
+
+这本身**不是 bug，而是一个隐含契约**：只要调用方保证 padding 区**填 0**，`Σ_{padding} x_i²` 恒为 0，实际行为就等价于 `(Σ_{i<origN} x_i²) / origN`，即标准的 RMSNorm。这也正是"pad 到 512 元素对齐"这个做法的由来——**padded RMSNorm 是 LLM 推理里的常规技巧**（对齐到向量宽度/缓存行，再把多余位置零）。
+
+**风险点在于契约是隐式的**：wrapper 只校验 `0 < original_normalized_size <= normalized_size`，既不检查、也不清零 padding。如果调用方拿一块复用过的、未清零的缓冲区当输入，padding 区的脏数据会被计入平方和、污染 mean。
+
+`test_host.cpp` 里那段"两个分支写法一模一样"的 `if` 正是这个契约留下的痕迹：
+
+```cpp
+for (size_t i = 0; i < nIn0; i++) {
+    host_A[i] = (DATATYPE)(dist(gen));
+    if (i % normalized_size >= original_normalized_size)
+        host_A[i] = (DATATYPE)(dist(gen));     // ← 原意大概是赋 0，现在两个分支一样
+}
+```
+
+原意应当是"padding 区填 0 以验证契约"，后来改成了随机填充但没删掉判断。
+
+**当前测试完全没有覆盖 `norm_size > origN` 的场景**：默认用例 `K == VK == 7168`；`--emu-multi` 路径也把同一个 `hidden_size` 当作 `case_size`/`normalized_size`/`original_normalized_size` 三个参数传（`run_case(case_size, hidden_size, hidden_size, ...)`）。所以这条 padding 路径只被代码逻辑覆盖、没有测试覆盖。如果生产中要依赖它，建议补一个 `normalized_size > original_normalized_size` 且 padding 填 0 的用例。
+
+#### 坑 2：没有用 FMA，`x*x` 与 `Σ` 是两条独立指令
+
+```cpp
+f32_sq.m1e0 = tmul(f32_din.m1e0, f32_din.m1e0);
+f32_sq_sum.m1e0 = tadd(f32_sq_sum.m1e0, f32_sq.m1e0);
+```
+
+反汇编里对应 `tmul.ttt.f32` + `tadd.ttt.f32` 两条（不是 `tfma`）。ISA 手册里有三操作数的 `tfma.tttt/tttr/ttti`（`TALU_FMA_FP32`），这里没用。影响：
+
+- **吞吐**：每 tile 多一条指令；
+- **精度**：`x²+acc` 分成两步，中间 `x²` 会被舍入一次，理论上比 FMA 差半个 ulp。
+
+但归约本身是 f32、输入是 bf16（8 位尾数），这点差异远低于 1% 判据，所以不是问题。不过如果将来要提高精度/性能，把这一对换成 `tfma` 是第一个可以动的地方。
+
+#### 坑 3：`vfredosum` vs `vfredusum` 的构建开关
+
+```cpp
+#ifdef RVV_UNORDER_REDUCE
+    zero_vec = __riscv_vfredusum_vs_f32m1_f32m1(vsum_vec, zero_vec, 32);
+#else
+    zero_vec = __riscv_vfredosum_vs_f32m1_f32m1(vsum_vec, zero_vec, 32);
+#endif
+```
+
+当前构建**未定义** `RVV_UNORDER_REDUCE`（反汇编是 `vfredosum.vs`），走**有序归约**。有序归约牺牲并行度换位精确可复现——对 EMU/CI 里"同一输入必须得到逐位相同输出"的比对场景是必要的。反过来说，**如果哪天有人打开这个宏，CI 里的逐位比对可能会挂**，而数值上没有任何问题。
+
+### 47.11 实测：编译与运行
+
+```
+$ source setup.sh
+$ cd source/source_builtin/attention/rms_norm
+$ bash build.sh
+$ ./build/test_host
+```
+
+`run.log` 输出（已实测复现）：
+
+```
+[SIRT] Library:0.4.2.3ec8ff9.Release @ /share_data/sicx_sdk/release/2609101917/lib/libsi150.so.0
+argc:1
+[SIRT] Environment Shim: auto, detected Shim: swemusp, version: .../si1.5/2609080400/lib/libarchmodel.so
+kernel to launch!
+kernel return!
+in golden function !!!
+strided kernel to launch, batch_size=33, normalized_size=512
+strided kernel return!
+in strided golden function !!!
+ ******      *       *****   *****          ← PASS 横幅（SIKERNEL_TEST_RETURN）
+ *     *    * *      *       *
+ ...
+```
+
+逐行对应：
+
+| 输出 | 含义 |
+| --- | --- |
+| `[SIRT] Library ...` | 运行时（SIRT）加载 `libsi150.so` |
+| `argc:1` | 无参数 → 走默认用例 |
+| `... detected Shim: swemusp` | 用 `swemusp` shim 跑 **archmodel（cmodel）**而非真实硬件 |
+| `kernel to launch!` / `kernel return!` | `run_case` 里 launch 前后的打印 |
+| `in golden function !!!` | `golden()` 被调用 → 说明**逐元素比对全部通过**（有失败会打 stderr 的 `Error at index:`） |
+| `strided kernel to launch, batch_size=33, normalized_size=512` | `run_strided_case` 进入 |
+| `in strided golden function !!!` | strided 用例也比对通过 |
+| `****** * ***** *****` | PASS 横幅 |
+
+**没有任何 `Error at index:` 输出**，两个用例（连续 bf16 7168、非连续 bf16 512/stride 2176）均通过。
+
+> **本地工作区提醒**：`test/test_host.cpp` 当前有一处未提交的调试改动（`run_case` 开头多打了一行 `,batch_size:...` 日志），其中把变量写错成了 `emu_test`（正确名是 `emu_test_mode`）：
+> ```cpp
+> std::cout << ",batch_size:" << batch_size << ...
+>     << ",emu_test:" << emu_test << ",no_compare:" << no_compare << ...;   // ← emu_test 未定义
+> ```
+> 这会导致 `bash build.sh` 直接编译失败（`error: 'emu_test' was not declared in this scope`）。上面的实测是在一份改回 `emu_test_mode` 的副本上跑通的；要恢复本仓库的构建，需要把这处改回 `emu_test_mode`（或删掉这行调试打印）。
+
+`--emu-multi` 路径（EMU 性能测试用）：
+
+```bash
+SIKERNEL_EMU_TEST_SKIP_CSV=1 ./build/test_host --emu-multi 1:512
+# 多 case：./build/test_host --emu-multi 16:7168 33:7168 --repeat 5
+```
+
+### 47.12 完整调用链时序（默认用例，M=16, K=7168, bf16）
+
+```
+main()
+ ├─ parse_multi_case_options → requested=false（argc==1）
+ ├─ run_case(16, 7168, 7168, emu_test_mode=false, no_compare=false)
+ │   ├─ malloc host_A(16×7168 bf16) / host_B(7168) / host_D / host_G
+ │   ├─ 随机填充：输入 U(-10,100)、weight U(-1,1)
+ │   ├─ siMalloc bo_A / bo_B / bo_D
+ │   ├─ siMemcpy H2D ×2
+ │   ├─ tensor 构造：input{16,7168} strides{7168,1}; output 同; weight{7168} strides{1}
+ │   ├─ rms_norm<bf16>(out, in, w, eps=1e-6, origN=7168, w_opt=1, eps_opt=1, stream=nullptr)
+ │   │   └─ rms_norm_launch<bf16>(..., nullptr, nullptr)
+ │   │       ├─ check_rms_norm_tensor_metadata → 10 类断言全过
+ │   │       │   └─ 7168 × 2 B = 14336 B ≡ 0 (mod 1024) ✓
+ │   │       ├─ is_contiguous_layout(input/output/weight) → 全 true
+ │   │       └─ rms_norm_contiguous_launch<bf16>
+ │   │           ├─ B=16: block_dim=2, grid_dim=(16+1)/2=8, cluster_dim=1
+ │   │           └─ rms_norm_bf16_kernel<<<grid{8}, cluster{1}, block{2}, 0, nullptr>>>(...)
+ │   │               ├─ all_threads = 8×2 = 16，tid ∈ [0,16)，每 thread 1 行
+ │   │               ├─ 每 thread: norm_tile_num = 14 个 tile
+ │   │               ├─ Pass 1: 14 × (tld 1KB → tst share → tcvt → tmul → tadd ×2)
+ │   │               ├─ 归约: tadd(m1e0,m1e1) → 8×tmv.vtr+vfadd → vfredosum → sum
+ │   │               ├─ mean=sum/7168 (+1e-6) → fsqrt.s → 1/x → tmv_t_f32 广播
+ │   │               ├─ twait_store_share(0)
+ │   │               └─ Pass 2: 14 × (tld share → tcvt → tmul rsqrt ×2 → tmul w ×2 → tcvt_bf16 → tst)
+ │   ├─ siMemcpy D2H(bo_D → host_D)
+ │   ├─ siFree ×3
+ │   ├─ golden(host_G, ...)  → 串行参考实现
+ │   └─ 逐元素 |gold-dev|/|gold| > 1% ? → 无输出，err=0
+ │
+ └─ run_strided_case(33, 512) && pass
+     ├─ input_tensor.strides = {2176, 1}   ← 手动覆盖
+     ├─ rms_norm<bf16>(...)
+     │   └─ rms_norm_launch<bf16>
+     │       ├─ is_contiguous_layout(input) → false（strides[0]=2176 ≠ 512）
+     │       ├─ bf16 分支：N=512 ∈ {512,1536} ✓，origN==N ✓，in.strides=(2176,1) ✓
+     │       │              out.strides[0]=512==N ✓，w.strides[0]=1 ✓
+     │       └─ rms_norm_bf16_strided_input_launch
+     │           └─ rms_norm_bf16_strided_input_kernel<<<grid{16}, cluster{1}, block{2}, 0, nullptr>>>
+     │               ├─ all_threads = 32，B = 33 → 线程 0 跑 bid=0 和 bid=32
+     │               ├─ 每行 norm_tile_num = 512/512 = 1
+     │               └─ 输入偏移 bid×2176×2 B，输出偏移 bid×512×2 B
+     └─ golden_strided_input(...) + 比对 → err=0
+```
+
+---
+
+### 47.13 一句话总结这份 kernel 的设计哲学
+
+**用最少的同步换最大的数据局部性**：一个 PE 的两个硬件线程各拿 256 KB SRAM 缓存自己负责的整行，Pass 1 读 global 顺手写 shared，Pass 2 从 shared 读，全程**只有一条 `twait_store_share(0)` 同步指令、零 `__syncthreads`、零跨线程归约**；代价是 `norm_size` 必须 1024 B 对齐（无 tail 处理）、occupancy 固定 1 block/PE、非连续布局只支持白名单里的两个精确 shape。对 LLM 推理里 hidden size 固定且对齐的场景，这是一笔非常划算的交易。
