@@ -4329,6 +4329,7 @@ sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
 
 
 从sikernel code base的  source/source_builtin/attention/rms_norm/test/test_host.cpp 入手，对 rmsnorm 的 实现进行讲解，整理出调用链。
+# 重要: SIPU device code 要重点讲解，逐行讲解.
 
 运行方法是  先在 sikernel code base source setup.sh
 然后:
