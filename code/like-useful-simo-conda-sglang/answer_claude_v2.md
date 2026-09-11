@@ -6091,3 +6091,195 @@ def : Pat<(riscv_tile_store $td, $rs1, (uimm5),
 
 1. **命令行**：`-mcpu` 的值是 `sipu150`（用 `-print-supported-cpus` 自己查），不是 `si150`；`-mllvm` 的 flag 是 `--siorigin-...`，不是 `--si-...`。**这两个 flag 和 `-DLAZYLOAD` 对反查都不需要，直接删掉。**
 2. **语义**：访存空间（`.share`/`.global`）由**函数名**决定，不是由指针的地址空间决定；`trii`/`trir` 由**偏移能否装进立即数**决定（`offset >= 0 && offset % 32 == 0 && offset <= 32736`），不是由"常量还是变量"这个笼统说法决定。**别只看测试文件就下结论。**
+
+---
+
+## 52. 探针里 `tld_linear_global_m1` 被优化没了 —— 死代码消除（DCE）
+
+**问题**：按第 51.1 节的办法写 `tld` 探针，编译出来只剩一条 `ret`：
+
+```c
+// /share/users/like/temp/probe.2.cpp
+#include <tile_vector.h>
+#include "siorigin_tile.h"
+
+void probe(const bfloat16_t * baseAddr, unsigned long offset) {
+  tbfloat16m1_t res = tld_linear_global_m1(baseAddr, offset);
+}   // ← res 从没被用过
+```
+
+```bash
+$CLANG -S --target=riscv64 -mcpu=sipu150 -O2 -I$INC probe.2.cpp -o -
+```
+
+```asm
+_Z5probePKDF16bm:
+.Lsipu.res.func0:
+	ret                     ← 调用整条不见了
+```
+
+**答：是，被死代码消除（Dead Code Elimination）删掉了。** 而且是**完全正确**的行为——不是编译器 bug，也不是探针写错了语法。
+
+### 52.0 一句话结论
+
+- `tld` 系列 intrinsic 只带 `IntrReadMem` 语义，**没有** `IntrHasSideEffects`。当它的返回值没人用、结果对程序再无影响时，LLVM 有权把整条调用删掉。
+- 反过来，`tst` 系列带 `IntrWriteMem`，**写内存本身就是可观测的副作用**，所以裸调用 `tst` 不会被删（这也是第 51.1 节的探针为什么一直好用——**它恰好是 store**）。
+- **修法**：让结果逃逸。最小改法是再调一次 `tst` 把 `res` 存回去；或改用 `-O0`；或只想要 intrinsic 名时用 `-O0 -emit-llvm`。
+
+### 52.1 实测证据：确实是 DCE，不是"没生成"
+
+把优化等级扫一遍，代码条数随 `-O` 变化，这是 DCE 的典型特征：
+
+| 编译选项 | 生成的 `tld`/`tst` 条数 |
+| --- | --- |
+| `-O0` | **6** |
+| `-O1` | **0** |
+| `-O2` | **0** |
+
+同一份源码，`-O0` 下六条指令都在，`-O1` 起全部消失。**指令选择是正常发生的，是后端的优化遍把它删了。**
+
+从 IR 层面看得更清楚——同样加 `-O2`，加不加 `-emit-llvm` 结果完全不同：
+
+```bash
+# -O0 -emit-llvm：call 在
+$CLANG ... -O0 -emit-llvm probe.2.cpp -o - | grep call
+  %8 = call <[tile] 512 x bfloat> @llvm.riscv.tld.trir.linear.global.m1.tv512bf16.p0.i64.i64.i32(
+        ptr %6, i64 0, i64 %7, i32 0)
+
+# -O2 -emit-llvm：call 没了，连参数都失去了名字
+$CLANG ... -O2 -emit-llvm probe.2.cpp -o - | grep define
+  define dso_local void @_Z5probePKDF16bm(ptr nocapture noundef readnone %0, i64 noundef %1) #0 {
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^
+```
+
+注意 `-O2` 那行里参数 `%0` 被标成了 **`readnone`**——连"这个指针被读过"都不再成立，因为读它的那条调用已经被删干净了。函数体是空的。
+
+### 52.2 根本原因：load 与 store 的副作用属性不对称
+
+这不是偶然，是 TableGen 里刻意区分的。两组 intrinsic 的属性定义在 `compiler-toolchain/llvm-project/llvm/include/llvm/IR/IntrinsicsRISCVXSOTile.td`：
+
+**`tld` 用的 `TLoadAttrIntrinsic`（`:128-136`）**：
+
+```c
+class TLoadAttrIntrinsic<bits<26> scalar_num, bit has_pass_thru, list<LLVMType> rs2_ty>
+    : DefaultAttrsIntrinsic<[llvm_anyvector_ty],
+                            !listconcat(...),
+                            [IntrReadMem, IntrArgMemOnly],          // ← 只有"读内存"
+                            "", [SDNPMemOperand]>,
+      TileIntrinsic {
+```
+
+**`tst` 用的 `TStoreAttrIntrinsic`（`:278-287`）**：
+
+```c
+class TStoreAttrIntrinsic<bits<26> scalar_num, list<LLVMType> rs2_ty>
+    : DefaultAttrsIntrinsic<[],
+                            !listconcat([llvm_anyvector_ty, llvm_anyptr_ty], ...),
+                            [IntrWriteMem, IntrArgMemOnly],         // ← "写内存"
+                            "", [SDNPMemOperand]>,
+      TileIntrinsic {
+```
+
+两者都**没有** `IntrHasSideEffects`（这个 flag 在文件里只加给了 `:147`、`:291`、`:394` 等少数几条，**linear load 不在其中**）。区别只在于 `IntrReadMem` 与 `IntrWriteMem`：
+
+| | 属性 | 结果没人用时 |
+| --- | --- | --- |
+| `tld`（load） | `IntrReadMem` + `IntrArgMemOnly` | **可删除**——读内存没有可观测效果 |
+| `tst`（store） | `IntrWriteMem` + `IntrArgMemOnly` | **保留**——写内存是可观测副作用 |
+
+编译出的 IR 属性行可以直接验证这一点。`-O0 -emit-llvm` 里，调用指令的注释行明明白白写着两个不同的 memory 语义：
+
+```llvm
+; probe.2.cpp（tld，load）
+; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)   ← read
+
+; s.cpp（tst，store）
+; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)  ← write
+```
+
+这一串就是 `IntrReadMem`/`IntrWriteMem` + `IntrArgMemOnly` 的落地产物（`argmem` = `IntrArgMemOnly`，`read`/`write` = 对应的内存效果）。**"读"和"写"的差别，就是这里一条调用能不能被删的全部依据。**
+
+**所以第 51.1 节的 `tst_linear_share_m1` 探针能直接出结果，纯粹是因为它是 store。** 换成任何 `tld`，只要返回值不用，在 `-O2` 下都会消失。这一点我在写第 51 节时没有意识到——**探针方法对 store 有效，对 load 需要额外一步**，现在补上。
+
+### 52.3 四种修法（实测）
+
+**修法 1（推荐）：让结果逃逸。** 再调一次 `tst` 把 `res` 存回去，两条指令都会保留：
+
+```c
+#include <tile_vector.h>
+#include "siorigin_tile.h"
+
+__shared__ bfloat16_t sbuf[512];
+
+void probe(const bfloat16_t * baseAddr, unsigned long offset) {
+  tbfloat16m1_t res = tld_linear_global_m1(baseAddr, offset);
+  tst_linear_share_m1(res, sbuf, 0);        // ← 让 res 逃逸
+}
+```
+
+实测 `-O2` 输出（两条都在，正好一次拿到 load 和 store 两个助记符）：
+
+```asm
+	tld.trir.linear.u32.global	T0, (a0), 0, a1
+	lui	a0, %hi(sbuf)
+	addi	a0, a0, %lo(sbuf)
+	tst.trii.linear.u32.share	T0, (a0), 0, 0
+```
+
+（`tld` 那行末尾的 `a1` 就是 `offset` 变量，印证了第 51.6 节说的"变量偏移走 `trir`"。）
+
+**修法 2：降优化等级到 `-O0`。** 直接有效，函数里六条指令都在：
+
+```asm
+	tld.trir.linear.u32.global	T0, (a0), 0, a1    ← 真正的那条
+	tst.trii.linear.u32.global	T0, (a0), 0, 0     # 1024-byte Folded Spill
+	tld.trii.linear.u32.global	T0, (a0), 0, 0     # 1024-byte Folded Reload
+	tst.trii.linear.u32.global	T0, (a0), 0, 0
+	tld.trii.linear.u32.global	T0, (a0), 0, 0     # 1024-byte Folded Reload
+	tst.trii.linear.u32.global	T0, (a0), 0, 0
+```
+
+**代价**：后五条全是第 51.1.1(4) 节说的 ABI spill 噪声（`1024-byte Folded Spill`/`Reload`），而且**全是 `.global`、全是 `trii`**——和你要找的那条形态完全不同，很容易挑错。要自己从里面认出第一条。**能用修法 1 就别用这个。**
+
+**修法 3：只要 LLVM intrinsic 名，就用 `-O0 -emit-llvm`。** 这一条很实用——`-emit-llvm` 发生在优化遍**之前**，所以即使在 `-O2` 下其实也……不，实测不行：
+
+| 命令 | `llvm.riscv.tld` 调用是否还在 |
+| --- | --- |
+| `-O0 -emit-llvm` | **在** |
+| `-O2 -emit-llvm` | **不在**（已被删） |
+
+**`-emit-llvm` 只有在配合 `-O0` 时才能拿到名字**，`-O2 -emit-llvm` 一样会被 DCE 掉。这一点容易想当然，实测确认一下：
+
+```bash
+$CLANG -S --target=riscv64 -mcpu=sipu150 -O0 -emit-llvm -I$INC probe.2.cpp -o -
+```
+
+```llvm
+call <[tile] 512 x bfloat> @llvm.riscv.tld.trir.linear.global.m1.tv512bf16.p0.i64.i64.i32(
+    ptr %6, i64 0, i64 %7, i32 0)
+```
+
+**修法 4：`volatile` 无效。** 把指针参数写成 `volatile const bfloat16_t *` 也没用——实测 `-O2` 下依然为空。原因同上：`IntrReadMem` 语义已经声明了"只读"，`volatile` 管的是 C 语言层面的访问次序，管不到一个 intrinsic 的返回值有没有人用。
+
+### 52.4 一条判断规则
+
+以后写新探针时，先问一句：**这条 intrinsic 的结果会不会被丢掉？**
+
+| intrinsic 家族 | 属性（定义处） | 裸调用在 `-O2` 下 |
+| --- | --- | --- |
+| `tld_*`（load） | `TLoadAttrIntrinsic`：`IntrReadMem`（`:134`） | **会被删**，必须让结果逃逸 |
+| `tst_*`（store） | `TStoreAttrIntrinsic`：`IntrWriteMem`（`:282`） | 保留，可直接裸调 |
+| `tmul` / `tadd` / `tcvt` 等 ALU | `TALUIntrinsic`：`IntrNoMem`（`:461`） | **会被删**——`tmul` 实测 `-O2` 下为空 |
+| `tacp_*` 等带 `IntrHasSideEffects` 的 | 明确标了 side effects（`:394`、`:723`、`:794`…） | 保留 |
+
+（`tmul` 用到 `TALUIntrinsic` 这条链路我不是只读源码推断的——实测 `tmul(a,b)` 结果丢掉后 `-O2` 输出为空，存回去才出现 `tmul.ttt.f32`，与属性表一致。）
+
+**简单记法：凡是"算出一个值给你"的（load、算术），在 `-O2` 下都必须把值用掉；凡是"往外写东西"的（store、异步拷贝），裸调就安全。** 第 51.1 节推荐的探针模板恰好落在第二类，所以一直没暴露这个问题。
+
+### 52.5 小结
+
+- `tld_linear_global_m1` 没有被"优化成 ret"，而是**整条调用被 DCE 删掉了**——源码里 `res` 从未被使用，编译器删除它是完全正确的。
+- 根因是 `tld` 只带 `IntrReadMem`（`IntrinsicsRISCVXSOTile.td:134`），而 `tst` 带 `IntrWriteMem`（`:282`）。**load 的结果无人使用时可以安全删除，store 不行。**
+- 最省事的修法是**再调一次 `tst` 把结果存回去**；其次 `-O0`；要 intrinsic 名就用 `-O0 -emit-llvm`（**注意 `-O2 -emit-llvm` 也会被删**）。
+- `volatile` 指针无效。
+- 第 51.1 节的探针模板本身没错，但**只对 store 类 intrinsic 开箱即用**；探 `tld` 或 ALU 类时必须让结果逃逸。
