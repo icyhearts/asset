@@ -3673,24 +3673,30 @@ rms_norm/
     └── test_host.cpp               # ★ host 测试 + golden 参考实现
 ```
 
-**构建断点**：`CMakeLists.txt` 把 `rms_norm_kernel.su` + `legacy_api.su` 编成 `librms_norm.so`（`scc -arch=si150`），再把 `test_host.cpp` 用**宿主 g++**编成可执行文件并链接这个 `.so`、`libsisirt` 与 `libsi150`：
+**构建断点**：`CMakeLists.txt` 把 `rms_norm_kernel.su` + `legacy_api.su` 编成 `librms_norm.so`（`scc -arch=sipu_150`），再把 `test_host.cpp` 用**宿主 g++**编成可执行文件并链接这个 `.so`、`libsirt` 与 `libsi`（`CMakeLists.txt:52-56`）：
 
 ```cmake
 scc_add_library(rms_norm SHARED kernel/rms_norm_kernel.su kernel/legacy_api.su)
 scc_target_compile_definitions(rms_norm PRIVATE TARGET_SIPU_ARCH=${TARGET_SIPU_ARCH})
 add_executable(test_host test/test_host.cpp)
-target_link_libraries(test_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/librms_norm.so sisirt si150)
+target_link_libraries(test_host PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/build/librms_norm.so
+    sipurt
+    sipu)
 ```
 
-实际编译命令（`build/CMakeFiles/rms_norm.dir/build.make`）：
+实际编译命令（`build/CMakeFiles/rms_norm.dir/build.make:84`）：
 
 ```
-scc -arch=si150 --keep-dir build/siWork.rms_norm -c -fPIC -o .../rms_norm_kernel.su.o \
+scc -arch=sipu_150 --keep-dir build/SipuWork.rms_norm -c -fPIC -o .../rms_norm_kernel.su.o \
+    -MD -MT ... -MF ... \
     -I<sikernel>/include -I<sikernel>/source/source_builtin/utils \
     -DTARGET_SIPU_ARCH=150 kernel/rms_norm_kernel.su
 ```
 
-`.su` 是"含 device 代码的编译单元"的后缀：`scc` 会把 `__global__` 函数编成 fatbin 塞进 `.so`，host 侧的普通 C++ 函数编成普通 ELF 符号。`build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm` 就是 device 代码的反汇编，本文后面用它来对照 ISA。
+> **注意 `-arch` 的取名**：不是 `si150`，而是 `sipu_150`。`scc --list-gpu-arch` 给出的是 `sipu_150` / `sipu_160` / `sipu_170`；`sikernel/setup.sh:39-55` 用的又是裸数字 `150/160/170`。三套写法互不相通，详见第 51.1.1 节。
+
+`.su` 是"含 device 代码的编译单元"的后缀：`scc` 会把 `__global__` 函数编成 fatbin 塞进 `.so`，host 侧的普通 C++ 函数编成普通 ELF 符号。`build/SipuWork.rms_norm/librms_norm_sipu_fatbin.llvm.asm` 就是 device 代码的反汇编，本文后面用它来对照 ISA。
 
 ### 47.2 调用链总览
 
@@ -4534,7 +4540,7 @@ f32 版的核心循环：
 | 输入跨行步长 | `norm_size` | `norm_size` | `norm_size` | **`input_stride0`** |
 | 输出跨行步长 | `norm_size` | `norm_size` | `norm_size` | `norm_size` |
 
-（`tile 寄存器用量` / `SRAM 用量` 来自 `build/siWork.rms_norm/librms_norm_si_fatbin.llvm.resource`，是编译期静态资源核算：`.treg = 8/19`、`.sram = 524288`。注意 f32 只用 8 个 tile 寄存器——因为它只需同时驻留 3 个 m1 tile，而 16 位版本要驻留 m2 中间量。）
+（`tile 寄存器用量` / `SRAM 用量` 来自 `build/SipuWork.rms_norm/librms_norm_sipu_fatbin.llvm.resource`，是编译期静态资源核算：`.treg = 8/19`、`.sram = 524288`。注意 f32 只用 8 个 tile 寄存器——因为它只需同时驻留 3 个 m1 tile，而 16 位版本要驻留 m2 中间量。）
 
 ### 47.8 intrinsic → ISA 指令映射（反汇编实证）
 
@@ -4660,7 +4666,7 @@ $ ./build/test_host
 `run.log` 输出（已实测复现）：
 
 ```
-[SIRT] Library:0.4.2.3ec8ff9.Release @ /share_data/sicx_sdk/release/2609101917/lib/libsi150.so.0
+[SIRT] Library:0.4.2.3ec8ff9.Release @ /share_data/sicx_sdk/release/2609101917/lib/libsipu.so.0
 argc:1
 ,batch_size:16,normalized_size:7168,original_normalized_size:7168,emu_test_mode:0,no_compare:0,repeat_count:1
 [SIRT] Environment Shim: auto, detected Shim: swemusp, version: .../si1.5/2609080400/lib/libarchmodel.so
@@ -4679,7 +4685,7 @@ in strided golden function !!!
 
 | 输出 | 含义 |
 | --- | --- |
-| `[SIRT] Library ...` | 运行时（SIRT）加载 `libsi150.so` |
+| `[SIRT] Library ...` | 运行时（SIRT）加载 `libsipu.so`（`CMakeLists.txt:55` 的 `sipu`） |
 | `argc:1` | 无参数 → 走默认用例 |
 | `,batch_size:16,...` | `run_case` 开头的 `// like_debug` 调试打印（本地未提交改动），非必要输出 |
 | `... detected Shim: swemusp` | 用 `swemusp` shim 跑 **archmodel（cmodel）**而非真实硬件 |
@@ -4693,7 +4699,7 @@ in strided golden function !!!
 
 **关于工作区里那两处 `// like_debug` 调试打印**：`main()` 开头和 `run_case()` 开头各有一行 `std::cout` 调试输出（`argc:...` 和 `,batch_size:...`），是未提交的本地改动。上面的实测就是在**带这两行打印的工作区原样**上跑通的，`bash build.sh` 返回 0、`./build/test_host` 返回 0。
 
-> 本文早期版本曾记录这里有一处 `emu_test`（正确名 `emu_test_mode`）的编译错误 —— **该问题已修复**，当前工作区第 175 行是 `<< ",emu_test_mode:" << emu_test_mode << ...`，可以正常编译。上面 `run.log` 里多出来的 `,batch_size:16,...` 那一行就是这两处调试打印的产物。运行时若直接 `./build/test_host` 报 `cannot open shared object file: libsi150.so.0`，是因为没 `source setup.sh`——`LD_LIBRARY_PATH` 不跨 shell 保留，需在同一条命令里先 source。
+> 本文早期版本曾记录这里有一处 `emu_test`（正确名 `emu_test_mode`）的编译错误 —— **该问题已修复**，当前工作区第 175 行是 `<< ",emu_test_mode:" << emu_test_mode << ...`，可以正常编译。上面 `run.log` 里多出来的 `,batch_size:16,...` 那一行就是这两处调试打印的产物。运行时若直接 `./build/test_host` 报 `cannot open shared object file: libsipu.so.0`，是因为没 `source setup.sh`——`LD_LIBRARY_PATH` 不跨 shell 保留，需在同一条命令里先 source。
 
 `--emu-multi` 路径（EMU 性能测试用）：
 
@@ -4759,7 +4765,7 @@ main()
 ## 48. CSR 指令详解：从 RISC-V 标量 CSR 到 Tile Core CSR
 
 **ISA 文档**：`/softhome/like/asset/code/isa/index.html` → 章节「Control Register Operation / CSR指令」
-**实证来源**：`sikernel/source/source_builtin/attention/rms_norm/build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm`
+**实证来源**：`sikernel/source/source_builtin/attention/rms_norm/build/SipuWork.rms_norm/librms_norm_sipu_fatbin.llvm.asm`
 
 第 47 节讲到 grid/block 坐标要从 CSR 里读出来，但没有展开 CSR 本身。这一节补齐。
 
@@ -5343,7 +5349,7 @@ if(i<shared_buffer_size/512){
 
 （行号按该文件实际内容编号。）
 
-`sikernel` 构建时 `-arch=si150`，编译器定义 `__riscv_xsotile150g`，所以走 `:20` 那条分支。
+`sikernel` 构建时 `-arch=sipu_150`（见第 47.1 节），编译器据此定义 `__riscv_xsotile150g`，所以走 `:20` 那条分支。
 
 **`siorigin_tile.h:18` 是 `TILE_HEADER` 的定义处**：
 
@@ -5512,7 +5518,7 @@ class toAsmStr<string input> {
 
 ### 50.7 实机验证：反汇编逐字段核对
 
-`sikernel/source/source_builtin/attention/rms_norm/build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm` 里，bf16 kernel 的 `tst_linear_share_m1` 调用点生成了：
+`sikernel/source/source_builtin/attention/rms_norm/build/SipuWork.rms_norm/librms_norm_sipu_fatbin.llvm.asm` 里，bf16 kernel 的 `tst_linear_share_m1` 调用点生成了：
 
 ```asm
 8040000001c4: 81b0607b 8205807b   tld.trir.linear.u32.global  T4, (a1), 0x0, s11
@@ -5627,7 +5633,7 @@ kernel/rms_norm_kernel_bf16.hpp:56
 
 | # | 办法 | 命令/位置 | 得到什么 | 成本 |
 | --- | --- | --- | --- | --- |
-| **1** | 直接编译探针 | 一条 `clang -S` | **汇编助记符**（需 `__shared__` + 变量偏移才准） | 最低，10 秒 |
+| **1** | 直接编译探针 | 一条 `clang -S` | **汇编助记符**（注意 `-mcpu` 名字与 `-O2`） | 最低，10 秒 |
 | **2** | 反汇编已构建产物 | `llvm-objcopy` + `llvm-objdump` | 汇编助记符 + 实际寻址代码 | 低，产物已在 |
 | **3** | 查自动生成的编译器测试 | `grep` 测试目录 | 助记符 + 类型重载全表 | 最低，纯 grep |
 | **4** | 读 TableGen 命名规则 | 编译器源码 | **名字每一段的含义**（唯一能给出"为什么"的办法） | 高，但一次学会终身受用 |
@@ -5642,65 +5648,122 @@ kernel/rms_norm_kernel_bf16.hpp:56
 
 **思路**：`siorigin_tile_150g.h` 里的函数都是 `clang_builtin_alias` 包装（见第 50 节），写一个最小函数调用它，让编译器把汇编打出来。
 
-新建 `/tmp/probe.cpp`：
+新建 `/tmp/probe.cpp`。**写得越朴素越好**——不需要 `__global__`，不需要 `__shared__`，不需要任何额外 flag：
 
 ```c
 #include <tile_vector.h>
 #include "siorigin_tile.h"
 
-__shared__ bfloat16_t sbuf[512];          // 必须真的建在 shared memory 上
-
-void probe(tbfloat16m1_t s, long off) {   // 偏移用变量，才能拿到 trir 形态
-  tst_linear_share_m1(s, sbuf, off);
+void probe(tbfloat16m1_t s, bfloat16_t *p, long off) {   // 偏移用变量，才能拿到 trir 形态
+  tst_linear_share_m1(s, p, off);
 }
 ```
 
-用 SDK 里的 clang 编译（`-S` 出汇编，`-DLAZYLOAD` 让函数走 `__tile_*` 内建路径）：
+编译命令（**`-O2` 是关键，见下面的坑**）：
 
 ```bash
-CLANG=/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/bin/clang
-$CLANG -S --target=riscv64 -mcpu=si150 \
-  -mllvm --si-disable-reuse-legalize \
-  -mllvm --si-default-threading-mode=single-thread \
-  -DLAZYLOAD -fno-inline \
-  -I$SDK/bin/nds64le-elf-newlib-v5d/lib/clang/20/include \
-  probe.cpp -o -
+SDK=/share_data/sicx_sdk/release/latest
+CLANG=$SDK/bin/nds64le-elf-newlib-v5d/bin/clang
+INC=$SDK/bin/nds64le-elf-newlib-v5d/lib/clang/20/include
+
+$CLANG -S --target=riscv64 -mcpu=sipu150 -O2 -I$INC probe.cpp -o -
 ```
 
-**实测输出**（只截取目标那行）：
+**实测输出**（整个函数就这么点）：
 
 ```asm
-_Z5probeu19__tile_bfloat16m1_tl:
-	tst.trii.linear.u32.global	T0, (a0), 0, 0   # 栈上溢出，噪声
-	...
-	tst.trir.linear.u32.share	T0, (a0), 0, a1  ← 目标
+_Z5probeu19__tile_bfloat16m1_tPDF16bl:
+.Lsipu.res.func0:
+	tst.trir.linear.u32.share	T0, (a0), 0, a1   ← 目标
+	ret
 ```
 
 一行就拿到了助记符。再拿 `tst.trir.linear.u32.share` 去 ISA 文档里搜，就能定位到「Tile Unit-stride Share Memory Store」章节。
 
-**两个必须注意的点**（我第一次探针就踩了，拿到的是 `.global`）：
+#### 51.1.1 四个必须注意的点（都是实测踩出来的）
 
-1. **第二个参数必须真的指向 shared memory**。写 `bfloat16_t* p` 这种普通指针参数，编译器会生成 `tst.trir.linear.u32.global`——因为普通指针的地址空间是 global。必须声明成 `__shared__` 数组，或者用 `__shared__` 修饰的指针，才能得到 `.share`。
-2. **偏移要用变量，不能用字面量 `0`**。常量会走立即数编码 `trii`，变量才走寄存器编码 `trir`（见 51.6）。
+**（1）`-mcpu` 的值是 `sipu150`，不是 `si150`。**
 
-**`-fno-inline` 带来的噪声**：输出里会有若干条 `tst.trii.linear.u32.global` 的 "1024-byte Folded Spill"——那是 ABI 把 tile 寄存器溢出到栈上保存，**不是你要找的调用**。看最后那条、且空间后缀匹配的即可。想更干净可以省略 `-fno-inline`，或把探针写成 `__device__` 函数。
+```
+clang: error: unsupported argument 'si150' to option '-mcpu='
+```
 
-**为什么 `-DLAZYLOAD` 有用**：`riscv_siorigin_xsotile_memory.td` 里两套名字并存——`tile_150g.h` 用的是 `TILE_HEADER(tst_trr_linear_share_m1)`（编译器内建名），而 `-DLAZYLOAD` 走 `__tile_` 前缀的 lazy 路径。两者生成的汇编相同，但 lazy 路径编译更快、不需要完整的 arch feature 集合。
-
-**变体：只想要 LLVM intrinsic 名**，把 `-S` 换成 `-S -emit-llvm`：
+这是我最初失败的直接原因。**不要猜 CPU 名，让编译器自己报**（列表很长，直接 grep）：
 
 ```bash
-$CLANG -S -emit-llvm ... probe.cpp -o -
+$CLANG --target=riscv64 -print-supported-cpus | grep -i sipu
+```
+
+实测输出就是三行：
+
+```
+	sipu150
+	sipu160
+	sipu170
+```
+
+注意 `scc` 的 `-arch` 取值是同一套名字（`scc --list-gpu-arch` 输出 `sipu_150` / `sipu_160` / `sipu_170`，多一个下划线），**都不是 `si150`**。`sikernel` 自己的 `setup.sh:39-55` 用的是裸数字 `150/160/170`，写进 `SIARCH` 之类的环境变量。这三套写法互不相通，混用就报错。
+
+**（2）`-mllvm` 的那两个 flag 名字也不是 `--si-xxx`。**
+
+```
+clang (LLVM option parsing): Unknown command line argument '--si-disable-reuse-legalize'.
+clang (LLVM option parsing): Did you mean '--siorigin-disable-reuse-legalize'?
+```
+
+正确拼写是 `-mllvm --siorigin-disable-reuse-legalize` 和 `-mllvm --siorigin-default-threading-mode=single-thread`。
+
+**不过更重要的是：这两个 flag 对反查助记符根本不需要。** 我做了对照实验，加上、去掉、甚至完全不写 `-mllvm`，`tst.trir.linear.u32.share` 一字不差。`-DLAZYLOAD` 同理——我把整个 SDK 头文件树和 `sikernel` 都 grep 了一遍，**`LAZYLOAD` 这个宏根本不存在**，加不加输出完全一样。这些都来自构建系统里为了别的目的（编译期、线程模式）加的开关，探针里请直接删掉，少一层出错面。
+
+**（3）`__shared__` / `__global__` 在探针里是多余的——而且会误导你。**
+
+这是最容易走偏的一点。我最初的推论是"第二个参数必须指向 shared memory 才能得到 `.share`"，**这是错的**。实测对照（同样传一个普通 `bfloat16_t *p` 参数）：
+
+| 调用的函数 | 生成的助记符 |
+| --- | --- |
+| `tst_linear_share_m1(s, p, off)` | `tst.trir.linear.u32.share` |
+| `tst_linear_global_m1(s, p, off)` | `tst.trir.linear.u32.global` |
+
+**访存空间由函数名的 `share`/`global` 那一段决定，和指针的实际地址空间无关。** 用普通指针参数就能拿到 `.share`，不需要 `__shared__` 数组，也不需要 `__global__` 函数。
+
+反过来，在 `--target=riscv64` 这个路径下写 `__shared__` / `__global__` 不但没用，还会被编译器忽略并告警：
+
+```
+warning: 'sipu_global' attribute ignored [-Wignored-attributes]
+warning: 'sipu_shared' attribute ignored [-Wignored-attributes]
+```
+
+（这两个属性只在 `scc` 那套 `-x sipu` 设备编译路径下才有意义，是另一条产线。）**换句话说：`__shared__` 加与不加，助记符一样；但它会给你一个"我控制了地址空间"的错觉。** 探针里删掉。
+
+**（4）`-O2` 不能省，`-fno-inline` 反而会污染输出。**
+
+省略优化（默认 `-O0`）时，编译器会插入大量 tile 寄存器到栈的保存/恢复，输出里混进一堆噪声：
+
+```asm
+	tst.trii.linear.u32.global	T0, (a0), 0, 0   # 1024-byte Folded Spill  ← 噪声
+	tld.trii.linear.u32.global	T0, (a0), 0, 0   # 1024-byte Folded Reload ← 噪声
+	...（重复十几条，且全是 global，不是你要的）...
+	tst.trir.linear.u32.share	T0, (a0), 0, a1   ← 真正那一行
+```
+
+这些 `1024-byte Folded Spill` 是 ABI 把 1 KB 的 tile 寄存器溢出到栈上，**和你的调用无关**。`-O2` 之后整个函数只剩两行，噪声全部消失。所以**别加 `-fno-inline`**（那是为了看别的才用的），想看干净输出就加 `-O2`。
+
+#### 51.1.2 变体：只想要 LLVM intrinsic 名
+
+把 `-S` 换成 `-S -emit-llvm`（同样加 `-O2`）：
+
+```bash
+$CLANG -S --target=riscv64 -mcpu=sipu150 -O2 -emit-llvm -I$INC probe.cpp -o -
 ```
 
 **实测输出**：
 
 ```llvm
-call void @llvm.riscv.tst.trir.linear.share.m1.tv512bf16.p0.i64.i64.i32(
-    <[tile] 512 x bfloat> %5, ptr %6, i64 0, i64 0, i32 0)
+tail call void @llvm.riscv.tst.trir.linear.share.m1.tv512bf16.p0.i64.i64.i32(
+    <[tile] 512 x bfloat> %0, ptr %1, i64 0, i64 %2, i32 0)
 ```
 
-名字里的 `tv512bf16` 就是 `tbfloat16m1_t`（512 个 bfloat 元素的 tile 向量），后缀 `p0.i64.i64.i32` 是参数类型签名。
+名字里的 `tv512bf16` 就是 `tbfloat16m1_t`（512 个 bfloat 元素的 tile 向量），后缀 `p0.i64.i64.i32` 是参数类型签名。**注意 `tst.trir` 这一段在 intrinsic 名里原样保留**——它对应的是 `IntrinsicsRISCVXSOTile.td:365` 的 `defm _trir_linear : TStoreLinearIntrinsic_m<0x14>`，和立即数版 `:368` 的 `defm _trii_linear : TStoreLinearIntrinsic_m<0x1C>` 是**两条不同的 LLVM intrinsic**。这一点在第 51.6 节展开。
 
 ---
 
@@ -5710,24 +5773,30 @@ call void @llvm.riscv.tst.trir.linear.share.m1.tv512bf16.p0.i64.i64.i32(
 
 `sikernel/source/source_builtin/attention/rms_norm/build/` 里的产物分两层：
 
-**（a）直接看已生成的 `.llvm.asm`**（最省事）：
+**（a）直接看已生成的 `.llvm.asm`**（最省事）。构建系统已经把它反汇编好了，路径在 `build/SipuWork.rms_norm/` 下（注意是**三个下划线**开头）：
 
 ```bash
-grep -n "tst.trir.linear.u32.share" \
-  source/source_builtin/attention/rms_norm/build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm
+cd <sikernel>
+grep "tst.trir.linear.u32.share" \
+  source/source_builtin/attention/rms_norm/build/SipuWork.rms_norm/librms_norm_sipu_fatbin.llvm.asm
 ```
 
-**（b）自己从 `.su.o` 里重新提取**——这个配方来自 `mma_dte_tile_tensor/CMakeLists.txt:238-243` 的 `add_custom_command`（`OBJCOPY`/`OBJDUMP` 在 `:215-216` 定义），是构建系统生成 `.llvm.asm` 的原始命令：
+**（b）自己从 `.su.o` 里重新提取**——这个配方来自 `mma_dte_tile_tensor/CMakeLists.txt:238-243` 的 `add_custom_command`（`OBJCOPY`/`OBJDUMP`/`ELFINFO` 在 `:215-217` 定义），是构建系统生成 `.llvm.asm` 的原始命令：
 
 ```bash
+cd <sikernel>
 BIN=/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/bin
-OBJ=source/source_builtin/attention/rms_norm/build/siObj/rms_norm/kernel/rms_norm_kernel.su.o
+OBJ=source/source_builtin/attention/rms_norm/build/SipuObj/rms_norm/kernel/rms_norm_kernel.su.o
+
+# 0) 先确认段名（别手写，见下面的坑）
+$BIN/llvm-readelf -S "$OBJ" | grep -i fatbin
+#   [59] __sipu_fatbin   PROGBITS  ...  ← 这就是段名
 
 # 1) 抽出 fatbin 段
-$BIN/llvm-objcopy -O binary --only-section=__si__fatbin "$OBJ" /tmp/fb.bin
+$BIN/llvm-objcopy -O binary --only-section=__sipu_fatbin "$OBJ" /tmp/fb.bin
 
 # 2) 反汇编
-$BIN/llvm-objdump --mattr=+m,+c,+f,+a,+xsotile150g -zCDS /tmp/fb.bin
+$BIN/llvm-objdump --mattr=+m,+c,+f,+a,+xsiorigin -zCDS /tmp/fb.bin
 ```
 
 **实测输出**（与 `.llvm.asm` 完全一致）：
@@ -5738,7 +5807,17 @@ $BIN/llvm-objdump --mattr=+m,+c,+f,+a,+xsotile150g -zCDS /tmp/fb.bin
 804000000560: 91a0607b 8304907b   tst.trir.linear.u32.share   T6, (s1), 0x0, s10
 ```
 
-**坑**：段名是 `__si__fatbin`（占位符还原后带前缀）。如果不确定，先用 `llvm-readelf -S` 列出来再复制，别手写。
+**坑**：段名不是想当然的 `__si__fatbin`，而是 `__sipu_fatbin`（四个下划线开头，中间三个）——写错会得到 `not found in any input file`。**别手写，用上面第 0 步的 `llvm-readelf -S` 输出复制。** 同样的道理，`--mattr` 里的架构扩展名（`+xsiorigin`，即 `+xsotile150g`）也去 `llvm-readelf` 的段内容或者构建系统的 `add_custom_command` 里抄，别自己拼。
+
+我实测跑了一遍完整配方，输出与 `.llvm.asm` 逐字节一致：
+
+```
+8040000001dc: 91a0607b 8204907b	tst.trir.linear.u32.share	T4, (s1), 0x0, s10
+804000000560: 91a0607b 8304907b	tst.trir.linear.u32.share	T6, (s1), 0x0, s10
+804000000926: 91a0607b 8304907b	tst.trir.linear.u32.share	T6, (s1), 0x0, s10
+```
+
+顺带一提，这个 64 bit 机器字 `0x8204907b91a0607b` 的**低 32 位是先打印的**（`91a0607b` 在前），解析位域时别弄反顺序——这一点第 50 节详细讲过。
 
 ---
 
@@ -5795,16 +5874,16 @@ memory.td    .td          同上          同上
         IntrinsicStr = !tolower(PseudoStr)
 ```
 
-拼装核心在 `compiler-toolchain/llvm-project/llvm/include/llvm/IR/IntrinsicsRISCVXSOTileFuncType.td:264-287` 的 `MemLinearConfig`：
+拼装核心在 `compiler-toolchain/llvm-project/llvm/include/llvm/IR/IntrinsicsRISCVXSOTileFuncType.td:264-290` 的 `MemLinearConfig`：
 
 ```c
-class MemLinearConfig<int tile_size, int mem_idx, int tmask_idx,
+class MemLinearConfig<int tile_size, int mem_idx, int tmask_idx,      // :264
                       string remote_name> : MemBasicConfig {
-  let MemNameStr  = !if(!eq(mem_idx, 0), "_GLOBAL", "_SHARE");       // :275
-  let MaskNameStr = !if(!eq(tmask_idx, 0), "", "_TM");               // :281
-  let TileNameStr = "_M"#!cond(!eq(tile_size, 1) : "1", ...);        // :272
-  let PseudoStr    = MemNameStr#remote_name#TileNameStr#MaskNameStr; // :284
-  let IntrinsicStr = !tolower(PseudoStr);                            // :285
+  let TileNameStr = "_M"#!cond(!eq(tile_size, 1) : "1", ...);         // :274
+  let MemNameStr  = !if(!eq(mem_idx, 0), "_GLOBAL", "_SHARE");        // :282
+  let MaskNameStr = !if(!eq(tmask_idx, 0), "", "_TM");                // :286
+  let PseudoStr    = MemNameStr#remote_name#TileNameStr#MaskNameStr;  // :288
+  let IntrinsicStr = !tolower(PseudoStr);                             // :289
 }
 ```
 
@@ -5843,7 +5922,7 @@ IntrinsicStr = tolower("_SHARE_M1")     =  "_share_m1"
 | `index` | Tile Indexed Load | 索引向量寻址（gather/scatter） |
 | `blk` | Tile Block Load | 块状 |
 
-**（c）访存空间** —— `MemNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:275`）：
+**（c）访存空间** —— `MemNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:282`）：
 
 | 名字里出现 | `mem_idx` | 含义 |
 | --- | --- | --- |
@@ -5868,9 +5947,9 @@ IntrinsicStr = tolower("_SHARE_M1")     =  "_share_m1"
 
 （字母来自 `IntrinsicsRISCVXSOTileFuncType.td:401-405` 的 `Basic_type_common = ["i","c","x","y","f","m","n","t","l"]`；类型码来自 `RISCVInstrInfoXSOTile.td` 的 `SiType` 表。）
 
-**（f）LMUL** —— `_m1` / `_m2` / `_m4` / `_m8` / `_mf2` / `_mf4` / `_mf8`，来自 `TileNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:272-279`）。
+**（f）LMUL** —— `_m1` / `_m2` / `_m4` / `_m8` / `_mf2` / `_mf4` / `_mf8`，来自 `TileNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:274-281`）。
 
-**（g）`.tm` 后缀** —— tile mask，`tmask_idx=1` 时才有（`IntrinsicsRISCVXSOTileFuncType.td:281`）。
+**（g）`.tm` 后缀** —— tile mask，`tmask_idx=1` 时才有（`IntrinsicsRISCVXSOTileFuncType.td:286`）。
 
 #### 51.4.3 从名字到 ISA 章节
 
@@ -5894,12 +5973,21 @@ IntrinsicStr = tolower("_SHARE_M1")     =  "_share_m1"
 
 | 办法 | 操作 | 结果 |
 | --- | --- | --- |
-| 1. 编译探针 | `clang -S ... probe.cpp`（`__shared__` + 变量偏移） | `tst.trir.linear.u32.share` |
+| 1. 编译探针 | `clang -S --target=riscv64 -mcpu=sipu150 -O2 probe.cpp`（普通指针 + 变量偏移） | `tst.trir.linear.u32.share` |
 | 2. 反汇编 | `llvm-objdump` on fatbin | `tst.trir.linear.u32.share T4, (s1), 0x0, s10` |
 | 3. 查测试 | `grep tst_linear_share_m1 .../xsotile150g/` | `// CHECK: tst.trii.linear.u32.share`（**imm 版**，与内核的 trir 不同） |
 | 4. 命名规则 | 查 TableGen | `tst`(存) + `linear`(连续) + `share`(共享内存) + `m1` |
 
-**四条路的结果互相印证，唯一差异是办法 3 给的是 `trii`（测试里传字面量），内核实际是 `trir`（传变量）——这正是 51.6 要说的事。**
+**四条路的结果互相印证，唯一差异是办法 3 给的是 `trii`（测试里传字面量 `0`），内核实际是 `trir`（传变量 `i*tile_size`）——这不是矛盾，是同一函数的两种编码，判据见 51.6。**
+
+**补充：办法 1 与办法 2 的交叉验证。** 我用办法 1 的探针配方直接编译了真实内核 `kernel/rms_norm_kernel.su`（用 `scc --dryrun` 拿到的原始 clang 命令），生成：
+
+```asm
+	tst.trir.linear.u32.share	T4, (s1), 0, s10
+	tst.trir.linear.u32.share	T6, (s1), 0, s10
+```
+
+与办法 2 从 fatbin 反汇编出来的**完全一致**。两条独立路径互为印证，可以放心当作定论。
 
 **名字逐段解释**：
 
@@ -5907,8 +5995,8 @@ IntrinsicStr = tolower("_SHARE_M1")     =  "_share_m1"
 | --- | --- | --- | --- |
 | `tst` | Tile STore | 写内存 | `xsotile_memory.td` 的 `defm tst_trr_linear` |
 | `linear` | — | unit-stride（连续地址） | `TStoreLinearBuiltin_m` 的 `MemoryOpKind::LINEAR` |
-| `share` | `mem_idx=1` | 写 **share memory** | `MemNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:275`） |
-| `m1` | LMUL=1 | 一个 tile register（1 KB） | `TileNameStr`（`:272`） |
+| `share` | `mem_idx=1` | 写 **share memory** | `MemNameStr`（`IntrinsicsRISCVXSOTileFuncType.td:282`） |
+| `m1` | LMUL=1 | 一个 tile register（1 KB） | `TileNameStr`（`:274`） |
 
 **一句话功能**：把 tile 寄存器 `src` 里的 1 KB 数据，以单位步长写进 **share memory** 的 `baseAddr + offset` 处。
 
@@ -5922,27 +6010,84 @@ tst.trir.linear.u32.share.[m2/m4/m8/mf2/mf4/mf8].[tm]  Ts1, (rs1), imm1, rs3
 
 ---
 
-### 51.6 一个补充：`trir` vs `trii` 是参数决定的，不是函数名决定的
+### 51.6 一个补充：`trir` vs `trii` 由**偏移的数值**决定，不是函数名决定的
 
-这是最容易踩的坑。同一个 `tst_linear_share_m1`，**第三个参数写常量还是变量，生成的助记符不同**。实测（`__shared__` 基址下）：
+这是最容易踩的坑，也是我初稿写错、实测纠正过来的一处。同一个 `tst_linear_share_m1`，**第三个参数（偏移）的编译期取值**决定生成哪个助记符。
+
+#### 51.6.1 表面规则
 
 | 源码 | 实测助记符 | 编码 |
 | --- | --- | --- |
-| `tst_linear_share_m1(s, sb, 0)` | **`tst.trii.linear.u32.share`** | `i` = immediate，偏移是编译期常量 |
-| `tst_linear_share_m1(s, sb, off)` | **`tst.trir.linear.u32.share`** | `r` = register，偏移是运行时变量 |
+| `tst_linear_share_m1(s, p, off)`（`off` 是变量） | **`tst.trir.linear.u32.share`** | `r` = register，偏移放在 GPR 里 |
+| `tst_linear_share_m1(s, p, 0)`（字面量 0） | **`tst.trii.linear.u32.share`** | `i` = immediate，偏移编进指令 |
+| `tst_linear_share_m1(s, p, 32768)` | **`tst.trir.linear.u32.share`** | 常量太大，装不进立即数 → 退回寄存器 |
 
-**所以查办法 3 的测试文件时，默认看到的是 `trii`（测试里大多传字面量 `0`），而内核里实际生成的可能是 `trir`**——rms_norm 的 `kernel/rms_norm_kernel_bf16.hpp:56` 传的是 `i*tile_size`，所以是 `trir`。要确认自己代码里的形态，用办法 1 或 2。
+**注意第三行**：光说"常量走 `trii`、变量走 `trir`"是**不准确的**。实测 `32768` 虽然是字面量，依然生成 `trir`。真正的判据不是"是不是常量"，而是"**这个常量能不能被立即数编码放下**"。
 
-两者在 TableGen 里是**分开注册的两条 builtin**（`riscv_siorigin_xsotile_memory.td` 的 `defm tst_trr_linear` 与 `defm tst_tri_linear`），C 层靠重载 + 常量折叠决定走哪条，`__builtin_rvv_tst_trr_linear_share_m1` 和 `__builtin_rvv_tst_tri_linear_share_m1` 是两个不同的内建。
+我实测扫了边界，实测结果如下：
+
+| 偏移（字面量） | 助记符 |
+| --- | --- |
+| `0`、`32`、`64`、`512`、`1024`、`2048`、`31744`、`32736` | `tst.trii.…` |
+| `1`、`2`、`4`、`8`、`16`、`33`、`1025` | `tst.trir.…` |
+| `32768`、`32737`、`-32` | `tst.trir.…` |
+
+规律是 **`offset >= 0` 且 `offset % 32 == 0` 且 `offset <= 32736`**（即 `1024*31 + 32*31`）时用 `trii`，否则一律 `trir`。
+
+#### 51.6.2 它到底是怎么实现的
+
+判据实现在编译器里，就一个函数——`compiler-toolchain/llvm-project/llvm/lib/Target/RISCV/RISCVISelDAGToDAG.cpp:3671-3697` 的 `decomposeTileOffset`：
+
+```c
+static std::optional<std::pair<uint64_t, uint64_t>>
+decomposeTileOffset(int64_t Offset, bool Has32BOffset = true,
+                    bool Has1024BOffset = true) {
+  if (Offset < 0 || Offset % 32 != 0) {          // ← 负数、非 32 对齐：立即数编码放不下
+    return std::nullopt;
+  }
+  ...
+  if (Offset <= 1024 * 31 + 32 * 31) {           // ← 32736，上界
+    return std::make_pair((Offset % 1024) / 32, Offset / 1024);
+  }
+  return std::nullopt;                            // ← 超界：退回 trir
+}
+```
+
+**为什么是这个式子**：ISA 的立即数版把偏移拆成两个 5 bit 字段——`imm1`（32 字节为单位）和 `rs3` 位置上的 `imm2`（1024 字节为单位）。两个 5 bit 各自最大 31，所以总上界 `31*1024 + 31*32 = 31744 + 992 = 32736`。`Offset % 32 != 0` 时低位字段装不下，同样退回。
+
+这个函数被两个 `ComplexPattern` 调用（`RISCVInstrInfoXSOTilePseudosMemory.td:892-896`）：`Tile32BAnd1024BOffset` 和 `Tile32BOffset`。它们挂在指令选择模式上（`RISCVInstrInfoXSOTile150GPseudosMemory.td:809` 的 `PatTStTRIR150G`）：
+
+```c
+// 150GPseudosMemory.td:820-833（节选）
+def : Pat<(riscv_tile_store $td, $rs1, (uimm5:$imm1), $rs3, $mode),          ← trir 形态
+          (inst $td, $rs1, $imm1, $rs3, $mode)>;
+def : Pat<(riscv_tile_store $td, $rs1, (uimm5),
+          (Tile32BAnd1024BOffset uimm5:$imm32, uimm5:$imm1024), $mode),       ← 拆成两个 imm
+          (inst_trii $td, $rs1, $imm32, $imm1024, $mode)>;
+```
+
+**所以真相是：C 层只有一个函数、一条 builtin（`TILE_HEADER(tst_trr_linear_share_m1)`），到机器码层才由指令选择器根据偏移数值分流成两条指令。** 名字里的 `trir`/`trii` 是**后端**的区分，不是前端两个 builtin。
+
+我初稿写的"`defm tst_trr_linear` 与 `defm tst_tri_linear` 是分开注册的两条 builtin"**是错的**——`riscv_siorigin_xsotile_memory.td` 里**只有 `defm tst_trr_linear`，没有 `tst_tri_linear`**（我 grep 过，命中数 0）。前端只有一条。
+
+#### 51.6.3 对反查的实用影响
+
+- **办法 3 查测试文件看到的多是 `trii`**（测试里传字面量 `0`），而 rms_norm 内核传的是 `i * tile_size`（变量），所以是 `trir`。**两个都对，是同一函数的两种编码**，别以为查错了。
+- **想稳定复现内核的行为，就用变量偏移**；想复现测试文件的输出，就用 `0`。
+- 如果 ISA 文档按 `trii`/`trir` 分章节，记得**你的代码是哪种取决于偏移的编译期取值**，不是取决于你调了哪个函数。
 
 ---
 
 ### 51.7 小结
 
-- **首选办法 1**（编译探针）——一条命令、10 秒、结果最准，且能反映你自己代码的实际参数形态。
-- **办法 2**（反汇编）适合已经构建过的算子，不用重编。
+- **首选办法 1**（编译探针）——一条命令、10 秒、结果最准，且能反映你自己代码的实际参数形态。探针写得越朴素越好：普通指针参数即可，**不要加 `__shared__`/`__global__`/`-DLAZYLOAD`/`-fno-inline`**，只要 `-O2`。
+- **办法 2**（反汇编）适合已经构建过的算子，不用重编。两条路交叉验证过，结果一致。
 - **办法 3**（查测试）纯 grep，适合快速浏览某个指令族的全部变体。
 - **办法 4**（读 TableGen）是唯一能解释"为什么叫这个名字"的办法，也是遇到查不到的名字时唯一的出路。命名规则完全机械：`操作名 + 模式 + 空间 + LMUL`，各段的字典都能从 `IntrinsicsRISCVXSOTileFuncType.td` 和 `RISCVInstrInfoXSOTile.td` 里机械提取。
 - 名字段到 ISA 手册章节是**一一映射**的：`tst_linear_share` → 「Tile Unit-stride Share Memory Store」，直接拿助记符去 ISA 文档里搜即可。
 - 唯一不自解释的一段是**元素类型字母**（`c`=S8、`x`=F16、`y`=BF16、`f`=F32、`t`=TF32、`h`=S4…），这张表在 51.4.2(e) 里给出了。
-- 最后提醒：`trii`/`trir` 由参数是常量还是变量决定，**别只看测试文件就下结论**。
+
+**上手时最容易出错的两个地方**（都是本次实测踩出来的）：
+
+1. **命令行**：`-mcpu` 的值是 `sipu150`（用 `-print-supported-cpus` 自己查），不是 `si150`；`-mllvm` 的 flag 是 `--siorigin-...`，不是 `--si-...`。**这两个 flag 和 `-DLAZYLOAD` 对反查都不需要，直接删掉。**
+2. **语义**：访存空间（`.share`/`.global`）由**函数名**决定，不是由指针的地址空间决定；`trii`/`trir` 由**偏移能否装进立即数**决定（`offset >= 0 && offset % 32 == 0 && offset <= 32736`），不是由"常量还是变量"这个笼统说法决定。**别只看测试文件就下结论。**
