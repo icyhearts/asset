@@ -5260,3 +5260,355 @@ using tfloat32 = SiFpBase<8, 10, uint32_t, sifmt::tf32::toFloat, sifmt::tf32::fr
 - **32 位浮点有两个 tile 类型**：`tfloat32m1_t`（IEEE f32，`IsTF=false`）和 `ttfloat32m1_t`（TF32，`IsTF=true`）。两者都是 256 元素 × 32 bit = 1 KB。
 - TF32 是**右对齐 19 位**（符号 1 / 指数 8 / 尾数 10），值不占满 32 bit。**只支持 load/store/MMA/GEMV，没有逐元素 ALU**——它是给矩阵乘准备的输入格式，不是通用计算类型。
 - rms_norm 的 f32 kernel 用的是 `tfloat32m1_t`（真 f32），不是 TF32。对 RMSNorm 这种需要逐元素乘/加/开方的算法，TF32 在指令层面就不可用。
+
+---
+
+## 50. `tst_linear_share_m1` 的完整展开：从 kernel 源码到 `tst.trir.linear.u32.share` 机器码
+
+**问题**：`rms_norm_kernel_bf16.hpp` 里的 `tst_linear_share_m1`，定义是在 `siorigin_tile_150g.h` 吗？`TILE_HEADER` 宏展开成什么样？包裹的 ISA 指令在哪里定义？
+
+**SDK**：`/share_data/sicx_sdk/release/latest/`（→ 软链到 `2609101917`）
+**编译器**：`/share/users/like/package/compiler-toolchain/`
+**ISA 文档**：`/softhome/like/asset/code/isa/index.html`
+
+### 50.0 一句话答案
+
+| 问题 | 答案 |
+| --- | --- |
+| 定义在 `siorigin_tile_150g.h` 吗？ | **是**，`kernel/rms_norm_kernel_bf16.hpp` 走的是这个头（`siorigin_tile_150g.h:15532`）。同一个名字在 `siorigin_tile_inter.h:11942` 也有重载，但那个需要 `sifmt::bfloat16*`，kernel 传的是内建 `bfloat16_t*`，**不匹配** |
+| `TILE_HEADER` 展开成什么？ | `static inline __device__ __attribute__((__always_inline__, __nodebug__)) __attribute__((clang_builtin_alias(__builtin_rvv_tst_trr_linear_share_m1)))` |
+| ISA 指令在哪定义？ | **TableGen**：`compiler-toolchain/llvm-project/llvm/lib/Target/RISCV/RISCVInstrInfoXSOTile150GMemory.td:198`（`TST_TRIR_LINEAR_U32`）；ISA 手册对应章节是「Tile Linear Load/Store」 |
+| 最终机器码 | `tst.trir.linear.u32.share T4, (s1), 0x0, s10` = `0x8204907b 91a0607b` |
+
+整条链有**五层**，下面逐层拆。
+
+### 50.1 第 0 层：调用点
+
+`source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:56`
+
+```c
+if(i<shared_buffer_size/512){
+  tst_linear_share_m1(bf16_din, shared_buff[threadIdx.x], i*tile_size);
+}
+```
+
+三个实参：
+
+| 实参 | 类型 | 含义 |
+| --- | --- | --- |
+| `bf16_din` | `tbfloat16m1_t`（`rms_norm_kernel_bf16.hpp:31`） | 源 tile 寄存器 |
+| `shared_buff[threadIdx.x]` | `bfloat16_t*`（`rms_norm_kernel_bf16.hpp:45`） | 目标 share memory 基址 |
+| `i*tile_size` | `int` | 字节偏移（`tile_size = 1024`） |
+
+注意第二个实参的静态类型是**内建** `bfloat16_t`（来自 `siorigin_tile_150g.h`，因为 `shared_buff` 声明为 `__shared__ bfloat16_t[...]`），**不是** `sifmt::bfloat16`。这一点决定了后面选哪个重载。
+
+`rms_norm_kernel_bf16.hpp:19-23` 的 include 顺序：
+
+```c
+#include <riscv_vector.h>
+#include <stdint.h>
+#include <siorigin_tile.h>     // ← 引入 tile_150g.h / tile_inter.h 的基础
+#include "sipu.h"
+#include "SiTe.hpp"                   // ← 引入 sifmt 类型 + tile_inter.h
+```
+
+### 50.2 第 1 层：`siorigin_tile.h` 的头文件分发
+
+`/share_data/sicx_sdk/release/latest/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/siorigin_tile.h`（全文件仅 30 行）：
+
+```c
+  7  #ifndef __SIORIGIN_TILE_H__          // （占位符还原后为对应前缀）
+  8  #define __SIORIGIN_TILE_H__
+  9
+ 10  #include <stdint.h>
+ 11  #include <riscv_vector.h>
+ 12
+ 13  #include <tile_vector.h>              // ① 类型别名层
+ 14
+ 15  #define __rvv_generic \
+ 16      static inline __device__ __attribute__((__always_inline__, __nodebug__))
+ 17  #if defined(__SIPU_ARCH__) && (__SIPU_ARCH__ >= 100)
+ 18  #define TILE_HEADER(T) __rvv_generic __attribute__((clang_builtin_alias(__builtin_rvv_##T)))
+ 19  #if defined(__riscv_xsotile150g)
+ 20  #include "siorigin_tile_150g.h"      // ② 指令原型层（arch=150）
+ 21  #endif
+ 22  #if defined(__riscv_xsotile160g)
+ 23  #include "siorigin_tile_160g.h"
+ 24  #endif
+ 25  #if defined(__riscv_xsotile170g)
+ 26  #include "siorigin_tile_170g.h"
+ 27  #endif
+ 28  #endif
+```
+
+（行号按该文件实际内容编号。）
+
+`sikernel` 构建时 `-arch=si150`，编译器定义 `__riscv_xsotile150g`，所以走 `:20` 那条分支。
+
+**`siorigin_tile.h:18` 是 `TILE_HEADER` 的定义处**：
+
+```c
+#define TILE_HEADER(T) __rvv_generic __attribute__((clang_builtin_alias(__builtin_rvv_##T)))
+```
+
+展开规则是 `##` 拼接——`TILE_HEADER(tst_trr_linear_share_m1)` 会拼出 `__builtin_rvv_tst_trr_linear_share_m1`。
+
+### 50.3 第 2 层：`TILE_HEADER` 的两次展开
+
+以 `siorigin_tile_150g.h:15532` 那行为例：
+
+```c
+TILE_HEADER(tst_trr_linear_share_m1) void tst_linear_share_m1(tbfloat16m1_t src, bfloat16_t * baseAddr, unsigned long offset, uint32_t attr = 0);
+```
+
+**第一次展开**——`TILE_HEADER(T)` → `__rvv_generic __attribute__((clang_builtin_alias(__builtin_rvv_##T)))`：
+
+```c
+__rvv_generic __attribute__((clang_builtin_alias(__builtin_rvv_tst_trr_linear_share_m1)))
+void tst_linear_share_m1(tbfloat16m1_t src, bfloat16_t * baseAddr, unsigned long offset, uint32_t attr = 0);
+```
+
+**第二次展开**——`__rvv_generic` → 它的定义（`siorigin_tile.h:15-16`）：
+
+```c
+static inline __device__ __attribute__((__always_inline__, __nodebug__))
+__attribute__((clang_builtin_alias(__builtin_rvv_tst_trr_linear_share_m1)))
+void tst_linear_share_m1(tbfloat16m1_t src, bfloat16_t * baseAddr, unsigned long offset, uint32_t attr = 0);
+```
+
+**最终形态**：一个 `static inline __device__` 的函数，函数体由编译器从内建 `__builtin_rvv_tst_trr_linear_share_m1` 生成。三个 attribute 的作用：
+
+| attribute | 作用 |
+| --- | --- |
+| `__always_inline__` + `static inline` | 强制内联，kernel 里不留函数调用 |
+| `__nodebug__` | 不生成调试信息（避免为每个 intrinsic 建 DWARF 条目） |
+| `clang_builtin_alias(...)` | **关键**：把这个函数名绑定到内建上，调用它等于直接调内建 |
+
+`clang_builtin_alias` 是 clang 的通用机制：它让一个普通 C 函数名成为某个 builtin 的别名，这样 SDK 可以用人类可读的名字 + 正确的 C 函数签名，而不用让用户直接写 `__builtin_rvv_*`。
+
+**`__device__` 在 host 编译时怎么处理**：`rms_norm_kernel.su` 里的 host 侧代码也会看到这个头。clang 对 `__device__` 函数在 host 侧的处理是"允许声明但不可调用"，所以 host 编译不会炸。
+
+### 50.4 第 3 层：所选重载 —— 为什么是 `tile_150g.h` 而不是 `tile_inter.h`
+
+同名函数在**两个**头文件里都有声明，签名只差第二个参数的类型：
+
+| 头文件 | 行 | 声明中的第二个参数 |
+| --- | --- | --- |
+| `siorigin_tile_150g.h` | 15532 | `bfloat16_t * baseAddr` ← **内建类型** |
+| `siorigin_tile_inter.h` | 11942 | `sifmt::bfloat16 * baseAddr` ← **类类型** |
+
+两者都会被包含（`tile_150g.h` 由 `siorigin_tile.h:20` 引入；`tile_inter.h` 由 `SiTe/SiTe.hpp:29` 引入，见 `SiTe.hpp` 里 `#ifdef __SIPU_ARCH__` 包住的那两行）。
+
+**选中的是 `tile_150g.h` 那个**，因为 kernel 传的 `shared_buff` 声明为 `__shared__ bfloat16_t [...]`（`rms_norm_kernel_bf16.hpp:45`）——`bfloat16_t` 是 clang 内建类型，精确匹配 `tile_150g.h:15532` 的签名。
+
+`sifmt::bfloat16`（`SiTe/sifmt/sifmt_fp.hpp:278`）虽然定义了 `operator bfloat16_t()` 转换（`:138`），但**指针之间不做转换**——`bfloat16_t*` 无法隐式转成 `sifmt::bfloat16*` 来匹配另一个重载。所以 `tile_inter.h:11942` 那个版本在这个调用点不会被选中。
+
+> 两个版本的差别不只是签名风格：`tile_inter.h` 用 `sifmt::` 标量类型是为了配合 SiTe 的高层算子库，`tile_150g.h` 用内建类型是 clang 生成的"裸"接口。**底层 builtin 是同一个**（都写 `TILE_HEADER(tst_trr_linear_share_m1)`），所以生成的汇编完全一致。
+
+### 50.5 第 4 层：builtin 名 → LLVM intrinsic
+
+`__builtin_rvv_tst_trr_linear_share_m1` 这个名字里的 `tst_trr_linear_share_m1` 一部分是编译器 TableGen **自动生成**的。生成规则在：
+
+`compiler-toolchain/llvm-project/llvm/include/llvm/IR/IntrinsicsRISCVXSOTileFuncType.td`
+
+`MemLinearConfig` 类（`:264-287`）负责拼名字：
+
+```c
+let MemNameStr   = !if(!eq(mem_idx, 0), "_GLOBAL", "_SHARE");
+let MaskNameStr  = !if(!eq(tmask_idx, 0), "", "_TM");
+let TileNameStr  = "_M"#!cond(!eq(tile_size, 1) : "1", ...);
+let PseudoStr    = MemNameStr#remote_name#TileNameStr#MaskNameStr;
+let IntrinsicStr = !tolower(PseudoStr);
+```
+
+对 `mem_idx=1`（share）、`tile_size=1`（m1）、`tmask_idx=0`：`PseudoStr = "_SHARE" + "" + "_M1" + ""`，`tolower` → `"_share_m1"`。
+
+再接上操作名前缀（`IntrinsicsRISCVXSOTile.td:363-377` 的 `TStoreIntrinsic_m`）：
+
+```c
+multiclass TStoreIntrinsic_m {
+  let IsLinear = true in {
+    defm _trir_linear : TStoreLinearIntrinsic_m<0x14>;
+  }
+  ...
+}
+```
+
+以及 clang 侧 `riscv_siorigin_xsotile_memory.td:299` 的 `defm tst_trr_linear : TStoreLinearBuiltin_m<"0sPeu", "tst_linear", ...>`，最终拼出：
+
+```
+tst  +  _trir_linear  +  _share_m1
+```
+
+即 builtin 名 `tst_trr_linear_share_m1`，LLVM intrinsic 名 `llvm.riscv.tst.trir.linear.share.m1.*`，汇编助记符 `tst.trir.linear.u32.share`。
+
+**名字各段的含义**：
+
+| 段 | 值 | 含义 |
+| --- | --- | --- |
+| `tst` | — | Tile STore |
+| `trir` | `t`=tile, `r`=GPR, `i`=imm, `r`=GPR | 操作数类型：`Td`(tile), `rs1`(基址 GPR), `imm1`(偏移立即数), `rs3`(GPR) |
+| `linear` | — | unit-stride（线性）访存模式 |
+| `u32` | — | 32 字节粒度 |
+| `share` | — | share memory 空间（对应 `mem_idx=1`）；另一种是 `global` |
+| **`m1`** | LMUL=1 | **汇编里被省略**（见 50.7） |
+
+同一份 fatbin 里也能看到对应的 `tst.trir.linear.u32.global`（写回 global memory 用）和 `tld.trir.linear.u32.share`（读回），名字规则一致。
+
+### 50.6 第 5 层：ISA 指令的真身（TableGen）
+
+builtin 只是编译器前端的名字；真正定义**指令编码**的地方在 TableGen：
+
+**（a）指令类的实例化** —— `compiler-toolchain/llvm-project/llvm/lib/Target/RISCV/RISCVInstrInfoXSOTile150GMemory.td:198`
+
+```c
+let hasSideEffects = 0, mayLoad = 0, mayStore = 1 in {
+  defm TST_TRII_LINEAR_U32 : TMemLinear150G_m<T_StOp, uimm5>;
+  defm TST_TRIR_LINEAR_U32 : TMemLinear150G_m<T_StOp, GPR>;     // ← 本 kernel 用的
+  ...
+}
+```
+
+`T_StOp` = `0b001000`（`RISCVInstrInfoXSOTile.td:17`）。`TMemLinear150G_m` 再展开成 `_GLOBAL` / `_SHARE` 两套（同文件 `:44-50`），`_SHARE` 带 `IsL2BStore = true`。
+
+**（b）编码位域** —— `RISCVInstrFormatsXSOTile.td:110-137` 的 `RVInstTMemLinear`：
+
+```c
+  // Word 2
+  let Inst{63}      = 0b1;
+  let Inst{62 - 55} = td;         // 源 tile 寄存器
+  let Inst{54 - 52} = tile_size;  // m1=0, m2=1, m4=2, m8=3, mf2=-1, mf4=-2, mf8=-3
+  let Inst{51 - 47} = rs1;        // 基址
+  let Inst{43}      = rmt;
+  let Inst{42}      = order;
+  let Inst{41}      = r_rsp;
+  let Inst{40 - 39} = 0b00;
+  // Word 1
+  let Inst{31}      = off_enc;    // 1 = trir（rs3 是 GPR）
+  let Inst{30 - 25} = memuop;     // T_StOp = 0b001000
+  let Inst{24 - 20} = rs3;        // 第 4 个操作数
+  let Inst{19 - 15} = imm1;       // 立即数偏移
+  let Inst{11 - 10} = 0b00;
+  let Inst{9}       = mode{24};
+  let Inst{8 - 7}   = 0b00;
+```
+
+**（c）汇编名生成** —— 同文件 `:6-22`，`toAsmStr` 把 TableGen 名转成汇编名：
+
+```c
+class toAsmStr<string input> {
+  string str = !tolower(!subst("_", ".", version_stripped));
+}
+```
+
+`TST_TRIR_LINEAR_U32` → 小写、下划线转点 → `tst.trir.linear.u32`。再拼上 `_SHARE` 的 `toAsmStr` 结果 `.share`，得到 `tst.trir.linear.u32.share`。
+
+**（d）`TILE_HEADER` 的名字从哪来** —— `toAsmStr` 的 `!subst("_", ".", ...)` 解释了汇编里的点号；而 builtin 名用的是 `IntrinsicStr = !tolower(PseudoStr)`（保留下划线）。**两者同源、不同格式**：
+
+| | 分隔符 | 例子 |
+| --- | --- | --- |
+| builtin / intrinsic 名 | 下划线 | `tst_trr_linear_share_m1` |
+| 汇编助记符 | 点号 | `tst.trir.linear.u32.share` |
+
+### 50.7 实机验证：反汇编逐字段核对
+
+`sikernel/source/source_builtin/attention/rms_norm/build/siWork.rms_norm/librms_norm_si_fatbin.llvm.asm` 里，bf16 kernel 的 `tst_linear_share_m1` 调用点生成了：
+
+```asm
+8040000001c4: 81b0607b 8205807b   tld.trir.linear.u32.global  T4, (a1), 0x0, s11
+8040000001d0: 68c044fb           tcsrr.r.b64 s1, tkernelidx
+8040000001d4: 88bd               andi  s1, s1, 0xf
+8040000001d6: 04ca               slli  s1, s1, 0x12
+8040000001d8: 01f4e4b3           or    s1, s1, t6
+8040000001dc: 91a0607b 8204907b   tst.trir.linear.u32.share   T4, (s1), 0x0, s10
+```
+
+`0x1dc` 那条就是 `tst_linear_share_m1`。我把 64 bit 机器码 `0x8204907b91a0607b` 按 TableGen 的位域逐字段拆开验证：
+
+| 位域 | 实测值 | 期望 | 对应 |
+| --- | --- | --- | --- |
+| `Inst{63}` | 1 | 1 | ACE 标志位 |
+| `Inst{62:55}` | `0b100` = 4 | T4 | **`td` = T4 ← 源 tile `bf16_din`** |
+| `Inst{54:52}` | 0 | `T_M1Op` = 0 | **tile_size = m1** |
+| `Inst{51:47}` | `0b1001` = 9 | x9 = s1 | **`rs1` = 基址** |
+| `Inst{43}` | 0 | 0 | rmt |
+| `Inst{42}` | 0 | 0 | order |
+| `Inst{41}` | 0 | 0 | r_rsp |
+| `Inst{40:39}` | 0 | 0 | 保留 |
+| `Inst{31}` | 1 | 1 | **`off_enc`=1 → trir** |
+| `Inst{30:25}` | `0b1000` = 8 | `T_StOp` = `0b001000` = 8 | **`memuop` = 存操作** |
+| `Inst{24:20}` | `0b11010` = 26 | x26 = s10 | **`rs3`** |
+| `Inst{19:15}` | 0 | 0 | `imm1` = 0（偏移在 rs3/rs1 里算） |
+| `Inst{11:10}` / `Inst{9}` / `Inst{8:7}` | 0 | 0 | 保留 / mode 位 / 保留 |
+
+**15 个字段全部吻合**。
+
+注意指令打印的**两个 32 bit 组顺序**：`91a0607b 8204907b` 中，**第一组是低 32 位（Word 1），第二组是高 32 位（Word 2）**——把 `0x8204907b` 当高位、`0x91a0607b` 当低位拼成 64 bit 才对得上 TableGen 的 `Inst{63:32}` / `Inst{31:0}` 划分。
+
+### 50.8 关于 `m1` 在汇编里消失
+
+注意生成的助记符是 `tst.trir.linear.u32.share`，**结尾没有 `.m1`**。这不是 bug，是设计：`toAsmStrWithType`（`IntrinsicsRISCVXSOTileFuncType.td:48-55`）里有一条替换规则：
+
+```c
+class toAsmStrWithType<string input> {
+  defvar substs = [ ..., [".m1", ""], ];
+  string str = !foldl(toAsmStr<input>.str, substs, acc, subst,
+                      !subst(subst[0], subst[1], acc));
+}
+```
+
+`.m1` 被显式替换成空串——**m1 是默认 LMUL，省略不写**；只有 m2/m4/m8/mf2/mf4/mf8 才会在助记符里出现后缀。
+
+验证：把整份 fatbin 里所有 `tst.trir.linear.u32.share*` 去重，只有 `tst.trir.linear.u32.share` 一种形式——因为 rms_norm 只用了 m1。而编码里的 `Inst{54:52} = 0` 才是真正的 LMUL 信息（`T_M1Op = 0b000`，`RISCVInstrInfoXSOTile.td:21`）。
+
+### 50.9 完整展开链一图
+
+```
+kernel/rms_norm_kernel_bf16.hpp:56
+  tst_linear_share_m1(bf16_din, shared_buff[threadIdx.x], i*tile_size);
+        │  实参类型: (tbfloat16m1_t, bfloat16_t*, int)
+        │
+        ├─ bfloat16_t 是 clang 内建 → 匹配 tile_150g.h 的重载
+        │
+        ▼
+  siorigin_tile_150g.h:15532
+  TILE_HEADER(tst_trr_linear_share_m1) void tst_linear_share_m1(
+        tbfloat16m1_t src, bfloat16_t * baseAddr, unsigned long offset, uint32_t attr = 0);
+        │
+        │  TILE_HEADER 宏定义在 siorigin_tile.h:18
+        ▼
+  static inline __device__ __attribute__((__always_inline__, __nodebug__))
+  __attribute__((clang_builtin_alias(__builtin_rvv_tst_trr_linear_share_m1)))
+  void tst_linear_share_m1(...);
+        │
+        │  clang_builtin_alias 绑定到编译器内建
+        ▼
+  __builtin_rvv_tst_trr_linear_share_m1
+        │
+        │  名字由 TableGen 生成:
+        │    IntrinsicsRISCVXSOTileFuncType.td:264  MemLinearConfig
+        │      PseudoStr = "_SHARE" + "" + "_M1" + ""  → IntrinsicStr="_share_m1"
+        │    riscv_siorigin_xsotile_memory.td:299  defm tst_trr_linear
+        │      overloaded_name = "tst_linear"
+        │    合成: tst + _trir_linear + _share_m1
+        ▼
+  llvm.riscv.tst.trir.linear.share.m1.*        (LLVM IR intrinsic)
+        │
+        │  指令定义 (CodeGen):
+        │    RISCVInstrInfoXSOTile150GMemory.td:198
+        │      defm TST_TRIR_LINEAR_U32 : TMemLinear150G_m<T_StOp, GPR>
+        │        编码类 RVInstTMemLinear 在 RISCVInstrFormatsXSOTile.td:110
+        ▼
+  tst.trir.linear.u32.share  T4, (s1), 0x0, s10       (汇编助记符)
+        │  名字: toAsmStr = tolower + "_"→"."  (IntrinsicsRISCVXSOTileFuncType.td:13)
+        ▼
+  0x8204907b 91a0607b                                  (64-bit 机器码)
+```
+
+### 50.10 小结
+
+- `tst_linear_share_m1` 在 kernel 里**确实来自 `siorigin_tile_150g.h:15532`**。`siorigin_tile_inter.h:11942` 有同名重载，但因为参数是 `sifmt::bfloat16*`（类类型）而非内建 `bfloat16_t*`，**不会被选中**。
+- `TILE_HEADER(T)` 定义为 `__rvv_generic __attribute__((clang_builtin_alias(__builtin_rvv_##T)))`（`siorigin_tile.h:18`），配合 `__rvv_generic`（`:15`）展开成 `static inline __device__ __attribute__((__always_inline__, __nodebug__)) __attribute__((clang_builtin_alias(__builtin_rvv_tst_trr_linear_share_m1)))`——**一个强制内联的设备端函数，函数体由编译器从内建生成**。
+- 内建的**名字**由 TableGen 拼成（`MemLinearConfig.IntrinsicStr` → `"_share_m1"`，再前缀 `tst_linear`）；**指令编码**定义在 `RISCVInstrInfoXSOTile150GMemory.td:198`，位域在 `RISCVInstrFormatsXSOTile.td:110`。
+- 最终汇编是 `tst.trir.linear.u32.share T4, (s1), 0x0, s10`，机器码 `0x8204907b 91a0607b`，**15 个编码字段已逐位核对全部吻合**。
+- 助记符里看不到 `.m1` 是因为 `toAsmStrWithType` 显式把 `.m1` 替换为空——m1 是默认 LMUL；真正的 LMUL 编码在 `Inst{54:52}`。
