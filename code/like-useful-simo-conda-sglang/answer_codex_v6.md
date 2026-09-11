@@ -2418,3 +2418,151 @@ void tst_linear_global_m1(
 - `tst_trr_linear_global_m1` 约在 `10390-10430` 行。
 
 它们使用 `sifmt::bfloat16` 等 SiTe 类型，是 SDK 的兼容/交互 API 声明集合。
+
+## 5. `TILE_HEADER` 如何绑定到 compiler builtin
+
+SDK 的 `siorigin_tile.h:15-18` 定义：
+
+```cpp
+#define __rvv_generic \
+    static inline __device__ \
+    __attribute__((__always_inline__, __nodebug__))
+
+#define TILE_HEADER(T) \
+    __rvv_generic \
+    __attribute__((clang_builtin_alias(__builtin_rvv_##T)))
+```
+
+所以：
+
+```cpp
+TILE_HEADER(tld_trr_linear_global_m1)
+tbfloat16m1_t tld_linear_global_m1(...);
+```
+
+概念上会绑定到：
+
+```cpp
+__builtin_rvv_tld_trr_linear_global_m1(...)
+```
+
+这解释了为什么 SDK header 中只有声明没有函数体：调用在编译阶段被识别为
+compiler builtin，不会生成对某个 runtime C 函数的普通调用。
+
+`trr` 是 SDK/compiler 对 operand pattern 的内部命名；源码公开使用的名字仍然
+是 `tld_linear_global_m1`。带 `passThru` 的另一组重载使用
+`tld_ttrr_linear_global_m1`，不要与当前三参数版本混淆。
+
+## 6. LLVM intrinsic 注册
+
+SDK 还提供：
+
+```text
+/share_data/sicx_sdk/release/2609101917/bin/nds64le-elf-newlib-v5d/include/llvm/IR/IntrinsicsRISCV.h
+```
+
+其中登记了：
+
+```text
+riscv_tld_trr_linear_global_m1  // llvm.riscv.tld.trr.linear.global.m1
+riscv_tst_trr_linear_global_m1  // llvm.riscv.tst.trr.linear.global.m1
+riscv_tld_tri_linear_global_m1  // llvm.riscv.tld.tri.linear.global.m1
+riscv_tst_tri_linear_global_m1  // llvm.riscv.tst.tri.linear.global.m1
+```
+
+这个文件主要是 LLVM intrinsic ID 注册，不是最终指令实现。真正的 lowering
+位于随 SDK 发布的 SIPU 定制 Clang/SCC backend 中。
+
+## 7. 为什么不是 runtime library 函数
+
+动态库中没有普通的 `tld_`/`tst_` 符号：
+
+```bash
+nm -D source/source_builtin/attention/rms_norm/build/librms_norm.so \
+  | rg 'tld_|tst_|__builtin'
+```
+
+相反，生成的 device 汇编直接出现：
+
+```text
+tld.trir.linear.u32.global T4, (a1), 0x0, s11
+tst.trir.linear.u32.global T3, (a0), 0x0, s10
+```
+
+本次 RMSNorm 的实际对应关系是：
+
+```text
+tld_linear_global_m1(...)
+  -> TILE_HEADER(tld_trr_linear_global_m1)
+  -> __builtin_rvv_tld_trr_linear_global_m1
+  -> llvm.riscv.tld.trr.linear.global.m1
+  -> tld.trir.linear.u32.global
+
+tst_linear_global_m1(...)
+  -> TILE_HEADER(tst_trr_linear_global_m1)
+  -> __builtin_rvv_tst_trr_linear_global_m1
+  -> llvm.riscv.tst.trr.linear.global.m1
+  -> tst.trir.linear.u32.global
+```
+
+## 8. 和 ISA 文档的关系
+
+`/softhome/like/asset/code/isa/index.html` 描述最终 ISA 的语义、operand 和
+encoding，例如：
+
+```text
+tld.trir.linear.u32.global.[m2/m4/m8/mf2/mf4/mf8] ...
+tst.trir.linear.u32.global.[m2/m4/m8/mf2/mf4/mf8] ...
+```
+
+它不提供可 include 的 C 函数，也不实现 intrinsic。各层职责如下：
+
+| 层 | 位置 | 职责 |
+| --- | --- | --- |
+| ISA 规范 | `asset/code/isa/index.html` | 指令语义、operand、encoding |
+| C/C++ 声明 | `siorigin_tile_150g.h`、`siorigin_tile_inter.h` | overload API |
+| builtin alias | `siorigin_tile.h` | `TILE_HEADER` -> `__builtin_rvv_*` |
+| LLVM ID | `IntrinsicsRISCV.h` | `llvm.riscv.tld/tst...` 注册 |
+| compiler backend | SIPU Clang/SCC | builtin/LLVM IR -> SIPU 指令 |
+| runtime | `libsipu.so`、`libsipurt.so` | kernel 装载、launch、copy、执行 |
+
+## 9. 本次运行验证
+
+按指定流程重新执行：
+
+```bash
+cd /softhome/like/package/sikernel
+source setup.sh
+cd source/source_builtin/attention/rms_norm
+bash build.sh
+./build/test_host
+```
+
+结果：
+
+- `TARGET_SIPU_ARCH=150`。
+- build 成功。
+- `./build/test_host` 返回码为 `0`。
+- 连续 `(16,7168)` 和 strided `(33,512)` case 完成。
+- 生成汇编包含 `tld.trir.linear.u32.global` 和
+  `tst.trir.linear.u32.global`。
+
+构建过程中的 `Clock skew detected` 是共享文件系统时间戳告警，不影响编译和
+测试结果。
+
+以后查这类 intrinsic，最直接的命令是：
+
+```bash
+rg -n 'tld_linear_global_m1|tst_linear_global_m1' \
+  "$SI_SDK_BIN/nds64le-elf-newlib-v5d/lib/clang/20/include"
+
+rg -n -C 3 'define TILE_HEADER|clang_builtin_alias|__builtin_rvv_' \
+  "$SI_SDK_BIN/nds64le-elf-newlib-v5d/lib/clang/20/include"
+
+rg -n 'tld_trr_linear_global_m1|tst_trr_linear_global_m1' \
+  "$SI_SDK_BIN/nds64le-elf-newlib-v5d/include/llvm/IR/IntrinsicsRISCV.h"
+```
+
+一句话总结：**这些 C intrinsic 的声明在 SIPU SDK 的 Clang include 头文件中，
+通过 `TILE_HEADER` 绑定到 SIPU Clang builtin；真正实现和编码在 SIPU 版
+Clang/SCC backend，最终生成 `tld.trir`/`tst.trir` ISA 指令。**
