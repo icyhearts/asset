@@ -4337,4 +4337,5 @@ cd source/source_builtin/attention/rms_norm
 bash build.sh
 ./build/test_host
 运行日志 /share/users/like/package/sikernel/source/source_builtin/attention/rms_norm/run.log
+把答案追加到 like-useful/answer_codex_v6.md
 }
