@@ -4234,7 +4234,8 @@ __global__ void rms_norm_bf16_kernel(sifmt::bfloat16* pout, sifmt::bfloat16* pin
 
 `tile_size = 1024` 是**字节**，即一个 tile 寄存器的大小。`__andescore_fp_mode(BF16)` 切换 core 的 16 位浮点解释模式。
 
-> 这个 intrinsic **不在 ISA 文档里**（文档只描述指令，不描述这种 core 级模式开关）。从源码看（`__clang_nds_device_functions.h`）它的实现是：
+
+> 这个 intrinsic **不在 ISA 文档里**（文档只描述指令，不描述这种 core 级模式开关）。从源码看（`__clang_nds_device_functions.h /share_data/sicx_sdk/release/latest/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/__clang_siorigin_device_functions.h `）它的实现是：
 > ```c
 > enum AndesFpMode { FP16 = 0, BF16 = 1 };
 > __device__ __attribute__((weak)) void __andescore_fp_mode(AndesFpMode mode) {
