@@ -2316,6 +2316,179 @@ tst.trir.linear.u32.global
 7. host 侧在 kernel API 返回后立即执行 D2H `sipuMemcpy`；测试依赖 runtime/cmodel
    对该 copy 的完成语义保证 output 已经可读。
 
+# 从 intrinsic 名字反查功能、LLVM intrinsic 和 ISA
+
+本节回答一个通用问题：当 SDK 的 `siorigin_tile_150g.h` 只有声明、没有注释时，
+如何从 `tst_linear_share_m1` 这类名字找到功能、LLVM intrinsic、汇编助记符和
+ISA 文档位置。
+
+通用链路是：SDK generated header -> compiler-toolchain TableGen builtin family
+-> Clang CodeGen 动态 LLVM intrinsic 名 -> LLVM CodeGen test 的 LLVM IR/汇编
+对照 -> LLVM Target TableGen 指令族/encoding -> ISA 文档语义。
+
+不要只按函数名猜。函数名用于生成搜索关键词，最终功能应由 compiler test、
+Target TableGen 和 ISA 文档交叉确认。
+
+## 1. 先看 sikernel 的真实调用点
+
+`source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp:56`
+中的 `rms_norm_bf16_kernel` 调用：
+
+`tst_linear_share_m1(bf16_din, shared_buff[threadIdx.x], i * tile_size)`。
+
+调用上下文已经给出第一层语义：把从 global memory 加载的 BF16 tile 写入当前
+thread 的 shared-memory scratch buffer。
+
+`source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f16.hpp:56`
+的 `rms_norm_f16_kernel` 和
+`source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_f32.hpp:51`
+的 `rms_norm_f32_kernel` 也把 tile 写入同一个 shared-memory scratch buffer，
+只是 tile dtype 不同。因此这个 intrinsic 的 memory operation 语义与 dtype 无关。
+
+## 2. 先拆函数名
+
+`tst_linear_share_m1` 可以先按命名约定拆成：
+
+| 片段 | 第一层含义 |
+| --- | --- |
+| `tst` | tile store，把 tile register 写入 memory |
+| `linear` | unit-stride/连续访问，区别于 stride/index/block |
+| `share` | 目标 memory space 是 share memory |
+| `m1` | 操作 1 个完整 tile，SIPU 中完整 tile 为 1024B |
+
+所以第一层结论是：它表示 tile register 到 share memory 的 unit-stride store，
+操作一个 m1 tile。
+
+但 `trr` operand 形式、offset 是 immediate 还是 GPR、mask/remote 属性等，不能
+只从公开函数名确定，必须继续查 compiler source。
+
+## 3. SDK 生成头中的声明
+
+当前 `latest` SDK 在 2026-09-12 解析为：
+
+`/share_data/sicx_sdk/release/2609111951`。
+
+声明位于：
+
+`/share_data/sicx_sdk/release/latest/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/siorigin_tile_150g.h:15526-15546`
+
+BF16 overload 是：
+
+`TILE_HEADER(tst_trr_linear_share_m1)`，其函数签名为
+`void tst_linear_share_m1(tbfloat16m1_t src, bfloat16_t *baseAddr, unsigned long offset, uint32_t attr = 0)`。
+
+这里最重要的是 `TILE_HEADER` 中的 compiler family name：
+`tst_trr_linear_share_m1`。它是后续搜索 compiler-toolchain 的关键词。
+
+## 4. compiler-toolchain 的 TableGen 定义
+
+### 4.1 include 入口
+
+`compiler-toolchain/llvm-project/clang/include/clang/Basic/riscv_siorigin_xsotile.td:73`
+include 了 `riscv_siorigin_xsotile_memory.td`。
+
+### 4.2 `tst_trr_linear` family
+
+`compiler-toolchain/llvm-project/clang/include/clang/Basic/riscv_siorigin_xsotile_memory.td:258-285`
+定义了 `TStoreLinearBuiltin_m`。
+
+这个 multiclass 的关键配置是：
+
+| 配置 | 作用 |
+| --- | --- |
+| `prototype = "0sPeu"` | store 无返回 tile result；第一个主要 operand 是 tile；有 pointer/offset/attr 类型 |
+| `overloaded_name = "tst_linear"` | 公开函数名前缀 |
+| `MemoryOpKind::LINEAR` | 进入 unit-stride memory lowering |
+| `param_names = ["src", "baseAddr", "offset"]` | source tile、base pointer、offset 的参数名 |
+
+### 4.3 为什么生成 `tst_linear_share_m1`
+
+SIPU150 的本地配置在：
+
+`compiler-toolchain/llvm-project/clang/include/clang/Basic/riscv_siorigin_xsotile_memory.td:326-358`。
+
+其中 `tst_trr_linear` 使用 `MemBasicStoreNoTmConfigList`。每个 configuration
+有一个 `IntrinsicStr`，例如 `linear_global_m1`、`linear_share_m1`、
+`linear_global_m2`、`linear_share_m2`。
+
+TableGen 通过 `overloaded_name # Conf.IntrinsicStr` 生成公开函数名，因此：
+
+`tst_trr_linear + linear_share_m1 -> tst_linear_share_m1`。
+
+这是一条可推广到其它 intrinsic 的规则：先把公开函数名拆成 family 和
+configuration suffix，再回到 TableGen 的 multiclass。
+
+## 5. 从 Clang CodeGen 找 LLVM intrinsic 名
+
+### 5.1 memory operation 进入 CodeGen
+
+`TStoreLinearBuiltin_m` 的 `ManualCodegen` 位于：
+
+`compiler-toolchain/llvm-project/clang/include/clang/Basic/riscv_siorigin_xsotile_memory.td:265-267`。
+
+它调用 `GetTileMemoryBuiltinExpr(..., MemoryOpKind::LINEAR, false)`，最后一个
+`false` 表示当前是 store，不是 load。
+
+实现位于：
+
+`compiler-toolchain/llvm-project/clang/lib/CodeGen/CGBuiltin.cpp:21863-21882`
+的 `GetTileMemoryBuiltinExpr`。
+
+`MemoryOpKind::LINEAR` 会转到：
+
+`compiler-toolchain/llvm-project/clang/lib/CodeGen/CGBuiltin.cpp:21731-21775`
+的 `GetTileLinearBuiltinExpr`。
+
+### 5.2 SIPU150 的 `trr -> trir`
+
+`compiler-toolchain/llvm-project/clang/lib/CodeGen/CGBuiltin.cpp:21406-21444`
+的 `combineLinearIntrinsicName` 负责根据架构、offset 形式和 pass-through
+形式重写 intrinsic family。
+
+SIPU150 的规则是：
+
+| 条件 | family 前缀 |
+| --- | --- |
+| immediate + pass-through | `ttrii_` |
+| immediate + no pass-through | `trii_` |
+| GPR offset + pass-through | `ttrir_` |
+| GPR offset + no pass-through | `trir_` |
+
+当前 `tst_linear_share_m1` 是 store、使用 GPR offset、没有 load pass-through，
+所以：
+
+`tst_trr_linear_share_m1 -> tst_trir_linear_share_m1`。
+
+`GetTileLinearBuiltinExpr:21741-21747` 还会在 SIPU150 下插入一个 32B offset
+operand。因此源码调用的 `src, baseAddr, offset` 会在 LLVM IR 中表现为 tile、
+pointer、额外的 `0`、GPR offset、attr。
+
+### 5.3 `tst_linear_share_m1` 的 LLVM intrinsic
+
+compiler-toolchain 自带的 LLVM CodeGen test 已经给出完整映射：
+
+`compiler-toolchain/llvm-project/llvm/test/CodeGen/RISCV/xsotile150g/tst-linear-gpr.ll:4897-4904`
+
+BF16 case 的 LLVM intrinsic 是：
+
+`llvm.riscv.tst.trir.linear.share.m1.tv512bf16.p0.i64.i64.i32`
+
+关键部分含义：
+
+| 片段 | 含义 |
+| --- | --- |
+| `tst` | tile store |
+| `trir` | SIPU150 的 tile/GPR/offset operand 形式 |
+| `linear` | unit-stride |
+| `share` | share memory |
+| `m1` | 一个 tile |
+| `tv512bf16` | 512 个 BF16 元素的 tile，即 1024B |
+| `p0` | pointer 类型/地址空间编码 |
+| `i64.i64.i32` | offset/attribute 等 LLVM 参数类型编码 |
+
+同一个 LLVM test 的 IR declaration 和调用可以直接作为 intrinsic 的准确名称
+来源，不需要从 SDK 函数名人工拼接。
+
 # SIPU C Intrinsic 的来源
 
 ## 1. 结论
