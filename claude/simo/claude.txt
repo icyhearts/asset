@@ -4546,3 +4546,23 @@ pt文件命名是如何决定的? dump数据的目录 为什么有很多pass?
 
 把答案追加到 like-useful/answer_codex_v3.md
 }
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+
+ sglang_sipu 代码位于 /share/users/like/package/sglang_sipu, 这是一个在开源 sglang 上做的 sipu 版本的 sglang.
+/share/users/like/package/sglang_sipu/test/srt/sipu 目录执行:
+ SIPU_TEST_CONTAINER=sipu-dev-dump bash test_utils/run_test.sh --config-yaml configs/deepseek/ds_v32_2layer.yaml --launch-config deepep_deepgemm_text --test-case text-only --device sipu > run-sipu.log.`nowstr.sh` 2>&1
+sipu-dev-dump mount 情况需要你自己查看
+
+日志位于 /share/users/like/package/sglang_sipu/test/srt/sipu/run-sipu.log.2026_09_12___22_48_30
+脚本失败了
+分析失败原因
+注意: sipu-dev-dump 容器内部 /sgl-workspace/sgl-kernel-sipu/tilelang_whl_path.txt 的内容已经改成 /share_data/tilelang/sicx_tilelang_dev/archive/tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d-cp38-abi3-linux_x86_64.whl 原本的 sipu版本tilelang 已经转移到这个路径了 
+
+
+把答案追加到 like-useful/answer_codex_v3.md
+}
