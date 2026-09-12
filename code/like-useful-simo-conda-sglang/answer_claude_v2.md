@@ -3199,10 +3199,11 @@ Filesystem            Size  Used Avail Use% Mounted on
 
 | 候选 | 大小 | 说明 |
 |---|---|---|
-| `guorui/投机解码训练/SpecForge` | 1.7T | 训练中间 checkpoint，确认后可删 |
+| `guorui/投机解码训练/SpecForge` | 1.7T | 训练中间 checkpoint，确认后可删 |# done
 | `yufne/UltraEdit`、`yufne/Senorita`、`yufne/JourneyDB` | 各 1.5T | 数据集，若可重新下载 |
 | `yufne/ShareGPT4Video` | 1.4T | 数据集 |
-| `weihongyang/JDJV` + `pengkunfu/JDJV` | 1.2T + 1.2T | 同名项目，疑似重复，建议比对 |
+| `weihongyang/JDJV` +
+`pengkunfu/JDJV` | 1.2T + 1.2T | 同名项目，疑似重复，建议比对 | #done
 | `weihongyang/ml-fastvlm/output` | 1.2T | 训练输出 |
 | `pengkunfu/JDJV/GaussianOcc` | 1.1T | |
 | `weihongyang/evalscope_latest` | 651G | 评测工作副本，可重建 |
