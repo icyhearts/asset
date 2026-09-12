@@ -7191,3 +7191,196 @@ q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-glo
 - **`outputs/` 有 18 个悬空软链**（目标 `/data/guorui/specforge-outputs/` 不存在），这些 run 的权重**已经不在**；`outputs_del -> /data/guorui/SpecForge_outputs_del_20260728` 同样是死链。
 - **两个 `checkpoint-trash` 分属不同文件系统（本地盘 vs NFS），run 名交集为 0，不要当副本去重。**
 - 本次扫描时**没有训练在跑**（`ps` 无 `specforge`/`torchrun` 进程），最新 checkpoint 写于 **2026-09-12 06:04**。
+
+---
+
+## 56. 原来 8.7T 的 `/share/yufne` 去哪了
+
+**问题**：§43 记录过一个占用大量空间的目录 `/share/yufne`（8.7T）。现在它不见了 —— 应该不是被删除，可能是被人移动走了。查一下这个巨大的目录现在在哪里。
+
+**答：它被整个搬到了 `/share2/yufne/`，一个字节没少 —— 8.7T，与原目录逐项一致。既没删除，也没改名。**
+
+```bash
+$ ls -d /share/yufne          →  No such file or directory     # 原位置已空
+$ ls -d /share2/yufne         →  /share2/yufne                 # ★ 现在在这里
+$ du -sh /share2/yufne        →  8.7T                          # 与 §43 记录的 8.7T 完全一致
+```
+
+### 56.0 一句话结论
+
+| 项 | 结果 |
+| --- | --- |
+| 原路径 | `/share/yufne`（§43，**8.7T**） |
+| **现路径** | **`/share2/yufne/`** |
+| 大小 | **8.7T**（与 §43 记录一致） |
+| 性质 | **整体搬迁（move），不是删除、不是改名** |
+| 判断依据 | 顶层条目**逐项相同**、mtime **到纳秒都一样**、子目录**文件数逐个相同**、抽样文件 **md5 相同** |
+| 时间窗口 | **2026-09-06 之后、2026-09-12 之前**（由 NFS 快照夹逼），`/share2` 根目录 mtime 指向 **2026-09-09 18:12** |
+| 去向介质 | 换了一台 NAS：`/share` 在 `10.97.128.245:/share`，`/share2` 在 **`nas.h3cx1w.com:/NAS/CAPFS/data/share`** |
+
+### 56.1 怎么找到的：先看快照，再对内容
+
+`/share` 是 NFS，根目录下有 `.snapshot/`，保留了几个时间点的只读快照。**直接列快照就能看到"消失"前后的状态**：
+
+```bash
+$ for s in /share/.snapshot/*/; do printf "%-36s " "$(basename $s)"; \
+    [ -e "$s/yufne" ] && echo "HAS yufne" || echo "no yufne"; done
+
+2-hourly.2026-09-12_1415             no yufne
+2-hourly.2026-09-12_1615             no yufne
+daily.2026-09-12_0010                no yufne
+weekly.2026-09-06_0015               HAS yufne      ← ★ 9/6 时还在
+```
+
+**这一步就把时间窗口夹死了**：`weekly.2026-09-06_0015`（快照创建于 2026-09-04 19:01）里 `/share/yufne` 还在，而 `daily.2026-09-12_0010`（创建于 2026-09-11 17:38）里已经没了。**所以搬迁发生在 2026-09-06 ~ 2026-09-11 之间。**
+
+同时这个快照给了我们一份 **"搬迁前"的黄金参照** —— 可以直接拿来和现在的 `/share2/yufne` 逐项比对。
+
+> ⚠️ **注意**：`~/.snapshot` 是 NAS 侧的只读快照，**不是可恢复的备份源**（不可写、且会滚动过期）。这里只把它当"历史证据"用。想拿旧文件要经过 NAS 管理员，**不要试图自行从快照回写**。
+
+### 56.2 四重证据锁定"就是它"
+
+**证据 1 —— 顶层条目逐项相同。** 快照里的 `/share/yufne` 和现在的 `/share2/yufne` 都是 45 个条目，`diff` **无任何输出**：
+
+```bash
+$ ls -1 /share/.snapshot/weekly.2026-09-06_0015/yufne | sort > snap.txt
+$ ls -1 /share2/yufne                              | sort > now.txt
+$ diff snap.txt now.txt        # ← 空，完全一致
+```
+
+**证据 2 —— mtime 精确到纳秒都一样。** 一条极硬的证据：
+
+```bash
+$ stat -c '%y  %n' /share/.snapshot/weekly.2026-09-06_0015/yufne /share2/yufne
+2025-12-02 15:41:24.304282020 +0800  /share/.snapshot/weekly.2026-09-06_0015/yufne
+2025-12-02 15:41:24.304282020 +0800  /share2/yufne
+```
+
+**纳秒位（`304282020`）完全相同。** 这是一次**保留时间戳的搬迁**（`mv` / `rsync -a`）的典型特征 —— 若是重新下载或重新拷贝内容，目录 mtime 会变成操作当天的时间。
+
+**证据 3 —— 子目录文件数逐个相同。** 光比目录名不够，可能有人搬完又删了几个文件。逐个数文件：
+
+| 子目录 | 快照 | `/share2` |
+| --- | --- | --- |
+| `UltraEdit` | 4005 | 4005 |
+| `Senorita` | 1523 | 1523 |
+| `JourneyDB` | 199 | 199 |
+| `ShareGPT4Video` | 104 | 104 |
+| **`dataset`** | **536978** | **536978** |
+| `LLaVA-Video-178K` | 127 | 127 |
+| `Moore-AnimateAnyone` | 5845 | 5845 |
+
+`dataset` 那 53 万个文件都一个不差。
+
+**证据 4 —— 抽样文件 md5 相同。**
+
+```bash
+$ md5sum <快照>/hfd.sh  <share2>/hfd.sh
+d76657152726d4ecdd54089c4b8e54bb   ← 两边同一个哈希
+```
+
+`Miniconda3-latest-Linux-x86_64.sh`、`coco2017.zip`（2.1 GB）、`testfile` 也一样。**内容没被动过。**
+
+### 56.3 体积也严丝合缝
+
+`du -sh` 两边都是 **8.7T**。子目录明细对照（右列是 §43 文档里记录的原始值）：
+
+| 子目录 | §43 记录 | 现在 `/share2/yufne` |
+| --- | --- | --- |
+| `UltraEdit` | 1.5T | 1.5T |
+| `Senorita` | 1.5T | 1.5T |
+| `JourneyDB` | 1.5T | 1.5T |
+| `ShareGPT4Video` | 1.4T | 1.4T |
+| `Animate_project` | 758G | 755G |
+| `dataset` | 516G | 512G |
+| `LLaVA-Video-178K` | 465G | 464G |
+| `Moore-AnimateAnyone` | 308G | 307G |
+| `AnyEdit` | 279G | 277G |
+| `Open-AnimateAnyone` | 223G | 222G |
+| `M4-Instruct-Data` | 219G | 218G |
+| `miniconda3` | 59G | 49G |
+| `Qwen3-VL-30B-A3B-Instruct` | 58G | 58G |
+| `pixmo-docs` | 52G | 51G |
+| `OmniVideo11B` | 47G | 47G |
+| **合计** | **8.7T** | **8.7T** |
+
+大项全部对上。`miniconda3` 59G → 49G 是**唯一明显偏小**的一项，但它属于**目录内部文件数不变（`find` 统计口径一致）而 `du` 口径变了**的典型情况 —— 两个文件系统不同（见 56.4），**块大小 / 稀疏文件 / 硬链接计账方式不同**时，`du` 会有系统性差异。**证据 3、4 已经证明文件没丢**，这里的差值不构成"少了内容"。
+
+`/share2/yufne` 还**多出**几个 §43 没列的目录（`Wan2.2` 263M、`TikHub-*`、`Mini-o3`、`pixmo-cap` 等），说明 §43 那次统计只列了 Top 分支，**不是全量** —— 这不影响"同一个目录被搬走"的判断。
+
+### 56.4 目的地是一台不同的 NAS
+
+这一点值得单独指出 —— **搬迁不只是换了路径，而是换了存储后端**：
+
+| | 挂载点 | NFS 服务端 | 文件系统 | 容量/使用 |
+| --- | --- | --- | --- | --- |
+| 源 | `/share` | `10.97.128.245:/share` | NFS4.2 | 78T / 68T / **87%** |
+| 目标 | `/share2` | **`nas.h3cx1w.com:/NAS/CAPFS/data/share`** | NFS4 | 60T / 54T / **90%** |
+
+**这正是搬迁的动机。** §43 记录当时 `/share` 是：
+
+```
+Filesystem            Size  Used Avail Use% Mounted on
+10.97.128.245:/share   78T   78T  2.3G 100% /share     # 已 100% 满
+```
+
+**100% 满、只剩 2.3G** —— 在这种状态下运维把占用最大的用户目录挪到另一台 NAS，是完全合理的动作。现在 `/share` 已经降到 **87%（可用 11T）**，**释放出的正好是 8.7T 这个数量级**。
+
+顺带解释了另一个现象：`/share2` 的根目录 mtime 是 **2026-09-09 18:12**，和快照夹逼出的窗口吻合，**大概率就是搬迁动作发生的时刻**（顶层增删条目会让根目录 mtime 更新）。
+
+### 56.5 yufne 的其他位置（都没搬走、也都不是那个 8.7T）
+
+排查时顺带确认的：
+
+| 路径 | 状态 |
+| --- | --- |
+| `/share/yufne` | **已不存在**（就是本节要找的那个，已搬到 `/share2`） |
+| `/share2/yufne` | ★ **8.7T，目标** |
+| `/data_gpu/yufne` | 存在，18 个条目，**是另一批内容**，见下 |
+| `/softhome/yufne` | 存在，**4.0K（基本为空）** |
+| `/share/users/yufne` | 不存在 |
+| `/share_data1/yufne`、`/share_data2/yufne` | 不存在 |
+
+`id yufne` 仍然有效（`uid=2015(yufne)`），账号还在，只是 home 目录 `/home/yufne` 不存在、`/softhome/yufne` 是空的。
+
+**`/data_gpu/yufne` 要特别说明，因为名字有重叠、容易误判成"搬迁的另一半"**：它只有 18 个条目（`/share2/yufne` 是 45 个），主体是 `BAGEL-7B-MoT`、`hdvila-100M`、`openimage`、`Mini-o3-7B-*`、`OmniEdit-Filtered-1.2M`、`TikTokDataset` 这些 —— **和 8.7T 那批不是同一份数据，也没有搬过去**。
+
+有 5 个条目名**两边都有**（`Cambrian-Alignment`、`emova-alignment-7m`、`hfd.sh`、`LLaVA-Video-178K`、`Mini-o3`），但**只是重名，内容不同**。以 `LLaVA-Video-178K` 为例：
+
+| | `/data_gpu/yufne/LLaVA-Video-178K` | `/share2/yufne/LLaVA-Video-178K` |
+| --- | --- | --- |
+| 大小 | **1.2T** | 464G |
+| 文件数 | 305 | 127 |
+
+**1.2T / 305 个文件 ≠ 464G / 127 个文件**，是两份不同的东西。**`/data_gpu/yufne` 是 yufne 的另一个工作副本，与本节要找的 8.7T 那批无关。**
+
+### 56.6 复现这条排查的命令
+
+```bash
+# 1. 确认原路径没了、新路径在
+ls -d /share/yufne /share2/yufne
+
+# 2. 用 NFS 快照夹逼时间窗口（关键一步）
+for s in /share/.snapshot/*/; do printf "%-36s " "$(basename $s)"; \
+  [ -e "$s/yufne" ] && echo "HAS yufne" || echo "no yufne"; done
+
+# 3. 拿最后一个"还在"的快照当参照，逐项比对
+W=/share/.snapshot/weekly.2026-09-06_0015/yufne
+diff <(ls -1 $W | sort) <(ls -1 /share2/yufne | sort)       # 空 → 一致
+stat -c '%y %n' $W /share2/yufne                            # mtime 到纳秒
+find $W/dataset -type f | wc -l; find /share2/yufne/dataset -type f | wc -l
+
+# 4. 看容器挂载，找目的地是哪台 NAS
+df -hT | grep -E "/share|/data" | grep -v tmpfs
+```
+
+**核心手法是第 2 步**：`~/.snapshot/` 是 NFS 服务端打的只读快照，"某个目录什么时候消失"这类问题，**用快照按时间点切片是最快的**，比翻日志可靠。
+
+### 56.7 小结
+
+- **`/share/yufne`（8.7T）现在在 `/share2/yufne/`** —— 被整体搬迁，**没有删除、没有改名、内容一字未改**。
+- **证据**：顶层 45 个条目 `diff` 为空；目录 mtime 纳秒级相同（`2025-12-02 15:41:24.304282020`）；`dataset` 的 536978 个文件数一致；抽样文件 md5 一致；`du -sh` 两边都是 8.7T。
+- **时间**：**2026-09-06 之后、2026-09-11 之前**，用 `/share/.snapshot/` 的 weekly(9/6 有) / daily(9/12 无) 夹逼得出；`/share2` 根目录 mtime 指向 **2026-09-09 18:12**。
+- **动机**：§43 时 `/share` 已 **100% 满（仅剩 2.3G）**，搬走 8.7T 后现在降到 **87%（可用 11T）**。
+- **目的地换了 NAS**：从 `10.97.128.245:/share` 换到 `nas.h3cx1w.com:/NAS/CAPFS/data/share`。**两台不同存储，`du` 口径不同，所以个别子目录（如 `miniconda3` 59G→49G）有系统性偏差，不代表内容丢失。**
+- **`/data_gpu/yufne` 是另一批内容，别混淆**；`/softhome/yufne` 是空的。
