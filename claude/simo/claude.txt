@@ -4529,3 +4529,20 @@ sikernel code base source/source_builtin/attention/rms_norm/kernel/rms_norm_kern
 
 把答案追加到 like-useful/answer_codex_v6.md
 }
+
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+ sglang_sipu 代码位于 /share/users/like/package/sglang_sipu, 这是一个在开源 sglang 上做的 sipu 版本的 sglang.
+/share/users/like/package/sglang_sipu/test/srt/sipu 目录执行:
+ACCURACY_CUDA_HOST=like@localhost bash test_utils/run_test.sh --config-yaml configs/deepseek/ds_v32_2layer.yaml  --launch-config deepep_deepgemm_text  --test-case text-only  --device cuda 
+日志 /share/users/like/package/sglang_sipu/test/srt/sipu/logs/deepseek/ds_v32_2layer_deepep_deepgemm_text_text-only_cuda.log
+sglang默认是不会 dump 输出的，这个脚本是使用了什么关键的参数或者开关，或者修改了什么代码，让 sglang 能够 dump 中间输出?
+dump数据位于 /share_data/sglang_sipu/accuracy_verify/like/ds_v32_2layer/,
+pt文件命名是如何决定的? dump数据的目录 为什么有很多pass?
+
+
+把答案追加到 like-useful/answer_codex_v3.md
+}
