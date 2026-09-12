@@ -6717,3 +6717,257 @@ vfloat32m1_t tmv_v_f32(tfloat32m1_t src, unsigned long index);
 2. **写探针/RVV 小例子时，`#pragma clang riscv intrinsic vector` 或 `#include <riscv_vector.h>` 二选一，必须有。** 只 include `siorigin_tile.h` 是不够的——它的 include 链里虽然间接带了 `riscv_vector.h`（`siorigin_tile.h:11`），但那只是因为 tile 头本身要用 `vbfloat16m1_t` 之类的 RVV 类型，**不能想当然认为"include 了 tile 头就能用 RVV intrinsic"**。
 3. **头文件路径不要硬编码**，用 `$(CLANG -print-resource-dir)/include`。实测 `latest` 是软链（当前指向 `2609111951`），而 `build.make:84` 里写死的是 `2609101917`，两者并存。
 4. **`__riscv_*` 是保留前缀**：写业务代码时如果出现"未声明标识符"但看着语法没问题，先想想是不是漏了 pragma/include；反过来，如果自己定义了以 `__riscv_` 开头的符号，很可能撞上 builtin 表。
+
+---
+
+## 54. `tcvt_f32` / `tcvt_bf16` 的第 2 个参数是什么？为什么两边都传 `t_r32`？
+
+**问题**：`source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp` 的 `rms_norm_bf16_kernel` 里，
+
+```c
+:59       f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);          // Pass 1：bf16 -> f32
+:97       f32_din.m2e0 = tcvt_f32(bf16_din, t_r32);          // Pass 2：bf16 -> f32
+:102        f32_wgt.m2e0 = tcvt_f32(bf16_wgt, t_r32);        // Pass 2：weight bf16 -> f32
+:106      bf16_out = tcvt_bf16(f32_out.m2e0, t_r32);         // Pass 2：f32 -> bf16
+```
+
+`tcvt_f32` 的第 2 个参数是什么含义？为什么传 `t_r32`？`tcvt_bf16` 的第 2 个参数又是什么含义？为什么**仍旧**传 `t_r32`？
+
+**答：两个函数的第 2 个参数是同一个东西——形参名就叫 `attr`，是一个 `uint32_t` 位掩码，`t_r32` 是其中的"shape（行模式）"标志位，选择 tile 的矩阵排布方式（32 行）。两边都传 `t_r32`，是因为上行转换设定的是哪种排布，下行转换就必须用同一种排布把它逆回来。**
+
+反直觉的地方在于：`tcvt` 是逐元素类型转换，按说跟"行怎么摆"无关。但实测表明**这个参数一字之差就会算错**，而且**只有两个方向的取值不一致时才错**。下面把证据摆全。
+
+### 54.0 一句话结论
+
+- 第 2 个参数 `attr` **不是数据类型、不是舍入模式**，而是**一整包转换属性的位掩码**——形状模式（`t_vec`/`t_r32`/`t_r16`/`t_r8`）只是其中最低 4 位，同一参数里还塞了舍入、饱和、reuse、取负、relu 等。
+- `t_r32 = 0x02`（`tile_vector.h:15`），指向 ISA 里的 **`ashape` 字段：`00` = 32 rows(r32)**（另见 `01`=r16、`10`=r8）。
+- 它决定**同一条 C++ 调用生成完全不同的指令**：传 `t_r32` → `tcvt.tt.f32.bf16.r32`（矩阵形式）；传 `t_vec` → `tcvt.tt.vec.f32.bf16.m8`（vector 形式）。**同一个 builtin，两种指令形态。**
+- 上下行都传 `t_r32` 是**必须一致**的：实测把上下行**一起**换成 `t_r16`/`t_r8`/`t_vec`，结果照样正确；但**只换一个方向**，立刻 57212 个元素算错。
+- `t_r32` 是本项目里的既定约定（全仓库 `tcvt` 调用点统计：`t_r32` 13577 次、`t_r8` 1100、`t_r16` 832、`t_vec` 267），因为 `tld_linear_*_m1` 取回的 1 KB linear tile 天然就是 32×32B 的 `r32` 排布。
+
+### 54.1 参数的真身：形参名就叫 `attr`
+
+先看声明。`tcvt_f32` 在 kernel 里的这个重载（`tbfloat16m1_t` → `tfloat32m2_t`）是：
+
+```c
+// $(CLANG -print-resource-dir)/include/siorigin_tile_150g.h:1080
+TILE_HEADER(tcvt_tt_vec_f32_bf16_m8) tfloat32m2_t tcvt_f32(tbfloat16m1_t src, uint32_t attr);
+```
+
+对应的下行转换：
+
+```c
+// 同文件 :1032
+TILE_HEADER(tcvt_tt_vec_bf16_f32_m8) tbfloat16m1_t tcvt_bf16(tfloat32m2_t src, uint32_t attr);
+```
+
+（另有 2 个 tile 形式的重载 `:548` / `:500`，签名是 `(tbfloat16m2_t src, uint32_t attr)` / `(tfloat32m4_t src, uint32_t attr)`，见 54.4。）
+
+两个函数的第 2 个参数**形参名一模一样，都叫 `attr`**——从编译器视角看就是同一个 `uint32_t`，没有任何类型层面的区别。
+
+`attr` 的取值不是随便定的，全部来自 `tile_vector.h` 的一组 `const unsigned`（`:14` 起，共 30 个）：
+
+```c
+// $(CLANG -print-resource-dir)/include/tile_vector.h:14-18
+const unsigned t_vec = 0x01;      // ← vector 排布（1x1024B）
+const unsigned t_r32 = 0x02;      // ← 32 rows，本项目默认
+const unsigned t_r16 = 0x04;      // ← 16 rows
+const unsigned t_r8  = 0x08;      // ← 8 rows
+const unsigned t_rne = 0x10;      // ← 从这里开始是舍入模式
+```
+
+也就是说 `attr` 是一包**按位或**出来的标志：
+
+| 位 | 常量 | 含义 | 本 kernel 用了吗 |
+| --- | --- | --- | --- |
+| bit0-3 | `t_vec` / `t_r32` / `t_r16` / `t_r8` | **shape 模式（互斥，四选一）** | ✅ 用了 `t_r32` |
+| bit4-7 | `t_rne`/`t_rtz`/`t_rtn`/`t_rtp`（或 `t_rni`/`t_rzi`/`t_rmi`/`t_rpi`） | 舍入模式 | ❌ 省略，走默认 |
+| bit16 | `t_sat` (0x10000) | 饱和（satfinite） | ❌ |
+| bit17 | `t_relu` (0x20000) | ReLU | ❌ |
+| bit8 | `t_reuse1` (0x100) | 寄存器 reuse | ❌ |
+| bit12 | `t_neg1` (0x1000) | 取负 | ❌ |
+
+**所以 `t_r32` 只是"这包标志里只填了 shape 字段、其余全 0"。** kernel 完全可以写 `tcvt_f32(bf16_din, t_r32 | t_rtz)` 之类，只是没必要。
+
+顺带说明一点：`t_rne` 和 `t_rtz` 等**同占 bit4-7**（`t_rne=0x10`、`t_rtz=0x20`…），`t_rni`/`t_rzi` 等又和它们**共用同一批位**——这是给整数转换用的另一套舍入命名。位是复用的，具体解释取决于指令的 dtype 组合，所以位掩码校验是**逐指令类型**做的，不是全局统一（见 54.6）。
+
+### 54.2 为什么是 `t_r32`：它是 tile 的"矩阵排布方式"
+
+ISA 文档（`/softhome/like/asset/code/isa/index.html`）在 GEMM 一节里定义了这个字段，并明确说了它名字的来历：
+
+> `ashape`
+> a矩阵的shape 00代表32 rows(r32)模式 01代表16 rows(r16)模式 10代表8 rows(r8)模式
+
+注意文档里的版本注记（对应 2025.1.8 那版）：
+
+> mma中的shape字段改名为ashape。
+
+**`r32` 就是 "32 rows"，`r16` = 16 rows，`r8` = 8 rows。** ISA 在 Tile Layout 一节解释了三种排布（`index.html` Tile Reg 排布方式）：
+
+> 32x32B的数据排布模式是行(M)方向32B排布，再按列(K)方向排布32个32B。
+> 16x64B的数据排布模式是行(M)方向32B排布，再按列(K)方向排布16个32B，再按行方向(M)方向排布2组16个32B。
+> 8x128B的数据排布模式是行(M)方向32B排布，再按列(K)方向排布8个32B，再按行方向(M)方向排布4组8个32B。
+> Vector Tile的数据排布模式是按列(K)方向排布1x1024B。
+
+三者的**字节总量完全相同**（都是 1024 B），区别只在"多少行为一组、多宽算一行"：
+
+| 模式 | 排布 | 对应 ISA 字节数 | 元素数（bf16, 2 B） |
+| --- | --- | --- | --- |
+| `t_r32` | 32×32B | 32×32 = **1024 B** | 512 |
+| `t_r16` | 16×64B | 16×64 = **1024 B** | 512 |
+| `t_r8` | 8×128B | 8×128 = **1024 B** | 512 |
+| `t_vec` | 1×1024B | **1024 B** | 512 |
+
+**这四个模式是同一块 1 KB 数据的四种"切法"。** 这也解释了为什么上下行必须配套——切法不同，元素在矩阵里的位置就不同。
+
+**为什么项目默认选 `r32`？** 因为输入是 `tld_linear_global_m1`/`tld_linear_share_m1` 取回的 1 KB **linear** tile，而 `r32` 是与之配套的 1 KB 粒度排布；更直接的证据来自 MMA：`r32` 与 `tile_M = 32` 绑定（见下），rms_norm 的每个 tile 恰好是 32 行 × 32B。全仓库统计也印证了这是主流写法：
+
+```
+t_r32 : 13577      t_r8 : 1100      t_r16 : 832      t_vec : 267
+```
+
+更直接的旁证在 `mma_dte_tile_tensor` 里——那批 util 文件**按 shape 分文件**，文件名就是设计意图：
+
+```
+mma_dte_tiled_tensor_kernel_util_non_mx_r32.hpp   // 注释：“r32 (tile_M=32) specific ...”
+mma_dte_tiled_tensor_kernel_util_non_mx_r16.hpp   // 注释：“r16 (tile_M=16) specific ...”
+mma_dte_tiled_tensor_kernel_util_non_mx_r8.hpp    // 注释：“r8 (tile_M=8) specific ...”
+```
+
+每个文件里 `tcvt` 用的 shape 与文件名**严格一致**（r32 文件里 128 处全是 `t_r32`，r16 文件里 20 处全是 `t_r16`，r8 文件里 32 处全是 `t_r8`），而它们服务的 MMA 也正是对应的 `tile_M = 32/16/8`。**shape 是从 MMA 的 M 维一路传下来的，`tcvt` 只是跟着走。**
+
+### 54.3 `attr` 如何改变生成的指令：实测对照表
+
+这一点最容易踩坑——`attr` 不只是"填充字段"，它**直接切换指令形态**。用同一份源码、只改第 2 个参数，实测（`clang -S --target=riscv64 -mcpu=sipu150 -O2`）：
+
+```c
+extern "C" tfloat32m2_t F(tbfloat16m1_t s){ return tcvt_f32(s, <ATTR>); }
+```
+
+| `<ATTR>` | 生成的指令 | 形态 |
+| --- | --- | --- |
+| `t_r32` | `tcvt.tt.f32.bf16.r32 T2, T0` | **矩阵形式** |
+| `t_r16` | `tcvt.tt.f32.bf16.r16 T2, T0` | 矩阵形式 |
+| `t_r8` | `tcvt.tt.f32.bf16.r8 T2, T0` | 矩阵形式 |
+| `t_vec` | `tcvt.tt.vec.f32.bf16.m8 T2, T0` | **vector 形式** |
+| `0`（省略） | `tcvt.tt.vec.f32.bf16.m8 T2, T0` | vector 形式（默认补 `t_vec`） |
+
+**同一个 C++ builtin，传 `t_r32` 出矩阵指令，传 `t_vec` 出 vector 指令。** 这跟 ISA 文档的说法完全吻合——矩阵转换要求"必须指定 r32/r16/r8"，而 vector 转换"无需指定 r32/r16/r8"：
+
+> 该指令用于matrix tile format的conversion，该指令需要指定r32/r16/r8模式。
+> tcvt.tt.dtype.atype.r32/r16/r8.[rtz/rtn/rtp/rzi/rmi/rpi].[satfinite].[reuse1].[neg1].[relu] Td, Ts1
+>
+> 该指令用于vector tile的conversion，该指令无需指定r32/r16/r8模式，使用1x1024B的layout排布工作。
+
+注意这里有个**默认值陷阱**：`attr=0`（或者只写 `t_sat` 之类）并不是"没有 shape"，编译器会**自动补上 `t_vec`**（`SiOriginTileSuffixAttr.cpp:295` `Imm |= t_vec;`），直接给你一条 vector 形式指令。所以**想用矩阵形式就必须显式写 `t_r32`/`t_r16`/`t_r8`，不能省**。
+
+从机器码层面看，shape 就是 32 位编码里的 bit18-19（用 `llvm-mc --show-encoding` 实测，编码小端读出后取位）：
+
+| 助记符 | 编码 | bit18-19 解码 |
+| --- | --- | --- |
+| `tcvt.tt.f32.bf16.r32` | `7b 60 00 60 ...` | `00` |
+| `tcvt.tt.f32.bf16.r16` | `7b 60 04 60 ...` | `01` |
+| `tcvt.tt.f32.bf16.r8` | `7b 60 08 60 ...` | `10` |
+| `tcvt.tt.vec...m8` | `7b e0 03 60 ...` | `00`（但 bit15-17 全 1，是另一个字段的 `vecen`） |
+
+**与 ISA 的 `ashape` 编码表逐位对上**——ISA 文档里的字段图也是 `vecen / shape / relu / rnd / sat / reuse1 / neg1` 这一串。
+
+### 54.4 为什么上行下行必须都用 `t_r32`（含反例）
+
+这才是问题的核心。既然四个 shape 描述的是同一块 1 KB，为什么不能上面用 `t_r32`、下面用 `t_r16`？
+
+**因为 `tcvt` 不是逐元素无关的搬运——shape 决定了数据在转换单元里怎么重排，下行必须精确逆回上行设定的那种排布。**
+
+我把 `rms_norm_kernel_bf16.hpp` 里的 `t_r32` 按不同方式替换后，用官方测试程序跑（`bash build.sh && ./build/test_host`，测试判定阈值 `err_rate > 0.01`，见 `test/test_host.cpp:282`）：
+
+| 改法 | `test_host` 退出码 | 报错元素数 | 结论 |
+| --- | --- | --- | --- |
+| **0. 原样（全 `t_r32`）** | 0 | 0 | ✅ 正确 |
+| **1. 全部换成 `t_r16`** | 0 | 0 | ✅ **仍然正确** |
+| **2. 全部换成 `t_r8`** | 0 | 0 | ✅ **仍然正确** |
+| **3. 全部换成 `t_vec`** | 0 | 0 | ✅ **仍然正确** |
+| **4. 只把上行换成 `t_r16`，下行留 `t_r32`** | **255** | **57212** | ❌ **算错** |
+| **5. 只把下行换成 `t_r16`，上行留 `t_r32`** | **255** | **57212** | ❌ **算错** |
+| **6. 再跑一遍原样** | 0 | 0 | ✅（可复现） |
+
+这张表说明两件事：
+
+**（1）测试是灵敏的，不是"改什么都不报错"。** 作为阳性对照，我把一行真正的数学改坏（`mean = sum/original_norm_size;` → `...*3.0f;`），立刻 **255 退出码 + 114688 个元素报错**。所以第 1-3 行"全换仍然通过"是真通过，不是测试失灵。
+
+**（2）关键不在"用哪个 shape"，而在"两个方向是否一致"。**
+
+- 全部换成同一个 shape → 上行的排布被下行**原样逆回**，中间夹着的 `tmul`/`tadd`/`tmv` 都是逐元素或与排布无关的归约，**净效果 = 恒等**，所以结果不变。
+- 只换一个方向 → 上下行的排布**对不上**，`tcvt_bf16` 按 32×32B 去解释一个按 16×64B 写进去的缓冲区，元素落到错误位置 → 大面积算错。
+
+反例的报错分布也印证是"排布错位"而不是数值精度问题——57212 ≈ 114688 的一半，且错误索引在**每个 32 元素块内均匀铺开**（`index mod 32` 从 0 到 31 各有约 1790 个错误，完全均匀）：
+
+```
+errors by (index mod 32):
+    0 : 1791      8 : 1791     16 : 1783     24 : 1783
+    1 : 1786      9 : 1786     17 : 1789     25 : 1789
+   ...            ...          ...           ...
+    7 : 1789     15 : 1789     23 : 1791     31 : 1791
+```
+
+**均匀铺开 = 整体移位/重排，而不是几个点上的舍入误差。** 如果是精度问题，应该是零星、集中在特定数值上的；这里的形态是典型的"数据搬错了地方"。
+
+而且报错值本身也支持这个判断——例如 `index 8, result: -0.204102, gold: -0.144531`、`index 9, result: -0.609375, gold: -0.234375`，**`result` 和 `gold` 都是合法的 bf16 数值**（`-0.609375` 是 bf16 能精确表示的），只是"对不上号"。
+
+**所以 kernel 里四处 `tcvt` 全部写 `t_r32` 的正确理由，不是"r32 是某种默认值"，而是"上下行必须锁定同一种排布"。** 写成全 `t_r16`/全 `t_r8` 在**功能上**同样正确（实测通过），但 `t_r32` 与 32 行的 tile 排布、以及与 `tile_M = 32` 的 MMA 配套，也是全仓库的既定约定，所以照写 `t_r32`。
+
+### 54.5 那个 `.m2e0` / `.m1e0` 是怎么来的（与 54.1 呼应）
+
+`tcvt_f32` 返回 `tfloat32m2_t`，而 kernel 里写的是 `f32_din.m2e0 = tcvt_f32(...)`。**`.m2e0` 不是 `tfloat32m2_t` 的成员**——直接对裸的 tile 类型写 `.m2e0` 会编译报错：
+
+```
+error: member reference base type 'tfloat32m2_t'
+       (aka '__tile_float32m2_t') is not a structure or union
+```
+
+真正的成员来自 SDK 的 union 包装（`include/sipu_dev_apis/dtype/union.h:204`——§47 里已经讲过这套 union 包装）：
+
+```c
+typedef tfloat32m1_t tfloat32m1;                    // :203
+typedef union                                       // :204
+{
+    struct
+    {
+        tfloat32m1_t m1e0;                          // :208
+        tfloat32m1_t m1e1;                          // :209
+    };
+    tfloat32m2_t m2e0;                              // :211  ← kernel 用的就是它
+} tfloat32m2;                                       // :212
+```
+
+**所以 kernel 里声明的 `tfloat32m2 f32_din;` 是 union，`.m2e0` 是它的 2 KB 全宽视图，`.m1e0`/`.m1e1` 是拆成两个 1 KB 半区的视图**（`tbfloat16m2` 同构，`union.h:104-117`）。`tcvt_f32(bf16_din, t_r32)` 返回 2 KB 的 `tfloat32m2_t`，直接赋给 `.m2e0` 整块落地；之后用 `.m1e0` / `.m1e1` 分别做乘加。**这和 `t_r32` 无关——`.m2e0` 是数据宽度（2 个 tile reg）的事，`t_r32` 是排布方式的事，两者正交。**
+
+### 54.6 实操规则与坑
+
+1. **第 2 个参数就是 `uint32_t attr`，位掩码。** 想加舍入/饱和/reuse 就按位或，例如 `t_r32 | t_rtz` → `tcvt.tt.f32.bf16.r32.rtz`。
+2. **矩阵形式必须显式写 shape。** `attr=0` 或只写 `t_sat` 会被编译器**自动补成 `t_vec`**（`SiOriginTileSuffixAttr.cpp:295`；160G 的对应实现在 `:315` 一带），生成 vector 形式指令，而不是你想要的矩阵形式。
+3. **上下行（或上游 `tcvt` 与下游 `tcvt`）的 shape 必须一致。** 这是实测出来的硬约束（54.4 表），不是风格问题。跨函数、跨 kernel 传递 tile 时尤其要注意。
+4. **合法取值是逐指令校验的，不能想当然。** 同一个 `t_r32`，在这个重载上合法、在另一个上直接被拒：
+
+   | 调用 | 传 `t_r32` 的结果 |
+   | --- | --- |
+   | `tcvt_f32(tbfloat16m1_t)` | ✅ → `tcvt.tt.f32.bf16.r32` |
+   | `tcvt_f32(tbfloat16m2_t)` | ✅ → `tcvt.tt.f32.bf16.r32` |
+   | `tcvt_f32(tbfloat16mf8_t)` | ❌ `Only Support t_vec,...,t_relu For TCVTVEC` |
+
+   原因是**小到只占 1/8 个 tile reg 的重载走的是 vector 形式**（声明名 `tcvt_tt_vec_*_m1`），vector 形式不接受 r32/r16/r8；**占满 1 个或更多 tile reg 的重载**（`tcvt_tt_vec_*_m8` 及以上，以及 `tcvt_tt_*` tile 系列）才接受 shape 模式。校验规则在 `compiler-toolchain/llvm-project/llvm/lib/Support/SiOriginTileSuffixAttr.cpp` 的 `checkImmediate`（`:179`）。
+
+5. **冲突的 shape 会直接报错**，不会静默取一个：
+   ```
+   t_r32 | t_r16   →  error: Invalid Shape Mode For Tile Convert
+   t_r32 | t_vec   →  error: Only Support t_r32,t_r16,t_r8,... For TCVTTILE
+   ```
+   前者来自 `TCVTTileRanges`（`SiOriginTileSuffixAttr.h:810`，`{1,3, OneHot}` —— bit1..3 必须恰好置一位），后者来自 `CheckMask` 的白名单。
+6. **省略 shape 时 `-S` 和 `-c` 行为不同**：`clang -S`（出汇编文本）会打印不带 shape 的 `tcvt.tt.f32.bf16`，但 `clang -c`（出目标文件）会报 `Invalid Shape Mode For Tile Convert`。**以 `-c` 为准**；`-S` 的输出不能直接拿去汇编，反过来汇编它也会报同样的错。
+
+### 54.7 小结
+
+- `tcvt_f32` / `tcvt_bf16` 的第 2 个参数都是 `uint32_t attr`，**一包按位或的属性**；`t_r32`（`= 0x02`）是其中的 shape 字段，含义是**"32 rows"矩阵排布**（ISA `ashape` 的 `00`）。
+- 它决定生成**矩阵形式**（`tcvt.tt.<dtype>.<atype>.r32`）还是 **vector 形式**（`tcvt.tt.vec.<dtype>.<atype>.m8`）指令——**同一个 builtin 两种形态**。
+- 两边都传 `t_r32`，是因为**上行设了哪种排布，下行就得用同一种逆回来**。实测：**全换成同一个 shape（r16/r8/vec）照样正确，只换一个方向就 57212 个元素算错**；而阳性对照（真改数学）会报 114688 个错，证明测试是灵敏的。
+- `t_r32` 本身不是"默认值"（默认其实是 `t_vec`）。选它是因为它与 32 行的 tile 排布、以及与 `tile_M = 32` 的 MMA 配套，也是全仓库 13577 处调用点的既定约定——但**换成别的 shape 只要上下一致，功能上同样成立**。
+- 这与 §47 / §53 里那些 `tcvt` 反汇编条目完全自洽：`tcvt.tt.f32.bf16.r32 T10, T6` 里的 `.r32` 后缀，就是这里这个 `t_r32` 一路传下去的结果。
