@@ -7384,3 +7384,355 @@ df -hT | grep -E "/share|/data" | grep -v tmpfs
 - **动机**：§43 时 `/share` 已 **100% 满（仅剩 2.3G）**，搬走 8.7T 后现在降到 **87%（可用 11T）**。
 - **目的地换了 NAS**：从 `10.97.128.245:/share` 换到 `nas.h3cx1w.com:/NAS/CAPFS/data/share`。**两台不同存储，`du` 口径不同，所以个别子目录（如 `miniconda3` 59G→49G）有系统性偏差，不代表内容丢失。**
 - **`/data_gpu/yufne` 是另一批内容，别混淆**；`/softhome/yufne` 是空的。
+
+---
+
+## 57. `sglang_sipu` 的准确度 dump：开关是什么、pt 怎么命名、为什么有很多 pass
+
+**问题**：跑
+```
+ACCURACY_CUDA_HOST=like@localhost bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml \
+  --launch-config deepep_deepgemm_text --test-case text-only --device cuda
+```
+sglang 默认不 dump 输出，这个脚本用了什么参数/开关、或改了什么代码让 sglang 能 dump 中间输出？pt 文件命名怎么决定？dump 目录为什么有很多 pass？
+
+**答（三句话）**：
+1. **开关就是 YAML 里的 `enable_tensor_dump: true`**（`configs/deepseek/ds_v32_2layer.yaml:31`）。它让 harness 把一份 **hook 规格列表**通过 `sgl.Engine(forward_hooks=[...])` 传进 sglang —— 用的是 **sglang 上游自带的 `forward_hooks` 扩展点**（PR #13217 / #13994，**不是 sipu 改的**），真正干活的 hook 函数在 `test/srt/sipu/test_utils/hook_factory.py`。
+2. **pt 名是 hook 规格里写死的 `filename`/`filename_template`**，由"**在哪个模块上挂 hook**"决定，与 step、rank、时间戳都无关；层号来自**模型 `config.json` 的 `num_hidden_layers`**。
+3. **一个 pass = 一次完整的模型 forward（一个 batch 的一步）**。本次 `max_new_tokens: 2`、prompt 74 token → **1 次 prefill + 2 次 decode = 3 个 pass**（`pass_000/001/002`）。每个 pass 都**重新 dump 全套张量**，所以 3 个 pass 目录里文件名完全相同、内容不同。
+
+---
+
+### 57.0 一句话结论表
+
+| 问题 | 答案 |
+| --- | --- |
+| 关键开关 | **`enable_tensor_dump: true`**（YAML）→ 往 `sgl.Engine` 塞 `forward_hooks=[...]` |
+| sglang 侧机制 | **上游自带** `ServerArgs.forward_hooks` + `register_forward_hooks()` —— **零代码修改** |
+| hook 实现 | `test/srt/sipu/test_utils/hook_factory.py`（**完全 AI 写的**，文件头有注明） |
+| 挂载点 | `model_runner_components/cuda_graph_setup.py:196`（**cuda graph capture 之后**才注册） |
+| pt 命名 | hook 规格里的 `filename`（固定名）或 `filename_template`（按 `layer_idx` 展开） |
+| pass 是什么 | **一次完整 forward**。本次 = 1 prefill + 2 decode = **3 个 pass** |
+| 为什么多 pass | 每步都 dump 全套 → 逐步对拍，定位"第几步开始错" |
+| 目录结构 | `<dump-base>/<model_id>/<launch_config>/<test_case>/<device>/pass_XXX/` |
+| 多卡时 | 自动加一层 `rank{N}/`；本次 `tp=1` 所以没有 |
+
+---
+
+### 57.1 开关链路：从 YAML 一行到 hook 挂上
+
+**第 1 步：YAML 里 `enable_tensor_dump: true`。**
+`test/srt/sipu/configs/deepseek/ds_v32_2layer.yaml`：
+
+```yaml
+launch_configs:
+  deepep_deepgemm_text:
+    enable_tensor_dump: true          # ★ 就是这个开关
+    tests: [text-only, prefix-caching]
+    cuda: { ... }                     # 引擎参数
+    sipu: { ... }
+```
+
+**这个键 sglang 根本不认识** —— 全仓库 grep `enable_tensor_dump` 只命中两处，都在 harness 里：
+
+```
+test/srt/sipu/test_utils/run_test_job.py:68
+```
+
+它是**给 `run_test_job.py` 看的**，不是引擎参数。
+
+**第 2 步：`run_test_job.py` 把它翻成 `forward_hooks`。**
+`test/srt/sipu/test_utils/run_test_job.py:57-74` `_engine_kwargs()`：
+
+```python
+kwargs = deepcopy(launch_cfg[device] or {})
+kwargs["model_path"] = cfg["model_path"]
+kwargs["device"] = device
+if launch_cfg.get("enable_tensor_dump", True) and dump_dir is not None:
+    kwargs["forward_hooks"] = build_forward_hooks(       # ★ 注入点
+        dump_dir=str(dump_dir),
+        include_vision=cfg.get("has_vision", False),
+        model_path=cfg.get("model_path"),
+    )
+return kwargs
+```
+
+注意默认值是 **`True`**（`launch_cfg.get("enable_tensor_dump", True)`）—— **不写这个键也会 dump**。想关掉得显式写 `false`。
+
+**第 3 步：`forward_hooks` 是 sglang 的既有能力，sipu 没改。**
+`server_args.py:3575`：
+
+```python
+forward_hooks: A[
+    Optional[List[dict[str, Any]]],
+    Arg(help="JSON-formatted forward hook specifications to attach to the model.",
+        type_parser=json_list_type),
+    NS("observability"),
+] = None
+```
+
+定义这个字段的提交是**上游**的：
+
+```
+6c190cbda  Rename: `--hooks` to `--forward-hooks` (#13994)  — Liangsheng Yin <hnyls2002@gmail.com>
+df5613922  Adding user defined hooks support      (#13217)  — Carlo Mussolini <...@users.noreply.github.com>
+```
+
+**并且这两个文件的工作区是干净的**（`git status --porcelain` 无输出）——**这一层确实是上游原样，一行没动**。见 57.6 关于"改了什么代码"的完整回答。
+
+**第 4 步：真正注册。**
+`model_runner_components/cuda_graph_setup.py:193-199`：
+
+```python
+# Register forward hooks AFTER cuda-graph capture so their tensor ops are
+# not traced into any captured graph — capture stays hook-free and hooks
+# fire only on the eager forward path (capture replay never runs Python
+# hooks anyway).
+if model_runner.server_args.forward_hooks:
+    register_forward_hooks(
+        model_runner.model, model_runner.server_args.forward_hooks
+    )
+```
+
+`register_forward_hooks`（`model_executor/hook_manager.py:11`）做三件事：遍历 hook 规格 → `fnmatch` 匹配 `target_modules` 里写的**模块名模式** → 对每个命中的 module 调 `module.register_forward_hook(hook)`。hook 函数本身通过 `hook_factory` 字段（`"hook_factory:make_hook"`）动态 import 得到。
+
+本次实际挂上的 13 个（日志 243-255 行）：
+
+```
+pass_boundary              → model
+embedding                  → model.embed_tokens
+attn_raw_0                 → model.layers.0.self_attn
+attn_plus_residual_0       → model.layers.0.post_attention_layernorm
+mlp_raw_0                  → model.layers.0.mlp
+attn_raw_1                 → model.layers.1.self_attn
+attn_plus_residual_1       → model.layers.1.post_attention_layernorm
+mlp_raw_1                  → model.layers.1.mlp
+mlp_plus_residual_0        → model.layers.1.input_layernorm     ← 注意是"下一层"的
+final_norm_mlp_plus_residual → model.norm
+lm_head                    → lm_head
+lm_head                    → logits_processor                   ← 同一个 role 挂了两个模块
+pass_finalize              → model
+```
+
+**这就是全部机关 —— 没有 SDK 补丁、没有环境变量、没有改 sglang 核心。** 一行 YAML + 一批 hook 规格。
+
+### 57.2 pt 文件命名怎么决定
+
+命名**完全由 hook 规格里的字段决定**，三种来源：
+
+**(1) 固定名 `filename=`** —— 与层无关的张量。`hook_factory.py:632/642/655`：
+
+```python
+filename="embedding.pt"                     # role=embedding
+filename="layer_last_mlp_plus_residual.pt"  # role=final_mlp_plus_residual
+filename="lm_head.pt"                       # role=lm_head
+```
+
+**(2) 模板名 `filename_template=` + `layer_idx`** —— 逐层张量。`hook_factory.py:307-321`：
+
+```python
+if "layer_idx" in filename_template and layer_idx is not None:
+    idx = layer_idx + layer_offset
+    filename = filename_template.format(layer_idx=idx)
+```
+
+**层号来源**分两条路，取决于能否读到模型的 `config.json`：
+
+- **能读到**（本次就是）→ `_text_layer_specs()`（`:463`）**预先展开**成每层一条规格，直接写死 `filename=f"layer_{layer_idx}_attn.pt"`（`:483`）。层数取自 `_model_layer_counts()`（`:440`）读的 **`<model_path>/config.json` 的 `num_hidden_layers`** —— 本次 `text_config.num_hidden_layers = 2`，所以正好生成 0、1 两层。
+- **读不到** → 退回 `filename_template="layer_{layer_idx}_attn.pt"`（`:681`），由 hook 运行时用 `_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")`（`:56`）从**模块名**里抠出层号。
+
+**注意 `layer_offset`**（`:293`、`:709`）：`mlp_plus_residual` 用 `layer_offset=-1`，因为它在**第 i+1 层的 `input_layernorm`** 上取第 i 层的输出，所以要减 1 才是它真正代表的层：
+
+```python
+_spec(name=f"mlp_plus_residual_{layer_idx - 1}",
+      target_modules=[f"{prefix}.input_layernorm" for prefix in layer_prefixes],  # 第 layer_idx 层
+      filename=f"layer_{layer_idx - 1}_mlp_plus_residual.pt",                      # 命名成 layer_idx-1
+      output_index=1)
+```
+
+这在日志里能直接看到：`mlp_plus_residual_0 → model.layers.1.input_layernorm`。
+
+**(3) 取哪个输出 `output_index`** —— 有些 op 返回 tuple，要挑一个。`_extract_tensor()`（`:234`）：
+
+```python
+if output_index is not None:
+    if isinstance(output, (tuple, list)) and len(output) > output_index:
+        return output[output_index]
+    return None
+```
+
+`*_plus_residual` 系列都传 `output_index=1` —— 因为残差加法的输出是第二个元素，**这正好抓到"加完残差"的值**，是精度对拍最想要的形态。
+
+**本次实际产出的 10 个文件名**（`manifest.json` 的 `checkpoint_order`）：
+
+```
+embedding.pt
+layer_0_attn.pt
+layer_0_attn_plus_residual.pt
+layer_0_mlp.pt
+layer_0_mlp_plus_residual.pt
+layer_1_attn.pt
+layer_1_attn_plus_residual.pt
+layer_1_mlp.pt
+layer_last_mlp_plus_residual.pt
+lm_head.pt
+```
+
+**文件名与 step、时间戳、rank 全都无关。** 名字里**没有步数信息** —— 步数信息在**目录名 `pass_XXX`** 上。这是理解 57.3 的前提。
+
+### 57.3 为什么有很多 pass
+
+**一个 `pass_XXX` = 一次完整的模型 forward = 一个 batch 的一步。**
+
+代码依据是 `_PassWriter`（`hook_factory.py:70`）的边界定义：
+
+- **pass 开始**：`pass_boundary` 是个 **pre_hook**，挂在 `model` / `language_model.model` 上（`:613-622`）。它对应的模块每次 forward 最先进入，**一个 pass 就开一次**。
+  但注意它的实现（`:273-280`）**只打日志、不真开 pass** —— 真正开是在**第一次 `save()`** 时懒触发（`_ensure_pass_dir_locked()`，`:122`，日志里的 `save lazy begin_pass`）。
+- **pass 结束**：`lm_head` 这个 role 存完之后**立刻**收尾。`hook_factory.py:335-337`：
+
+```python
+if tensor is not None:
+    writer.save(filename, tensor)
+    if role == "lm_head":
+        writer.write_manifest()
+        writer.end_pass()          # ★ 一个 forward 到此结束
+```
+
+**`lm_head` 是模型 forward 的最后一个模块**，它一触发就说明这次 forward 走完了 —— 拿它当 pass 的结束哨兵，是很自然的选择。
+
+**本次为什么正好 3 个：**
+
+```yaml
+sampling:
+  max_new_tokens: 2        # ← 生成 2 个 token
+```
+
+prompt 长度 74（日志 `embedding shape=(74, 7168)`）。于是：
+
+| pass | 触发 | 输入 token 数 | 目录体积 |
+| --- | --- | --- | --- |
+| `pass_000` | **prefill** | **74** | 大（每个 `.pt` ≈ 1 MB） |
+| `pass_001` | decode 第 1 步 | 1 | 小（每个 `.pt` ≈ 16 KB） |
+| `pass_002` | decode 第 2 步 | 1 | 小 |
+
+日志里三处 `embedding` 的 shape 就是铁证：
+
+```
+role=embedding ... tensor=shape=(74, 7168)     ← pass_000  prefill
+role=embedding ... tensor=shape=(1, 7168)      ← pass_001  decode step 1
+role=embedding ... tensor=shape=(1, 7168)      ← pass_002  decode step 2
+```
+
+调度器侧也对得上（`SGLANG_TRACE`）：
+
+```
+run_batch iter=1 mode=1 bs=1     ← mode=1 = prefill  → pass_000
+run_batch iter=2 mode=2 bs=1     ← mode=2 = decode   → pass_001
+run_batch iter=3 mode=2 bs=1     ← mode=2 = decode   → pass_002
+```
+
+**1 次 prefill + 2 次 decode = 3 个 pass。** 如果 `max_new_tokens` 改成 4 就是 5 个 pass，以此类推。
+
+**每个 pass 内 dump 的是同一套 10 个名字。** 因为 `_PassWriter` 每开一个新 pass 都 `self._seen_in_pass = set()`（`:98`）清空去重集合，所以 `embedding.pt` 这类名字**每个 pass 都能再存一次**，落到各自的 `pass_XXX/` 里。`_seen_in_pass` 只在**单个 pass 内**去重 —— 它的作用是防止同一个 pass 里同名的 hook 被触发多次（比如 `lm_head` role 同时挂在 `lm_head` 和 `logits_processor` 两个模块上，日志 253-254 行；没有去重就会写两遍）。
+
+**为什么要分 pass 存 —— 这是这个设计最有价值的地方：** 逐**步**对拍。§52 讨论过 DCE，这里则是相反的场景：**不只需要"某层输出是多少"，而是需要"第几步开始偏"**。prefill 和 decode 走的是**完全不同的 kernel 路径**（prefill 用批量 GEMM，decode 用 GEMV / 不同 attention backend），一次跑出所有步的中间值，才能把"哪一步、哪一层开始错"定位出来。这也是 `run_meta.json` 里同时记 `prompts` 和 `outputs` 的原因（本次输出 `"pap leisure"`），对拍时必须有确定性的输入输出做锚点。
+
+### 57.4 目录结构：每一层从哪来
+
+```
+/share_data/sglang_sipu/accuracy_verify/like/ds_v32_2layer/deepep_deepgemm_text/text-only/cuda/
+└── pass_000/ pass_001/ pass_002/  +  manifest.json  +  run_meta.json
+```
+
+路径逐层对应 `run_test_job.py:42-49` `_dump_dir()`：
+
+```python
+return (Path(cfg["accuracy_verify_base_path"])   # --dump-base 参数
+        / cfg["model_id"]                        # YAML 的 model_id: ds_v32_2layer
+        / launch_config                          # --launch-config: deepep_deepgemm_text
+        / test_case                              # --test-case: text-only
+        / device)                                # --device: cuda
+```
+
+`accuracy_verify_base_path` 来自 `run_test.sh` 的默认值（`:DUMP_BASE="${DUMP_BASE:-/share_data/sglang_sipu/accuracy_verify/${CURRENT_USER}}"`），`CURRENT_USER=like` → 所以路径里有 `like`。**改 `--dump-base` 就能整体搬走。**
+
+两个元数据文件：
+
+| 文件 | 内容 | 写在哪 |
+| --- | --- | --- |
+| `run_meta.json` | model_id / launch_config / test_case / device / **prompts / outputs / execution_mode** | `run_test_job.py:88` `_write_run_meta()` |
+| `manifest.json` | `{"passes": 3, "checkpoint_order": [10 个文件名]}` | `hook_factory.py:173` `write_manifest()` |
+
+本次 `manifest.json` 实读：
+
+```json
+{
+  "passes": 3,
+  "checkpoint_order": ["embedding.pt", "layer_0_attn.pt", ..., "lm_head.pt"]
+}
+```
+
+`passes: 3` 就是 `self._pass_id + 1`（`hook_factory.py:180`）。
+
+**多卡时会多一层 `rank{N}/`**（`hook_factory.py:195-224` `_distributed_rank_suffix()` / `_resolve_dump_dir()`）：`world_size > 1` 才加。**本次 `tp_size=1`**（日志 server_args），所以没有 rank 层。要让每个 rank 各存各的，用 `rank{N}` 隔开——否则多个进程会互相覆盖同一个 `pass_000/`。
+
+**重跑会清空。** `_PassWriter.__init__` 调 `_clear_previous_run()`（`:81-90`），**先 `rmtree` 掉所有 `pass_*`，再删 `manifest.json` / `run_meta.json`**。所以这个目录**永远只有本次跑的 pass**，不会累积历史。想留旧结果得先手动拷走 —— 好在路径里带了 `launch_config` / `test_case` / `device` 三个维度，不同配置之间天然隔离。
+
+### 57.5 "改了什么代码"的准确回答
+
+把三部分分清楚，别混为一谈：
+
+| 部分 | 出处 | 是否被改 |
+| --- | --- | --- |
+| `ServerArgs.forward_hooks` 字段 | **sglang 上游**（PR #13217、#13994） | **没改**，工作区 `git status` 干净 |
+| `hook_manager.register_forward_hooks()` | **sglang 上游** | **没改** |
+| `cuda_graph_setup.py` 里的注册调用（含"capture 之后注册"的注释） | **sglang 上游**（该文件 4 行 commit 记录） | **没改** |
+| `hook_factory.py` / `run_test_job.py` / `run_test.sh` | **sipu 自己的**（`test/srt/sipu/`，已 git track） | 新增，**属测试基建** |
+
+**结论：让 sglang dump 出中间输出的，不是"改了 sglang 的代码"，而是"用了 sglang 已有的 hook 扩展点"** —— 上游早就留了 `--forward-hooks` 这个口子，sipu 只是**写了 hook 的规格和实现**。
+
+**上游归属（逐个 commit 落实）：**
+
+| 代码 | commit | 作者 |
+| --- | --- | --- |
+| `ServerArgs.forward_hooks` 字段 | `df5613922` Adding user defined hooks support (#13217) | Carlo Mussolini |
+| 改名 `--hooks` → `--forward-hooks` | `6c190cbda` (#13994) | Liangsheng Yin |
+| `cuda_graph_setup.py` 里的注册调用（含 "AFTER cuda-graph capture" 注释） | `bf04cc9b1` Extract cuda-graph setup into a module (#31168) | fzyzcjy |
+
+三个都是上游作者、上游 PR，**sipu 一行没动**。
+
+一个值得注意的细节：`run_test_job.py:77-85` 里有个 `_patch_hook_registration()`，它想把 `hm.register_forward_hooks` **替换**成自己的 `register_forward_hooks_with_pre`（为的是支持 spec 里的 `is_pre_hook` 开关）。但**这个猴子补丁没生效**：
+
+```python
+import sglang.srt.model_executor.hook_manager as hm     # 拿到模块对象
+hm.register_forward_hooks = register_forward_hooks_with_pre
+```
+
+而实际调用点是 `cuda_graph_setup.py:33` 的 **`from ... import register_forward_hooks`** —— 这种写法在 import 那一刻就把函数对象**绑进了该模块自己的命名空间**，之后改 `hm` 的属性**不会影响它**。日志给出了直接证据：
+
+```
+243: Registered forward hook 'pass_boundary' on model
+```
+
+这是 **`hook_manager.py` 的措辞**（`:56`）；patched 版本打的是 `Registered hook ...`（`hook_factory.py:832`，注意没有 "forward"）。全日志 **13 条全是上游措辞，patched 的 0 条**。
+
+**后果：所有 hook 都以 forward hook 注册，`is_pre_hook: True` 被忽略。** 对本次跑：
+
+- `pass_boundary` 以 forward hook 注册 —— 日志打的是 `hook pass_boundary forward no-op; pass starts lazily`（`make_hook` 的 forward 分支 `:274`），而不是 `make_pre_hook` 分支会打的 `pre_hook pass_boundary start`（`:361`）。**无害**：它本来就是 no-op，pass 由第一次 `save()` 懒开（日志 `save lazy begin_pass`）。
+- `pass_finalize` 以 forward hook 注册 —— **也正常工作**，日志 `hook pass_finalize start` → `write_manifest start/done` → `hook pass_finalize done`（3 次，每个 pass 一次）可证。它本来也不需要是 pre-hook。
+
+**但视觉模型会出问题**：`_vision_pre_specs()`（`:521`）和 `_vision_layer_specs()`（`:568`）里给 `attn_plus_residual` 显式标了 `config_extra={"is_pre_hook": True}` —— **它必须是 pre-hook**，因为要抓的是 `norm2` 的**输入**（= attn 输出 + 残差）。补丁没生效时它会退化成 forward hook，抓成 `norm2` 的**输出**，**张量含义就错了**（是本该 dump 的值的下游）。所以视觉模型的对拍数据不能直接信，得先确认这条路径。
+
+真要修，两条路：把 `_patch_hook_registration()` 改成**同时**给 `cuda_graph_setup` 模块重新赋值（`import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as cgs; cgs.register_forward_hooks = ...`），或者把调用点改成属性访问 `hook_manager.register_forward_hooks(...)` 的写法。**本次纯文本模型没走到这条路，所以 dump 是对的。**
+
+### 57.6 小结
+
+- **开关**：YAML 里 `enable_tensor_dump: true`。**默认就是 `True`**，不写也 dump；要关得显式写 `false`。它只被 `run_test_job.py:68` 读，用来决定要不要往 `sgl.Engine` 塞 `forward_hooks=[...]`。
+- **机制是上游的**：`ServerArgs.forward_hooks`（PR #13217）→ `register_forward_hooks()` → 在 `cuda_graph_setup.py:196`（**cuda graph capture 之后**）挂上。**sglang 核心一行没改**；改的是 sipu 自己的测试基建 `test/srt/sipu/test_utils/`。
+- **pt 命名**：hook 规格里的 `filename`（固定名，如 `embedding.pt` / `lm_head.pt`）或 `filename_template`（按 `layer_idx` 展开，如 `layer_{layer_idx}_attn.pt`）。**层号来自模型 `config.json` 的 `num_hidden_layers`**；`layer_offset=-1` 处理 `mlp_plus_residual` 挂在下一层 `input_layernorm` 上的错位；`output_index=1` 取残差加法后的值。
+- **文件名的名字里没有步数** —— 步数在**目录名 `pass_XXX`** 上。
+- **pass = 一次完整 forward**。`pass_boundary`(pre-hook) 开、`lm_head` 存完关（`hook_factory.py:335-337`）。本次 `max_new_tokens: 2` + 74-token prompt → **1 prefill + 2 decode = 3 个 pass**，实测 shape 为 `(74,7168) / (1,7168) / (1,7168)`，与调度器 `run_batch iter=1 mode=1` 后跟两个 `mode=2` 完全对应。
+- **多 pass 的意义**：逐步对拍，定位"第几步开始偏"——prefill 和 decode 走不同 kernel 路径，必须分步比。每个 pass 存同一套 10 个文件名；`_seen_in_pass` 只在**单 pass 内**去重。
+- **重跑先清空**：`_clear_previous_run()` 会 `rmtree` 所有 `pass_*`。目录路径含 `model_id/launch_config/test_case/device` 四个维度做隔离；`tp>1` 时再多一层 `rank{N}/`。
+- **一个隐患**：`_patch_hook_registration()` 的猴子补丁**没生效**（`from X import Y` 的绑定在 import 时就固定了），日志里 13 条全是上游措辞可证。本次无影响，但视觉模型的 `vision_attn_plus_residual` pre-hook 在 CUDA 上会静默不工作。
