@@ -4509,3 +4509,23 @@ sikernel code base source/source_builtin/attention/rms_norm/kernel/rms_norm_kern
 
 把答案追加到 like-useful/answer_codex_v6.md
 }
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+帮我把  /share/guorui/投机解码训练/SpecForge 里面的训练的权重, checkpoint 找出来
+
+把答案追加到 like-useful/answer_codex_v6.md
+}
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+根据 like-useful/answer_claude_v2.md, 曾经有一个目录 /share/yufne 占用大量存储空间，现在这个不见了，应该不是删除了，可能是有人移动走了，查一下，这个巨大的目录现在在哪里
+
+把答案追加到 like-useful/answer_codex_v6.md
+}

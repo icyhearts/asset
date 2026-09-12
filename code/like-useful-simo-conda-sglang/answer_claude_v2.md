@@ -6971,3 +6971,222 @@ typedef union                                       // :204
 - 两边都传 `t_r32`，是因为**上行设了哪种排布，下行就得用同一种逆回来**。实测：**全换成同一个 shape（r16/r8/vec）照样正确，只换一个方向就 57212 个元素算错**；而阳性对照（真改数学）会报 114688 个错，证明测试是灵敏的。
 - `t_r32` 本身不是"默认值"（默认其实是 `t_vec`）。选它是因为它与 32 行的 tile 排布、以及与 `tile_M = 32` 的 MMA 配套，也是全仓库 13577 处调用点的既定约定——但**换成别的 shape 只要上下一致，功能上同样成立**。
 - 这与 §47 / §53 里那些 `tcvt` 反汇编条目完全自洽：`tcvt.tt.f32.bf16.r32 T10, T6` 里的 `.r32` 后缀，就是这里这个 `t_r32` 一路传下去的结果。
+
+---
+
+## 55. SpecForge 训练权重 / checkpoint 在哪里
+
+**问题**：把 `/share/guorui/投机解码训练/SpecForge` 里面的训练权重、checkpoint 找出来。
+
+**答**：全量清单已经落到 `like-useful/specforge_checkpoints.txt`（人读）/ `.tsv`（机器读，可直接喂脚本）。**共 467 个 checkpoint，456.95 GB，分布在 201 个 run 目录、3 个存储位置。**
+
+这一节先给结论和定位方法，再给清单本身。**清单文件才是交付物** —— 本节只讲怎么读它、以及扫的时候哪些坑必须知道。
+
+### 55.0 一句话结论
+
+| 项 | 值 |
+| --- | --- |
+| 权重文件 | **`<run>/epoch_<N>_step_<M>/model.safetensors`** |
+| checkpoint 形态 | 目录名即 `epoch_N_step_M`，**没有 HF 的 `checkpoint-<step>` 形态**，也没有多分片/index |
+| 训练状态 | 同目录 `training_state.pt` + `training_state_rank{0..7}.pt` + `rng_state_rank{0..7}.pt` |
+| 模型结构 | 同目录 `config.json` + `<model_type>.py`（`auto_map` 指向的 modeling 文件，会被一起存下来） |
+| 总量 | **467 个 / 456.95 GB / 201 个 run 目录** |
+| 三个位置 | `outputs/`（现役）199 个 201.19 GB；`cache/checkpoint-trash/`（本机回收站）71 个 18.08 GB；`/data/guorui/checkpoint-trash/`（另一台盘）197 个 237.68 GB |
+
+### 55.1 一个 checkpoint 目录里有什么
+
+`source/source_builtin/...` 跟这个无关，这里直接看一个真实目录。以
+`/share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_140000/` 为例：
+
+```
+config.json                                   1.7 KB    ← 模型结构（HuggingFace 格式）
+dflash.py                                   125   KB    ← auto_map 指向的 modeling 实现
+model.safetensors                           269.7 MB   ← ★ 权重本体，只有这一个文件
+static_non_pre_norm_one_gate_difference_pool_domino.py  6.6 KB  ← 同一个 modeling，另一份拷贝
+training_state.pt                           435.7 MB   ← 优化器/EMA 等训练状态（单文件）
+training_state_rank0.pt … rank3.pt          435.7 MB each ← per-rank 分片
+training_state_rank4.pt … rank7.pt           29.7 KB each ← 该 rank 不持有参数时只剩空壳
+rng_state_rank0.pt … rank7.pt                10.7 KB each ← 数据加载/采样随机数状态
+```
+
+三个要点：
+
+1. **权重就是 `model.safetensors` 一个文件**，没有 `model-00001-of-00002` 那种分片，也没有 `*.safetensors.index.json`（全量扫描确认：**0 个 index 文件、0 个分片文件**）。
+2. **`training_state.pt` 不是权重**，是恢复训练用的优化器状态，通常比权重还大（上面 435 MB vs 270 MB）。**要拿权重只取 `model.safetensors` 就够**，这一条直接决定了 456 GB 里有多少是"真权重"。
+3. `training_state_rank*.pt` 大小参差（435 MB / 29.7 KB）是**分片训练的正常现象** —— 只有持有参数的分片才有内容，其余是空壳。别把 29.7 KB 的那几个当成"checkpoint 坏了"。
+
+`config.json` 里 `auto_map` 指向的类，决定了同目录那个 `.py` 叫什么：
+
+```json
+"auto_map": {
+  "AutoModel": "static_non_pre_norm_one_gate_difference_pool_domino.StaticNonPreNormOneGateDifferencePoolDominoDraftModel"
+}
+```
+
+所以 **checkpoint 是"自包含"的**：拿 `config.json` + `model.safetensors` + 那个 `.py`，配 `trust_remote_code=True` 就能 `from_pretrained` 加载，不依赖 SpecForge 主仓库当时的代码版本。这一点在"训练代码改了、但想复现旧 checkpoint"时特别重要。
+
+### 55.2 一种 checkpoint 命名，两种存放约定
+
+**命名**：`epoch_<N>_step_<M>`，`M` 是**全局 step**（不随 epoch 归零）。上面例子 `epoch_1_step_140000` 就是第 1 个 epoch 结束、全局第 140000 步。
+
+**存放**约定有两种，**这一点必须分清**：
+
+| 位置 | 目录名 | 说明 |
+| --- | --- | --- |
+| `outputs/<run>/epoch_N_step_M/` | **无时间戳** | 现役，脚本按固定路径覆盖写，**每个 run 通常只留最新 1 个**（实测 177 个 run 里 165 个只有 1 个） |
+| `checkpoint-trash/<run>/epoch_N_step_M-<YYYYMMDD-HHMMSS>/` | **带时间戳后缀** | 从 `outputs/` 淘汰下来的历史存档，**同一步的多个版本会因时间戳不同而并存** |
+
+这个"只留最新"的规律**实测成立**：17 个 run 同时出现在 `outputs/`（各 1 个）和 trash 里，**每一个都是 `outputs/` 那个 step 号最大**。例如：
+
+| run | `outputs/` 里留的 | trash 里最大的 |
+| --- | --- | --- |
+| `q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-...` | `epoch_1_step_140000` | step 135000（27 个） |
+| `...-sink-pre-gated-norm-b8-l5-1node-019-...` | `epoch_1_step_130000` | step 125000（25 个） |
+| `...-sink-gated-norm-b8-l5-1node-011-...` | `epoch_0_step_55000` | step 50000（10 个） |
+
+**所以规则是清楚的：`outputs/` = 最新那一个，trash = 之前的所有历史。** 想拿"某个 run 训练过程中的任意一步"，去 trash 里按 step 找。
+
+`cache/checkpoint-trash/` 和 `/data/guorui/checkpoint-trash/` 里都是带时间戳的那种，例：
+
+```
+epoch_0_step_5000-20260815-032205     ← 存于 2026-08-15 03:22:05
+epoch_0_step_10000-20260815-041028
+```
+
+**所以现在的 `outputs/` 只看到 1 个 checkpoint 的 run，它的历史版本很可能在 trash 里。** 反过来，trash 里 31 个 checkpoint 的 run（如 `qwen3-4b-residual-static-gate-pool-domino-shared-q-causal-block-...`），在 `outputs/` 里可能一个都不剩了。**找"某个 step 的权重"时两个地方都要看。**
+
+### 55.3 三个存储位置的关系（扫的时候最容易踩的坑）
+
+```
+/share/guorui/投机解码训练/SpecForge/
+├── outputs/                         199 个  201.19 GB   ← 现役
+├── cache/checkpoint-trash/           71 个   18.08 GB   ← 本机回收站
+└── outputs_del -> /data/guorui/SpecForge_outputs_del_20260728   ← 【悬空软链，目标不存在】
+
+/data/guorui/
+├── checkpoint-trash/                197 个  237.68 GB   ← 另一个盘的回收站
+├── models/qwen3.5-4b/                                    ← 基座模型，不是训练产物
+└── specforge-tmp/                                        ← 只有 triton/inductor 缓存，无权重
+```
+
+三个坑：
+
+**坑 1：`outputs/` 里有 18 个悬空软链。** `find -L` 会静默跳过它们，`find` 不加 `-L` 又会对它们报错。实测：
+
+```
+symlinks OK=0 BROKEN=18
+./smoke_kvbranch_20260910 -> /data/guorui/specforge-outputs/smoke_kvbranch_20260910
+```
+
+**全部 18 个都是断的**，因为软链目标是 `/data/guorui/specforge-outputs/`，而这个目录**不存在**（`ls` 报 `No such file or directory`）。所以 `outputs/` 里带软链的 run，**权重已经没了**。清单里这些 run 不会出现 —— 如果发现某个 run 在 `ls outputs/` 里看得到、清单里却没有，先 `[ -e "$d" ]` 测一下是不是悬空链。
+
+**坑 2：两个 `checkpoint-trash` 是两棵不相交的树，别去重。** 名字一样，但：
+
+```bash
+$ stat -c '%d %i' /data/guorui/checkpoint-trash .../SpecForge/cache/checkpoint-trash
+66312 330170370          # /data  盘
+63 9290389181891343292   # /share 盘（NFS）
+$ comm -12 t_data.txt t_cache.txt | wc -l
+0
+```
+
+**`/data` 是本地盘（`/dev/md0p1`），`/share` 是 NFS（`10.97.128.245:/share`）—— 不同文件系统、不同 inode、run 名交集为 0。** 所以两边的 197 + 71 = 268 个要**全部计入**，不能因为目录名相同就以为是同一份副本去重。
+
+**坑 3：`outputs_del` 是个死链。** 它指向 `/data/guorui/SpecForge_outputs_del_20260728`，**目标不存在**（`ls` 直接报错）。看名字是 2026-07-28 删除的一批输出，现在**已经不可恢复**。同理 `/data/guorui/specforge-outputs/` 也不存在 —— **这两个"删除归档"的位置没有任何权重**。
+
+### 55.4 清单怎么用
+
+**人读**：`like-useful/specforge_checkpoints.txt`（1734 行），三部分 —— 总量统计 → 按 run 名 A-Z 的逐 run 明细（每个 run 给出位置、数量、总大小、step 区间、最新写入时间，再逐条列 checkpoint）→ 按写入时间倒序的前 40 条。
+
+**机器读**：`like-useful/specforge_checkpoints.tsv`（467 行 + 表头），列：
+
+```
+root  run  checkpoint  weights_path  size_bytes  size_gb  mtime  modified
+```
+
+`weights_path` 是**拼好的 `model.safetensors` 绝对路径**，直接拿去加载/拷贝。另外 `like-useful/specforge_checkpoints_raw.tsv` 是扫描原始记录（多两列：是否含 `dflash.py` / `config.json` / `training_state.pt`）。
+
+常用查询：
+
+```bash
+# 某个 run 的所有 checkpoint
+awk -F'\t' '$2=="<run名>"' like-useful/specforge_checkpoints.tsv
+
+# 全部 456 GB 的权重路径列表（拿去 rsync/统计）
+awk -F'\t' 'NR>1{print $4}' like-useful/specforge_checkpoints.tsv
+
+# 只要最新的 20 个
+awk -F'\t' 'NR>1{print $8"\t"$4}' like-useful/specforge_checkpoints.tsv | sort -r | head -20
+
+# 某一步的权重（step 在目录名里，直接 grep）
+grep "step_140000" like-useful/specforge_checkpoints.txt
+```
+
+### 55.5 复现扫描的命令
+
+清单是扫出来的，不是猜的。核心一条：
+
+```bash
+find <root> -name "model.safetensors" -printf "%s\t%p\n" | sort -rn
+```
+
+三个 root 各扫一遍（`outputs`、`cache/checkpoint-trash`、`/data/guorui/checkpoint-trash`），`-printf` 同时拿大小和路径，`sort -rn` 让大文件排前面。**注意不要加 `-L`**，否则悬空软链被静默跳过、问题被掩盖；不加 `-L` 时软链本身就是个文件条目，`-name "model.safetensors"` 不会匹配到它，但**至少能看到 run 目录存在**。
+
+### 55.6 统计画像
+
+**按权重体积**（`model.safetensors` 单文件大小）：
+
+| 桶 | 数量 | 典型对应 |
+| --- | --- | --- |
+| 1 – 1.5 GB | **323** | Qwen3-4B 类 draft 模型（含 target embedding / KV adapter 的大头） |
+| < 0.5 GB | 111 | Qwen3-0.6B（`q3-06-*`）小 draft |
+| 0.5 – 1 GB | 25 | 去掉词表后的瘦身版 |
+| 1.5 – 2 GB | 4 | 带独立 LM head 的版本（`...-independent-lm-head-...` / `...-l2sp-lm-head-...`） |
+| 2 – 3 GB | 3 | lowrank KV adapter r128 系列（`...-lowrank-kv-adapter-...-r128-...`） |
+| > 3 GB | 1 | `qwen3.6-27b-domino-...`（3.63 GB，唯一的 27B） |
+
+1–1.5 GB 占绝对多数（323/467 ≈ 69%），**说明绝大多数 run 训的是同一种体量的 Qwen3-4B draft**；体积异常的那几个（>1.5 GB）基本都是**额外挂了东西**：独立 LM head、低秩 KV adapter。查清单时体积是个好用的初筛维度。
+
+**按基座模型**（仅 `outputs/`，199 个）：
+
+| 前缀 | 数量 | 基座 |
+| --- | --- | --- |
+| `qwen3-4b-*` | 128 | Qwen3-4B |
+| `q3-06-*` | 34 | Qwen3-0.6B |
+| 其他 | 27 | 各类调试/临时 run |
+| `qwen3.5-*` | 9 | Qwen3.5-4B |
+| `qwen3.6-27b-*` | 1 | Qwen3.6-27B |
+
+**命名里能读出实验维度**，值得记一下。典型：
+
+```
+q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+       │      │      │       │      │     │   │   │    │         │        │  │       │    │      │      └ 日期
+       │      │      │       │      │     │   │   │    │         │        │  │       │    │      └ eval 每 1000 步
+       │      │      │       │      │     │   │   │    │         │        │  │       │    └ γ=7
+       │      │      │       │      │     │   │   │    │         │        │  │       └ 2 epochs
+       │      │      │       │      │     │   │   │    │         │        └ global batch 16
+       │      │      │       │      │     │   │   │    │         └ per-device bs 2
+       │      │      │       │      │     │   │   │    └ 从零训（非 resume）
+       │      │      │       │      │     │   │   └ 节点 011
+       │      │      │       │      │     │   └ 1 node
+       │      │      │       │      │     └ 第 5 层
+       │      │      │       │      └ block size 8
+       │      │      │       └ domino 投影器
+       │      │      └ difference pool 聚合
+       │      └ one gate
+       └ static / 非 pre-norm
+     └ Qwen3-0.6B
+```
+
+**`step` 号在同一个 run 里连续递增、跨 run 不可比** —— `epoch_1_step_140000` 是那个 run 自己的第 140000 步，不同 run 的 step 数因为 batch size / 节点数不同而不能横向比。要比进展就看 `epoch` 或百分比，别直接比 step。
+
+### 55.7 小结
+
+- **要权重**：`<run>/epoch_N_step_M/model.safetensors`，467 个 / 456.95 GB，清单在 `like-useful/specforge_checkpoints.txt`（人读）和 `.tsv`（机器读，含拼好的绝对路径）。
+- **要接着训**：同目录 `training_state.pt`（+ `training_state_rank*.pt`）+ `rng_state_rank*.pt`。
+- **要加载模型**：`config.json` + 那个 `.py`（`auto_map` 指向的 modeling 文件）与权重同目录存放，**checkpoint 自包含，不依赖 SpecForge 当时的代码版本**。
+- **找历史版本去 `checkpoint-trash`**：`outputs/` 每个 run 通常只留最新 1 个，带时间戳后缀的历史存档在 `cache/checkpoint-trash/`（71 个）和 `/data/guorui/checkpoint-trash/`（197 个）。
+- **`outputs/` 有 18 个悬空软链**（目标 `/data/guorui/specforge-outputs/` 不存在），这些 run 的权重**已经不在**；`outputs_del -> /data/guorui/SpecForge_outputs_del_20260728` 同样是死链。
+- **两个 `checkpoint-trash` 分属不同文件系统（本地盘 vs NFS），run 名交集为 0，不要当副本去重。**
+- 本次扫描时**没有训练在跑**（`ps` 无 `specforge`/`torchrun` 进程），最新 checkpoint 写于 **2026-09-12 06:04**。

@@ -1,0 +1,1734 @@
+SpecForge 训练权重 / Checkpoint 全量清单
+生成时间: 2026-09-12 06:04
+扫描根目录:
+  [outputs]  /share/guorui/投机解码训练/SpecForge/outputs
+  [cache/checkpoint-trash]  /share/guorui/投机解码训练/SpecForge/cache/checkpoint-trash
+  [/data/guorui/checkpoint-trash]  /data/guorui/checkpoint-trash
+
+总计: 467 个 checkpoint, 456.95 GB, 201 个 run 目录
+
+按存储位置统计:
+  outputs                         199 个    201.19 GB
+  cache/checkpoint-trash           71 个     18.08 GB
+  /data/guorui/checkpoint-trash   197 个    237.68 GB
+
+==============================================================================================================
+一、按 run 汇总（按 run 名排序，A-Z）
+==============================================================================================================
+
+● 20260903_valid
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/20260903_valid
+    数量: 1 个 checkpoint   合计 0.26 GB
+    步数: step 55000 → 55000   最新写入: 2026-09-03 17:19
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        q3-06-static-bare-gate-af-rope-enc-dec-b8-1node-010-fromscratch-bs2-globalbs16-epoch2-maxlen3072-eval1000-20260903-retry1/epoch_0_step_55000   0.26 GB  2026-09-03 17:19
+
+● 20260907_additive_spectral_carrier_q_b8_node11
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/20260907_additive_spectral_carrier_q_b8_node11
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 5000 → 5000   最新写入: 2026-09-07 13:17
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.25 GB  2026-09-07 13:17
+
+● 20260907_additive_spectral_carrier_q_b8_node11_retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/20260907_additive_spectral_carrier_q_b8_node11_retry1
+    数量: 2 个 checkpoint   合计 0.50 GB
+    步数: step 5000 → 10000   最新写入: 2026-09-07 13:46
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.25 GB  2026-09-07 13:34
+        epoch_0_step_10000                                 0.25 GB  2026-09-07 13:46
+
+● 20260907训练结构
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/20260907训练结构
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 25000 → 25000   最新写入: 2026-09-07 12:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_25000                                 0.25 GB  2026-09-07 12:40
+
+● DominoBeamTreeVerify-qwen3-4b-domino-from-official-fixedbeam-8gpu-frontcheck
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoBeamTreeVerify-qwen3-4b-domino-from-official-fixedbeam-8gpu-frontcheck
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-08 02:31
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_1                                     1.10 GB  2026-07-08 02:31
+
+● DominoBeamTreeVerify-qwen3-4b-domino-from-official-fixedbeam-8gpu-smoke
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoBeamTreeVerify-qwen3-4b-domino-from-official-fixedbeam-8gpu-smoke
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-08 02:29
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_1                                     1.10 GB  2026-07-08 02:29
+
+● DominoBeamTreeVerify-smoke-localnorm-20260708
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoBeamTreeVerify-smoke-localnorm-20260708
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-08 03:17
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_1                                     1.10 GB  2026-07-08 03:17
+
+● DominoBeamTreeVerify-smoke-path-proposal-20260708
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoBeamTreeVerify-smoke-path-proposal-20260708
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-08 02:53
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_1                                     1.10 GB  2026-07-08 02:53
+
+● DominoBeamTreeVerify-smoke-verifieronly-20260708
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoBeamTreeVerify-smoke-verifieronly-20260708
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-08 03:00
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_1                                     1.10 GB  2026-07-08 03:00
+
+● DominoTransferSFT-profile-single-xfer16-20260707
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoTransferSFT-profile-single-xfer16-20260707
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 45 → 45   最新写入: 2026-07-07 04:01
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_45                                    1.10 GB  2026-07-07 04:01
+
+● DominoTransferSFT-profile-single-xfer32-20260707
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoTransferSFT-profile-single-xfer32-20260707
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 45 → 45   最新写入: 2026-07-07 04:03
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_45                                    1.10 GB  2026-07-07 04:03
+
+● DominoTransferSFT-profile-single-xfer64-20260707
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoTransferSFT-profile-single-xfer64-20260707
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 45 → 45   最新写入: 2026-07-07 04:05
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_45                                    1.10 GB  2026-07-07 04:05
+
+● DominoTransferSFT-qwen3-4b-domino-perfectblend-from-official-2node-bs2-lr2e-5-xfer256-sampledonly-ib-restart1-20260707
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoTransferSFT-qwen3-4b-domino-perfectblend-from-official-2node-bs2-lr2e-5-xfer256-sampledonly-ib-restart1-20260707
+    数量: 9 个 checkpoint   合计 9.86 GB
+    步数: step 2000 → 18000   最新写入: 2026-07-07 09:45
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000                                  1.10 GB  2026-07-07 05:01
+        epoch_0_step_4000                                  1.10 GB  2026-07-07 05:37
+        epoch_0_step_6000                                  1.10 GB  2026-07-07 06:12
+        epoch_0_step_8000                                  1.10 GB  2026-07-07 06:48
+        epoch_0_step_10000                                 1.10 GB  2026-07-07 07:23
+        epoch_0_step_12000                                 1.10 GB  2026-07-07 07:58
+        epoch_0_step_14000                                 1.10 GB  2026-07-07 08:34
+        epoch_0_step_16000                                 1.10 GB  2026-07-07 09:10
+        epoch_0_step_18000                                 1.10 GB  2026-07-07 09:45
+
+● DominoTransferSFT-qwen3-4b-domino-perfectblend-from-official-single-bs2-lr2e-5-lambda1-xfer256-sampledonly-cachehit-20260707
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoTransferSFT-qwen3-4b-domino-perfectblend-from-official-single-bs2-lr2e-5-lambda1-xfer256-sampledonly-cachehit-20260707
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 2000 → 2000   最新写入: 2026-07-07 10:59
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000                                  1.10 GB  2026-07-07 10:59
+
+● DominoTransferSFT-smoke-single-xfer256-sampledonly-20260707
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/DominoTransferSFT-smoke-single-xfer256-sampledonly-20260707
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 12 → 12   最新写入: 2026-07-07 04:17
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_12                                    1.10 GB  2026-07-07 04:17
+
+● debug-constant-lr-onpolicy-1step
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/debug-constant-lr-onpolicy-1step
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-07 13:16
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_1                                     1.10 GB  2026-07-07 13:16
+
+● debug-stdrel-launch-095628
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/debug-stdrel-launch-095628
+    数量: 1 个 checkpoint   合计 1.06 GB
+    步数: step 1 → 1   最新写入: 2026-07-03 09:57
+    权重文件: model.safetensors
+        epoch_1_step_1                                     1.06 GB  2026-07-03 09:57
+
+● eval_qfreq_gate_step160000_20260907
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/eval_qfreq_gate_step160000_20260907
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 0 → 0   最新写入: 2026-09-07 15:45
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     0.25 GB  2026-09-07 15:45
+
+● q3-06-naive-joint-both-difference-pool-domino-b8-1node-012-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-naive-joint-both-difference-pool-domino-b8-1node-012-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 1 个 checkpoint   合计 0.22 GB
+    步数: step 30000 → 30000   最新写入: 2026-09-11 00:32
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_30000                                 0.22 GB  2026-09-11 00:32
+
+● q3-06-pd-resume-step30000-2node-1011-gbs32-lr2e-3-threshold005-r1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-pd-resume-step30000-2node-1011-gbs32-lr2e-3-threshold005-r1
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 43901 → 43901   最新写入: 2026-09-02 14:39
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_43901                                 0.25 GB  2026-09-02 14:39
+
+● q3-06-plain-ppppp-star-only-difference-pool-domino-b8-1node-012-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910__superseded_ppppp_stop7550
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-plain-ppppp-star-only-difference-pool-domino-b8-1node-012-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910__superseded_ppppp_stop7550
+    数量: 1 个 checkpoint   合计 0.22 GB
+    步数: step 5000 → 5000   最新写入: 2026-09-10 22:56
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.22 GB  2026-09-10 22:56
+
+● q3-06-s-block-layered-pspsps-shared-gate-prefix-kv-difference-pool-domino-b8-1node-009-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-s-block-layered-pspsps-shared-gate-prefix-kv-difference-pool-domino-b8-1node-009-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 1 个 checkpoint   合计 0.23 GB
+    步数: step 25000 → 25000   最新写入: 2026-09-11 00:46
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_25000                                 0.23 GB  2026-09-11 00:46
+
+● q3-06-s-block-layered-psspsspss-shared-gate-prefix-kv-difference-pool-domino-b8-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-s-block-layered-psspsspss-shared-gate-prefix-kv-difference-pool-domino-b8-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 1 个 checkpoint   合计 0.29 GB
+    步数: step 25000 → 25000   最新写入: 2026-09-11 00:26
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_25000                                 0.29 GB  2026-09-11 00:26
+
+● q3-06-static-bare-gate-b16-7layer-1node-002-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-bare-gate-b16-7layer-1node-002-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry2
+    数量: 1 个 checkpoint   合计 0.32 GB
+    步数: step 5000 → 5000   最新写入: 2026-09-03 02:11
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.32 GB  2026-09-03 02:11
+
+● q3-06-static-bare-gate-b8-1node-011-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-bare-gate-b8-1node-011-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    数量: 2 个 checkpoint   合计 0.50 GB
+    步数: step 30000 → 35000   最新写入: 2026-09-02 23:36
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_30000                                 0.25 GB  2026-09-02 23:21
+        epoch_0_step_35000                                 0.25 GB  2026-09-02 23:36
+
+● q3-06-static-bare-gate-b8-7layer-1node-002-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-bare-gate-b8-7layer-1node-002-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    数量: 1 个 checkpoint   合计 0.32 GB
+    步数: step 20000 → 20000   最新写入: 2026-09-03 01:31
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_20000                                 0.32 GB  2026-09-03 01:31
+
+● q3-06-static-bare-gate-recurrent-kv-af-rope-enc-dec-b8-1node-011-fromscratch-bs2-globalbs16-epoch2-maxlen3072-eval1000-gate05-20260903-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-bare-gate-recurrent-kv-af-rope-enc-dec-b8-1node-011-fromscratch-bs2-globalbs16-epoch2-maxlen3072-eval1000-gate05-20260903-retry3
+    数量: 1 个 checkpoint   合计 0.26 GB
+    步数: step 150000 → 150000   最新写入: 2026-09-04 12:37
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_150000                                0.26 GB  2026-09-04 12:37
+
+● q3-06-static-bare-gate-standard-rope-theta1e6-enc-dec-b8-1node-010-fromscratch-bs2-globalbs16-epoch2-maxlen3072-eval1000-20260903-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-bare-gate-standard-rope-theta1e6-enc-dec-b8-1node-010-fromscratch-bs2-globalbs16-epoch2-maxlen3072-eval1000-20260903-retry1
+    数量: 1 个 checkpoint   合计 0.26 GB
+    步数: step 100000 → 100000   最新写入: 2026-09-04 12:22
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_100000                                0.26 GB  2026-09-04 12:22
+
+● q3-06-static-baseline-b8-1node-010-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-baseline-b8-1node-010-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 85000 → 85000   最新写入: 2026-09-02 21:00
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_85000                                 0.25 GB  2026-09-02 21:00
+
+● q3-06-static-gated-q-norm-b8-1node-gpu011-20260908-lr2e3-epoch2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-gated-q-norm-b8-1node-gpu011-20260908-lr2e3-epoch2
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 10000 → 10000   最新写入: 2026-09-08 12:13
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 0.25 GB  2026-09-08 12:13
+
+● q3-06-static-gated-rmsnorm-b8-1node-gpu011-20260908-lr2e3-epoch2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-gated-rmsnorm-b8-1node-gpu011-20260908-lr2e3-epoch2
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 50000 → 50000   最新写入: 2026-09-08 15:42
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_50000                                 0.25 GB  2026-09-08 15:42
+
+● q3-06-static-newdata-r3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-newdata-r3
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-31 23:46
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 0.25 GB  2026-08-31 23:46
+
+● q3-06-static-no-self-b8-1node-gpu011-20260908-lr2e3-epoch2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-no-self-b8-1node-gpu011-20260908-lr2e3-epoch2
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 95000 → 95000   最新写入: 2026-09-08 21:20
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_95000                                 0.25 GB  2026-09-08 21:20
+
+● q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-002-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-002-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 5000 → 5000   最新写入: 2026-09-11 14:49
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.25 GB  2026-09-11 14:49
+
+● q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    位置: [cache/checkpoint-trash] /share/guorui/投机解码训练/SpecForge/cache/checkpoint-trash/q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    数量: 27 个 checkpoint   合计 6.78 GB
+    步数: step 5000 → 135000   最新写入: 2026-09-11 20:53
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260911-073018                  0.25 GB  2026-09-11 15:17
+        epoch_0_step_10000-20260911-074310                 0.25 GB  2026-09-11 15:30
+        epoch_0_step_15000-20260911-075606                 0.25 GB  2026-09-11 15:43
+        epoch_0_step_20000-20260911-080900                 0.25 GB  2026-09-11 15:56
+        epoch_0_step_25000-20260911-082154                 0.25 GB  2026-09-11 16:09
+        epoch_0_step_30000-20260911-083451                 0.25 GB  2026-09-11 16:21
+        epoch_0_step_35000-20260911-084746                 0.25 GB  2026-09-11 16:34
+        epoch_0_step_40000-20260911-090038                 0.25 GB  2026-09-11 16:47
+        epoch_0_step_45000-20260911-091331                 0.25 GB  2026-09-11 17:00
+        epoch_0_step_50000-20260911-092626                 0.25 GB  2026-09-11 17:13
+        epoch_0_step_55000-20260911-093922                 0.25 GB  2026-09-11 17:26
+        epoch_0_step_60000-20260911-095217                 0.25 GB  2026-09-11 17:39
+        epoch_0_step_65000-20260911-100512                 0.25 GB  2026-09-11 17:52
+        epoch_0_step_70000-20260911-101807                 0.25 GB  2026-09-11 18:05
+        epoch_0_step_75000-20260911-103105                 0.25 GB  2026-09-11 18:18
+        epoch_0_step_80000-20260911-104401                 0.25 GB  2026-09-11 18:31
+        epoch_0_step_85000-20260911-105658                 0.25 GB  2026-09-11 18:44
+        epoch_1_step_90000-20260911-110956                 0.25 GB  2026-09-11 18:56
+        epoch_1_step_95000-20260911-112253                 0.25 GB  2026-09-11 19:09
+        epoch_1_step_100000-20260911-113546                0.25 GB  2026-09-11 19:22
+        epoch_1_step_105000-20260911-114844                0.25 GB  2026-09-11 19:35
+        epoch_1_step_110000-20260911-120142                0.25 GB  2026-09-11 19:48
+        epoch_1_step_115000-20260911-121443                0.25 GB  2026-09-11 20:01
+        epoch_1_step_120000-20260911-122738                0.25 GB  2026-09-11 20:14
+        epoch_1_step_125000-20260911-124039                0.25 GB  2026-09-11 20:27
+        epoch_1_step_130000-20260911-125337                0.25 GB  2026-09-11 20:40
+        epoch_1_step_135000-20260911-130635                0.25 GB  2026-09-11 20:53
+
+● q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 140000 → 140000   最新写入: 2026-09-11 21:06
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_140000                                0.25 GB  2026-09-11 21:06
+
+● q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    位置: [cache/checkpoint-trash] /share/guorui/投机解码训练/SpecForge/cache/checkpoint-trash/q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    数量: 6 个 checkpoint   合计 1.51 GB
+    步数: step 5000 → 30000   最新写入: 2026-09-11 14:47
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260911-055505                  0.25 GB  2026-09-11 13:41
+        epoch_0_step_10000-20260911-060813                 0.25 GB  2026-09-11 13:55
+        epoch_0_step_15000-20260911-062123                 0.25 GB  2026-09-11 14:08
+        epoch_0_step_20000-20260911-063428                 0.25 GB  2026-09-11 14:21
+        epoch_0_step_25000-20260911-064738                 0.25 GB  2026-09-11 14:34
+        epoch_0_step_30000-20260911-070050                 0.25 GB  2026-09-11 14:47
+
+● q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 35000 → 35000   最新写入: 2026-09-11 15:00
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_35000                                 0.25 GB  2026-09-11 15:00
+
+● q3-06-static-one-gate-difference-pool-domino-sink-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-sink-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 2 个 checkpoint   合计 0.64 GB
+    步数: step 5000 → 10000   最新写入: 2026-09-11 01:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.32 GB  2026-09-11 01:26
+        epoch_0_step_10000                                 0.32 GB  2026-09-11 01:40
+
+● q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    位置: [cache/checkpoint-trash] /share/guorui/投机解码训练/SpecForge/cache/checkpoint-trash/q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    数量: 10 个 checkpoint   合计 2.52 GB
+    步数: step 5000 → 50000   最新写入: 2026-09-11 13:10
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260911-025048                  0.25 GB  2026-09-11 10:37
+        epoch_0_step_10000-20260911-032312                 0.25 GB  2026-09-11 10:50
+        epoch_0_step_15000-20260911-033623                 0.25 GB  2026-09-11 11:23
+        epoch_0_step_20000-20260911-034935                 0.25 GB  2026-09-11 11:36
+        epoch_0_step_25000-20260911-040241                 0.25 GB  2026-09-11 11:49
+        epoch_0_step_30000-20260911-041557                 0.25 GB  2026-09-11 12:02
+        epoch_0_step_35000-20260911-042906                 0.25 GB  2026-09-11 12:15
+        epoch_0_step_40000-20260911-045438                 0.25 GB  2026-09-11 12:29
+        epoch_0_step_45000-20260911-051013                 0.25 GB  2026-09-11 12:54
+        epoch_0_step_50000-20260911-052328                 0.25 GB  2026-09-11 13:10
+
+● q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 55000 → 55000   最新写入: 2026-09-11 13:23
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_55000                                 0.25 GB  2026-09-11 13:23
+
+● q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [cache/checkpoint-trash] /share/guorui/投机解码训练/SpecForge/cache/checkpoint-trash/q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 2 个 checkpoint   合计 0.64 GB
+    步数: step 5000 → 10000   最新写入: 2026-09-11 02:37
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260910-183753                  0.32 GB  2026-09-11 02:23
+        epoch_0_step_10000-20260910-185218                 0.32 GB  2026-09-11 02:37
+
+● q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 1 个 checkpoint   合计 0.32 GB
+    步数: step 15000 → 15000   最新写入: 2026-09-11 02:52
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 0.32 GB  2026-09-11 02:52
+
+● q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l5-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [cache/checkpoint-trash] /share/guorui/投机解码训练/SpecForge/cache/checkpoint-trash/q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l5-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 25 个 checkpoint   合计 6.31 GB
+    步数: step 5000 → 125000   最新写入: 2026-09-11 08:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260910-195855                  0.25 GB  2026-09-11 03:45
+        epoch_0_step_10000-20260910-201141                 0.25 GB  2026-09-11 03:58
+        epoch_0_step_15000-20260910-202456                 0.25 GB  2026-09-11 04:11
+        epoch_0_step_20000-20260910-203810                 0.25 GB  2026-09-11 04:24
+        epoch_0_step_25000-20260910-205114                 0.25 GB  2026-09-11 04:38
+        epoch_0_step_30000-20260910-210426                 0.25 GB  2026-09-11 04:51
+        epoch_0_step_35000-20260910-211723                 0.25 GB  2026-09-11 05:04
+        epoch_0_step_40000-20260910-213029                 0.25 GB  2026-09-11 05:17
+        epoch_0_step_45000-20260910-214345                 0.25 GB  2026-09-11 05:30
+        epoch_0_step_50000-20260910-215644                 0.25 GB  2026-09-11 05:43
+        epoch_0_step_55000-20260910-220957                 0.25 GB  2026-09-11 05:56
+        epoch_0_step_60000-20260910-222317                 0.25 GB  2026-09-11 06:09
+        epoch_0_step_65000-20260910-223617                 0.25 GB  2026-09-11 06:23
+        epoch_0_step_70000-20260910-224929                 0.25 GB  2026-09-11 06:36
+        epoch_0_step_75000-20260910-230229                 0.25 GB  2026-09-11 06:49
+        epoch_0_step_80000-20260910-231523                 0.25 GB  2026-09-11 07:02
+        epoch_0_step_85000-20260910-232821                 0.25 GB  2026-09-11 07:15
+        epoch_1_step_90000-20260910-234056                 0.25 GB  2026-09-11 07:28
+        epoch_1_step_95000-20260910-235336                 0.25 GB  2026-09-11 07:40
+        epoch_1_step_100000-20260911-000639                0.25 GB  2026-09-11 07:53
+        epoch_1_step_105000-20260911-001935                0.25 GB  2026-09-11 08:06
+        epoch_1_step_110000-20260911-003202                0.25 GB  2026-09-11 08:19
+        epoch_1_step_115000-20260911-004440                0.25 GB  2026-09-11 08:32
+        epoch_1_step_120000-20260911-005747                0.25 GB  2026-09-11 08:44
+        epoch_1_step_125000-20260911-011027                0.25 GB  2026-09-11 08:57
+
+● q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l5-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l5-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 130000 → 130000   最新写入: 2026-09-11 09:10
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_130000                                0.25 GB  2026-09-11 09:10
+
+● q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [cache/checkpoint-trash] /share/guorui/投机解码训练/SpecForge/cache/checkpoint-trash/q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 1 个 checkpoint   合计 0.32 GB
+    步数: step 5000 → 5000   最新写入: 2026-09-11 03:10
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260910-192504                  0.32 GB  2026-09-11 03:10
+
+● q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-one-gate-difference-pool-domino-sink-pre-gated-norm-b8-l7-1node-019-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260910
+    数量: 1 个 checkpoint   合计 0.32 GB
+    步数: step 10000 → 10000   最新写入: 2026-09-11 03:25
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 0.32 GB  2026-09-11 03:25
+
+● q3-06-static-q-frequency-gate-b8-1node-node2-20260906
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-q-frequency-gate-b8-1node-node2-20260906
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 10000 → 10000   最新写入: 2026-09-07 02:45
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 0.25 GB  2026-09-07 02:45
+
+● q3-06-static-q-frequency-gate-b8-1node-node2-20260906-2epoch
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-q-frequency-gate-b8-1node-node2-20260906-2epoch
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 160000 → 160000   最新写入: 2026-09-07 09:09
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_160000                                0.25 GB  2026-09-07 09:09
+
+● q3-06-static-q-frequency-gate-caf-b8-1node-node10-20260907-10000step
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-q-frequency-gate-caf-b8-1node-node10-20260907-10000step
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 145000 → 145000   最新写入: 2026-09-07 18:22
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_145000                                0.25 GB  2026-09-07 18:22
+
+● q3-06-static-qk-head-temperature-linear-b8-1node-gpu002-20260908-lr2e3-epoch2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-qk-head-temperature-linear-b8-1node-gpu002-20260908-lr2e3-epoch2
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 110000 → 110000   最新写入: 2026-09-08 09:14
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_110000                                0.25 GB  2026-09-08 09:14
+
+● q3-06-static-qkv-b8-2node-1011-fromscratch-bs2-globalbs32-epoch3-metrics-20260902-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-qkv-b8-2node-1011-fromscratch-bs2-globalbs32-epoch3-metrics-20260902-retry2
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 15000 → 15000   最新写入: 2026-09-02 16:58
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 0.25 GB  2026-09-02 16:58
+
+● q3-06-static-qkv-bias-b8-1node-011-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-qkv-bias-b8-1node-011-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 80000 → 80000   最新写入: 2026-09-02 21:30
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_80000                                 0.25 GB  2026-09-02 21:30
+
+● q3-06-static-qkv-bias-pre-norm-b8-1node-gpu002-20260907-fromscratch-bs2-globalbs16-epoch4-metrics
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-qkv-bias-pre-norm-b8-1node-gpu002-20260907-fromscratch-bs2-globalbs16-epoch4-metrics
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 25000 → 25000   最新写入: 2026-09-08 02:29
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_25000                                 0.25 GB  2026-09-08 02:29
+
+● q3-06-static-target-attn-mlp-bare-gate-57source-1node-002-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-target-attn-mlp-bare-gate-57source-1node-002-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 35000 → 35000   最新写入: 2026-09-03 00:20
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_35000                                 0.25 GB  2026-09-03 00:20
+
+● q3-06-static-target-hs-pre-rmsnorm-bare-gate-1node-008-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/q3-06-static-target-hs-pre-rmsnorm-bare-gate-1node-008-fromscratch-bs2-globalbs16-epoch3-fullmetrics-20260902-retry1
+    数量: 1 个 checkpoint   合计 0.25 GB
+    步数: step 20000 → 20000   最新写入: 2026-09-02 23:36
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_20000                                 0.25 GB  2026-09-02 23:36
+
+● qwen3-4b-attnres-rms-cache-metrics-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260823-retry5
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-attnres-rms-cache-metrics-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260823-retry5
+    数量: 1 个 checkpoint   合计 1.33 GB
+    步数: step 30000 → 30000   最新写入: 2026-08-24 09:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_30000                                 1.33 GB  2026-08-24 09:40
+
+● qwen3-4b-context-block-q-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-retry2-20260808
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-context-block-q-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-retry2-20260808
+    数量: 5 个 checkpoint   合计 5.91 GB
+    步数: step 5000 → 25000   最新写入: 2026-08-09 06:50
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260809-052555                  1.18 GB  2026-08-09 04:58
+        epoch_0_step_10000-20260809-055356                 1.18 GB  2026-08-09 05:25
+        epoch_0_step_15000-20260809-062209                 1.18 GB  2026-08-09 05:53
+        epoch_0_step_20000-20260809-065020                 1.18 GB  2026-08-09 06:22
+        epoch_0_step_25000-20260809-065758                 1.18 GB  2026-08-09 06:50
+
+● qwen3-4b-context-block-q-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-retry2-20260808
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-context-block-q-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-retry2-20260808
+    数量: 1 个 checkpoint   合计 1.18 GB
+    步数: step 26335 → 26335   最新写入: 2026-08-09 06:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_26335                                 1.18 GB  2026-08-09 06:57
+
+● qwen3-4b-dflare-all36-b8-fixed7-learned-weights-step3p5-perfectblend-mix-2node-1516-bs2acc1-epoch4-ar-eval-20260804-rerun
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-dflare-all36-b8-fixed7-learned-weights-step3p5-perfectblend-mix-2node-1516-bs2acc1-epoch4-ar-eval-20260804-rerun
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 70000 → 70000   最新写入: 2026-08-04 09:04
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_70000                                 1.08 GB  2026-08-04 09:04
+
+● qwen3-4b-dflare-all36-b8-step3p5-perfectblend-mix-2node-1516-bs2acc1-epoch4-ar-eval-20260803
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-dflare-all36-b8-step3p5-perfectblend-mix-2node-1516-bs2acc1-epoch4-ar-eval-20260803
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-04 01:42
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.08 GB  2026-08-04 01:42
+
+● qwen3-4b-diff-pool-dc-domino-all36-b16-l5-2node-1516-bs2acc1-epoch4-ar-eval-20260804
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-diff-pool-dc-domino-all36-b16-l5-2node-1516-bs2acc1-epoch4-ar-eval-20260804
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-05 00:51
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.08 GB  2026-08-05 00:51
+
+● qwen3-4b-diff-pool-dc-domino-all36-b16-l5-fixed-2node-1516-bs2acc1-epoch4-ar-eval-20260804
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-diff-pool-dc-domino-all36-b16-l5-fixed-2node-1516-bs2acc1-epoch4-ar-eval-20260804
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 65000 → 65000   最新写入: 2026-08-05 09:55
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_65000                                 1.08 GB  2026-08-05 09:55
+
+● qwen3-4b-difference-linear-pure-pool-domino-all36-b16-l5-post-norm-2node-0509-bs2acc1-epoch4-ar-eval-20260804
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-difference-linear-pure-pool-domino-all36-b16-l5-post-norm-2node-0509-bs2acc1-epoch4-ar-eval-20260804
+    数量: 14 个 checkpoint   合计 15.20 GB
+    步数: step 5000 → 70000   最新写入: 2026-08-05 08:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260805-002235                  1.09 GB  2026-08-04 23:39
+        epoch_0_step_10000-20260805-010528                 1.09 GB  2026-08-05 00:22
+        epoch_0_step_15000-20260805-014824                 1.09 GB  2026-08-05 01:05
+        epoch_0_step_20000-20260805-023114                 1.09 GB  2026-08-05 01:48
+        epoch_0_step_25000-20260805-031407                 1.09 GB  2026-08-05 02:31
+        epoch_0_step_30000-20260805-035701                 1.09 GB  2026-08-05 03:14
+        epoch_0_step_35000-20260805-043959                 1.09 GB  2026-08-05 03:57
+        epoch_1_step_40000-20260805-052251                 1.09 GB  2026-08-05 04:39
+        epoch_1_step_45000-20260805-060550                 1.09 GB  2026-08-05 05:22
+        epoch_1_step_50000-20260805-064850                 1.09 GB  2026-08-05 06:05
+        epoch_1_step_55000-20260805-073139                 1.09 GB  2026-08-05 06:48
+        epoch_1_step_60000-20260805-081435                 1.09 GB  2026-08-05 07:31
+        epoch_1_step_65000-20260805-085732                 1.09 GB  2026-08-05 08:14
+        epoch_1_step_70000-20260805-094032                 1.09 GB  2026-08-05 08:57
+
+● qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch5-20260730-retry
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch5-20260730-retry
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 100000 → 100000   最新写入: 2026-07-30 11:02
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_100000                                1.39 GB  2026-07-30 11:02
+
+● qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch5-20260730-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch5-20260730-retry2
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 100000 → 100000   最新写入: 2026-07-30 12:11
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_100000                                1.39 GB  2026-07-30 12:11
+
+● qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch5-20260730-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch5-20260730-retry3
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 104000 → 104000   最新写入: 2026-07-30 13:13
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_104000                                1.39 GB  2026-07-30 13:13
+
+● qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729
+    数量: 21 个 checkpoint   合计 29.13 GB
+    步数: step 2000 → 42000   最新写入: 2026-07-30 08:58
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000-20260730-033946                  1.39 GB  2026-07-30 03:23
+        epoch_0_step_4000-20260730-035626                  1.39 GB  2026-07-30 03:39
+        epoch_0_step_6000-20260730-041314                  1.39 GB  2026-07-30 03:56
+        epoch_0_step_8000-20260730-043001                  1.39 GB  2026-07-30 04:13
+        epoch_0_step_10000-20260730-044643                 1.39 GB  2026-07-30 04:30
+        epoch_0_step_12000-20260730-050329                 1.39 GB  2026-07-30 04:46
+        epoch_0_step_14000-20260730-052016                 1.39 GB  2026-07-30 05:03
+        epoch_0_step_16000-20260730-053702                 1.39 GB  2026-07-30 05:20
+        epoch_0_step_18000-20260730-055345                 1.39 GB  2026-07-30 05:37
+        epoch_1_step_20000-20260730-061031                 1.39 GB  2026-07-30 05:53
+        epoch_1_step_22000-20260730-062717                 1.39 GB  2026-07-30 06:10
+        epoch_1_step_24000-20260730-064404                 1.39 GB  2026-07-30 06:27
+        epoch_1_step_26000-20260730-070050                 1.39 GB  2026-07-30 06:44
+        epoch_1_step_28000-20260730-071735                 1.39 GB  2026-07-30 07:00
+        epoch_1_step_30000-20260730-073421                 1.39 GB  2026-07-30 07:17
+        epoch_1_step_32000-20260730-075105                 1.39 GB  2026-07-30 07:34
+        epoch_1_step_34000-20260730-080752                 1.39 GB  2026-07-30 07:51
+        epoch_1_step_36000-20260730-082438                 1.39 GB  2026-07-30 08:07
+        epoch_1_step_38000-20260730-084153                 1.39 GB  2026-07-30 08:24
+        epoch_2_step_40000-20260730-085838                 1.39 GB  2026-07-30 08:41
+        epoch_2_step_42000-20260730-091636                 1.39 GB  2026-07-30 08:58
+
+● qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-draft-layer-gate-independent-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 46000 → 46000   最新写入: 2026-07-30 09:48
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_46000                                 1.39 GB  2026-07-30 09:48
+
+● qwen3-4b-domino-all36-draft-layer-gate-layerwise-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729-rerun
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-domino-all36-draft-layer-gate-layerwise-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729-rerun
+    数量: 4 个 checkpoint   合计 5.55 GB
+    步数: step 2000 → 8000   最新写入: 2026-07-30 02:34
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000-20260730-020033                  1.39 GB  2026-07-30 01:44
+        epoch_0_step_4000-20260730-021718                  1.39 GB  2026-07-30 02:00
+        epoch_0_step_6000-20260730-023409                  1.39 GB  2026-07-30 02:17
+        epoch_0_step_8000-20260730-025054                  1.39 GB  2026-07-30 02:34
+
+● qwen3-4b-domino-all36-draft-layer-gate-layerwise-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729-rerun
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-draft-layer-gate-layerwise-rmsnorm-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch4-eval1k-20260729-rerun
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 10000 → 10000   最新写入: 2026-07-30 02:50
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 1.39 GB  2026-07-30 02:50
+
+● qwen3-4b-domino-all36-draft-layer-gate-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch3-eval1k-20260729
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-draft-layer-gate-lowrank-r1024-b16-step3p5-perfectblend-mix-4node-051011-bs2acc1-epoch3-eval1k-20260729
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 4000 → 4000   最新写入: 2026-07-29 23:16
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_4000                                  1.39 GB  2026-07-29 23:16
+
+● qwen3-4b-domino-all36-gate-lowrank-r1024-b16-step3p5-perfectblend-mix-3node-091011-bs2acc1-epoch3-eval1k-20260729
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-gate-lowrank-r1024-b16-step3p5-perfectblend-mix-3node-091011-bs2acc1-epoch3-eval1k-20260729
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 26000 → 26000   最新写入: 2026-07-29 22:31
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_26000                                 1.39 GB  2026-07-29 22:31
+
+● qwen3-4b-domino-all36-shared-gate-rmsnorm-lowrank-r1024-b8-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-20260730
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-shared-gate-rmsnorm-lowrank-r1024-b8-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-20260730
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 15000 → 15000   最新写入: 2026-07-30 17:08
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 1.39 GB  2026-07-30 17:08
+
+● qwen3-4b-domino-all36-shared-gate-rmsnorm-lowrank-r1024-b8-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-fixed-20260730
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-all36-shared-gate-rmsnorm-lowrank-r1024-b8-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-fixed-20260730
+    数量: 1 个 checkpoint   合计 1.39 GB
+    步数: step 155000 → 155000   最新写入: 2026-07-31 10:18
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_155000                                1.39 GB  2026-07-31 10:18
+
+● qwen3-4b-domino-am-0.9m
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-am-0.9m
+    数量: 2 个 checkpoint   合计 2.19 GB
+    步数: step 126000 → 128000   最新写入: 2026-06-30 01:41
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_126000                                1.10 GB  2026-06-30 01:14
+        epoch_2_step_128000                                1.10 GB  2026-06-30 01:41
+
+● qwen3-4b-domino-b16-continuous-anchor256-continue-step118506-step3p5-perfectblend-mix-1node11-bs2acc2-lr1e4-epoch3-20260721
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-b16-continuous-anchor256-continue-step118506-step3p5-perfectblend-mix-1node11-bs2acc2-lr1e4-epoch3-20260721
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 22000 → 22000   最新写入: 2026-07-21 19:39
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_22000                                 1.10 GB  2026-07-21 19:39
+
+● qwen3-4b-domino-b16-nonoverlap-anchor256-continue-step118506-step3p5-perfectblend-mix-1node15-bs2acc2-lr1e4-epoch3-20260721
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-b16-nonoverlap-anchor256-continue-step118506-step3p5-perfectblend-mix-1node15-bs2acc2-lr1e4-epoch3-20260721
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 2000 → 2000   最新写入: 2026-07-21 16:39
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000                                  1.10 GB  2026-07-21 16:39
+
+● qwen3-4b-domino-b16-nonoverlap-train-continuous-eval-anchor256-continue-step118506-step3p5-perfectblend-mix-1node15-bs2acc2-lr1e4-epoch3-20260721
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-b16-nonoverlap-train-continuous-eval-anchor256-continue-step118506-step3p5-perfectblend-mix-1node15-bs2acc2-lr1e4-epoch3-20260721
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 20000 → 20000   最新写入: 2026-07-21 20:20
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_20000                                 1.10 GB  2026-07-21 20:20
+
+● qwen3-4b-domino-frontier-fixed-eval64-official-8gpu-20260710-v1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-frontier-fixed-eval64-official-8gpu-20260710-v1
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-11 03:15
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_1                                     1.10 GB  2026-07-11 03:15
+
+● qwen3-4b-domino-frontier-fixed-eval64-trained1000-8gpu-20260710-v1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-frontier-fixed-eval64-trained1000-8gpu-20260710-v1
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 1 → 1   最新写入: 2026-07-11 03:16
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_1                                     1.10 GB  2026-07-11 03:16
+
+● qwen3-4b-domino-layer-aligned-early18-26-late26-34-b16-5layer-step3p5-perfectblend-mix-4node-08101112-bs2acc1-epoch3-eval1k-20260723
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-layer-aligned-early18-26-late26-34-b16-5layer-step3p5-perfectblend-mix-4node-08101112-bs2acc1-epoch3-eval1k-20260723
+    数量: 1 个 checkpoint   合计 1.16 GB
+    步数: step 59253 → 59253   最新写入: 2026-07-24 08:09
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_59253                                 1.16 GB  2026-07-24 08:09
+
+● qwen3-4b-domino-layer-aligned-early18-26-late26-34-b16-step3p5-perfectblend-mix-4node-08101112-bs2acc1-epoch3-eval1k-20260723
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-layer-aligned-early18-26-late26-34-b16-step3p5-perfectblend-mix-4node-08101112-bs2acc1-epoch3-eval1k-20260723
+    数量: 1 个 checkpoint   合计 0.97 GB
+    步数: step 2000 → 2000   最新写入: 2026-07-24 00:30
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000                                  0.97 GB  2026-07-24 00:30
+
+● qwen3-4b-domino-ls-rope-enc-dec-b16-l5-2node-1011-bs2-globalbs32-lr6e-4-epoch3-metrics50-20260905-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-ls-rope-enc-dec-b16-l5-2node-1011-bs2-globalbs32-lr6e-4-epoch3-metrics50-20260905-retry2
+    数量: 1 个 checkpoint   合计 1.49 GB
+    步数: step 118506 → 118506   最新写入: 2026-09-06 15:54
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_118506                                1.49 GB  2026-09-06 15:54
+
+● qwen3-4b-domino-ls-rope-theta1e4-b16-l5-2node-0809-bs2-globalbs32-lr6e-4-epoch3-20260904
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-ls-rope-theta1e4-b16-l5-2node-0809-bs2-globalbs32-lr6e-4-epoch3-20260904
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 118506 → 118506   最新写入: 2026-09-05 15:35
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_118506                                1.10 GB  2026-09-05 15:35
+
+● qwen3-4b-domino-official-arch-b16-nonoverlap-anchor256-step3p5-perfectblend-mix-continue-step38000-2node-1011-16gpu-bs3acc1-epoch3-evalrandom-eval1k-20260722
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-official-arch-b16-nonoverlap-anchor256-step3p5-perfectblend-mix-continue-step38000-2node-1011-16gpu-bs3acc1-epoch3-evalrandom-eval1k-20260722
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 79005 → 79005   最新写入: 2026-07-22 16:27
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_79005                                 1.10 GB  2026-07-22 16:27
+
+● qwen3-4b-domino-official-arch-b16-step3p5-perfectblend-mix-from-scratch-2node-0911-bs2acc1-epoch3-eval1k-restart-20260713
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-official-arch-b16-step3p5-perfectblend-mix-from-scratch-2node-0911-bs2acc1-epoch3-eval1k-restart-20260713
+    数量: 2 个 checkpoint   合计 2.19 GB
+    步数: step 118000 → 118506   最新写入: 2026-07-14 09:43
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_118000                                1.10 GB  2026-07-14 09:40
+        epoch_3_step_118506                                1.10 GB  2026-07-14 09:43
+
+● qwen3-4b-domino-official-b8-true-step3p5-perfectblend-mix-from-scratch-4node-13141718-32gpu-bs2acc1-epoch4-eval1k-20260731-rerun2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-official-b8-true-step3p5-perfectblend-mix-from-scratch-4node-13141718-32gpu-bs2acc1-epoch4-eval1k-20260731-rerun2
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 79808 → 79808   最新写入: 2026-08-01 09:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_79808                                 1.10 GB  2026-08-01 09:40
+
+● qwen3-4b-domino-perfectblend-prefix-from-scratch-4node-bs2-fair-20260704
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-perfectblend-prefix-from-scratch-4node-bs2-fair-20260704
+    数量: 3 个 checkpoint   合计 3.29 GB
+    步数: step 2000 → 6000   最新写入: 2026-07-04 17:35
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000                                  1.10 GB  2026-07-04 17:05
+        epoch_0_step_4000                                  1.10 GB  2026-07-04 17:20
+        epoch_0_step_6000                                  1.10 GB  2026-07-04 17:35
+
+● qwen3-4b-domino-perfectblend-prefix-single-bs3-from-scratch-cachehit-20260706
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-domino-perfectblend-prefix-single-bs3-from-scratch-cachehit-20260706
+    数量: 2 个 checkpoint   合计 2.19 GB
+    步数: step 34000 → 36000   最新写入: 2026-07-07 03:13
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_34000                                 1.10 GB  2026-07-07 02:55
+        epoch_0_step_36000                                 1.10 GB  2026-07-07 03:13
+
+● qwen3-4b-fork-domino-all36-b16-l5-split2-r256-2node-0509-continue-step2000-retry5d-strict-reference
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-fork-domino-all36-b16-l5-split2-r256-2node-0509-continue-step2000-retry5d-strict-reference
+    数量: 14 个 checkpoint   合计 15.26 GB
+    步数: step 2000 → 28000   最新写入: 2026-08-18 01:41
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_2000-20260818-000902                  1.09 GB  2026-08-17 23:52
+        epoch_0_step_4000-20260818-001726                  1.09 GB  2026-08-18 00:00
+        epoch_0_step_6000-20260818-002549                  1.09 GB  2026-08-18 00:09
+        epoch_0_step_8000-20260818-003415                  1.09 GB  2026-08-18 00:17
+        epoch_0_step_10000-20260818-004240                 1.09 GB  2026-08-18 00:25
+        epoch_0_step_12000-20260818-005107                 1.09 GB  2026-08-18 00:34
+        epoch_0_step_14000-20260818-005933                 1.09 GB  2026-08-18 00:42
+        epoch_0_step_16000-20260818-010757                 1.09 GB  2026-08-18 00:51
+        epoch_0_step_18000-20260818-011620                 1.09 GB  2026-08-18 00:59
+        epoch_0_step_20000-20260818-012443                 1.09 GB  2026-08-18 01:07
+        epoch_0_step_22000-20260818-013309                 1.09 GB  2026-08-18 01:16
+        epoch_0_step_24000-20260818-014132                 1.09 GB  2026-08-18 01:24
+        epoch_0_step_26000-20260818-014956                 1.09 GB  2026-08-18 01:33
+        epoch_0_step_28000-20260818-015820                 1.09 GB  2026-08-18 01:41
+
+● qwen3-4b-fork-domino-full31-n8-noeval-metrics-action4-v2-base150k-lr5e5-2node-0509-20260818
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-fork-domino-full31-n8-noeval-metrics-action4-v2-base150k-lr5e5-2node-0509-20260818
+    数量: 1 个 checkpoint   合计 1.11 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-18 07:29
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260818-080736                  1.11 GB  2026-08-18 07:29
+
+● qwen3-4b-fork-domino-full31-n8-noeval-metrics-fixed-base150k-lr5e5-2node-0509-20260818
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-fork-domino-full31-n8-noeval-metrics-fixed-base150k-lr5e5-2node-0509-20260818
+    数量: 4 个 checkpoint   合计 4.44 GB
+    步数: step 5000 → 20000   最新写入: 2026-08-18 06:42
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260818-052518                  1.11 GB  2026-08-18 04:46
+        epoch_0_step_10000-20260818-060359                 1.11 GB  2026-08-18 05:25
+        epoch_0_step_15000-20260818-064243                 1.11 GB  2026-08-18 06:03
+        epoch_0_step_20000-20260818-085130                 1.11 GB  2026-08-18 06:42
+
+● qwen3-4b-headwise-signed-diff-kv-domino-all36-b16-l5-5node-0508091011-bs2-epoch4-ar-eval-20260811
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-headwise-signed-diff-kv-domino-all36-b16-l5-5node-0508091011-bs2-epoch4-ar-eval-20260811
+    数量: 7 个 checkpoint   合计 7.94 GB
+    步数: step 5000 → 35000   最新写入: 2026-08-12 07:53
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260812-035746                  1.13 GB  2026-08-12 03:10
+        epoch_0_step_10000-20260812-044452                 1.13 GB  2026-08-12 03:57
+        epoch_0_step_15000-20260812-053202                 1.13 GB  2026-08-12 04:44
+        epoch_1_step_20000-20260812-061919                 1.13 GB  2026-08-12 05:32
+        epoch_1_step_25000-20260812-070624                 1.13 GB  2026-08-12 06:19
+        epoch_1_step_30000-20260812-075334                 1.13 GB  2026-08-12 07:06
+        epoch_2_step_35000-20260812-084045                 1.13 GB  2026-08-12 07:53
+
+● qwen3-4b-headwise-signed-diff-kv-domino-all36-b16-l5-5node-0508091011-bs2-epoch4-ar-eval-20260811
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-headwise-signed-diff-kv-domino-all36-b16-l5-5node-0508091011-bs2-epoch4-ar-eval-20260811
+    数量: 1 个 checkpoint   合计 1.13 GB
+    步数: step 40000 → 40000   最新写入: 2026-08-12 08:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_40000                                 1.13 GB  2026-08-12 08:40
+
+● qwen3-4b-independent-lm-head-pure-pool-independent-kv-domino-all36-b8-continue-step79808-lr2e-4-3epoch-4node-08091011-20260802
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-independent-lm-head-pure-pool-independent-kv-domino-all36-b8-continue-step79808-lr2e-4-3epoch-4node-08091011-20260802
+    数量: 1 个 checkpoint   合计 1.81 GB
+    步数: step 80000 → 80000   最新写入: 2026-08-03 02:22
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_80000                                 1.81 GB  2026-08-03 02:22
+
+● qwen3-4b-independent-lm-head-pure-pool-independent-kv-domino-all36-b8-step3p5-perfectblend-mix-from-scratch-5node-0809101112-bs2acc1-epoch4-ar-eval-20260802-rerun2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-independent-lm-head-pure-pool-independent-kv-domino-all36-b8-step3p5-perfectblend-mix-from-scratch-5node-0809101112-bs2acc1-epoch4-ar-eval-20260802-rerun2
+    数量: 1 个 checkpoint   合计 1.81 GB
+    步数: step 45000 → 45000   最新写入: 2026-08-03 09:02
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_45000                                 1.81 GB  2026-08-03 09:02
+
+● qwen3-4b-layer-pool-domino-all36-shared-semantic-ffn-r1024-b8-step3p5-perfectblend-mix-4node-08091011-bs2acc1-epoch4-ar-eval-20260801
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-layer-pool-domino-all36-shared-semantic-ffn-r1024-b8-step3p5-perfectblend-mix-4node-08091011-bs2acc1-epoch4-ar-eval-20260801
+    数量: 1 个 checkpoint   合计 1.09 GB
+    步数: step 40000 → 40000   最新写入: 2026-08-01 20:43
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_40000                                 1.09 GB  2026-08-01 20:43
+
+● qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry1
+    数量: 1 个 checkpoint   合计 1.33 GB
+    步数: step 119715 → 119715   最新写入: 2026-08-22 19:45
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_119715                                1.33 GB  2026-08-22 19:45
+
+● qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l9-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l9-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry1
+    数量: 1 个 checkpoint   合计 2.28 GB
+    步数: step 15000 → 15000   最新写入: 2026-08-21 22:25
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 2.28 GB  2026-08-21 22:25
+
+● qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-input-pool-split-shift-learned-sink-r128-all36-b8-l5-2node-0912-retry1-fromscratch-bs2-lr1p2e-3-epoch3-20260822
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-input-pool-split-shift-learned-sink-r128-all36-b8-l5-2node-0912-retry1-fromscratch-bs2-lr1p2e-3-epoch3-20260822
+    数量: 1 个 checkpoint   合计 1.33 GB
+    步数: step 30000 → 30000   最新写入: 2026-08-23 00:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_30000                                 1.33 GB  2026-08-23 00:57
+
+● qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-learned-sink-r128-all36-b8-l9-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-learned-sink-r128-all36-b8-l9-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry1
+    数量: 1 个 checkpoint   合计 2.28 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-21 18:08
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 2.28 GB  2026-08-21 18:08
+
+● qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-r128-all36-b8-l5-3node-091011-prefixsafe-bs2-lr1p2e-3-epoch3-20260820
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-linear-anchor-source-cond-lowrank-kv-adapter-r128-all36-b8-l5-3node-091011-prefixsafe-bs2-lr1p2e-3-epoch3-20260820
+    数量: 1 个 checkpoint   合计 1.33 GB
+    步数: step 35000 → 35000   最新写入: 2026-08-21 08:53
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_35000                                 1.33 GB  2026-08-21 08:53
+
+● qwen3-4b-multiblock-linear-anchor-source-cond-lowrank-kv-adapter-input-pool-learned-sink-all36-b8-p6n4-3node-131418-fromscratch-bs2-lr1p2e-3-epoch3-20260823-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-multiblock-linear-anchor-source-cond-lowrank-kv-adapter-input-pool-learned-sink-all36-b8-p6n4-3node-131418-fromscratch-bs2-lr1p2e-3-epoch3-20260823-retry2
+    数量: 1 个 checkpoint   合计 1.27 GB
+    步数: step 79809 → 79809   最新写入: 2026-08-23 18:05
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_79809                                 1.27 GB  2026-08-23 18:05
+
+● qwen3-4b-non-pre-norm-difference-linear-pure-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260806
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-non-pre-norm-difference-linear-pure-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260806
+    数量: 1 个 checkpoint   合计 1.09 GB
+    步数: step 25000 → 25000   最新写入: 2026-08-06 14:19
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_25000                                 1.09 GB  2026-08-06 14:19
+
+● qwen3-4b-non-pre-norm-difference-linear-pure-pool-domino-all36-b16-l5-lambda01-2node-1011-bs2acc1-epoch4-ar-eval-20260806
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-non-pre-norm-difference-linear-pure-pool-domino-all36-b16-l5-lambda01-2node-1011-bs2acc1-epoch4-ar-eval-20260806
+    数量: 1 个 checkpoint   合计 1.09 GB
+    步数: step 15000 → 15000   最新写入: 2026-08-06 16:46
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 1.09 GB  2026-08-06 16:46
+
+● qwen3-4b-official-domino-b16-perfectblend-downstream-eval1k-reuse-dkv-cache-1node11-bs2acc1-max1000-20260713
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-official-domino-b16-perfectblend-downstream-eval1k-reuse-dkv-cache-1node11-bs2acc1-max1000-20260713
+    数量: 2 个 checkpoint   合计 2.19 GB
+    步数: step 1000 → 1000   最新写入: 2026-07-13 15:58
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_1000                                  1.10 GB  2026-07-13 15:58
+        epoch_1_step_1000                                  1.10 GB  2026-07-13 15:58
+
+● qwen3-4b-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-projmetrics1000-flex-clean-20260824
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-projmetrics1000-flex-clean-20260824
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 15000 → 15000   最新写入: 2026-08-24 14:48
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 1.08 GB  2026-08-24 14:48
+
+● qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b16-step3p5-perfectblend-mix-4node-08091011-bs2acc1-epoch6-ar-eval-20260801
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b16-step3p5-perfectblend-mix-4node-08091011-bs2acc1-epoch6-ar-eval-20260801
+    数量: 1 个 checkpoint   合计 1.05 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-01 22:58
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 1.05 GB  2026-08-01 22:58
+
+● qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b8-l7-step3p5-perfectblend-mix-3node-050809-bs2acc1-epoch4-ar-eval-20260731
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b8-l7-step3p5-perfectblend-mix-3node-050809-bs2acc1-epoch4-ar-eval-20260731
+    数量: 21 个 checkpoint   合计 29.86 GB
+    步数: step 5000 → 105000   最新写入: 2026-08-01 13:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260801-015252                  1.42 GB  2026-08-01 01:14
+        epoch_0_step_10000-20260801-023106                 1.42 GB  2026-08-01 01:52
+        epoch_0_step_15000-20260801-030934                 1.42 GB  2026-08-01 02:31
+        epoch_0_step_20000-20260801-034735                 1.42 GB  2026-08-01 03:09
+        epoch_0_step_25000-20260801-042541                 1.42 GB  2026-08-01 03:47
+        epoch_1_step_30000-20260801-050353                 1.42 GB  2026-08-01 04:25
+        epoch_1_step_35000-20260801-054151                 1.42 GB  2026-08-01 05:03
+        epoch_1_step_40000-20260801-061953                 1.42 GB  2026-08-01 05:41
+        epoch_1_step_45000-20260801-065757                 1.42 GB  2026-08-01 06:19
+        epoch_1_step_50000-20260801-073604                 1.42 GB  2026-08-01 06:57
+        epoch_2_step_55000-20260801-081409                 1.42 GB  2026-08-01 07:36
+        epoch_2_step_60000-20260801-085208                 1.42 GB  2026-08-01 08:14
+        epoch_2_step_65000-20260801-093017                 1.42 GB  2026-08-01 08:52
+        epoch_2_step_70000-20260801-100826                 1.42 GB  2026-08-01 09:30
+        epoch_2_step_75000-20260801-104640                 1.42 GB  2026-08-01 10:08
+        epoch_3_step_80000-20260801-112438                 1.42 GB  2026-08-01 10:46
+        epoch_3_step_85000-20260801-120241                 1.42 GB  2026-08-01 11:24
+        epoch_3_step_90000-20260801-124055                 1.42 GB  2026-08-01 12:02
+        epoch_3_step_95000-20260801-131910                 1.42 GB  2026-08-01 12:40
+        epoch_3_step_100000-20260801-135716                1.42 GB  2026-08-01 13:19
+        epoch_3_step_105000-20260801-140814                1.42 GB  2026-08-01 13:57
+
+● qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b8-l7-step3p5-perfectblend-mix-3node-050809-bs2acc1-epoch4-ar-eval-20260731
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b8-l7-step3p5-perfectblend-mix-3node-050809-bs2acc1-epoch4-ar-eval-20260731
+    数量: 1 个 checkpoint   合计 1.42 GB
+    步数: step 106412 → 106412   最新写入: 2026-08-01 14:08
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_106412                                1.42 GB  2026-08-01 14:08
+
+● qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b8-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-20260731-rerun
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pool-domino-all36-shared-semantic-ffn-r1024-b8-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-20260731-rerun
+    数量: 1 个 checkpoint   合计 1.05 GB
+    步数: step 159620 → 159620   最新写入: 2026-08-01 10:54
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_159620                                1.05 GB  2026-08-01 10:54
+
+● qwen3-4b-post-norm-target-hs-affine-hadamard-no-embedding-2node-1011-fromscratch-bs2-globalbs32-lr1e-3-wd1e-2-epoch3-calib-reuse3node-eval1000-fused-compact-attn-20260827-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-post-norm-target-hs-affine-hadamard-no-embedding-2node-1011-fromscratch-bs2-globalbs32-lr1e-3-wd1e-2-epoch3-calib-reuse3node-eval1000-fused-compact-attn-20260827-retry3
+    数量: 3 个 checkpoint   合计 3.25 GB
+    步数: step 15000 → 25000   最新写入: 2026-08-27 15:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 1.08 GB  2026-08-27 14:11
+        epoch_0_step_20000                                 1.08 GB  2026-08-27 15:04
+        epoch_0_step_25000                                 1.08 GB  2026-08-27 15:57
+
+● qwen3-4b-prefix-gated-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260823-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-prefix-gated-linear-anchor-source-cond-lowrank-kv-adapter-direct-anchor-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260823-retry1
+    数量: 1 个 checkpoint   合计 1.33 GB
+    步数: step 20000 → 20000   最新写入: 2026-08-24 01:38
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_20000                                 1.33 GB  2026-08-24 01:38
+
+● qwen3-4b-pure-kv-domino-b16-q1-static-top9-inblock-d512-2node-1011-bs2acc1-epoch3-20260724
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-kv-domino-b16-q1-static-top9-inblock-d512-2node-1011-bs2acc1-epoch3-20260724
+    数量: 1 个 checkpoint   合计 1.03 GB
+    步数: step 26000 → 26000   最新写入: 2026-07-24 13:29
+    权重文件: model.safetensors
+        epoch_0_step_26000                                 1.03 GB  2026-07-24 13:29
+
+● qwen3-4b-pure-kv-domino-b16-q1-static-top9-position-mask-inblock-d1024-bidirectional-1node-8gpu-20260725
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-kv-domino-b16-q1-static-top9-position-mask-inblock-d1024-bidirectional-1node-8gpu-20260725
+    数量: 1 个 checkpoint   合计 1.06 GB
+    步数: step 104000 → 104000   最新写入: 2026-07-26 02:00
+    权重文件: model.safetensors
+        epoch_1_step_104000                                1.06 GB  2026-07-26 02:00
+
+● qwen3-4b-pure-kv-domino-b16-q1-static-top9-position-mask-inblock-d1024-causal-1node-8gpu-20260725
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-kv-domino-b16-q1-static-top9-position-mask-inblock-d1024-causal-1node-8gpu-20260725
+    数量: 1 个 checkpoint   合计 1.06 GB
+    步数: step 108000 → 108000   最新写入: 2026-07-25 14:00
+    权重文件: model.safetensors
+        epoch_1_step_108000                                1.06 GB  2026-07-25 14:00
+
+● qwen3-4b-pure-kv-domino-b16-q1-static-top9-position-mask-inblock-d512-2node-1011-bs2acc1-epoch3-20260724
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-kv-domino-b16-q1-static-top9-position-mask-inblock-d512-2node-1011-bs2acc1-epoch3-20260724
+    数量: 1 个 checkpoint   合计 1.03 GB
+    步数: step 60000 → 60000   最新写入: 2026-07-24 23:04
+    权重文件: model.safetensors
+        epoch_1_step_60000                                 1.03 GB  2026-07-24 23:04
+
+● qwen3-4b-pure-kv-domino-b16-q1-static-top9-swa64-sink3-domino-cache-from-scratch-4node-05101112-bs2acc1-epoch3-restart2-20260725
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-kv-domino-b16-q1-static-top9-swa64-sink3-domino-cache-from-scratch-4node-05101112-bs2acc1-epoch3-restart2-20260725
+    数量: 1 个 checkpoint   合计 1.20 GB
+    步数: step 118506 → 118506   最新写入: 2026-07-26 19:56
+    权重文件: model.safetensors
+        epoch_6_step_118506                                1.20 GB  2026-07-26 19:56
+
+● qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l4-step3p5-perfectblend-mix-5node-0809101112-bs2acc1-epoch4-ar-eval-20260802
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l4-step3p5-perfectblend-mix-5node-0809101112-bs2acc1-epoch4-ar-eval-20260802
+    数量: 1 个 checkpoint   合计 0.89 GB
+    步数: step 15000 → 15000   最新写入: 2026-08-03 01:58
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 0.89 GB  2026-08-03 01:58
+
+● qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l7-continue-step50000-2node-1011-lr191683-lambda3671-20260804
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l7-continue-step50000-2node-1011-lr191683-lambda3671-20260804
+    数量: 1 个 checkpoint   合计 1.48 GB
+    步数: step 130000 → 130000   最新写入: 2026-08-04 14:19
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_130000                                1.48 GB  2026-08-04 14:19
+
+● qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l7-step3p5-perfectblend-mix-node10-bs2acc1-epoch4-ar-eval-20260804
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l7-step3p5-perfectblend-mix-node10-bs2acc1-epoch4-ar-eval-20260804
+    数量: 9 个 checkpoint   合计 13.33 GB
+    步数: step 5000 → 45000   最新写入: 2026-08-04 08:05
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260804-030035                  1.48 GB  2026-08-04 02:17
+        epoch_0_step_10000-20260804-034410                 1.48 GB  2026-08-04 03:00
+        epoch_0_step_15000-20260804-042744                 1.48 GB  2026-08-04 03:44
+        epoch_1_step_20000-20260804-051120                 1.48 GB  2026-08-04 04:27
+        epoch_1_step_25000-20260804-055456                 1.48 GB  2026-08-04 05:11
+        epoch_1_step_30000-20260804-063836                 1.48 GB  2026-08-04 05:54
+        epoch_1_step_35000-20260804-072213                 1.48 GB  2026-08-04 06:38
+        epoch_2_step_40000-20260804-080548                 1.48 GB  2026-08-04 07:22
+        epoch_2_step_45000-20260804-084923                 1.48 GB  2026-08-04 08:05
+
+● qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l7-step3p5-perfectblend-mix-node10-bs2acc1-epoch4-ar-eval-20260804
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-pool-independent-kv-domino-all36-b16-l7-step3p5-perfectblend-mix-node10-bs2acc1-epoch4-ar-eval-20260804
+    数量: 1 个 checkpoint   合计 1.48 GB
+    步数: step 50000 → 50000   最新写入: 2026-08-04 08:49
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_50000                                 1.48 GB  2026-08-04 08:49
+
+● qwen3-4b-pure-pool-independent-kv-domino-all36-b8-step3p5-perfectblend-mix-4node-08091011-bs2acc1-epoch4-ar-eval-20260801
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-pool-independent-kv-domino-all36-b8-step3p5-perfectblend-mix-4node-08091011-bs2acc1-epoch4-ar-eval-20260801
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 79808 → 79808   最新写入: 2026-08-02 09:50
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_79808                                 1.08 GB  2026-08-02 09:50
+
+● qwen3-4b-pure-pool-independent-kv-domino-l2sp-lm-head-all36-b8-from-step79808-noskip-node10-20260803-fixed
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-pool-independent-kv-domino-l2sp-lm-head-all36-b8-from-step79808-noskip-node10-20260803-fixed
+    数量: 1 个 checkpoint   合计 1.81 GB
+    步数: step 125000 → 125000   最新写入: 2026-08-04 01:21
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_125000                                1.81 GB  2026-08-04 01:21
+
+● qwen3-4b-pure-pool-independent-kv-domino-l2sp-lm-head-init-audit-20260803
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-pool-independent-kv-domino-l2sp-lm-head-init-audit-20260803
+    数量: 1 个 checkpoint   合计 1.81 GB
+    步数: step 319200 → 319200   最新写入: 2026-08-03 10:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_5_step_319200                                1.81 GB  2026-08-03 10:57
+
+● qwen3-4b-pure-pool-shared-embedding-kv-additive-layer0init-all36-b16-l5-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-20260804-rerun2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-pure-pool-shared-embedding-kv-additive-layer0init-all36-b16-l5-step3p5-perfectblend-mix-2node-1011-bs2acc1-epoch4-ar-eval-20260804-rerun2
+    数量: 1 个 checkpoint   合计 1.09 GB
+    步数: step 155000 → 155000   最新写入: 2026-08-05 12:36
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_155000                                1.09 GB  2026-08-05 12:36
+
+● qwen3-4b-qformer-kv-native-layerpos-multiblock-linear-anchor-all36-b8-p6n4-2node-0912-fromscratch-bs2-lr1p2e-3-epoch3-20260823
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-qformer-kv-native-layerpos-multiblock-linear-anchor-all36-b8-p6n4-2node-0912-fromscratch-bs2-lr1p2e-3-epoch3-20260823
+    数量: 1 个 checkpoint   合计 1.29 GB
+    步数: step 55000 → 55000   最新写入: 2026-08-24 09:18
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_55000                                 1.29 GB  2026-08-24 09:18
+
+● qwen3-4b-query-anchor-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-20260808
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-query-anchor-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-20260808
+    数量: 4 个 checkpoint   合计 4.33 GB
+    步数: step 5000 → 20000   最新写入: 2026-08-09 02:41
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260809-020129                  1.08 GB  2026-08-09 01:41
+        epoch_0_step_10000-20260809-022135                 1.08 GB  2026-08-09 02:01
+        epoch_0_step_15000-20260809-024140                 1.08 GB  2026-08-09 02:21
+        epoch_0_step_20000-20260809-030138                 1.08 GB  2026-08-09 02:41
+
+● qwen3-4b-query-anchor-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-20260808
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-query-anchor-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch1-ar-eval-20260808
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 25000 → 25000   最新写入: 2026-08-09 03:01
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_25000                                 1.08 GB  2026-08-09 03:01
+
+● qwen3-4b-query-refine-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-0912-bs2-lr1p2e-3-epoch3-20260821-fromscratch
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-query-refine-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-0912-bs2-lr1p2e-3-epoch3-20260821-fromscratch
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 119715 → 119715   最新写入: 2026-08-22 13:13
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_119715                                1.08 GB  2026-08-22 13:13
+
+● qwen3-4b-relu-mlp-3node-101112-l5-b16-fromscratch-gbs48-lr1e-3-wd1e-2-20260830-r1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-relu-mlp-3node-101112-l5-b16-fromscratch-gbs48-lr1e-3-wd1e-2-20260830-r1
+    数量: 2 个 checkpoint   合计 1.71 GB
+    步数: step 5000 → 10000   最新写入: 2026-08-30 23:05
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.85 GB  2026-08-30 22:18
+        epoch_0_step_10000                                 0.85 GB  2026-08-30 23:05
+
+● qwen3-4b-residual-static-gate-pool-domino-beta0-all36-b16-l5-2node-0512-bs2-epoch4-ar-eval-20260813
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-residual-static-gate-pool-domino-beta0-all36-b16-l5-2node-0512-bs2-epoch4-ar-eval-20260813
+    数量: 1 个 checkpoint   合计 1.18 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-13 22:50
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260813-233116                  1.18 GB  2026-08-13 22:50
+
+● qwen3-4b-residual-static-gate-pool-domino-shared-q-all36-b16-l5-5node-0509101112-bs2-epoch4-ar-eval-20260814
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-residual-static-gate-pool-domino-shared-q-all36-b16-l5-5node-0509101112-bs2-epoch4-ar-eval-20260814
+    数量: 10 个 checkpoint   合计 10.84 GB
+    步数: step 5000 → 50000   最新写入: 2026-08-14 08:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260814-025929                  1.08 GB  2026-08-14 02:17
+        epoch_0_step_10000-20260814-034158                 1.08 GB  2026-08-14 02:59
+        epoch_0_step_15000-20260814-042450                 1.08 GB  2026-08-14 03:41
+        epoch_1_step_20000-20260814-050726                 1.08 GB  2026-08-14 04:24
+        epoch_1_step_25000-20260814-055001                 1.08 GB  2026-08-14 05:07
+        epoch_1_step_30000-20260814-063238                 1.08 GB  2026-08-14 05:50
+        epoch_2_step_35000-20260814-071523                 1.08 GB  2026-08-14 06:32
+        epoch_2_step_40000-20260814-075803                 1.08 GB  2026-08-14 07:15
+        epoch_2_step_45000-20260814-084036                 1.08 GB  2026-08-14 07:58
+        epoch_3_step_50000-20260814-092310                 1.08 GB  2026-08-14 08:40
+
+● qwen3-4b-residual-static-gate-pool-domino-shared-q-causal-block-all36-b16-l7-2node-0509-bs2-epoch4-ar-eval-20260814
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-residual-static-gate-pool-domino-shared-q-causal-block-all36-b16-l7-2node-0509-bs2-epoch4-ar-eval-20260814
+    数量: 31 个 checkpoint   合计 45.85 GB
+    步数: step 5000 → 155000   最新写入: 2026-08-16 02:46
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260815-032205                  1.48 GB  2026-08-15 02:33
+        epoch_0_step_10000-20260815-041028                 1.48 GB  2026-08-15 03:22
+        epoch_0_step_15000-20260815-045852                 1.48 GB  2026-08-15 04:10
+        epoch_0_step_20000-20260815-054707                 1.48 GB  2026-08-15 04:58
+        epoch_0_step_25000-20260815-063533                 1.48 GB  2026-08-15 05:47
+        epoch_0_step_30000-20260815-072357                 1.48 GB  2026-08-15 06:35
+        epoch_0_step_35000-20260815-081224                 1.48 GB  2026-08-15 07:23
+        epoch_1_step_40000-20260815-090047                 1.48 GB  2026-08-15 08:12
+        epoch_1_step_45000-20260815-094914                 1.48 GB  2026-08-15 09:00
+        epoch_1_step_50000-20260815-103740                 1.48 GB  2026-08-15 09:49
+        epoch_1_step_55000-20260815-112600                 1.48 GB  2026-08-15 10:37
+        epoch_1_step_60000-20260815-121425                 1.48 GB  2026-08-15 11:25
+        epoch_1_step_65000-20260815-130248                 1.48 GB  2026-08-15 12:14
+        epoch_1_step_70000-20260815-135118                 1.48 GB  2026-08-15 13:02
+        epoch_1_step_75000-20260815-143950                 1.48 GB  2026-08-15 13:51
+        epoch_2_step_80000-20260815-152811                 1.48 GB  2026-08-15 14:39
+        epoch_2_step_85000-20260815-161636                 1.48 GB  2026-08-15 15:28
+        epoch_2_step_90000-20260815-170457                 1.48 GB  2026-08-15 16:16
+        epoch_2_step_95000-20260815-175325                 1.48 GB  2026-08-15 17:04
+        epoch_2_step_100000-20260815-184151                1.48 GB  2026-08-15 17:53
+        epoch_2_step_105000-20260815-193020                1.48 GB  2026-08-15 18:41
+        epoch_2_step_110000-20260815-201846                1.48 GB  2026-08-15 19:30
+        epoch_2_step_115000-20260815-210710                1.48 GB  2026-08-15 20:18
+        epoch_3_step_120000-20260815-215532                1.48 GB  2026-08-15 21:07
+        epoch_3_step_125000-20260815-224354                1.48 GB  2026-08-15 21:55
+        epoch_3_step_130000-20260815-233221                1.48 GB  2026-08-15 22:43
+        epoch_3_step_135000-20260816-002055                1.48 GB  2026-08-15 23:32
+        epoch_3_step_140000-20260816-010920                1.48 GB  2026-08-16 00:20
+        epoch_3_step_145000-20260816-015749                1.48 GB  2026-08-16 01:09
+        epoch_3_step_150000-20260816-024621                1.48 GB  2026-08-16 01:57
+        epoch_3_step_155000-20260816-031538                1.48 GB  2026-08-16 02:46
+
+● qwen3-4b-separate-prefix-block-independent-o-block-sink-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-0912-fromscratch-bs2-lr1p2e-3-wd1e-2-epoch3-metrics50-flex-20260824
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-independent-o-block-sink-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-0912-fromscratch-bs2-lr1p2e-3-wd1e-2-epoch3-metrics50-flex-20260824
+    数量: 1 个 checkpoint   合计 1.18 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-24 21:35
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.18 GB  2026-08-24 21:35
+
+● qwen3-4b-separate-prefix-block-l2x100-all5-control-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-l2x100-all5-control-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-25 00:43
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.08 GB  2026-08-25 00:43
+
+● qwen3-4b-separate-prefix-block-l2x100-all5-prefix-control-sum-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-4node-09101112-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-l2x100-all5-prefix-control-sum-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-4node-09101112-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 55000 → 55000   最新写入: 2026-08-25 09:36
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_55000                                 1.08 GB  2026-08-25 09:36
+
+● qwen3-4b-separate-prefix-block-nccl-auto-20260824
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-nccl-auto-20260824
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 120 → 120   最新写入: 2026-08-24 16:27
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_120                                   1.08 GB  2026-08-24 16:27
+
+● qwen3-4b-separate-prefix-block-no-l2-control-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-init55000-bs2-lr1p2e-3-warmup10-epoch3-metrics50-flex-20260825
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-no-l2-control-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-init55000-bs2-lr1p2e-3-warmup10-epoch3-metrics50-flex-20260825
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 20000 → 20000   最新写入: 2026-08-25 13:14
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_20000                                 1.08 GB  2026-08-25 13:14
+
+● qwen3-4b-separate-prefix-block-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824-retry14
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824-retry14
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 15000 → 15000   最新写入: 2026-08-24 21:12
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 1.08 GB  2026-08-24 21:12
+
+● qwen3-4b-separate-prefix-block-profile-single-node-20260824
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-profile-single-node-20260824
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 60 → 60   最新写入: 2026-08-24 16:10
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_60                                    1.08 GB  2026-08-24 16:10
+
+● qwen3-4b-separate-prefix-block-value-differential-beta0p5-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-0912-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-separate-prefix-block-value-differential-beta0p5-peri-norm-static-non-pre-norm-one-gate-difference-pool-domino-all36-b8-l5-2node-0912-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260824-retry2
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-24 23:01
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.08 GB  2026-08-24 23:01
+
+● qwen3-4b-sft-gru-domino-custom-b16-2node-1516-bs2acc1-epoch2-lr2e-4-ar-eval-20260811
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-sft-gru-domino-custom-b16-2node-1516-bs2acc1-epoch2-lr2e-4-ar-eval-20260811
+    数量: 1 个 checkpoint   合计 1.10 GB
+    步数: step 79004 → 79004   最新写入: 2026-08-12 06:03
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_79004                                 1.10 GB  2026-08-12 06:03
+
+● qwen3-4b-silu-mlp-3node-101112-l5-b16-fromscratch-gbs48-lr1e-3-wd1e-2-20260830-r1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-silu-mlp-3node-101112-l5-b16-fromscratch-gbs48-lr1e-3-wd1e-2-20260830-r1
+    数量: 1 个 checkpoint   合计 0.85 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-31 00:10
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  0.85 GB  2026-08-31 00:10
+
+● qwen3-4b-source-cond-lowrank-kv-adapter-layernorm-pool-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry5
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-source-cond-lowrank-kv-adapter-layernorm-pool-learned-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry5
+    数量: 1 个 checkpoint   合计 1.28 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-21 14:02
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.28 GB  2026-08-21 14:02
+
+● qwen3-4b-source-cond-lowrank-kv-adapter-layernorm-pool-learned-sink-r128-all36-b8-l9-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry7
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-source-cond-lowrank-kv-adapter-layernorm-pool-learned-sink-r128-all36-b8-l9-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821-retry7
+    数量: 1 个 checkpoint   合计 2.23 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-21 15:27
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  2.23 GB  2026-08-21 15:27
+
+● qwen3-4b-source-cond-lowrank-kv-adapter-layernorm-pool-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-source-cond-lowrank-kv-adapter-layernorm-pool-sink-r128-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-20260821
+    数量: 1 个 checkpoint   合计 1.28 GB
+    步数: step 15000 → 15000   最新写入: 2026-08-23 02:53
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_15000                                 1.28 GB  2026-08-23 02:53
+
+● qwen3-4b-source-cond-lowrank-kv-adapter-r128-all36-b8-l5-2node-1011-bs2-lr1p2e-3-epoch3-20260820-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-source-cond-lowrank-kv-adapter-r128-all36-b8-l5-2node-1011-bs2-lr1p2e-3-epoch3-20260820-retry3
+    数量: 1 个 checkpoint   合计 1.28 GB
+    步数: step 40000 → 40000   最新写入: 2026-08-20 23:51
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_40000                                 1.28 GB  2026-08-20 23:51
+
+● qwen3-4b-static-37-source-prenorm-final-bare-gate-all36-b16-l5-4node-08101112-bs2-globalbs64-lr2e-3-epoch4-eval10k-save20k-log500-fromscratch-20260902-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-37-source-prenorm-final-bare-gate-all36-b16-l5-4node-08101112-bs2-globalbs64-lr2e-3-epoch4-eval10k-save20k-log500-fromscratch-20260902-retry1
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 79004 → 79004   最新写入: 2026-09-03 09:31
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_79004                                 1.08 GB  2026-09-03 09:31
+
+● qwen3-4b-static-37-source-qk-bias-enc-dec-b16-l5-4node-08101112-bs2-globalbs64-lr6e-4-epoch3-20260907
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-37-source-qk-bias-enc-dec-b16-l5-4node-08101112-bs2-globalbs64-lr6e-4-epoch3-20260907
+    数量: 1 个 checkpoint   合计 1.47 GB
+    步数: step 59253 → 59253   最新写入: 2026-09-08 08:26
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_59253                                 1.47 GB  2026-09-08 08:26
+
+● qwen3-4b-static-37-source-qk-bias-enc-dec-b16-l5-5node-0809101112-bs2-globalbs80-lr6e-4-epoch3-20260907
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-37-source-qk-bias-enc-dec-b16-l5-5node-0809101112-bs2-globalbs80-lr6e-4-epoch3-20260907
+    数量: 1 个 checkpoint   合计 1.47 GB
+    步数: step 40000 → 40000   最新写入: 2026-09-07 08:31
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_40000                                 1.47 GB  2026-09-07 08:31
+
+● qwen3-4b-static-73-source-attn-mlp-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-bs2-globalbs32-lr6e-4-epoch4-eval5k-save10k-log500-fromscratch-20260903
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-73-source-attn-mlp-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-bs2-globalbs32-lr6e-4-epoch4-eval5k-save10k-log500-fromscratch-20260903
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 60000 → 60000   最新写入: 2026-09-04 12:02
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_60000                                 1.08 GB  2026-09-04 12:02
+
+● qwen3-4b-static-73-source-attn-mlp-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-strict-resume-step60000-20260904
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-73-source-attn-mlp-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-strict-resume-step60000-20260904
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 158008 → 158008   最新写入: 2026-09-05 13:30
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_158008                                1.08 GB  2026-09-05 13:30
+
+● qwen3-4b-static-73-source-attn-mlp-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-4node-09101112-bs2-globalbs64-lr6e-4-epoch4-eval5k-save10k-log500-fromscratch-20260901-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-73-source-attn-mlp-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-4node-09101112-bs2-globalbs64-lr6e-4-epoch4-eval5k-save10k-log500-fromscratch-20260901-retry2
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 79004 → 79004   最新写入: 2026-09-02 08:54
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_79004                                 1.08 GB  2026-09-02 08:54
+
+● qwen3-4b-static-enc-dec-pool-domino-all36-b16-l5-2node-1011-bs2-lr1p2e-3-epoch3-20260820-retry6
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-enc-dec-pool-domino-all36-b16-l5-2node-1011-bs2-lr1p2e-3-epoch3-20260820-retry6
+    数量: 1 个 checkpoint   合计 1.18 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-20 13:22
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.18 GB  2026-08-20 13:22
+
+● qwen3-4b-static-enc-dec-pool-domino-independent-o-all36-b8-l5-2node-1011-bs2-lr1p2e-3-epoch3-20260820-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-enc-dec-pool-domino-independent-o-all36-b8-l5-2node-1011-bs2-lr1p2e-3-epoch3-20260820-retry2
+    数量: 1 个 checkpoint   合计 1.28 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-20 16:12
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 1.28 GB  2026-08-20 16:12
+
+● qwen3-4b-static-gate-delta-embedding-pool-domino-all36-b16-l5-2node-1011-bs2-epoch4-ar-eval-20260813
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-gate-delta-embedding-pool-domino-all36-b16-l5-2node-1011-bs2-epoch4-ar-eval-20260813
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 40000 → 40000   最新写入: 2026-08-13 17:21
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_40000                                 1.08 GB  2026-08-13 17:21
+
+● qwen3-4b-static-gate-delta-mask-pool-domino-all36-b16-l5-4node-09101112-bs2-epoch4-ar-eval-20260812
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-gate-delta-mask-pool-domino-all36-b16-l5-4node-09101112-bs2-epoch4-ar-eval-20260812
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 79004 → 79004   最新写入: 2026-08-13 07:16
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_79004                                 1.08 GB  2026-08-13 07:16
+
+● qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l3-6node-050809101112-bs1-epoch4-ar-eval-20260809
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l3-6node-050809101112-bs1-epoch4-ar-eval-20260809
+    数量: 19 个 checkpoint   合计 13.07 GB
+    步数: step 5000 → 95000   最新写入: 2026-08-09 23:47
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260809-184129                  0.69 GB  2026-08-09 18:23
+        epoch_0_step_10000-20260809-185929                 0.69 GB  2026-08-09 18:41
+        epoch_0_step_15000-20260809-191733                 0.69 GB  2026-08-09 18:59
+        epoch_0_step_20000-20260809-193528                 0.69 GB  2026-08-09 19:17
+        epoch_0_step_25000-20260809-195322                 0.69 GB  2026-08-09 19:35
+        epoch_1_step_30000-20260809-201129                 0.69 GB  2026-08-09 19:53
+        epoch_1_step_35000-20260809-202927                 0.69 GB  2026-08-09 20:11
+        epoch_1_step_40000-20260809-204722                 0.69 GB  2026-08-09 20:29
+        epoch_1_step_45000-20260809-210530                 0.69 GB  2026-08-09 20:47
+        epoch_1_step_50000-20260809-212327                 0.69 GB  2026-08-09 21:05
+        epoch_2_step_55000-20260809-214122                 0.69 GB  2026-08-09 21:23
+        epoch_2_step_60000-20260809-215930                 0.69 GB  2026-08-09 21:41
+        epoch_2_step_65000-20260809-221732                 0.69 GB  2026-08-09 21:59
+        epoch_2_step_70000-20260809-223532                 0.69 GB  2026-08-09 22:17
+        epoch_2_step_75000-20260809-225340                 0.69 GB  2026-08-09 22:35
+        epoch_3_step_80000-20260809-231142                 0.69 GB  2026-08-09 22:53
+        epoch_3_step_85000-20260809-232941                 0.69 GB  2026-08-09 23:11
+        epoch_3_step_90000-20260809-234749                 0.69 GB  2026-08-09 23:29
+        epoch_3_step_95000-20260810-000554                 0.69 GB  2026-08-09 23:47
+
+● qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l3-6node-050809101112-bs1-epoch4-ar-eval-20260809
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l3-6node-050809101112-bs1-epoch4-ar-eval-20260809
+    数量: 1 个 checkpoint   合计 0.69 GB
+    步数: step 100000 → 100000   最新写入: 2026-08-10 00:05
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_100000                                0.69 GB  2026-08-10 00:05
+
+● qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260805
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260805
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 45000 → 45000   最新写入: 2026-08-06 10:24
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_45000                                 1.08 GB  2026-08-06 10:24
+
+● qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch6-ar-eval-20260809
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch6-ar-eval-20260809
+    数量: 23 个 checkpoint   合计 24.92 GB
+    步数: step 5000 → 115000   最新写入: 2026-08-10 08:35
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260810-010807                  1.08 GB  2026-08-10 00:47
+        epoch_0_step_10000-20260810-012929                 1.08 GB  2026-08-10 01:08
+        epoch_0_step_15000-20260810-015046                 1.08 GB  2026-08-10 01:29
+        epoch_0_step_20000-20260810-021158                 1.08 GB  2026-08-10 01:50
+        epoch_0_step_25000-20260810-023324                 1.08 GB  2026-08-10 02:11
+        epoch_1_step_30000-20260810-025437                 1.08 GB  2026-08-10 02:33
+        epoch_1_step_35000-20260810-031552                 1.08 GB  2026-08-10 02:54
+        epoch_1_step_40000-20260810-033717                 1.08 GB  2026-08-10 03:15
+        epoch_1_step_45000-20260810-035829                 1.08 GB  2026-08-10 03:37
+        epoch_1_step_50000-20260810-041944                 1.08 GB  2026-08-10 03:58
+        epoch_2_step_55000-20260810-044109                 1.08 GB  2026-08-10 04:19
+        epoch_2_step_60000-20260810-050222                 1.08 GB  2026-08-10 04:41
+        epoch_2_step_65000-20260810-052340                 1.08 GB  2026-08-10 05:02
+        epoch_2_step_70000-20260810-054507                 1.08 GB  2026-08-10 05:23
+        epoch_2_step_75000-20260810-060621                 1.08 GB  2026-08-10 05:45
+        epoch_3_step_80000-20260810-062745                 1.08 GB  2026-08-10 06:06
+        epoch_3_step_85000-20260810-064905                 1.08 GB  2026-08-10 06:27
+        epoch_3_step_90000-20260810-071021                 1.08 GB  2026-08-10 06:49
+        epoch_3_step_95000-20260810-073146                 1.08 GB  2026-08-10 07:10
+        epoch_3_step_100000-20260810-075305                1.08 GB  2026-08-10 07:31
+        epoch_3_step_105000-20260810-081422                1.08 GB  2026-08-10 07:53
+        epoch_4_step_110000-20260810-083550                1.08 GB  2026-08-10 08:14
+        epoch_4_step_115000-20260810-085711                1.08 GB  2026-08-10 08:35
+
+● qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch6-ar-eval-20260809
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-difference-pool-domino-all36-b16-l5-6node-050809101112-bs1-epoch6-ar-eval-20260809
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 120000 → 120000   最新写入: 2026-08-10 08:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_120000                                1.08 GB  2026-08-10 08:57
+
+● qwen3-4b-static-non-pre-norm-linear-gate-difference-pool-domino-all36-b16-l5-2node-1516-bs2acc1-epoch4-ar-eval-20260806
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-linear-gate-difference-pool-domino-all36-b16-l5-2node-1516-bs2acc1-epoch4-ar-eval-20260806
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 40000 → 40000   最新写入: 2026-08-06 22:31
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_40000                                 1.08 GB  2026-08-06 22:31
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-no-anchor-pool-domino-all36-b16-l5-4node-09101112-bs2-lr1p2e-3-epoch4-ar-eval-20260819
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-no-anchor-pool-domino-all36-b16-l5-4node-09101112-bs2-lr1p2e-3-epoch4-ar-eval-20260819
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-19 23:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.08 GB  2026-08-19 23:40
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260806
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260806
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 200000 → 200000   最新写入: 2026-08-10 16:25
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_5_step_200000                                1.08 GB  2026-08-10 16:25
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260810
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260810
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-10 10:38
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.08 GB  2026-08-10 10:38
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-aggressive-slot-delta-l0-anchor-only-prepend-mask-sink-all36-b8-l7-4node-09101112-fromscratch-bs2-lr1e-3-wd1e-2-epoch3-anchor-grad-attn-sink-metrics50-flex-20260826-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-aggressive-slot-delta-l0-anchor-only-prepend-mask-sink-all36-b8-l7-4node-09101112-fromscratch-bs2-lr1e-3-wd1e-2-epoch3-anchor-grad-attn-sink-metrics50-flex-20260826-retry3
+    数量: 1 个 checkpoint   合计 1.48 GB
+    步数: step 20000 → 20000   最新写入: 2026-08-26 08:51
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_20000                                 1.48 GB  2026-08-26 08:51
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-elementwise-g1-unified-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260825
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-elementwise-g1-unified-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260825
+    数量: 1 个 checkpoint   合计 1.18 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-25 17:18
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 1.18 GB  2026-08-25 17:18
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-unified-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260825-retry1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-unified-all36-b8-l5-2node-1011-fromscratch-bs2-lr1p2e-3-epoch3-metrics50-flex-20260825-retry1
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-25 15:29
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 1.08 GB  2026-08-25 15:29
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-vscale-unified-all36-b8-l7-2node-1011-fromscratch-bs2-lr4e-3-epoch3-ma-metrics50-flex-20260825
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-post-norm-vscale-unified-all36-b8-l7-2node-1011-fromscratch-bs2-lr4e-3-epoch3-ma-metrics50-flex-20260825
+    数量: 1 个 checkpoint   合计 1.48 GB
+    步数: step 20000 → 20000   最新写入: 2026-08-25 22:13
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_20000                                 1.48 GB  2026-08-25 22:13
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-pre-norm-vscale-unified-all36-b8-l7-2node-0912-fromscratch-bs2-lr4e-3-epoch3-ma-metrics50-flex-20260825
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-pre-norm-vscale-unified-all36-b8-l7-2node-0912-fromscratch-bs2-lr4e-3-epoch3-ma-metrics50-flex-20260825
+    数量: 1 个 checkpoint   合计 1.48 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-25 21:54
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 1.48 GB  2026-08-25 21:54
+
+● qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-two-tap-conv-all36-b16-l5-4node-09101112-bs2-lr1p2e-3-epoch3-ar-eval-20260820
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-difference-pool-domino-two-tap-conv-all36-b16-l5-4node-09101112-bs2-lr1p2e-3-epoch3-ar-eval-20260820
+    数量: 1 个 checkpoint   合计 1.11 GB
+    步数: step 59253 → 59253   最新写入: 2026-08-20 09:07
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_59253                                 1.11 GB  2026-08-20 09:07
+
+● qwen3-4b-static-non-pre-norm-one-gate-no-embedding-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260810
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-no-embedding-difference-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260810
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 150000 → 150000   最新写入: 2026-08-11 01:47
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_150000                                1.08 GB  2026-08-11 01:47
+
+● qwen3-4b-static-non-pre-norm-one-gate-no-embedding-difference-pool-domino-all36-b16-l5-2node-1516-bs2acc1-epoch4-ar-eval-20260806
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-no-embedding-difference-pool-domino-all36-b16-l5-2node-1516-bs2acc1-epoch4-ar-eval-20260806
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 80000 → 80000   最新写入: 2026-08-07 09:03
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_80000                                 1.08 GB  2026-08-07 09:03
+
+● qwen3-4b-static-non-pre-norm-one-gate-no-embedding-difference-pool-domino-all36-b16-l5-6node-131415161718-bs1-epoch6-ar-eval-20260809
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-one-gate-no-embedding-difference-pool-domino-all36-b16-l5-6node-131415161718-bs1-epoch6-ar-eval-20260809
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 120000 → 120000   最新写入: 2026-08-10 09:00
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_4_step_120000                                1.08 GB  2026-08-10 09:00
+
+● qwen3-4b-static-non-pre-norm-residual-stream-beta-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260811-rerun2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-residual-stream-beta-pool-domino-all36-b16-l5-2node-1011-bs2acc1-epoch4-ar-eval-20260811-rerun2
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 120000 → 120000   最新写入: 2026-08-12 01:57
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_120000                                1.08 GB  2026-08-12 01:57
+
+● qwen3-4b-static-non-pre-norm-residual-stream-difference-pool-domino-all36-b16-l5-6node-050809101112-bs2-epoch4-ar-eval-20260810
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-static-non-pre-norm-residual-stream-difference-pool-domino-all36-b16-l5-6node-050809101112-bs2-epoch4-ar-eval-20260810
+    数量: 8 个 checkpoint   合计 8.67 GB
+    步数: step 5000 → 40000   最新写入: 2026-08-11 08:25
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260811-035646                  1.08 GB  2026-08-11 03:12
+        epoch_0_step_10000-20260811-044139                 1.08 GB  2026-08-11 03:56
+        epoch_1_step_15000-20260811-052625                 1.08 GB  2026-08-11 04:41
+        epoch_1_step_20000-20260811-061110                 1.08 GB  2026-08-11 05:26
+        epoch_1_step_25000-20260811-065601                 1.08 GB  2026-08-11 06:11
+        epoch_2_step_30000-20260811-074043                 1.08 GB  2026-08-11 06:56
+        epoch_2_step_35000-20260811-082538                 1.08 GB  2026-08-11 07:40
+        epoch_3_step_40000-20260811-091021                 1.08 GB  2026-08-11 08:25
+
+● qwen3-4b-static-non-pre-norm-residual-stream-difference-pool-domino-all36-b16-l5-6node-050809101112-bs2-epoch4-ar-eval-20260810
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-non-pre-norm-residual-stream-difference-pool-domino-all36-b16-l5-6node-050809101112-bs2-epoch4-ar-eval-20260810
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 45000 → 45000   最新写入: 2026-08-11 09:10
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_45000                                 1.08 GB  2026-08-11 09:10
+
+● qwen3-4b-static-recurrent-kv-target-embedding-hidden-states-bare-gate-all36-b16-l5-4node-09101112-epoch3-20260911
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-recurrent-kv-target-embedding-hidden-states-bare-gate-all36-b16-l5-4node-09101112-epoch3-20260911
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 60000 → 60000   最新写入: 2026-09-11 09:19
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_60000                                 1.08 GB  2026-09-11 09:19
+
+● qwen3-4b-static-recurrent-kv-target-embedding-hidden-states-bare-gate-all36-b16-l5-4node-09101112-mix-epoch3-20260911
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-recurrent-kv-target-embedding-hidden-states-bare-gate-all36-b16-l5-4node-09101112-mix-epoch3-20260911
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 59253 → 59253   最新写入: 2026-09-12 06:04
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_59253                                 1.08 GB  2026-09-12 06:04
+
+● qwen3-4b-static-strict-accept-hist-eval-node10-20260817
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-accept-hist-eval-node10-20260817
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 16:06
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 16:06
+
+● qwen3-4b-static-strict-loss-decomp-eval-node10-20260817
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-loss-decomp-eval-node10-20260817
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 13:53
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 13:53
+
+● qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry2
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry2
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 14:08
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 14:08
+
+● qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry3
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 14:12
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 14:12
+
+● qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry4
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry4
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 14:15
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 14:15
+
+● qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry5
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry5
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 14:18
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 14:18
+
+● qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry6
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-loss-decomp-eval-node10-20260817-retry6
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 14:21
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 14:21
+
+● qwen3-4b-static-strict-prefix-accept-eval-node10-20260817
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-strict-prefix-accept-eval-node10-20260817
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 0 → 0   最新写入: 2026-08-17 15:50
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_0                                     1.08 GB  2026-08-17 15:50
+
+● qwen3-4b-static-target-embedding-hidden-states-bare-gate-all36-b16-l5-4node-08101112-bs2-globalbs64-lr6e-4-epoch3-raw-perfectblend-20260908
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-static-target-embedding-hidden-states-bare-gate-all36-b16-l5-4node-08101112-bs2-globalbs64-lr6e-4-epoch3-raw-perfectblend-20260908
+    数量: 1 个 checkpoint   合计 1.08 GB
+    步数: step 65436 → 65436   最新写入: 2026-09-09 08:04
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_3_step_65436                                 1.08 GB  2026-09-09 08:04
+
+● qwen3-4b-two-dim-difference-linear-pure-pool-domino-all36-b16-l5-2node-0509-bs2acc1-epoch4-ar-eval-20260804
+    位置: [/data/guorui/checkpoint-trash] /data/guorui/checkpoint-trash/qwen3-4b-two-dim-difference-linear-pure-pool-domino-all36-b16-l5-2node-0509-bs2acc1-epoch4-ar-eval-20260804
+    数量: 1 个 checkpoint   合计 1.09 GB
+    步数: step 5000 → 5000   最新写入: 2026-08-04 21:49
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000-20260804-224014                  1.09 GB  2026-08-04 21:49
+
+● qwen3-4b-two-dim-difference-linear-pure-pool-domino-all36-b16-l5-2node-0509-bs2acc1-epoch4-ar-eval-20260804
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3-4b-two-dim-difference-linear-pure-pool-domino-all36-b16-l5-2node-0509-bs2acc1-epoch4-ar-eval-20260804
+    数量: 1 个 checkpoint   合计 1.09 GB
+    步数: step 10000 → 10000   最新写入: 2026-08-04 22:40
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_10000                                 1.09 GB  2026-08-04 22:40
+
+● qwen3.5-4b-dflash2-legacy-b8-2node-1314-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.5-4b-dflash2-legacy-b8-2node-1314-retry3
+    数量: 1 个 checkpoint   合计 1.27 GB
+    步数: step 500 → 500   最新写入: 2026-09-01 01:15
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_500                                   1.27 GB  2026-09-01 01:15
+
+● qwen3.5-4b-dflash2-legacy-b8-2node-1314-strict-resume1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.5-4b-dflash2-legacy-b8-2node-1314-strict-resume1
+    数量: 1 个 checkpoint   合计 1.27 GB
+    步数: step 110000 → 110000   最新写入: 2026-09-01 19:39
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_110000                                1.27 GB  2026-09-01 19:39
+
+● qwen3.5-4b-dflash2-legacy-b8-4node-13141718-restart1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.5-4b-dflash2-legacy-b8-4node-13141718-restart1
+    数量: 1 个 checkpoint   合计 1.27 GB
+    步数: step 500 → 500   最新写入: 2026-09-01 01:26
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_500                                   1.27 GB  2026-09-01 01:26
+
+● qwen3.5-4b-dflash2-static-gate-pool-all32-b8-1node-gpu012-dpace-normalized-10k-20260901
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.5-4b-dflash2-static-gate-pool-all32-b8-1node-gpu012-dpace-normalized-10k-20260901
+    数量: 1 个 checkpoint   合计 1.27 GB
+    步数: step 5000 → 5000   最新写入: 2026-09-01 09:07
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_5000                                  1.27 GB  2026-09-01 09:07
+
+● qwen3.5-4b-dflash2-static-gate-pool-all32-b8-2node-1011-anchor256-resume70000
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.5-4b-dflash2-static-gate-pool-all32-b8-2node-1011-anchor256-resume70000
+    数量: 1 个 checkpoint   合计 1.27 GB
+    步数: step 110000 → 110000   最新写入: 2026-09-01 14:54
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_110000                                1.27 GB  2026-09-01 14:54
+
+● qwen3.5-4b-dflash2-static-gate-pool-all32-b8-2node-1011-strict-resume1
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.5-4b-dflash2-static-gate-pool-all32-b8-2node-1011-strict-resume1
+    数量: 3 个 checkpoint   合计 3.81 GB
+    步数: step 60000 → 70000   最新写入: 2026-09-01 10:39
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_1_step_60000                                 1.27 GB  2026-09-01 09:30
+        epoch_1_step_65000                                 1.27 GB  2026-09-01 10:05
+        epoch_1_step_70000                                 1.27 GB  2026-09-01 10:39
+
+● qwen3.5-4b-static-non-pre-norm-one-gate-difference-pool-domino-two-tap-conv-all32-b8-l5-3node-101112-bs2-lr1p2e-3-epoch3-ar-eval-20260830-retry3
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.5-4b-static-non-pre-norm-one-gate-difference-pool-domino-two-tap-conv-all32-b8-l5-3node-101112-bs2-lr1p2e-3-epoch3-ar-eval-20260830-retry3
+    数量: 1 个 checkpoint   合计 1.12 GB
+    步数: step 80000 → 80000   最新写入: 2026-08-31 09:21
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_2_step_80000                                 1.12 GB  2026-08-31 09:21
+
+● qwen3.6-27b-domino-sharegpt-full-b16-l5-2node-1011-tp8-triton-mem45-fullshard-localcache-retry8-bs1acc2-epoch3-20260807
+    位置: [outputs] /share/guorui/投机解码训练/SpecForge/outputs/qwen3.6-27b-domino-sharegpt-full-b16-l5-2node-1011-tp8-triton-mem45-fullshard-localcache-retry8-bs1acc2-epoch3-20260807
+    数量: 1 个 checkpoint   合计 3.38 GB
+    步数: step 12000 → 12000   最新写入: 2026-08-07 19:01
+    权重文件: model.safetensors  + dflash.py/config.json/training_state.pt
+        epoch_0_step_12000                                 3.38 GB  2026-08-07 19:01
+
+==============================================================================================================
+二、按最近写入时间排序（前 40）
+==============================================================================================================
+  2026-09-12 06:04    1.08 GB  [outputs] qwen3-4b-static-recurrent-kv-target-embedding-hidden-states-bare-gate-all36-b16-l5-4node-09101112-mix-epoch3-20260911/epoch_3_step_59253
+  2026-09-11 21:06    0.25 GB  [outputs] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_140000
+  2026-09-11 20:53    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_135000-20260911-130635
+  2026-09-11 20:40    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_130000-20260911-125337
+  2026-09-11 20:27    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_125000-20260911-124039
+  2026-09-11 20:14    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_120000-20260911-122738
+  2026-09-11 20:01    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_115000-20260911-121443
+  2026-09-11 19:48    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_110000-20260911-120142
+  2026-09-11 19:35    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_105000-20260911-114844
+  2026-09-11 19:22    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_100000-20260911-113546
+  2026-09-11 19:09    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_95000-20260911-112253
+  2026-09-11 18:56    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_1_step_90000-20260911-110956
+  2026-09-11 18:44    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_85000-20260911-105658
+  2026-09-11 18:31    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_80000-20260911-104401
+  2026-09-11 18:18    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_75000-20260911-103105
+  2026-09-11 18:05    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_70000-20260911-101807
+  2026-09-11 17:52    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_65000-20260911-100512
+  2026-09-11 17:39    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_60000-20260911-095217
+  2026-09-11 17:26    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_55000-20260911-093922
+  2026-09-11 17:13    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_50000-20260911-092626
+  2026-09-11 17:00    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_45000-20260911-091331
+  2026-09-11 16:47    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_40000-20260911-090038
+  2026-09-11 16:34    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_35000-20260911-084746
+  2026-09-11 16:21    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_30000-20260911-083451
+  2026-09-11 16:09    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_25000-20260911-082154
+  2026-09-11 15:56    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_20000-20260911-080900
+  2026-09-11 15:43    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_15000-20260911-075606
+  2026-09-11 15:30    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_10000-20260911-074310
+  2026-09-11 15:17    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_5000-20260911-073018
+  2026-09-11 15:00    0.25 GB  [outputs] q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_35000
+  2026-09-11 14:49    0.25 GB  [outputs] q3-06-static-one-gate-difference-pool-domino-b8-l5-1node-002-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_5000
+  2026-09-11 14:47    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_30000-20260911-070050
+  2026-09-11 14:34    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_25000-20260911-064738
+  2026-09-11 14:21    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_20000-20260911-063428
+  2026-09-11 14:08    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_15000-20260911-062123
+  2026-09-11 13:55    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_10000-20260911-060813
+  2026-09-11 13:41    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_5000-20260911-055505
+  2026-09-11 13:23    0.25 GB  [outputs] q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_55000
+  2026-09-11 13:10    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_50000-20260911-052328
+  2026-09-11 12:54    0.25 GB  [cache/checkpoint-trash] q3-06-static-one-gate-difference-pool-domino-sink-gated-norm-b8-l5-1node-011-fromscratch-bs2-globalbs16-epoch2-gamma7-eval1k-20260911/epoch_0_step_45000-20260911-051013
