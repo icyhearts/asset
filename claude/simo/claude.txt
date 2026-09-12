@@ -4480,3 +4480,32 @@ rvv instrinsic 函数在哪个头文件声明的 ？
 
 把答案追加到 like-useful/answer_codex_v6.md
 }
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sikernel 代码位于 /softhome/like/package/sikernel
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+
+sipu sdk 目录位于 /share_data/sicx_sdk/release/latest/
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+
+
+从sikernel code base的  source/source_builtin/attention/rms_norm/test/test_host.cpp 入手, 一个运行例子:
+运行方法是  先在 sikernel code base source setup.sh
+然后:
+cd source/source_builtin/attention/rms_norm
+bash build.sh
+./build/test_host
+运行日志 /share/users/like/package/sikernel/source/source_builtin/attention/rms_norm/run.log
+
+
+
+
+sikernel code base source/source_builtin/attention/rms_norm/kernel/rms_norm_kernel_bf16.hpp rms_norm_bf16_kernel , 97    行   f32_din.m2e0 = tcvt_f32(bf16_din, t_r32)， 106     行  bf16_out = tcvt_bf16(f32_out.m2e0, t_r32), tcvt_f32 的第2个参数是什么含义？为什么传 t_r32? tcvt_bf16 的第2个参数是什么含义？ 为什么仍旧传 t_r32?
+
+把答案追加到 like-useful/answer_codex_v6.md
+}
