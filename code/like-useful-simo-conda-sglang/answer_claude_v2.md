@@ -3204,9 +3204,9 @@ Filesystem            Size  Used Avail Use% Mounted on
 | `yufne/ShareGPT4Video` | 1.4T | 数据集 |
 | `weihongyang/JDJV` +
 `pengkunfu/JDJV` | 1.2T + 1.2T | 同名项目，疑似重复，建议比对 | #done
-| `weihongyang/ml-fastvlm/output` | 1.2T | 训练输出 |
+| `weihongyang/ml-fastvlm/output` | 1.2T | 训练输出 |# done
 | `pengkunfu/JDJV/GaussianOcc` | 1.1T | |
-| `weihongyang/evalscope_latest` | 651G | 评测工作副本，可重建 |
+| `weihongyang/evalscope_latest` | 651G | 评测工作副本，可重建 |# done
 | `caolujing/data/images` + `imagenet` | 245G + 151G | 数据集 |
 | `mtang/.cache` | 344G | 可 `rm -rf` 后重建 |
 | `guorui/home_cache`（tvm-ffi/deep_gemm/torch_compile） | 79G | 可重建 |
