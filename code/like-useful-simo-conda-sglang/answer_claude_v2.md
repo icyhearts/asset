@@ -7736,3 +7736,312 @@ hm.register_forward_hooks = register_forward_hooks_with_pre
 - **多 pass 的意义**：逐步对拍，定位"第几步开始偏"——prefill 和 decode 走不同 kernel 路径，必须分步比。每个 pass 存同一套 10 个文件名；`_seen_in_pass` 只在**单 pass 内**去重。
 - **重跑先清空**：`_clear_previous_run()` 会 `rmtree` 所有 `pass_*`。目录路径含 `model_id/launch_config/test_case/device` 四个维度做隔离；`tp>1` 时再多一层 `rank{N}/`。
 - **一个隐患**：`_patch_hook_registration()` 的猴子补丁**没生效**（`from X import Y` 的绑定在 import 时就固定了），日志里 13 条全是上游措辞可证。本次无影响，但视觉模型的 `vision_attn_plus_residual` pre-hook 在 CUDA 上会静默不工作。
+
+---
+
+## 58. `run-sipu.log.2026_09_12___22_48_30` 失败原因
+
+**问题**：在 `test/srt/sipu/` 用
+```
+SIPU_TEST_CONTAINER=sipu-dev-dump bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml --launch-config deepep_deepgemm_text \
+  --test-case text-only --device sipu > run-sipu.log.`nowstr.sh` 2>&1
+```
+跑 `sipu` 设备，脚本失败。日志停在 `setup_tilelang.sh` 的 CMODEL 加载块末尾，**没有任何报错**。
+
+**答（一句话）**：**`setup_tilelang.sh:34` 在 `set -eo pipefail` 下静默退出** —— 那行 `CURRENT_VERSION="$(python -m pip show tilelang ... | awk ...)"` 是一条**管道赋值**，容器里 **tilelang 没装** → `pip show` 返回 1 → `pipefail` 把管道标成失败 → `set -e` 直接终止整个 `bash -lc`。**因为进程是"正常退出"（exit 1）而非报错，日志里连一行错误都没有**，所以看起来像"卡住/莫名失败"。
+
+**修复**：`sipu-dev-dump` 容器**已经装好 tilelang**了（见 58.5），直接**重跑即可**。若想根治，给 `setup_tilelang.sh:34` 补一个 `|| true`（sibling 的 `setup.sh:26` 就是这么写的，见 58.6）。
+
+---
+
+### 58.0 一句话结论表
+
+| 项 | 值 |
+| --- | --- |
+| 失败脚本 | `setup_tilelang.sh`（容器内 `/sgl-workspace/sgl-kernel-sipu/`） |
+| 失败行 | **`:34`** `CURRENT_VERSION="$(python -m pip show tilelang 2>/dev/null \| awk '/^Version:/ {print $2}')"` |
+| 触发条件 | 容器内 **tilelang 未安装** → `pip show` 返回 **1** |
+| 放大机制 | `run_test.sh` 的 `set -eo pipefail` 被 `docker exec ... bash -lc` 继承 → `pipefail` 让管道整体失败 → `set -e` 终止 |
+| 为什么没报错 | 是**静默退出**（exit 1），不是抛出异常；`setup_tilelang.sh` 里那条"找不到 whl"的友好提示在**上一版**路径下才会触发，与本次路径无关 |
+| 当前状态 | **tilelang 已装好**（`0.1.13+sicx.v0.1.0.cpu.git8343f08d`），重跑即可 |
+| 建议修法 | `:34` 行末加 `\|\| true`（与 `setup.sh:26` 一致） |
+
+---
+
+### 58.1 现象：日志"凭空断掉"，没有任何错误
+
+日志 `/share/users/like/package/sglang_sipu/test/srt/sipu/run-sipu.log.2026_09_12___22_48_30`（184 行）：
+
+```
+$ grep -niE "error|traceback|failed|no such file|cannot|exception" run-...log.2026_09_12___22_48_30
+(无输出)
+```
+
+**整个日志一条错误都没有。** 最后 8 行是 CMODEL 的 `LD_LIBRARY_PATH` 和分隔线，然后就结束了：
+
+```
+========== Environment ==========
+SI_CMODEL_ROOT: /share_data/arch_cmodel_release/sipu1.5/2608270400
+SI_CMODEL_HW_ARCH: 1.5
+LD_LIBRARY_PATH: .../lib:.../lib:.../lib
+=================================      ← 到此为止
+```
+
+`mtime=2026-09-12 22:48:45`，脚本 22:48:30 启动，**15 秒后就没了**。这种"没有错误就结束"的形态，第一嫌疑人就是 **`set -e` 静默退出**。
+
+### 58.2 定位：三条 `source`，卡在第三条
+
+`run_test.sh` 的 CUDA 分支跑的是（日志 125 行可见）：
+
+```bash
+cd /sgl-workspace/sgl-kernel-sipu
+source setup.sh              # ①
+source setup_triton.sh       # ②
+source setup_tilelang.sh     # ③
+python3 -u .../run_test_job.py ...
+```
+
+日志里的 SDK 加载块正好 **3 个**，可以逐个对上：
+
+| 块 | 行 | 末尾独有标记 | 对应 |
+| --- | --- | --- | --- |
+| 1 | 131-148 | `siinfer version 0.3.6+... is already installed` | **`setup.sh`**（`setup.sh:36` 打这行） |
+| 2 | 150-168 | `Triton version 3.3.1+siorigin.v0.6.0... is already installed` | **`setup_triton.sh`**（`setup_triton.sh:42` 打这行） |
+| 3 | 170-184 | **（没有任何"已安装"行）** | **`setup_tilelang.sh`** ← 卡在这 |
+
+第 1、2 块各自打到自己的"satisfied"行就过去了；**第 3 块打完了 SDK/CMODEL 环境信息后直接没了** —— 而 `setup_tilelang.sh` 里打环境信息的正是第 15、22 行的 `source`，**紧接着的第 24-34 行就是失败点**。
+
+用健康的容器把同一条链跑一遍做对照（输出重定向到文件）：
+
+```bash
+docker exec sipu-dev-dump bash -lc '
+cd /sgl-workspace/sgl-kernel-sipu
+source setup.sh >/tmp/a.log 2>&1;         echo "rc=$?"   # rc=0
+source setup_triton.sh >/tmp/b.log 2>&1;  echo "rc=$?"   # rc=0
+source setup_tilelang.sh >/tmp/c.log 2>&1; echo "rc=$?"  # rc=0
+'
+```
+
+对照文件 `/tmp/c.log` 的**最后三行**，正是第三条脚本应当输出、而失败日志里缺失的内容：
+
+```
+TileLang 0.1.13+sicx.v0.1.0.cpu.git8343f08d is already installed
+Composable Kernel is not installed or found in the expected path
+TileLang loaded from: /usr/local/lib/python3.10/dist-packages/tilelang/__init__.py
+```
+
+**所以"断点"精确落在 `setup_tilelang.sh` 的第 24 行之前 / 之后。**
+
+### 58.3 根因：`set -e` + `pipefail` + `pip show` 返回非零
+
+`setup_tilelang.sh:24-41`：
+
+```bash
+24: TILELANG_WHL_PATH="$(head -1 "$SCRIPT_DIR/tilelang_whl_path.txt")"
+25: if [ ! -f "$TILELANG_WHL_PATH" ]; then
+26:     echo "Error: TileLang wheel file not found: $TILELANG_WHL_PATH"
+27:     echo "Please map /share_data/tilelang into the container."
+28:     return 1
+29: fi
+30:
+31: WHEEL_FILENAME="$(basename "$TILELANG_WHL_PATH")"
+32: WHEEL_VERSION="${WHEEL_FILENAME#tilelang-}"
+33: WHEEL_VERSION="${WHEEL_VERSION%%-cp*}"
+34: CURRENT_VERSION="$(python -m pip show tilelang 2>/dev/null | awk '/^Version:/ {print $2}')"   # ★
+35:
+36: if [ "$CURRENT_VERSION" != "$WHEEL_VERSION" ]; then
+37:     echo "Installing TileLang from: $TILELANG_WHL_PATH"
+38:     python -m pip install "$TILELANG_WHL_PATH"
+39: else
+40:     echo "TileLang $CURRENT_VERSION is already installed"
+41: fi
+```
+
+**第 34 行是一条管道。** 当 tilelang **没安装**时：
+
+- `python -m pip show tilelang` → **退出码 1**（`WARNING: Package(s) not found: tilelang`）
+- `awk` → 退出码 0，无输出
+- **`pipefail`** 让管道整体取**最后一个非零**退出码 → 管道 = **1**
+- 这是**纯赋值**（`VAR=$(...)` 无命令名），不在 `if`/`&&`/`||` 等"豁免位置" → **`set -e` 直接终止**
+
+实测（在容器里跑，完全复刻这两级语义）：
+
+```bash
+# 带 pipefail（= run_test.sh 的真实环境）
+$ bash -c 'set -eo pipefail; V="$(python -m pip show definitely-not-real-xyz 2>/dev/null | awk "/^Version:/{print \$2}")"; echo REACHED'
+(无输出，rc=1)                    ← 死在第 34 行，后面的 echo 根本没到
+
+# 不带 pipefail（对照组）
+$ bash -c 'set -e;          V="$(python -m pip show definitely-not-real-xyz 2>/dev/null | awk "/^Version:/{print \$2}")"; echo REACHED'
+REACHED                            ← 活着
+```
+
+**`pipefail` 是关键。** 没有它时，管道的退出码取最后一个命令（`awk`，恒为 0），`set -e` 不会触发；加上它，`pip show` 的失败才传导上来。
+
+**为什么 `-e` 在这里必须生效**：`run_test.sh` 开头 `set -eo pipefail`，而执行命令是
+
+```bash
+docker exec ... sipu-dev-dump bash -lc '
+set -eo pipefail                 ← 又一次显式设置
+source setup.sh
+source setup_triton.sh
+source setup_tilelang.sh
+python3 -u .../run_test_job.py ...
+'
+```
+
+`bash -lc` 里那句 `set -eo pipefail` 是**显式重设**的，所以脚本嵌套多深都不会被"子 shell 重置"救回来。三层全部落在这个 `set -e` 之下。
+
+**为什么日志里没有 `Installing TileLang ...` 也没有 `already installed`**：这两行都在 **34 行之后**（37/40 行），而进程在 34 行就没了 —— 与日志表现**完全一致**。
+
+### 58.4 佐证：三次跑的日志形态变化
+
+同目录下还有两次更早的尝试，把过程串起来了：
+
+| 时间 | 日志 | 结尾 | 说明 |
+| --- | --- | --- | --- |
+| 22:18:20 | `run-sipu.log.2026_09_12___22_18_20` | `Error: TileLang wheel file not found: .../sicx_tilelang_dev/latest/tilelang-...whl` | **友好报错**。当时 `tilelang_whl_path.txt` 还指向 `latest/`，而那里只剩 `0.1.14` 的 whl（文件名对不上）→ **第 25 行的 `[ ! -f ]` 命中**，打了提示并 `return 1` |
+| 22:42:55 | — | — | 编辑前备份：`tilelang_whl_path.txt.back` 落盘 |
+| 22:43:09 | — | — | `tilelang_whl_path.txt` 改成 `archive/...` 路径（**备份比改动早 14 秒**） |
+| 22:43:29 | `run-sipu.log.2026_09_12___22_43_29` | **无报错，直接停** | 路径改对了，`[ ! -f ]` 不再命中 → 越过 25 行 → **撞上 34 行** |
+| 22:48:30 | `run-sipu.log.2026_09_12___22_48_30` | **无报错，直接停** | 同上（重试） |
+
+**这解释了一个反直觉的转折**：改路径**修好了 A 问题（whl 找不到），却暴露出 B 问题（`pip show` 静默退出）**。而 B 的表现比 A"更差"——A 至少有明确提示，B 什么都没有。这就是为什么"改完路径反而变成莫名失败"。
+
+两次路径的对照：
+
+```
+.back（旧，22:42:55）  /share_data/tilelang/sicx_tilelang_dev/latest/tilelang-...whl     ← 不存在
+当前（新，22:43:09）  /share_data/tilelang/sicx_tilelang_dev/archive/tilelang-...whl    ← 存在
+```
+
+旧路径不存在的**真正原因不是 `latest` 坏了，而是 `latest` 已经指向了更新的版本**：
+
+```bash
+$ readlink /share_data/tilelang/sicx_tilelang_dev/latest
+/share_data/tilelang/sicx_tilelang_dev/260911        # 存在，但里面是 0.1.14
+
+$ ls /share_data/tilelang/sicx_tilelang_dev/latest/
+tilelang-0.1.14+sicx.v0.1.0.cpu.git74900636-cp39-abi3-linux_x86_64.whl
+tilelang-0.1.14+sicx.v0.1.0.cpu.git8cc10d81-cp39-abi3-linux_x86_64.whl
+```
+
+**`latest/` 下只有 `0.1.14` 的 wheel，而要找的是 `0.1.13+...git8343f08d` 那个具体版本** —— 文件名对不上，所以 `[ ! -f ]` 命中。`260911/` 目录本身是好的，只是里面没有旧版本。
+
+**这也解释了为什么"改路径"是正确的修法**：`0.1.13+...git8343f08d` 这个特定版本只留存在 `archive/` 里。`latest` 是**滚动更新的**（今天指向 260911 的 0.1.14），**不适合用来 pin 一个确定的版本** —— 这本身就是个值得注意的用法问题：`tilelang_whl_path.txt` 要固定版本，就该指向 `archive/` 的具体文件，而不是 `latest/`。
+
+所以 22:18 那次报的错是**真问题**，改成 `archive/` 是**对的** —— 只是改完撞上了下一个坑。
+
+### 58.5 当前状态：tilelang 现在已装好
+
+排查过程中确认了容器内 tilelang 的安装状态：
+
+```bash
+# 排查开始时
+$ docker exec sipu-dev-dump python -c "import tilelang"
+ModuleNotFoundError: No module named 'tilelang'
+$ docker exec sipu-dev-dump python -m pip show tilelang
+WARNING: Package(s) not found: tilelang          ← 正是 34 行失败的根因
+
+# 执行 pip install 后（23:02:40 落盘）
+$ docker exec sipu-dev-dump python -c "import tilelang; print(tilelang.__version__)"
+0.1.13+sicx.v0.1.0.cpu.git8343f08d
+```
+
+**`sipu-dev-dump` 是个新建的容器**：`docker inspect` 的 `Created=2026-09-12T14:41:45Z` = **22:41:45 CST**。
+
+这个时间点很关键 —— 它**晚于** 22:18:20 那次运行，而那次运行日志里也有 `Stopping/Starting sipu-dev-dump`，说明**22:18 用的是同名但更早的一个容器实例，中间被重建过**。重建后的新容器是从镜像起的，**只装了 `setup.sh` / `setup_triton.sh` 覆盖的包，没有 tilelang**（`setup_tilelang.sh` 本来就是负责装它的，设计上就假设它可能不存在）—— 这正是"老容器能跑、新容器挂"的原因。
+
+改过 `tilelang_whl_path.txt` 的时间也对得上这个新容器：
+
+| 时刻（CST） | 事件 |
+| --- | --- |
+| 22:41:45 | 容器 `sipu-dev-dump` 创建 |
+| 22:42:55 | `tilelang_whl_path.txt.back` 落盘（备份镜像里的原内容，指向 `latest/`） |
+| 22:43:09 | `tilelang_whl_path.txt` 改成 `archive/` 路径 |
+| 22:43:29 | 运行 → 静默失败 |
+| 22:48:30 | 重跑 → 静默失败 |
+
+**注意 `/sgl-workspace/sgl-kernel-sipu` 不在容器的 bind mount 列表里**（挂载只有 `/share_data`、`/share`、`/share2`、`/data_gpu`、`/softhome`，以及 `/share/users/like/package/sglang_sipu -> /sgl-workspace/sglang`）。也就是说 **`setup_tilelang.sh` 和那个 `tilelang_whl_path.txt` 是容器内（镜像/可写层）的文件，不是宿主机上 `sglang` 目录里的文件** —— 改它们得 `docker exec` 进容器改，改宿主机对应路径是无效的。
+
+**挂载本身是齐的，不是问题所在** —— 全部映射如下，`/share_data` 已挂进来：
+
+```
+bind  /share_data      -> /share_data      (rw=true)
+bind  /share/users/like/package/sglang_sipu -> /sgl-workspace/sglang  (rw=true)
+bind  /softhome        -> /softhome        (rw=true)
+bind  /data_gpu        -> /data_gpu        (rw=true)
+bind  /share2          -> /share2          (rw=true)
+bind  /share           -> /share           (rw=true)
+```
+
+`/share_data/tilelang/...` 在容器内可见、可读（`ls` 能列出 74 MB 的 whl）。**所以 whl 路径本身没问题**，问题只在"读完路径之后那一步"。
+
+### 58.6 两个附带发现
+
+**(1) 同一个 bug 在 `setup_triton.sh` 里潜伏着。** 三个 setup 脚本用的是同一个写法，但**只有 `setup.sh` 加了 `|| true`**：
+
+```bash
+setup.sh:26           CURRENT_VERSION="$(pip show siinfer ... | awk ...)" || true      ← 有保护
+setup_triton.sh:32    CURRENT_VERSION=$(pip show triton ... | grep "^Version:" | awk ...)  ← 无保护
+setup_tilelang.sh:34  CURRENT_VERSION="$(python -m pip show tilelang ... | awk ...)"   ← 无保护（本次踩中）
+```
+
+实测 `setup_triton.sh:32` 那种写法在包缺失时**同样会死**：
+
+```bash
+$ bash -c 'set -eo pipefail; V=$(pip show definitely-not-real-triton-xyz 2>/dev/null | grep "^Version:" | awk "{print \$2}"); echo REACHED'
+(无输出，rc=1)
+```
+
+**所以"triton 未安装的新容器"上，`setup_triton.sh` 会在同一位置静默退出** —— 只是这个容器里 triton 恰好装好了（日志第 165 行 `Triton version 3.3.1+... is already installed`）才没暴露。**同一个坑，换台机器/换个容器就会再踩一次。**
+
+**(2) 修法。** 最小改动，给 `setup_tilelang.sh:34` 补 `|| true`，与 `setup.sh:26` 对齐：
+
+```bash
+CURRENT_VERSION="$(python -m pip show tilelang 2>/dev/null | awk '/^Version:/ {print $2}')" || true
+```
+
+实测有效——包缺失时变量为空字符串，脚本继续走到第 36 行的判断，走"安装"分支：
+
+```bash
+$ bash -c 'set -eo pipefail; V="$(python -m pip show definitely-not-real-xyz 2>/dev/null | awk "/^Version:/{print \$2}")" || true; echo "REACHED, V=[$V]"'
+REACHED, V=[]        ← 空字符串，正是 36 行 if 期望的"未安装"
+```
+
+**关于 `|| true` 加在哪**：加在 `awk ...` 之后（管道内部）或整个赋值之后都行，**两种写法等价**。因为 `||` 的优先级低于 `|`，`pip show ... | awk ... || true` 会被解析成 `(pip show ... | awk ...) || true` —— `|| true` 作用在**整条管道**上，把 `pipefail` 标出来的失败一并盖掉。实测两种都活：
+
+```bash
+$ bash -c 'set -eo pipefail; V="$(pip show not-real 2>/dev/null | awk "..." || true)";       echo REACHED'
+REACHED
+$ bash -c 'set -eo pipefail; V="$(pip show not-real 2>/dev/null | awk "...")" || true;       echo REACHED'
+REACHED
+```
+
+两种写法下 `V` 都得到**空字符串**（`true` 无输出），正好是第 36 行 `if` 期望的"未安装"。
+
+另一个可选做法是把赋值放进 `if` 条件（`if ! V=$(...) ; then V= ; fi`），因为在 `if` 条件里的失败**不受 `set -e` 约束**（实测 `bash -c 'set -eo pipefail; if python -m pip show xyz | awk "..." ; then echo X; fi; echo SURVIVED'` → 输出 `SURVIVED`）。但改动更大，**推荐 `|| true`**，且与 `setup.sh:26` 的既有写法一致。
+
+### 58.7 立即重跑
+
+tilelang 已装好，**原命令直接重跑即可**：
+
+```bash
+cd /share/users/like/package/sglang_sipu/test/srt/sipu
+SIPU_TEST_CONTAINER=sipu-dev-dump bash test_utils/run_test.sh \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml --launch-config deepep_deepgemm_text \
+  --test-case text-only --device sipu > run-sipu.log.`nowstr.sh` 2>&1
+```
+
+判断是否走通的标志：日志里应出现 `TileLang 0.1.13+sicx.v0.1.0.cpu.git8343f08d is already installed`（走 else 分支）**或** `Installing TileLang from: ...`（走 if 分支），**随后**才是 `run_test_job.py` 的输出（`Dump dir: ...`、`Registered forward hook ...` 等，见 §57）。
+
+**注意**：如上（58.5）所述，`setup_tilelang.sh` 是**容器内**的文件，不在宿主机 bind mount 下 —— 改 `|| true` 要 `docker exec` 进容器改。（不过既然 tilelang 已经装好，**现在不改也能跑**。）
+
+### 58.8 小结
+
+- **失败点在 `setup_tilelang.sh:34`**：一条 `python -m pip show tilelang | awk ...` 的**管道赋值**。
+- **机理**：容器里 tilelang 没装 → `pip show` 返回 1 → **`pipefail`** 把管道标为失败 → **`set -e`** 终止 `bash -lc`。**静默退出、零错误输出**，所以表现为"日志凭空断掉"。
+- **为什么恰好是这一步**：22:18 那次遇到的是"whl 路径不存在"（`latest/` 已失效），有友好报错；22:43:09 把路径改成 `archive/` 之后越过了检查，**才第一次走到 34 行**，于是撞上这个一直存在的隐患。改路径修好了 A，暴露了 B。
+- **当前已装好**（`0.1.13+sicx.v0.1.0.cpu.git8343f08d`，23:02:40 落盘），**重跑即可**。
+- **建议根治**：`setup_tilelang.sh:34` 补 `|| true`；**`setup_triton.sh:32` 有同样的坑**，建议一并修（`setup.sh:26` 已有 `|| true`，可作模板）。
