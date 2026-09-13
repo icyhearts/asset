@@ -4586,3 +4586,17 @@ sipu-dev-dump mount 情况需要你自己查看
 
 把答案追加到 like-useful/answer_codex_v3.md
 }
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+
+ sglang_sipu 代码位于 /share/users/like/package/sglang_sipu, 这是一个在开源 sglang 上做的 sipu 版本的 sglang.
+harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0 这个 sipu版本的 docker image 是如何从  /share/users/like/package/sglang_sipu/docker/ 里面的文件构建出来的?
+如果想构建一个新的 image ，tag取为 v0.5.18-sipu-dev-0.1.0-fix, 应该如何做?
+
+
+把答案追加到 like-useful/answer_codex_v3.md
+}
