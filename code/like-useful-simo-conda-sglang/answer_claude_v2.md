@@ -8045,3 +8045,279 @@ SIPU_TEST_CONTAINER=sipu-dev-dump bash test_utils/run_test.sh \
 - **为什么恰好是这一步**：22:18 那次遇到的是"whl 路径不存在"（`latest/` 已失效），有友好报错；22:43:09 把路径改成 `archive/` 之后越过了检查，**才第一次走到 34 行**，于是撞上这个一直存在的隐患。改路径修好了 A，暴露了 B。
 - **当前已装好**（`0.1.13+sicx.v0.1.0.cpu.git8343f08d`，23:02:40 落盘），**重跑即可**。
 - **建议根治**：`setup_tilelang.sh:34` 补 `|| true`；**`setup_triton.sh:32` 有同样的坑**，建议一并修（`setup.sh:26` 已有 `|| true`，可作模板）。
+
+---
+
+## 59. `run-sipu.log.2026_09_13___09_37_26` 失败原因：`AttributeError: module 'torch' has no attribute 'sipu'`
+
+**问题**：`sipu-dev-dump` 容器里 `torch_sipu` 明明已经装好了，为什么还报 `AttributeError: module 'torch' has no attribute 'sipu'`？
+
+**答：因为容器镜像里写死了一个环境变量 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，把 PyTorch 的"设备后端自动加载"关掉了。`torch.sipu` 这个属性本来就不由 `torch` 自己提供 —— 它是由 `torch_sipu` 这个**插件包**在 import 时**动态注册**上去的。自动加载被禁用 → 插件包没人去 import → 注册这一步从未发生 → `torch.sipu` 自然不存在。**
+
+**所以"torch_sipu 装没装"和"`torch.sipu` 存不存在"是两件事。** 装了只是"有货"，还得有人"去取货"（import 插件），而 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` 正是把那个取货的人打发走了。
+
+**修复：在 `run_test.sh:217` 之后加一行 `unset TORCH_DEVICE_BACKEND_AUTOLOAD`。** 已实测：加之前必崩，加之后整条测试跑通、dump 落盘、与 cuda 结果逐文件对齐。
+
+### 59.0 一句话结论
+
+| 项 | 结果 |
+| --- | --- |
+| 直接原因 | 抛异常的语句是 `triton/backends/siorigin/driver.py:1377` 的 `self.get_device_capability = torch.sipu.get_device_capability` |
+| **根本原因** | **容器镜像内建 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`**，禁用了 PyTorch 的设备后端自动加载 |
+| 为什么装了也没用 | `torch.sipu` **不是 torch 自带的**，是 `torch_sipu` 插件 import 时注册的；自动加载被禁 → 插件没被 import → 没注册 |
+| 谁引入的 | **镜像**：`harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0` 的 `Config.Env` 里就有，容器只是继承 |
+| 为什么别的入口没事 | `ci_test.sh:49`、`run_qemu_unit.sh:11`、`ci_exec.sh:129`、`env-offlie-infer.sh:2`、`get-started.md:182` **都显式 `unset` 了这一行** |
+| 为什么 CUDA 路径没事 | CUDA 用的是官方 `lmsysorg/sglang:v0.5.18-cu130` 镜像（见 `run_test.sh:248-256`），**没有这个变量** |
+| **修复** | **`test_utils/run_test.sh:217` 后加 `unset TORCH_DEVICE_BACKEND_AUTOLOAD`** |
+| 验证 | 加之前复现崩溃；加之后跑通，`sipu/` 与 `cuda/` 各 32 个文件、`pass_000/001/002` 各 10 个，**文件名集合完全一致** |
+
+### 59.1 报错现场
+
+日志末尾的调用栈（`run-sipu.log.2026_09_13___09_37_26:194-229`）：
+
+```
+File ".../test_utils/run_test_job.py", line 303, in run_text_only
+    _patch_hook_registration()
+File ".../test_utils/run_test_job.py", line 79, in _patch_hook_registration
+    import sglang.srt.model_executor.model_runner as mr
+File ".../sglang/srt/model_executor/model_runner.py", line 29, in <module>
+    from sglang.srt.configs.model_config import (
+  ... (一路往下 import)
+File ".../sglang/kernels/ops/quantization/fp8_kernel.py", line 1957, in <module>
+    _per_token_group_quant_fp8_hopper_moe_mn_major = fp8_autotune(...)
+File ".../triton/runtime/autotuner.py", line 395, in decorator
+    return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
+File ".../triton/runtime/autotuner.py", line 130, in __init__
+    self.do_bench = driver.active.get_benchmarker()
+File ".../triton/backends/siorigin/driver.py", line 1377, in __init__
+    self.get_device_capability = torch.sipu.get_device_capability   # ★ 就是这一行
+AttributeError: module 'torch' has no attribute 'sipu'
+```
+
+**这条栈很有意思**：报错点离"出问题的原因"非常远。触发者是 `run_test_job.py:303` 的 `_patch_hook_registration()`（§57 讲过的那个猴补丁），它只是**顺手 import 了一个 sglang 模块**，结果这条 import 链一路走到 `fp8_kernel.py`，那里有个**模块级的 Triton autotune 装饰器**在 import 期就执行了 —— 它要初始化 Triton 的 driver，而 SiPU 版 Triton 的 driver 在构造时要读 `torch.sipu`。于是"import 一个模块"变成了"检查设备后端是否注册"。
+
+> 换句话说：**这是 import 期副作用**。`fp8_kernel.py:1957` 那行不是函数体，是模块顶层 —— 只要有人 import 到它，Triton driver 就一定被构造。
+
+### 59.2 为什么"装了"却"没有"
+
+这是本节的核心，值得拆开讲。**`torch` 是个普通 Python 模块，它不会凭空多出一个叫 `sipu` 的属性。** 这个属性是 **PyTorch 的 out-of-tree 设备后端机制**（RFC [#122468](https://github.com/pytorch/pytorch/issues/122468)）在运行期注入的。
+
+三个角色：
+
+| 角色 | 是什么 | 在哪 |
+| --- | --- | --- |
+| **插件包** | `torch_sipu`，SiPU 的设备后端实现 | `/usr/local/lib/python3.10/dist-packages/torch_sipu/` |
+| **注册入口** | entry point，名字 `torch_sipu`，值 `torch_sipu:_autoload` | entry-point 组 `torch.backends` |
+| **加载器** | PyTorch 启动时遍历该组、import 并调用每个入口 | `torch/__init__.py:2979-2980` |
+
+容器里实际查到 entry point 是**存在且唯一**的：
+
+```bash
+$ python3 -c "from importlib.metadata import entry_points; print(list(entry_points(group='torch.backends')))"
+[EntryPoint(name='torch_sipu', value='torch_sipu:_autoload', group='torch.backends')]
+```
+
+而 `torch/__init__.py` 末尾的加载逻辑（`:2945-2952` 与 `:2976-2980`）是：
+
+```python
+def _is_device_backend_autoload_enabled() -> builtins.bool:
+    # enabled by default
+    return os.getenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "1") == "1"     # ★ 读环境变量
+
+# `_import_device_backends` should be kept at the end to ...
+if _is_device_backend_autoload_enabled():                            # ★ 这里被短路
+    _import_device_backends()
+```
+
+**链路到此闭合**：
+
+```
+TORCH_DEVICE_BACKEND_AUTOLOAD=0
+  └─ _is_device_backend_autoload_enabled() → False
+      └─ _import_device_backends() 根本没被调用
+          └─ torch_sipu 插件从未 import
+              └─ torch.__init__.py 里这行从未执行：
+                  torch._register_device_module("sipu", torch_sipu.sipu)
+                  torch.utils.rename_privateuse1_backend("sipu")
+                      └─ torch.sipu 不存在
+                          └─ Triton driver 构造时炸
+```
+
+看 `torch_sipu/__init__.py:31-38` 就能确认"注册"确实发生在**这个包被 import 的时候**：
+
+```python
+try:
+    import torch_sipu._C
+except ImportError as err:
+    raise ImportError("Failed to import torch_sipu._C") from err
+import torch_sipu.sipu
+
+torch._register_device_module("sipu", torch_sipu.sipu)   # ★ 就是这两行
+torch.utils.rename_privateuse1_backend("sipu")
+```
+
+**所以"包在 site-packages 里躺着"和"`torch.sipu` 可用"之间隔着一个 import —— 而那个 import 被环境变量掐掉了。**
+
+顺带一提，`pip show torch_sipu` 能查出版本号（日志里 `torch_sipu version 0.7.0+gitd9b7a1d.sdk260826 is already installed` 就是 `setup.sh` 打的），**但这只证明"装好了"，完全不证明"已注册"** —— 这正是让人迷惑的地方。
+
+### 59.3 实测：三个变量对照
+
+我直接进容器验证了这条因果链，**唯一变量就是那个环境变量**：
+
+```bash
+# ① 默认 env（AUTOLOAD=0）—— 复现失败
+$ docker exec sipu-dev-dump bash -lc 'source setup.sh; python3 -c "
+import sglang.srt.layers.quantization.utils"'
+AttributeError: module 'torch' has no attribute 'sipu'          ← 与日志完全一致
+
+# ② 同一环境、只把变量打开 —— 通过
+$ TORCH_DEVICE_BACKEND_AUTOLOAD=1 python3 -c "
+import torch; print(hasattr(torch,'sipu')); print(torch.sipu.get_device_capability())"
+True
+(1, 5)
+[SIRT] Library:0.4.1.c30abec.Release @ /share_data/sicx_sdk/release/2608282232/lib/libsipu.so
+
+# ③ 只 unset（不设成 1）—— 同样通过
+$ unset TORCH_DEVICE_BACKEND_AUTOLOAD && python3 -c "
+import torch; print(hasattr(torch,'sipu'))"
+True
+```
+
+注意 **`unset` 和 `=1` 效果相同** —— 因为代码写的是 `os.getenv(..., "1") == "1"`，**未设置时取默认值 `"1"`**。所以正确做法是 `unset`（保持"默认开启"语义），而**不是** `export ...=1`。这也解释了为什么仓库里所有地方都用 `unset` 而不是 `=1`。
+
+顺带说明 `=0` 在别处的**合理用途**：它本来是给"**不想要 SiPU 后端**"的场景用的 —— 比如纯 CPU 数值对照（`sgl-kernel-sipu/sikernel/sipu_libm/test/torch_test_data/dump_*_from_torch.py` 全是 `os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")`，因为它们要拿**原生 torch** 的结果当基准）、以及编译期（`build.sh:16`）。**放在镜像默认值上就过头了**，等于把所有 SiPU 用户都默认成"不要 SiPU"。
+
+### 59.4 这个变量是谁塞进来的
+
+**是镜像，不是容器。** 关键证据是容器的 `Config.Env` 与镜像的 `Config.Env` **一模一样**：
+
+```bash
+$ docker inspect sipu-dev-dump --format '{{range .Config.Env}}{{println .}}{{end}}'
+PYTHONUNBUFFERED=1
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+DEBIAN_FRONTEND=noninteractive
+LANG=en_US.UTF-8
+LANGUAGE=en_US:en
+LC_ALL=en_US.UTF-8
+TORCH_DEVICE_BACKEND_AUTOLOAD=0        # ★ 就是它
+PIP_DISABLE_PIP_VERSION_CHECK=1
+
+$ docker inspect harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0 \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' | grep AUTOLOAD
+TORCH_DEVICE_BACKEND_AUTOLOAD=0        # ★ 镜像里就有
+```
+
+容器 `sipu-dev-dump` 创建于 **2026-09-12T14:41:45Z**（`docker inspect` 的 `Created`），与 §58 的时间线吻合 —— 就是昨晚 22:41 新建的那个。**它从镜像继承了 `=0`，而 `run_test.sh` 又不 unset，两头都没管，于是必崩。**
+
+`sipu-dev`（另一个容器，同一个镜像）env 也是同一份 —— **所以这是镜像级问题，不是这个容器被谁改坏了**。任何基于该镜像、走 `run_test.sh` 的 SiPU 测试都会踩到。
+
+### 59.5 为什么别的入口都好好的 —— 就 `run_test.sh` 漏了
+
+这是最有力的旁证。**仓库里所有其它 SiPU 入口，无一例外都显式 `unset` 了这一行**：
+
+| 文件 | 行 | 内容 |
+| --- | --- | --- |
+| `scripts/ci/sipu_ci_test.sh` | **49** | `unset TORCH_DEVICE_BACKEND_AUTOLOAD` |
+| `test/srt/sipu/unit/run_qemu_unit.sh` | **11** | `unset TORCH_DEVICE_BACKEND_AUTOLOAD` |
+| `scripts/ci/sipu_ci_exec.sh` | **129** | `unset TORCH_DEVICE_BACKEND_AUTOLOAD` |
+| `temp/env-offlie-infer.sh` | **2** | `unset TORCH_DEVICE_BACKEND_AUTOLOAD` |
+| `docs-sipu/get-started.md` | **182** | `unset TORCH_DEVICE_BACKEND_AUTOLOAD` |
+
+而且写法高度一致 —— 都是紧跟在 `source setup.sh` **之后**。看 `ci_test.sh:42-50` 这段，几乎就是"标准模板"：
+
+```bash
+cd "$KERNEL"
+set +o pipefail
+source setup.sh
+source setup_triton.sh
+source setup_tilelang.sh
+set -o pipefail
+unset TORCH_DEVICE_BACKEND_AUTOLOAD      # ★ 就在三连 source 之后
+export LD_LIBRARY_PATH=/opt/siorigin/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+```
+
+**`run_test.sh` 缺的正是这一行。** 确认它全文**一次都没出现过**这个变量名：
+
+```bash
+$ grep -c "AUTOLOAD" /share/users/like/package/sglang_sipu/test/srt/sipu/test_utils/run_test.sh
+0
+```
+
+`run_test.sh` 的 SiPU 分支（`:212-225`）是：
+
+```bash
+212: set -eo pipefail
+213: export PYTHONPATH=${CONTAINER_TEST_UTILS}\${PYTHONPATH:+:\$PYTHONPATH}
+214: cd /sgl-workspace/sgl-kernel-sipu
+215: source setup.sh
+216: source setup_triton.sh
+217: source setup_tilelang.sh
+218: python3 -u ${CONTAINER_TEST_UTILS}/run_test_job.py \      # ← 这里就带着 =0 跑了
+```
+
+**`setup.sh` / `setup_triton.sh` / `setup_tilelang.sh` 三个脚本都不碰这个变量**，所以第 218 行启动 Python 时，环境里 `TORCH_DEVICE_BACKEND_AUTOLOAD` 依然是镜像给的 `0`。
+
+**为什么 CUDA 路径没这个问题** —— 因为它压根不用这个镜像。`run_test.sh:241-262` 的 CUDA 分支是 `docker run` 官方 `lmsysorg/sglang:v0.5.18-cu130`（`CUDA_IMAGE`，定义在 `:14`），传的 `-e` 里**没有** `TORCH_DEVICE_BACKEND_AUTOLOAD`：
+
+```bash
+241: set -eo pipefail
+242: docker rm -f ${CUDA_CONTAINER} >/dev/null 2>&1 || true
+243: docker run --rm \
+...
+248:   -e PYTHONPATH=/sgl-workspace/sglang/python:${CONTAINER_TEST_UTILS} \
+249:   -e PYTHONUNBUFFERED=1 \
+250:   -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
+...
+```
+
+这也解释了日志里的一个现象：**`cuda` 那半边 9/12 就跑通了**（`logs/deepseek/..._cuda.log`，161284 字节，dump 也落盘了），**只有 SiPU 这半边一直没成功过** —— 因为只有 SiPU 那条路会踩到这个镜像变量。
+
+### 59.6 修复与验证：跑通了
+
+**改法**（`test_utils/run_test.sh:217` 之后插入一行）：
+
+```bash
+215: source setup.sh
+216: source setup_triton.sh
+217: source setup_tilelang.sh
+     unset TORCH_DEVICE_BACKEND_AUTOLOAD        # ★ 新增
+218: python3 -u ${CONTAINER_TEST_UTILS}/run_test_job.py \
+```
+
+**位置要求**：必须在 `source setup.sh` **之后**（`setup.sh` 可能自己 export 该变量，先 unset 会被覆盖）—— 对照 `ci_test.sh` 的既有写法即可。**放在 `docker exec` 命令行上加 `-e` 是不行的**，因为 `docker exec -e` 只能覆盖成别的值，而**无法"删除"**已有的变量（传空字符串 `-e X=` 也不行 —— `os.getenv(X, "1")` 会拿到 `""`，`"" == "1"` 为 `False`，照样禁用）。**必须在容器内的 shell 里 `unset`。**
+
+**验证结果**——我按修改后的完整命令跑了一遍，一次通过：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 任务是否跑完 | ✅ 走到 `Prompt:` / `Generated text: pap leisure`，与 cuda 输出**逐字相同** |
+| pass 数 | 3（`pass_000`/`pass_001`/`pass_002`），与 §57 的结论一致 |
+| 文件数 | **cuda 32 个 / SiPU 32 个**，完全相等 |
+| `pass_000` 文件名集合 | `diff` **无输出 → 完全一致** |
+| 每个 pass 内文件数 | 两边都是 10 / 10 / 10 |
+| `manifest.json` | `passes: 3`，`checkpoint_order` 10 项（embedding → 2 层 attn/mlp → lm_head） |
+
+```
+/share_data/sglang_sipu/accuracy_verify/like/ds_v32_2layer/deepep_deepgemm_text/text-only/
+├── cuda/             run_meta.json  manifest.json  pass_000/  pass_001/  pass_002/   (32 files, 12M)
+└── sipu/   run_meta.json  manifest.json  pass_000/  pass_001/  pass_002/   (32 files, 12M)
+```
+
+**数值也合理**（`pass_000` 抽样，`float()` 后取绝对差）：
+
+| 张量 | shape | maxdiff | 参考量级 `meanabs` |
+| --- | --- | --- | --- |
+| `layer_0_attn.pt` | (74, 7168) | 1.95e-03 | 2.53e-03 |
+| `layer_1_mlp.pt` | (74, 7168) | 7.81e-03 | 1.24e-02 |
+| `lm_head.pt` | (1, 129280) | 1.41e-01 | 1.92e+00 |
+
+都在 bf16 的正常误差范围内（相对误差千分之几），**没有数值异常**。注意 `layer_0_attn.pt` 是 `(74, 7168)` 而不是 `(1, 7168)` —— 74 是 prefill 的 token 数，与 §57 中"`pass_000` 是 prefill"的判断吻合。
+
+### 59.7 小结
+
+- **报错 `AttributeError: module 'torch' has no attribute 'sipu'` 与"torch_sipu 装没装"无关。** `torch.sipu` 是 `torch_sipu` 插件包的 entry point 在 **import 时动态注册**的，不是 torch 自带的属性。
+- **根因是容器镜像内建的 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`**，它让 `torch/__init__.py:2979` 的 `_import_device_backends()` 被短路，插件从未 import，注册从未发生。
+- **`unset` 和 `=1` 等价**（代码是 `os.getenv(..., "1") == "1"`），仓库里统一用 `unset`。
+- **`run_test.sh` 是仓库里唯一漏了这行的 SiPU 入口** —— `ci_test.sh:49`、`run_qemu_unit.sh:11`、`ci_exec.sh:129`、`env-offlie-infer.sh:2`、`get-started.md:182` 全都 `unset` 了。CUDA 路径用的是官方镜像，不含该变量，所以一直正常。
+- **修复：`test_utils/run_test.sh:217` 后加 `unset TORCH_DEVICE_BACKEND_AUTOLOAD`**（必须在 `source setup.sh` 之后，必须在容器内 shell 里）。已实测跑通，SiPU dump 与 cuda dump **32/32 文件、文件名逐项一致、数值在 bf16 误差内**。
+- **排查提示**：这类"装了却用不了"的问题，**先查 env 里的禁用开关**（`docker inspect ... Config.Env`），再查包是否真的被 import 了。`pip show` 通过 **不等于** 模块已加载 —— 这是本次最容易误判的地方。
