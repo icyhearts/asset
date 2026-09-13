@@ -6,7 +6,6 @@ if [ -d "$sys_session_dir" ] && [ "$(stat -c '%U' "$sys_session_dir")" = "$USER"
   export HIST_DIR=$sys_session_dir
 elif [ -d "$home_session_dir" ] && [ "$(stat -c '%U' "$home_session_dir")" = "$USER" ]; then
   export HIST_DIR=$home_session_dir
-  mkdir -p ${HIST_DIR}
 else
   export HIST_DIR=$home_session_dir_docker
   mkdir -p ${HIST_DIR}
