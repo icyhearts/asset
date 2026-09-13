@@ -43,7 +43,7 @@ export PYTHON_BASIC_REPL=1
 # 1. 历史文件位置
 # export HISTFILE=~/.bash_eternal_history
 # 确保目录存在
-source ~/asset/code/hist_dir.sh
+source /softhome/like/asset/code/hist_dir.sh
 # 2. 历史记录无限制
 export HISTSIZE=-1          # 内存中的历史条数（-1 = 无限）
 export HISTFILESIZE=-1      # 历史文件的最大行数（-1 = 无限）
