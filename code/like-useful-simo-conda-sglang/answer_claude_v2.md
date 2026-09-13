@@ -8321,3 +8321,327 @@ $ grep -c "AUTOLOAD" /share/users/like/package/sglang_sipu/test/srt/sipu/test_ut
 - **`run_test.sh` 是仓库里唯一漏了这行的 SiPU 入口** —— `ci_test.sh:49`、`run_qemu_unit.sh:11`、`ci_exec.sh:129`、`env-offlie-infer.sh:2`、`get-started.md:182` 全都 `unset` 了。CUDA 路径用的是官方镜像，不含该变量，所以一直正常。
 - **修复：`test_utils/run_test.sh:217` 后加 `unset TORCH_DEVICE_BACKEND_AUTOLOAD`**（必须在 `source setup.sh` 之后，必须在容器内 shell 里）。已实测跑通，SiPU dump 与 cuda dump **32/32 文件、文件名逐项一致、数值在 bf16 误差内**。
 - **排查提示**：这类"装了却用不了"的问题，**先查 env 里的禁用开关**（`docker inspect ... Config.Env`），再查包是否真的被 import 了。`pip show` 通过 **不等于** 模块已加载 —— 这是本次最容易误判的地方。
+
+---
+
+## 60. `v0.5.18-sipu-dev-0.1.0` 镜像是怎么构建的，以及怎么构建 `-fix` 版本
+
+**问题**：`harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0` 这个镜像，是如何从 `/share/users/like/package/sglang_sipu/docker/` 里的文件构建出来的？如果想构建一个新镜像、tag 取 `v0.5.18-sipu-dev-0.1.0-fix`，应该怎么做？
+
+**答：它是 `docker/` 下两个 Dockerfile 分层构建出来的 —— `sipu-0.5.18-base.Dockerfile` 造底座，`sipu-0.5.18.Dockerfile` 在其上叠加 sglang 与 sgl-kernel-sipu。** 构建命令就写在两个文件顶部的注释里（`sipu-0.5.18.Dockerfile:13-25`、`sipu-0.5.18-base.Dockerfile:17-28`），**加个 `-t ...-fix` 就是新镜像**。
+
+**但要注意一个关键前提**：中间层 `v0.5.18-sipu-base` **本地和 harbor 上都不存在**（见 60.5），所以必须**先重建 base**。好在 base 的构建缓存还在，重跑大约几分钟。
+
+### 60.0 一句话结论
+
+| 项 | 结果 |
+| --- | --- |
+| 构建方式 | **两层 Dockerfile 叠加**（base → overlay），BuildKit 构建 |
+| 底座 | `docker/sipu-0.5.18-base.Dockerfile` → tag `v0.5.18-sipu-base` |
+| 叠加层 | `docker/sipu-0.5.18.Dockerfile` → tag `v0.5.18-sipu-dev-0.1.0` ★ |
+| 作者 / 提交 | `91462e291 feat(sipu): add sipu support on v0.5.18`（Zechuan Wu, 2026-09-02） |
+| **构建上下文** | **`docker build` 的 `.` 参数其实没用** —— 两个文件里**一个 `COPY`/`ADD` 都没有**，全靠 **named build context + bind mount** 供料（见 60.3） |
+| 关键机制 | `RUN --mount=type=bind,from=<ctx>` + `--build-context name=path` |
+| 需要 buildx | 是（`--mount=type=bind`/`type=ssh` 是 BuildKit 语法），已装 `buildx v0.35.0` |
+| 源码头 | `git clone` **SSH 拉取** `git@gitlabsoft.siorigin.com:algo/framework/sglang.git`，需 ssh-agent |
+| **先决条件** | ⚠️ **`v0.5.18-sipu-base` 镜像不存在，必须先重建**（60.5） |
+| 构建新 tag | 把 `-t` 换成 `...:v0.5.18-sipu-dev-0.1.0-fix` 即可，其余不变 |
+| 实测 | ✅ 已按此流程重建 base 成功（见 60.7） |
+
+### 60.1 两层结构：谁是谁的底座
+
+```
+ubuntu:22.04                                    ← 一切从这里开始
+      │
+      │  sipu-0.5.18-base.Dockerfile          (228 行：apt / clang-19 / python3.10 / torch 2.10 / 依赖)
+      ▼
+harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-base     ← 中间层
+      │
+      │  sipu-0.5.18.Dockerfile               (112 行叠加：sgl-kernel-sipu + sglang 源码)
+      ▼
+harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0   ← 最终镜像 ★
+```
+
+**为什么要拆两层？** base 自己在 `:5-6` 写明了：
+
+```
+# Layer cache: this file is the slow, rarely-changing half. Rebuild
+# sipu-0.5.18.Dockerfile when sglang / sgl-kernel-sipu commits change.
+```
+
+**base 是"慢且不常变"的那一半**（装 apt、编译工具链、torch、一大堆 pip 依赖），overlay 是"经常要变"的那一半（换 sglang commit、换 kernel）。拆开后，改 sglang 源码只需要重跑 overlay，不用重装整个工具链。
+
+### 60.2 最终镜像确实是这两个文件构建的 —— 有硬证据
+
+不是推测，`docker history` 的层和 Dockerfile 语句**逐条对得上**：
+
+```bash
+$ docker history harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0 \
+    --no-trunc --format '{{.CreatedBy}}' | tail -4
+ENV DEBIAN_FRONTEND=noninteractive LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8 TORCH_DEVICE_BACKEND_AUTOLOAD=0 PIP_DISABLE_PIP_VERSION_CHECK=1
+SHELL [/bin/bash -c]
+/bin/sh -c #(nop)  CMD ["/bin/bash"]
+/bin/sh -c #(nop) ADD file:799f4e238d67485cc109d93512f4fe6f75bafc26a3476772191154125e52201d in /
+```
+
+- 那行 `ENV ... TORCH_DEVICE_BACKEND_AUTOLOAD=0 ...` **正是 `sipu-0.5.18-base.Dockerfile:39-44`**
+- `ADD file:799f... in /` 是 `ubuntu:22.04` 的 rootfs（`:36` 的 `FROM ubuntu:22.04`）
+- 往上层依次是 `rsync`（overlay `:57-65`）、`make install-dev`（`:70-84`）、`git clone`（`:91-102`）、sideepgemm（`:106-110`）—— **全部能对上**
+
+镜像内 sglang 的 commit 也**正是 Dockerfile:89 钉的那个**：
+
+```bash
+$ docker run --rm --entrypoint bash <image> -lc 'cd /sgl-workspace/sglang && git log -1 --format="%h %ci %s"'
+a4ad63a67 2026-08-30 09:20:12 +0800 add timeout for each model
+```
+
+对照 `sipu-0.5.18.Dockerfile:89`：
+
+```dockerfile
+ARG SGLANG_COMMIT=a4ad63a673cd8bd09f5132c8daac0839ea5603e1     # ← 完全一致
+```
+
+**这就是 §59 那个 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` 的来源** —— `sipu-0.5.18-base.Dockerfile:43` 写死在 base 层里，overlay 也继承（`:48`）。
+
+镜像元数据：
+
+```bash
+$ docker inspect ...:v0.5.18-sipu-dev-0.1.0 --format '{{.Created}}'
+2026-08-30T21:37:28.717991403+05:00          # 构建时间
+```
+
+### 60.3 最重要的机制：构建上下文其实用不到
+
+**两个 Dockerfile 里一个 `COPY` 都没有**，也没有 `ADD`：
+
+```bash
+$ grep -n "^COPY\|^ADD\|COPY \|ADD " docker/sipu-0.5.18.Dockerfile \
+      docker/sipu-0.5.18-base.Dockerfile
+(无输出)
+```
+
+**所以命令末尾那个 `.`（构建上下文）是摆设** —— 没有 `COPY`，BuildKit 就不会把仓库目录传给 daemon。真正供料的是 **named build context**：
+
+```bash
+--build-context <名字>=<宿主机路径>
+```
+
+配合 Dockerfile 里：
+
+```dockerfile
+RUN --mount=type=bind,from=<名字>,source=/,target=<容器内路径>,readonly
+```
+
+**这就是"把宿主机的目录临时挂进某一层 RUN，用完就丢"**。关键性质：
+
+- **只在那一条 `RUN` 期间可见**，命令结束即消失
+- **不会存进镜像任何一层** —— 所以 wheel / SDK / cmodel **都不在镜像里**。最终镜像 `docker images` 显示 `DISK USAGE 9.58GB / CONTENT SIZE 2.12GB`（base 是 `7.76GB / 1.62GB`）—— 那些动辄几百 MB 的 wheel 和 SDK **一字节都没进镜像**
+- 用 `from=<名字>` 时**不需要 root 也能读**，绕开了权限问题
+
+overlay 一共用了 5 个 named context + 1 个 ssh：
+
+| context 名 | 宿主机路径 | 挂到容器里 | 用途 | 行 |
+| --- | --- | --- | --- | --- |
+| `sgl_kernel_src` | `/share_data/wzc/sglang-sipu-dev/sgl-kernel-sipu` | `/mnt/sgl-kernel-sipu` | rsync 进镜像（含预编译 `.so`） | 57-65 |
+| `sicx_sdk_rel` | `/share_data/sicx_sdk/release/2608282232` | `/share_data/sicx_sdk/release/260828` | `source setup.sh` | 70 |
+| `sipu15_cmodel` | `/share_data/arch_cmodel_release/sipu1.5/2608270400` | 同左 | cmodel | 71 |
+| `torch_sipu_whl` | `/share_data/torch_sipu/latest_sdk/260827` | 同左 | setup.sh 要校验 pin 路径 | 72 |
+| `sideepgemm_whl` | `/share_data/sglang_sipu/wheels/sideepgemm` | `/mnt/sideepgemm_whl` | DeepGEMM 的 Python API wheel | 106 |
+| **`ssh`** | ssh-agent | — | `git clone` 私有仓库 | 91 |
+
+> 注意 `sicx_sdk_rel` 那行有个**路径改名**：宿主机的 `2608282232` 挂进容器叫 `260828`。`sipu-0.5.18.Dockerfile:33-34` 解释了原因：**pin 文件里写的是 `.../260828/...`**，而实际 release 目录名是 `2608282232`。所以这里挂载时特意起了个别名去迎合 pin 文件。
+> 同理 `:35-36` 提到 cmodel 的 SDK 软链在 release 目录**外面**，所以必须单独挂一个 context 进去。
+
+### 60.4 逐步拆解：每层在做什么
+
+#### base 层（`sipu-0.5.18-base.Dockerfile`）
+
+| 行 | 干什么 |
+| --- | --- |
+| `:36` | `FROM ubuntu:22.04` |
+| `:39-44` | `ENV` —— **`TORCH_DEVICE_BACKEND_AUTOLOAD=0` 就在这里**（§59 的病根） |
+| `:49-76` | apt 换清华源 + gcc-13 + python3.10 + get-pip |
+| `:78-79` | tzdata 时区预置（Asia/Shanghai），避免交互 |
+| `:81-95` | clang-19 / lld-19 / libc++（Triton 编译 kernel 用） |
+| `:98-130` | 运行时依赖：ffmpeg / grpc / boost / pybind11 / openssh 等 |
+| `:132-139` | pip 换阿里源 + cmake / ninja / setuptools-scm |
+| `:142-151` | **torch 2.10.0+cpu** + 依赖 wheel（`from=torch_deps`），排除了 `torchmo-*` |
+| `:154-166` | **torch_sipu / siinfer / siorigin triton** 三个主力 wheel，`--force-reinstall` |
+| `:172-175` | transformers 5.12.1 / gguf / xgrammar 0.2.1 |
+| `:180-183` | torchaudio 2.10.0+cpu、torchcodec 0.10.0（都 `--no-deps`，防止把 torch 顶到 2.11） |
+| `:187-228` | 一大串 sglang 运行时依赖（aiohttp / datasets / openai / decord / pyyaml …） |
+
+> `:170-171` 和 `:177-179` 的注释点出了两个**版本地雷**：`transformers` 必须 5.12.1（Qwen2.5-VL 的 `rotary_embedding` 改了签名），`torchcodec` 必须 0.10（0.15 要 torch≥2.11，会报 `undefined symbol torch_from_blob`）。
+
+#### overlay 层（`sipu-0.5.18.Dockerfile`）
+
+| 行 | 干什么 |
+| --- | --- |
+| `:43-44` | `FROM ${BASE_IMAGE}` —— 默认就是 base 那个 tag |
+| `:47-48` | 再设一遍 `ENV`（含 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`） |
+| `:57-65` | **rsync 整个 sgl-kernel-sipu 进镜像**，排除 `.git`/`__pycache__`，然后断言预编译 `.so` 存在 |
+| `:70-84` | `source setup.sh` → `make install-dev` / `install-triton-ops` / `install-siorigin-triton-kernels` + `pip install -e deepep` |
+| `:91-102` | **`git clone` sglang 源码**（SSH），checkout 到指定 commit，`pip install -e python --no-deps` |
+| `:106-110` | 装 sideepgemm wheel |
+
+**这里有个关键的坑，注释写在 `:52-54`：**
+
+```
+# SDK 260828 scc cannot rebuild current sikernel (tadd_neg2 / tile builtin
+# mismatch). Ship the already-built libsglang_sipu_kernels.so from this tree.
+```
+
+**当前 SDK 编不动 sikernel**，所以**不重新编译，直接把别人编好的 `.so` 拷进来**。这就是为什么 `sgl_kernel_src` context 必须指向 `/share_data/wzc/sglang-sipu-dev/sgl-kernel-sipu`（一个**已经编好**的树），而**不是** `sglang/sgl-kernel-sipu`（那是 submodule，没有产物）。同理 `:80-83` 刻意**跳过了 `make install-kernels`**。
+
+### 60.5 ⚠️ 最大的前提：base 镜像没了
+
+**这是动手前必须知道的**：`v0.5.18-sipu-base` **本地没有、harbor 上也没有**。
+
+```bash
+$ docker image inspect harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-base
+Error response from daemon: No such image: ...:v0.5.18-sipu-base
+
+$ docker manifest inspect harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-base
+unknown: artifact sglang-sipu/release:v0.5.18-sipu-base not found
+```
+
+（对照：同一个 registry 上 `...:v0.5.18-sipu-dev-0.1.0` 是能查到的 —— 所以**不是网络/认证问题，就是这个 tag 真的不存在**。）
+
+**原因**：base 造出来只是为了喂给 overlay，overlay 构建完它就被弃用了（本地被清、也没推 harbor）。而 `docker history` 里 base 那些层显示为 `<missing>`，正说明**中间层已经不在本地**。
+
+**后果**：直接跑 overlay 的构建命令会**先去 pull base → 失败**。
+
+**解法：先重建 base。** 已实测可行（见 60.7），且 base 的构建缓存**部分还在**，整体几分钟。
+
+### 60.6 完整操作步骤
+
+**所有命令都在仓库根目录 `/share/users/like/package/sglang_sipu` 下执行**（`-f docker/...` 是相对路径）。
+
+#### 第 0 步：准备 ssh-agent（overlay 要 `git clone` 私有仓库）
+
+```bash
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519        # 若无 agent，至少确认 key 能 ssh -T git@gitlabsoft.siorigin.com
+```
+
+实测 `ssh -T git@gitlabsoft.siorigin.com` 返回 `Welcome to GitLab, @xtubk!`，key 可用。
+
+#### 第 1 步：重建 base
+
+```bash
+DOCKER_BUILDKIT=1 docker buildx build \
+  --build-context torch_deps=/share_data/torch_sipu/dependencies_v2.10.0 \
+  --build-context torch_sipu_whl=/share_data/torch_sipu/latest_sdk/260827 \
+  --build-context siinfer_whl=/share_data/sglang_sipu/wheels/siinfer \
+  --build-context triton_rel=/share_data/triton/siorigin_triton_dev/260828 \
+  -f docker/sipu-0.5.18-base.Dockerfile \
+  -t harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-base \
+  --load .
+```
+
+（`--load` 是必要的：buildx 默认只把结果留在 build cache，`--load` 才会在 `docker images` 里出现。）
+
+#### 第 2 步：构建 `-fix` 镜像
+
+**与原命令唯一的区别就是最后一行的 `-t`**：
+
+```bash
+DOCKER_BUILDKIT=1 docker buildx build \
+  --ssh default \
+  --build-context sgl_kernel_src=/share_data/wzc/sglang-sipu-dev/sgl-kernel-sipu \
+  --build-context sicx_sdk_rel=/share_data/sicx_sdk/release/2608282232 \
+  --build-context sipu15_cmodel=/share_data/arch_cmodel_release/sipu1.5/2608270400 \
+  --build-context torch_sipu_whl=/share_data/torch_sipu/latest_sdk/260827 \
+  --build-context sideepgemm_whl=/share_data/sglang_sipu/wheels/sideepgemm \
+  -f docker/sipu-0.5.18.Dockerfile \
+  -t harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0-fix \
+  --load .
+```
+
+**与原注释（`:16-25`）相比有两点不同，都必须改**：
+
+1. **`docker build` → `docker buildx build`** —— `--mount=type=bind` / `type=ssh` 是 BuildKit 语法，要用 buildx（`docker build` 在 `DOCKER_BUILDKIT=1` 下也行，但 buildx 更稳）。
+2. **加 `--load`** —— 否则镜像只在 build cache 里，`docker images` 看不到、容器也起不来。
+
+#### 第 3 步：验证
+
+```bash
+docker images | grep v0.5.18-sipu
+docker run --rm --entrypoint bash \
+  harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0-fix -lc '
+    grep -c AUTOLOAD /sgl-workspace/sglang/test/srt/sipu/test_utils/run_test.sh
+    python3 -c "import torch; print(torch.__version__)"
+    echo "ENV AUTOLOAD=$TORCH_DEVICE_BACKEND_AUTOLOAD"'
+```
+
+#### 一定要改源码头怎么办？
+
+默认 `git clone` 的是 `wzc/v0.5.18-sipu-dev` 分支的 `a4ad63a67`（`:88-89`）。**如果你想把自己的修改打进镜像**，有两个办法：
+
+**(a) 改 build-arg**（适合已经在远端分支上的 commit）：
+
+```bash
+  --build-arg SGLANG_BRANCH=<你的分支> \
+  --build-arg SGLANG_COMMIT=<你的commit sha> \
+```
+
+**(b) 改 Dockerfile**（适合本地未提交的修改）：把 `:91-102` 那个 `git clone` 段换成 `COPY`，或者塞一个从本地 `scp` 进去的 tar。注意仓库根目录有 `.dockerignore -> .gitignore`（软链），里面有 `*.so`、`**/lib/` 等排除项，用 `COPY` 时要留意别把要的东西排掉。
+
+> ⚠️ **但要想清楚：镜像里的 sglang 会被 bind mount 覆盖。** `docs-sipu/get-started.md:34` 明确要求 **"Always bind-mount this checkout to `/sgl-workspace/sglang`"**，而 `run_test.sh` 起的容器（§59）确实挂了 `-v /share/users/like/package/sglang_sipu:/sgl-workspace/sglang`。**所以改了 `test/srt/` 这类位于 `sglang/` 下的文件，重打镜像对测试毫无影响** —— 换成挂载的宿主机版本就生效了。
+> **真正需要重打镜像的，是 `sgl-kernel-sipu` 相关的东西**（它没被挂载，用的是镜像里那份）、以及 `ENV` / 系统包 / pip 依赖这类**镜像层属性**。§59 的 `unset TORCH_DEVICE_BACKEND_AUTOLOAD` 修复就**不需要**重打镜像（改 `run_test.sh` 即可）；但若想**根除**，可以把 `sipu-0.5.18-base.Dockerfile:43` 那个 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` 删掉再重打。
+
+### 60.7 实测：base 重建成功
+
+我在动手前实际跑了一遍 base 的构建（`nohup docker buildx build ... > base_build.log`），验证上面第 1 步的命令可用：
+
+- 前 11 个 stage **全部命中缓存**，秒过
+- 从 `#14 [stage-0 3/12]`（apt 装 gcc-13）开始实跑，**因为 base 层本来就不在本地**
+- 各步耗时：apt 工具链 ~49s、clang-19 ~12s、运行时依赖 ~31s、pip 基础 ~19s、torch wheel ~17s
+- 一路走到最后的 sglang 运行时依赖（`aiohttp` 等），**无报错**
+- 最后 `#24 DONE 71.7s` 导出成功，**base 镜像已落盘**：
+
+```
+$ docker images | grep v0.5.18-sipu-base
+harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-base   fec6b374b747   7.76GB
+```
+
+**结论：第 1 步的命令经过实跑验证，确实能重建出 base。**（整轮从零到导出约 6 分钟。）
+
+前置条件我逐个检查过，**全部在位**：
+
+| 依赖 | 状态 |
+| --- | --- |
+| `torch_deps` = `/share_data/torch_sipu/dependencies_v2.10.0` | ✅ 存在，`torch-2.10.0+cpu-...whl` 在 |
+| `torch_sipu_whl` = `.../latest_sdk/260827` | ✅ 存在，`torch_sipu-0.7.0+gitd9b7a1d.sdk260826-...whl` 在 |
+| `siinfer_whl` = `.../wheels/siinfer` | ✅ 存在，`siinfer-0.3.6+git6167223-...whl` 在 |
+| `triton_rel` = `/share_data/triton/siorigin_triton_dev/260828` | ✅ 存在，`triton-3.3.1+siorigin.v0.6.0.git53f191c2-...whl` 在 |
+| `sgl_kernel_src` = `/share_data/wzc/sglang-sipu-dev/sgl-kernel-sipu` | ✅ 存在，**且预编译 `libsglang_sipu_kernels.so`（4.8MB）在** |
+| `sicx_sdk_rel` / `sipu15_cmodel` | ✅ 存在，`sipu_sdk_setup.sh` / `sipu_cmodel_setup.sh` 都在 |
+| `sideepgemm_whl` | ✅ 存在，`sideepgemm-0.3.0-cp310-cp310-linux_x86_64.whl` 在 |
+| ssh → `gitlabsoft.siorigin.com` | ✅ 通，`Welcome to GitLab, @xtubk!` |
+| buildx | ✅ `v0.35.0` |
+| docker 磁盘 | ✅ `/data/docker` 所在 `/dev/md0p1` **4.8T 可用** |
+
+⚠️ 一个提醒：`sgl_kernel_src` 那个目录属主是 `wuzechuan`，git 会报 `detected dubious ownership`。**构建本身不受影响**（只用 `rsync` 拷文件），但如果你想在里面跑 `git` 命令，先：
+```bash
+git config --global --add safe.directory /share_data/wzc/sglang-sipu-dev/sgl-kernel-sipu
+```
+
+### 60.8 两个容易踩的点
+
+**1. `-t` 改了，但 `ARG BASE_IMAGE` 没改。** `sipu-0.5.18.Dockerfile:43` 默认拉的是 `...:v0.5.18-sipu-base`。如果你把 base 打成了别的 tag，要显式传：
+
+```bash
+  --build-arg BASE_IMAGE=harbor.siorigin.com/sglang-sipu/release:<你的 base tag>
+```
+
+**2. 注释里的 `--build-arg SGL_KERNEL_SIPU_COMMIT=<sha>` 其实无效。** `:28` 宣传可以用它换 kernel 版本，但 `:55-56` 声明的这两个 ARG **在文件里再没被引用过**（只有 `:59` 的 `rsync` 是实际取内容的动作）。**真正决定 kernel 内容的是 `--build-context sgl_kernel_src=<哪个目录>`** —— 换 commit 要靠换目录，不是换 build-arg。
+
+### 60.9 小结
+
+- 镜像由 `docker/` 下**两个 Dockerfile 分层构建**：base（`:36` 起，ubuntu + 工具链 + torch + 依赖）→ overlay（`:44` 起，rsync kernel + clone sglang）。
+- **构建上下文 `.` 没有用** —— 全文件无 `COPY`/`ADD`，供料靠 **named build context + `RUN --mount=type=bind`**，所以 wheel/SDK **不落进镜像**。
+- **`TORCH_DEVICE_BACKEND_AUTOLOAD=0` 来自 `sipu-0.5.18-base.Dockerfile:43`**，就是 §59 那个 bug 的源头。
+- **动手前必须先重建 base** —— `v0.5.18-sipu-base` 本地和 harbor 都不存在。命令见 60.6 第 1 步，**已实测可用**。
+- **打新 tag 只需改 `-t`**，但要同时在原注释基础上加 **`buildx`** 和 **`--load`**；并先 `ssh-add` 好 key（overlay 要 clone 私有仓库）。
+- ⚠️ **改 `sglang/` 下的文件不必重打镜像** —— 容器会把宿主机 checkout bind mount 覆盖上去（`get-started.md:34`）。**只有 `sgl-kernel-sipu`、`ENV`、系统包/pip 依赖才需要重打。**
