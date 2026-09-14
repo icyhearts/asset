@@ -4600,3 +4600,38 @@ harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0 这个 sipu版本
 
 把答案追加到 like-useful/answer_codex_v3.md
 }
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+ sglang_sipu 代码位于 /share/users/like/package/sglang_sipu, 这是一个在开源 sglang 上做的 sipu 版本的 sglang.
+
+我想把 test/srt/sipu//test_utils/run_test.sh 的python 脚本, 不通过 bash脚本启动，直接先启动docker, 进入docker,直接在docker里面执行  python 脚本。
+
+lmsysorg/sglang:v0.5.18-cu130 本身是有 完整 sglang 代码的，我不明白，为什么  test/srt/sipu//test_utils/run_test.sh 会用本地 sglang_sipu 代码覆盖 docker image 内部代码。
+
+1) 覆盖版本
+docker run -itd   --name sgl0518-like-dump   --gpus all --net=host --ipc=host --privileged   --shm-size 32g --ulimit memlock=-1 --ulimit stack=67108864   -e NVIDIA_VISIBLE_DEVICES=0   -e PYTHONPATH=/sgl-workspace/sglang/python:/sgl-workspace/sglang/test/srt/sipu/test_utils   -e PYTHONUNBUFFERED=1   -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1   -e SGLANG_JIT_DEEPGEMM_PRECOMPILE=0   -e NCCL_DEBUG=INFO   -e NVSHMEM_DEBUG=INFO   -e NVIDIA_IMEX_CHANNELS=0   -v /share/users/like/package/sglang_sipu:/sgl-workspace/sglang:rw   -v /share_data/sglang_sipu:/share_data/sglang_sipu:rw   -v /share_data/inference-framework/tiny-models:/share_data/inference-framework/tiny-models:ro   -w /sgl-workspace/sglang/test/srt/sipu/test_utils   lmsysorg/sglang:v0.5.18-cu130   /bin/bash
+在container sgl0518-like-dump 内部, 工作目录/sgl-workspace/sglang/test/srt/sipu/test_util， 执行
+python3 /sgl-workspace/sglang/test/srt/sipu/test_utils/run_test_job.py     --config-yaml /sgl-workspace/sglang/test/srt/sipu/configs/deepseek/ds_v32_2layer.yaml     --launch-config deepep_deepgemm_text     --test-case text-only     --device cuda     --dump-base /share_data/sglang_sipu/accuracy_verify/like     --log-base /sgl-workspace/sglang/test/srt/sipu/logs >  ../temp/cuda-in-docker.log.1 2>&1
+日志位于物理机： /share/users/like/package/sglang_sipu/test/srt/sipu/temp/cuda-in-docker.log.1
+成功执行。
+
+2） 没有覆盖版本：
+使用image 内部的 sglang python code:
+
+docker run -itd   --name sgl0518-like-dump-v3-no-sipu-sglang   --gpus all --net=host --ipc=host --privileged   --shm-size 32g --ulimit memlock=-1 --ulimit stack=67108864   -e NVIDIA_VISIBLE_DEVICES=0   -e PYTHONPATH=/share/users/like/package/sglang_sipu/test/srt/sipu/test_utils   -e PYTHONUNBUFFERED=1   -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1   -e SGLANG_JIT_DEEPGEMM_PRECOMPILE=0   -e NCCL_DEBUG=INFO   -e NVSHMEM_DEBUG=INFO   -e NVIDIA_IMEX_CHANNELS=0   -v  /share/:/share/ -v  /share_data/:/share_data/       -w /share/users/like/package/sglang_sipu/test/srt/sipu/test_utils    lmsysorg/sglang:v0.5.18-cu130   /bin/bash
+
+在 container sgl0518-like-dump-v3-no-sipu-sglang 内部，工作目录 /share/users/like/package/sglang_sipu/test/srt/sipu 执行命令
+ python3 test_utils/run_test_job.py --config-yaml configs/deepseek/ds_v32_2layer.yaml --launch-config deepep_deepgemm_text --test-case text-only --device cuda --dump-base /share_data/sglang_sipu/accuracy_verify/like.sgl0518-like-dump-v3-no-sipu-sglang --log-base /sgl-workspace/sglang/test/srt/sipu/logs.sgl0518-like-dump-v3-no-sipu-sglang > temp/cuda-in-docker.log.sgl0518-like-dump-v3-no-sipu-sglang.1 2>&1
+
+ 日志位于物理机：/share/users/like/package/sglang_sipu/test/srt/sipu/temp/cuda-in-docker.log.sgl0518-like-dump-v3-no-sipu-sglang.1
+ 同样的 run_test_job.py ，为什么使用官方的 sglang image里面的原始 sglang 代码 无法运行，用 sglang_sipu 覆盖 image 内部的sglang 代码，才可以运行？
+ 如果想用 sglang image里面的原始 sglang 代码  运行 run_test_job.py, 要怎么做？
+
+注意: 报错日志:AssertionError: fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048, 这里实际传的 topk 大概率=64, 日志开始位置有打印 Setting page size to 64 for DeepSeek DSA.
+
+把答案追加到 like-useful/answer_codex_v3.md
+}
