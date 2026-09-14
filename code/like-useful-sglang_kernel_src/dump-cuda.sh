@@ -6,3 +6,6 @@ SGLANG_PLUGINS=mywhite PYTHONPATH=/share/users/like/package/sglang_sipu/test/srt
 
 
 docker run -itd   --name sgl0518-like-dump   --gpus all --net=host --ipc=host --privileged   --shm-size 32g --ulimit memlock=-1 --ulimit stack=67108864   -e NVIDIA_VISIBLE_DEVICES=0   -e PYTHONPATH=/sgl-workspace/sglang/python:/sgl-workspace/sglang/test/srt/sipu/test_utils   -e PYTHONUNBUFFERED=1   -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1   -e SGLANG_JIT_DEEPGEMM_PRECOMPILE=0   -e NCCL_DEBUG=INFO   -e NVSHMEM_DEBUG=INFO   -e NVIDIA_IMEX_CHANNELS=0   -v /share/users/like/package/sglang_sipu:/sgl-workspace/sglang:rw   -v /share_data/sglang_sipu:/share_data/sglang_sipu:rw   -v /share_data/inference-framework/tiny-models:/share_data/inference-framework/tiny-models:ro   -w /sgl-workspace/sglang/test/srt/sipu/test_utils   lmsysorg/sglang:v0.5.18-cu130   /bin/bash
+
+
+docker run -itd   --name sgl0518-like-dump-v2   --gpus all --net=host --ipc=host --privileged   --shm-size 32g --ulimit memlock=-1 --ulimit stack=67108864  -v  /share/:/share/ -v  /share_data/:/share_data/         lmsysorg/sglang:v0.5.18-cu130   /bin/bash
