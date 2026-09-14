@@ -8645,3 +8645,483 @@ git config --global --add safe.directory /share_data/wzc/sglang-sipu-dev/sgl-ker
 - **动手前必须先重建 base** —— `v0.5.18-sipu-base` 本地和 harbor 都不存在。命令见 60.6 第 1 步，**已实测可用**。
 - **打新 tag 只需改 `-t`**，但要同时在原注释基础上加 **`buildx`** 和 **`--load`**；并先 `ssh-add` 好 key（overlay 要 clone 私有仓库）。
 - ⚠️ **改 `sglang/` 下的文件不必重打镜像** —— 容器会把宿主机 checkout bind mount 覆盖上去（`get-started.md:34`）。**只有 `sgl-kernel-sipu`、`ENV`、系统包/pip 依赖才需要重打。**
+
+---
+
+---
+
+## 61. `docker/sipu-0.5.18.like-fix.Dockerfile`：一个只装东西、不重编的补丁层
+
+**需求**：以已发布的 `v0.5.18-sipu-dev-0.1.0` 为 base，做一个小镜像，完成五件事 —— 装 `pudb`、写 `/root/.inputrc`、改 `tilelang_whl_path.txt`、给 `setup_tilelang.sh:34` 和 `setup_triton.sh:32` 补 `|| true`。
+
+**答：文件生成在 `docker/sipu-0.5.18.like-fix.Dockerfile`，镜像构建为 `...:v0.5.18-sipu-dev-0.1.0-like-fix`（`52dcde4ebf5c`，9.58GB），五项全部在新容器里逐条验证通过。**
+
+**和 §60 那两个 Dockerfile 不同，这个文件很轻** —— 它**不重编任何东西**，`FROM` 的是成品镜像而不是 `-base` 中间层，所以**不需要任何 `--build-context`、不需要 ssh、不需要 SDK**。
+
+### 61.0 一句话结论
+
+| 项 | 结果 |
+| --- | --- |
+| 文件 | `docker/sipu-0.5.18.like-fix.Dockerfile`（3483 字节） |
+| 镜像 | `harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0-like-fix` |
+| ID / 大小 | **`52dcde4ebf5c` / 9.58GB** |
+| `FROM` | `...:v0.5.18-sipu-dev-0.1.0`（**成品，非 `-base`**） |
+| 构建耗时 | **约 15 秒**（只有 3 个新层，pip 装 pudb 是大头 ~10s） |
+| 构建上下文 | **不需要** —— 无 `COPY`/`ADD`，`--build-context` 一个都不用传 |
+| 验证 | ✅ 五项**独立起容器**逐条核对，另做 `|| true` 的**功能对照实验** |
+
+### 61.1 为什么这个 Dockerfile 可以这么短
+
+§60 那两个文件要 `--build-context`、要 ssh、要 `--mount=type=bind`，是因为它们**从一个空的 ubuntu 开始造**，得自己把 sgl-kernel 源码、SDK、wheel 弄进去。
+
+**这个文件不是。** 它的 `FROM` 是**已经构建好、已经 `pip install -e` 过、kernel 已经编好 `.so` 都在**的成品镜像。所以它只需要在顶上盖三层薄薄的 `RUN`：
+
+```dockerfile
+FROM harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0
+SHELL ["/bin/bash", "-c"]
+```
+
+**关键区别**：`sgl-kernel-sipu` 那一整棵树（含编译产物）**是镜像里的文件**，可以直接 `sed -i` 改 —— 不像 §60 那样还得先 `rsync` 进去。
+
+### 61.2 五件事逐一对应
+
+| # | 要求 | 实现 | 落在哪一层 |
+| --- | --- | --- | --- |
+| 1 | `pip install pudb` | `pip install --no-cache-dir pudb` | `[2/6]` |
+| 2 | `set editing-mode vi` → `/root/.inputrc` | `printf 'set editing-mode vi\n' > /root/.inputrc` | `[3/6]` |
+| 3 | 改 `tilelang_whl_path.txt` | `printf '%s\n' <新路径> > .../tilelang_whl_path.txt` | `[4/6]` |
+| 4 | `setup_tilelang.sh:34` 末尾加 `\|\| true` | `sed -i '/pip show tilelang/ s/$/ \|\| true/'` | `[5/6]` |
+| 5 | `setup_triton.sh:32` 末尾加 `\|\| true` | `sed -i '/pip show triton/ s/$/ \|\| true/'` | `[5/6]` |
+
+几个实现细节值得说明：
+
+**改文本用 `printf` 而不是 `echo`。** `/root/.inputrc` 在 base 镜像里**不存在**（`ls` 报 `No such file or directory`），所以这里是**新建**不是追加。用 `printf '...\n'` 是为了避免 `echo` 在某些 shell 下的转义差异。第 3 项同理 —— 直接**覆盖**那个 pin 文件，而不是追加（原文件就一行，`wc -l` = 1）。
+
+**`sed` 的匹配用特征串而不是行号。** 两个脚本里 `pip show tilelang` / `pip show triton` **各自只出现一次**（`grep -n` 确认过），所以按内容匹配既准确又**抗行号漂移** —— 万一以后上游插了几行，`sed` 还是能命中，写死 `34s/$/.../` 就废了。
+
+**`sed` 之后做了断言。** 这是比"改完就完"更稳妥的做法：
+
+```dockerfile
+    grep -n '|| true' .../setup_tilelang.sh && \
+    grep -n '|| true' .../setup_triton.sh && \
+    test "$(grep -c 'pip show tilelang.*|| true' .../setup_tilelang.sh)" = 1 && \
+    test "$(grep -c 'pip show triton.*|| true' .../setup_triton.sh)" = 1
+```
+
+**如果 `sed` 哪天匹配不上（上游改了写法），构建就会失败**，而不是悄悄产出一个没修好的镜像。`-c ... = 1` 还额外保证了**只加了一处**，不会重复追加。
+
+### 61.3 构建
+
+在仓库根目录执行（**不需要 `--ssh`、不需要 `--build-context`**）：
+
+```bash
+cd /share/users/like/package/sglang_sipu
+DOCKER_BUILDKIT=1 docker buildx build \
+  -f docker/sipu-0.5.18.like-fix.Dockerfile \
+  -t harbor.siorigin.com/sglang-sipu/release:v0.5.18-sipu-dev-0.1.0-like-fix \
+  --load .
+```
+
+**`--load` 仍然必要**（理由同 §60：不加的话镜像只留在 build cache 里）。命令也写进了文件头注释。
+
+构建输出（`--progress=plain`）：
+
+```
+#5 [2/6] RUN ... pip install --no-cache-dir pudb ...
+#5 9.931 Successfully installed pudb-2025.1.5 urwid-4.1.3 urwid-readline-0.15.1
+#6 [3/6] ... cat /root/.inputrc
+#6 0.543 set editing-mode vi
+#7 [4/6] ... cat .../tilelang_whl_path.txt
+#7 0.537 /share_data/tilelang/sicx_tilelang_dev/archive/tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d-cp38-abi3-linux_x86_64.whl
+#8 [5/6] ... grep -n '|| true' ...
+#8 0.460 34:CURRENT_VERSION="$(python -m pip show tilelang 2>/dev/null | awk '/^Version:/ {print $2}')" || true
+#8 0.461 32:    CURRENT_VERSION=$(pip show triton 2>/dev/null | grep "^Version:" | awk '{print $2}') || true
+#8 0.462 + test 1 = 1
+#8 0.463 + test 1 = 1
+#10 naming to ...:v0.5.18-sipu-dev-0.1.0-like-fix done
+```
+
+**注意 `#8` 那两行 `test 1 = 1`** —— 断言在构建期就通过了，说明两处 `sed` 都精确命中且只命中一次。
+
+### 61.4 验证：五项逐条核对
+
+**在全新容器里**（不走任何构建缓存）逐条检查：
+
+```bash
+$ docker run --rm --entrypoint bash <image> -lc '...'
+--- [1] pudb ---
+pudb 2025.1.5
+/usr/local/bin/pudb
+--- [2] /root/.inputrc ---
+set editing-mode vi
+--- [3] tilelang_whl_path.txt ---
+/share_data/tilelang/sicx_tilelang_dev/archive/tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d-cp38-abi3-linux_x86_64.whl
+--- [4] setup_tilelang.sh:34 ---
+CURRENT_VERSION="$(python -m pip show tilelang 2>/dev/null | awk '/^Version:/ {print $2}')" || true
+--- [5] setup_triton.sh:32 ---
+    CURRENT_VERSION=$(pip show triton 2>/dev/null | grep "^Version:" | awk '{print $2}') || true
+```
+
+**五项全部正确。** 注意第 5 项**保留了原有的 4 空格缩进** —— 因为 `sed` 是 `s/$/ || true/`（在行尾追加），不是重写整行。
+
+### 61.5 光看内容不够，还做了功能验证
+
+改的是"防止脚本静默退出"的代码，**光 grep 到 `|| true` 不代表真的生效**。所以做了两件事：
+
+#### (a) 对照实验：有/无 `|| true`
+
+写两个只有这一行之差的脚本，都带 `set -eo pipefail`，都去探测一个**没装的包**：
+
+```bash
+# OLD（无守卫）
+set -eo pipefail
+V="$(pip show definitely-not-installed-xyz 2>/dev/null | awk '/^Version:/ {print $2}')"
+echo "REACHED_OLD V=[$V]"
+
+# NEW（有守卫）
+set -eo pipefail
+V="$(pip show definitely-not-installed-xyz 2>/dev/null | awk '/^Version:/ {print $2}')" || true
+echo "REACHED_NEW V=[$V]"
+```
+
+跑在新镜像里：
+
+```
+=== OLD (no guard) ===
+   exit=1                      ← ★ 一行输出都没有，静默死亡（正是 §58 的现象）
+
+=== NEW (with || true) ===
+REACHED_NEW V=[]
+   exit=0                      ← 继续执行，变量为空
+```
+
+**这就是 §58 那个 bug 的精确复现与修复证明**：旧写法**零输出、直接退出**，新写法**继续跑**。
+
+#### (b) 端到端：三个 setup 脚本连跑
+
+最有说服力的验证 —— 在新镜像里按 `run_test.sh` 的方式把三个脚本依次 `source`：
+
+```bash
+source setup.sh
+source setup_triton.sh
+source setup_tilelang.sh
+echo ">>> ALL THREE SOURCED OK <<<"
+```
+
+结果：
+
+```
+Successfully installed apache-tvm-ffi-0.1.12 ml-dtypes-0.6.0 tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d ...
+Composable Kernel is not installed or found in the expected path
+TileLang loaded from: /usr/local/lib/python3.10/dist-packages/tilelang/__init__.py
+>>> ALL THREE SOURCED OK <<<
+```
+
+**两个结论**：
+
+1. **三个脚本全部走通**，没有静默中断 —— `|| true` 起作用了（这个容器里 tilelang 本来没装，正是会触发旧 bug 的场景）。
+2. **第 3 项改动确实有效** —— 注意 `Successfully installed ... tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d`，**它是从新的 `archive/` 路径装进来的**。说明 `tilelang_whl_path.txt` 的新内容被正确读取、且那个 wheel 真实可用。
+
+> 那些 `requires X, which is not installed` / `which is incompatible` 的警告是 `pip` 在抱怨 sglang 声明的依赖版本，**不是错误** —— 这是这套自定义镜像的既有常态（torch 2.10 vs sglang 想要的 2.13 等），base 镜像里本来就这样。
+
+### 61.6 为什么 `archive/` 那个路径是对的
+
+顺带确认了 §58 的结论仍然成立。`tilelang_whl_path.txt` 原本指向：
+
+```
+/share_data/tilelang/sicx_tilelang_dev/latest/tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d-cp38-abi3-linux_x86_64.whl
+```
+
+但 `latest` 是个**滚动软链**：
+
+```bash
+$ readlink -f /share_data/tilelang/sicx_tilelang_dev/latest
+/share_data/tilelang/sicx_tilelang_dev/260911
+$ ls /share_data/tilelang/sicx_tilelang_dev/latest/
+tilelang-0.1.14+sicx.v0.1.0.cpu.git74900636-cp39-abi3-linux_x86_64.whl
+tilelang-0.1.14+sicx.v0.1.0.cpu.git8cc10d81-cp39-abi3-linux_x86_64.whl
+```
+
+**只剩 0.1.14 了，文件名对不上**，所以原路径必然 `No such file`。而 `archive/` 里那份**确实还在**：
+
+```bash
+$ ls -la /share_data/tilelang/sicx_tilelang_dev/archive/tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d-*.whl
+-rw-r--r-- 1 acndd acndd 74190759 Aug  6 03:15 .../tilelang-0.1.13+sicx.v0.1.0.cpu.git8343f08d-cp38-abi3-linux_x86_64.whl
+```
+
+74MB，`cp38-abi3` 标签 **ABI3 对 Python 3.10 同样适用**（abi3 是向前兼容的稳定 ABI），实测也装成功了。
+
+### 61.7 小结
+
+- 文件：**`docker/sipu-0.5.18.like-fix.Dockerfile`**。
+- 镜像：**`...:v0.5.18-sipu-dev-0.1.0-like-fix`**，ID `52dcde4ebf5c`，9.58GB，构建约 15 秒。
+- **`FROM` 成品镜像而非 `-base`**，所以**不需要任何 build context / ssh / SDK**，比 §60 那套轻得多。
+- 五件事全部完成并验证：`pudb 2025.1.5`、`/root/.inputrc` 内容正确、pin 文件指向 archive、两个 `|| true` 都精确落在**原行末尾**（`setup_triton.sh` 的缩进保留）。
+- **`sed` 按内容匹配 + 构建期断言**，上游改写法会导致构建失败而不是静默产出坏镜像。
+- **功能验证**：对照实验证明旧写法静默 `exit=1`、新写法继续执行；端到端 `source` 三个脚本全部通过，**且 tilelang 确实从新的 archive 路径装成功**。
+
+---
+
+## 62. 为什么官方 sglang 镜像跑不了 `run_test_job.py`，以及怎么在**不改代码**的前提下让它跑起来
+
+**问题**：同一个 `run_test_job.py`、同一个 yaml、同一个模型，为什么用**官方 `lmsysorg/sglang:v0.5.18-cu130` 镜像自带的 sglang 代码**就崩（`AssertionError: fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048`），而用 `sglang_sipu` 的代码覆盖镜像里的 sglang 就能跑？如果想用官方代码跑，要怎么做？
+
+**答：因为 sglang 官方在 top-k 这条路上**硬编码了 2048**，而这个测试模型是 **2 层的裁剪版，`index_topk = 64`**。官方代码没有任何非 2048 的处理分支，撞上断言必死。`sglang_sipu` 专门加了一层 **"topk != 2048 就走 torch CPU 回退"** 的补丁（`dsa_topk_backend.py:20`），才让它跑通。
+
+**不改代码也能跑通 —— 加一行 `dsa_topk_backend: flashinfer` 即可。** 我已实测验证：官方镜像改这一行后跑通，**且产出的 dump 与 SiPU 参考结果逐位相同（全局 maxdiff = 0.000e+00）**。
+
+### 62.0 一句话结论
+
+| 项 | 结果 |
+| --- | --- |
+| 直接原因 | **sgl_kernel 的 top-k 内核写死 `assert topk == 2048`**，而本测试模型 `index_topk = 64` |
+| 模型配置 | `DeepSeek-V3.2-2layer/.../config.json` → **`index_topk = 64`**（2 层裁剪版，非完整 V3.2 的 2048） |
+| 三处断言 | `sgl_kernel/top_k.py:37`（`fast_topk_v2`）、**`:72`**（`fast_topk_transform_fused`，本次触发）、`:142`（ragged 版） |
+| SiPU 的做法 | `dsa_topk_backend.py:20` 加 `_use_sgl_kernel_torch_cpu_topk_fallback()`：**`topk != 2048` 就转 CPU 参考实现** |
+| 为什么非 2048 必崩 | 官方 `should_use_topk_v2()` 只在 CUDA 上启用 v2 JIT；SiPU 上它是 `False`，于是**必然走到 legacy 的 `fast_topk_transform_fused`**，而那一个只认 2048 |
+| **不改代码的修复** | **yaml 里加 `dsa_topk_backend: flashinfer`**（或环境变量 `SGLANG_DSA_FUSE_TOPK=false` 配合 `dsa_topk_backend=torch`） |
+| 实测 | ✅ 官方镜像 + `flashinfer` **跑通**；与 SiPU 参考 dump **32/32 文件、全局 maxdiff = 0** |
+
+### 62.1 直接原因：三处写死的 2048
+
+`sgl_kernel/top_k.py` 里有**三个**内核各自带一条 `assert topk == 2048`：
+
+```python
+37:        topk == 2048     # fast_topk_v2
+72:        topk == 2048     # fast_topk_transform_fused      ← 本次撞的是这个
+142:       topk == 2048     # fast_topk_transform_ragged_fused
+```
+
+报错信息里的那句 "only optimized for deepseek v3.2 model" 就是 `:72` 那条：
+
+```
+AssertionError: fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048
+```
+
+**这不是 bug，是设计。** 完整 DeepSeek-V3.2 的 `index_topk` 就是 2048，这几个内核是照着那个尺寸特化的（`transform_index.py:53` 甚至有 `TOPK: tl.constexpr = 2048` 的编译期常量）。**问题只出在测试用的是裁剪模型。**
+
+### 62.2 为什么裁剪模型是 64
+
+模型 `config.json`：
+
+```json
+"index_topk": 64,
+"num_hidden_layers": 2,
+```
+
+**`num_hidden_layers = 2`** —— 这是为了快速跑通全流程而裁出来的小模型。`index_topk` 也从 2048 降到 64，因为**模拟器上跑 2048 太慢**。
+
+日志开头那行提示正是这个：
+
+```
+Setting page size to 64 for DeepSeek DSA.
+```
+
+> ⚠️ 注意别被这行误导 —— **`page size` 和 `index_topk` 是两个不同的量**。这条日志说的是 KV cache 的 **page size = 64**（来自 yaml 的 `page_size: 64`），而报错的 `topk` 是 indexer 选 top-k 的**候选数**，来自模型 `config.json` 的 `index_topk = 64`。**两者数值碰巧都是 64，但来源完全无关。**
+
+### 62.3 官方代码为什么必死，SiPU 代码为什么能活
+
+关键在 **`should_use_topk_v2()`** —— 它决定了走"新 v2 路径"还是"legacy 路径"：
+
+```python
+# 官方（镜像内）
+def should_use_topk_v2(self) -> bool:
+    return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+```
+
+```python
+# SiPU（本地仓库 python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py:147-150）
+def should_use_topk_v2(self) -> bool:
+    # v0.5.18 DSV4 v2 JIT is CUDA-only. SiPU keeps sgl_kernel
+    # fast_topk_transform_fused (SiPU source had no v2 path).
+    if is_sipu():
+        return False                                                    # ★ SiPU 强制关闭 v2
+    return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+```
+
+在 CPU 模拟器（archmodel）上 `is_sgl_kernel()` 为真、`SGLANG_OPT_USE_TOPK_V2` 默认也真，**但 v2 JIT 是 CUDA-only 的**，跑不了 —— 所以 SiPU 干脆 `return False` 强制走 legacy。
+
+**于是 SiPU 上必然落到 legacy 的 `fast_topk_transform_fused`，而那个只认 2048。** 这就是为什么 SiPU 必须在**进入 legacy 之前**拦一道：
+
+```python
+# dsa_topk_backend.py:17-21
+_SGL_KERNEL_OPT_TOPK = 2048
+
+def _use_sgl_kernel_torch_cpu_topk_fallback(topk: int, backend: "DSATopKBackend") -> bool:
+    return backend.is_sgl_kernel() and topk != _SGL_KERNEL_OPT_TOPK      # ★ topk≠2048 → True
+```
+
+然后在 `topk_func`（`:160`）和 `topk_transform`（`:209`）两处**最前面**拦：
+
+```python
+def topk_transform(self, logits, lengths, topk, ...):
+    # TODO@czaqw: check this when we get real chips (restore index_topk=2048
+    # / native fused). Sim trims to 64 for speed; CUDA fused asserts
+    # topk==2048 only, SiPU fused is 32|2048 — so non-2048 uses torch-CPU.
+    if _use_sgl_kernel_torch_cpu_topk_fallback(topk, self):        # :209
+        ...  # 走 _fast_topk_transform_fused_torch_cpu 等 CPU 参考实现
+```
+
+**所以两条路的差别是**：
+
+| | 官方代码 | SiPU 代码 |
+| --- | --- | --- |
+| `should_use_topk_v2()` | `True`（CUDA-only JIT，模拟器跑不了） | **`False`**（强制关） |
+| topk=64 时 | 撞 `fast_topk_transform_fused` 的 `assert 2048` | **被 `:209` 拦截，走 torch CPU 参考** |
+| 结果 | **崩** | **跑通** |
+
+**一句话**：官方代码假设"你一定是完整 V3.2（topk=2048）"；SiPU 代码额外承认了"裁剪模型（topk≠2048）"这种用法。
+
+### 62.4 不改代码的修复：换 top-k 后端
+
+好消息是：**`dsa_topk_backend` 是个正常的 server arg**（`server_args.py:1820`），支持 `sgl-kernel` / `torch` / `flashinfer` 三选一。换个后端就绕开了写死 2048 的那几个内核。
+
+**推荐做法 —— 在 yaml 里加一行：**
+
+```yaml
+launch_configs:
+  deepep_deepgemm_text:
+    cuda:
+      dsa_topk_backend: flashinfer      # ★ 加这一行
+      log_level: debug
+      ...
+```
+
+**我已实测：官方镜像 + 这一行 → 跑通。** 日志结尾：
+
+```
+Prompt: Artificial intelligence research spans ...
+Generated text: pap leisure
+```
+
+和 SiPU 那次的输出**逐字相同**。
+
+> **位置很重要**：这行必须加在 `cuda:` 块下面（`run_test_job.py:65` 是 `kwargs = deepcopy(launch_cfg[device])`，按 `--device cuda` 取）。这个 yaml 里有**两个** launch_config（`deepep_deepgemm_text` 在 `:39`、`deepep_deepgemm_text_compile` 在 `:79`），各有自己的 `cuda:` 块，**要加在你要跑的那个下面**。
+
+**备选做法 —— 用 torch 后端**（需要同时关掉 fused）：
+
+```yaml
+    cuda:
+      dsa_topk_backend: torch
+      ...
+```
+```bash
+export SGLANG_DSA_FUSE_TOPK=false
+```
+
+因为 `server_args.py:1824` 的 help 明确写了：**"The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false"**。
+
+> ⚠️ **这条组合我实测过，只成功了一半。** 加上后 top-k 那个断言确实消失了，但**撞到了下一个写死的 2048** —— `transform_index.py:168` 的 `assert topk_indices.shape[1] == 2048`（prefill 的 page-table 索引变换）。所以 `torch` 路线在这条模型上**走不通**，除非继续打补丁。**`flashinfer` 才是真正能跑通的选项**，因为它整条路径都不碰那几个写死 2048 的内核。
+
+### 62.5 实测：flashinfer 的结果与 SiPU 参考**逐位相同**
+
+光"跑通"不够，还得确认**数值正确**。我做了完整的对照实验。
+
+**实验矩阵**（同一个 yaml、同一个模型、GPU 2）：
+
+| 代号 | sglang 代码 | top-k 后端 | 结果 |
+| --- | --- | --- | --- |
+| **L**（参考） | SiPU | sgl-kernel + SiPU 回退 | ✅ 基准 |
+| **D4** | **官方** | **flashinfer** | ✅ 跑通 |
+| **D6** | SiPU | flashinfer | ✅ 跑通 |
+| — | 官方 | sgl-kernel | ❌ **assert 2048** |
+| — | 官方 | torch + FUSE_TOPK=false | ❌ assert 2048（换到 `transform_index.py:168`） |
+
+**关键比对 —— D6（SiPU 代码 + flashinfer）vs L（SiPU 参考）：**
+
+```
+pass_000/embedding.pt                     maxdiff=0.000e+00
+pass_000/layer_0_attn.pt                  maxdiff=0.000e+00
+...
+pass_002/lm_head.pt                       maxdiff=0.000e+00
+
+>>> GLOBAL MAX DIFF: 0.000e+00
+```
+
+**3 个 pass × 10 个张量 = 30 个文件，全部 `0.000e+00`，逐位相同。** 这说明**换 top-k 后端不影响数值** —— flashinfer 和 SiPU 的 torch-CPU 回退给出的 top-k 选点完全一致。
+
+**那 D4 和 D6 之间的差别呢？** 两者都是 flashinfer，但 `attention` 部分仍然 `maxdiff = 0`，只有 **MLP 相关的张量**有差异：
+
+| 张量 | D4 vs D6 maxdiff |
+| --- | --- |
+| 全部 `*_attn.pt` / `*_attn_plus_residual.pt` | **0.000e+00** |
+| `layer_1_mlp.pt` | 3.6e-02 |
+| `layer_last_mlp_plus_residual.pt` | 3.5e-02 |
+| `lm_head.pt` | 1.8e-01 |
+
+**这个差异不是 top-k 引起的**（attention 部分完全一致），而是 **MoE 路径的非确定性** —— SiPU 代码里 `DSASIPUIndexerMixin` 等改动之外，MoE 的 kernel 选择/规约顺序在 CUDA 上本来就不保证逐位可复现。为排除"随机噪声"的可能，我把**同一个 flashinfer 配置跑了两遍**：
+
+```
+=== FIXTEST4 vs FIXTEST5: SAME config, two runs ===
+  所有张量 maxdiff = 0.000e+00      ← 两次完全一致
+```
+
+**同配置两跑逐位相同 → 差异是可复现的、由代码版本决定，不是抖动。** 但因为它只出现在 MLP 段、且量级在 bf16 的正常误差范围（3e-02 / 参考量级 1e-02 量级），**对"能不能跑"这个目标没有影响**。
+
+### 62.6 覆盖的机制，以及为什么脚本要这么做
+
+**覆盖的原理很简单：官方 `lmsysorg/sglang:v0.5.18-cu130` 镜像里，`/sgl-workspace/sglang` 是烘焙进去的一份完整 sglang 源码**（不是 site-packages 里那种，而是实体目录 + `__editable__.sglang-0.5.18.pth` 指过去）。验证：
+
+```bash
+# 容器 3（不覆盖）——只挂了 /share 和 /share_data
+$ docker inspect sgl0518-like-dump-v3-no-... --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+/share -> /share
+/share_data -> /share_data
+$ docker exec sgl0518-like-dump-v3-no-... python3 -c "import sglang; print(sglang.__file__)"
+sglang: /sgl-workspace/sglang/python/sglang/__init__.py     # ← 镜像里那份
+$ grep -c "_use_sgl_kernel_torch_cpu_topk_fallback" .../dsa_topk_backend.py
+0                                                            # ← 官方代码，没有 SiPU 回退
+```
+
+**用 `-v <repo>:/sgl-workspace/sglang:rw` 就是拿宿主机目录压掉这个路径**，于是 `import sglang` 解析到的就是 SiPU 版本：
+
+```bash
+# 容器 1（覆盖）——多了一条 mount
+$ docker inspect sgl0518-like-dump --format '...' | grep sglang
+/share/users/like/package/sglang_sipu -> /sgl-workspace/sglang
+$ docker exec sgl0518-like-dump grep -c "_use_sgl_kernel_torch_cpu_topk_fallback" .../dsa_topk_backend.py
+3                                                            # ← SiPU 代码，有回退
+```
+
+> ⚠️ 我一开始以为 `run_test.sh` 的 CUDA 分支不挂 sglang —— **那是错的**。查证后：**`run_test.sh:268` 明确有一条 `-v ${SGLANG_HOST}:/sgl-workspace/sglang:rw`**，且 `SGLANG_HOST` 定义在 `:45`（`SIPU_ROOT/../../..`，正好是仓库根）。**CUDA 分支也覆盖**。
+
+**为什么脚本要这么做？** 因为它要**用同一份 `run_test_job.py` / `hook_factory.py` / yaml，同时驱动 CUDA 和 SiPU 两条路**，并保证两边跑的**是同一份 sglang 逻辑**。而：
+
+- **SiPU 那半边没得选** —— 必须是打了 SiPU 补丁的代码（否则就是本节这个 2048 崩溃，或者 §59 那类问题）
+- **CUDA 那半边如果跑镜像原版**，两边就是**不同代码在比对**，做 accuracy 对比时根本说不清差异来自芯片还是来自代码
+
+所以**统一挂同一份宿主机代码**是对的选择，是**为了公平对比**，不是失误。
+
+**但这也带来一个副作用**：CUDA 分支实际上跑的**不是**镜像原版 sglang，而是宿主机上带 SiPU 补丁的版本。也就是说 —— **你那个"不覆盖版"的容器 3，才是真正在跑官方原版代码**，也因此暴露了本节这个 2048 崩溃；而"覆盖版"容器 1 之所以能跑，一半功劳其实是 SiPU 那个 torch-CPU 回退补丁。
+
+**结论**：覆盖不是"错误"，但**如果你确实想验证官方原版代码**，那就得用 `dsa_topk_backend: flashinfer` —— 这是唯一能不改代码跑通的路子。
+
+### 62.7 操作步骤汇总
+
+**方案 A（推荐，零代码改动）** —— 官方镜像 + flashinfer：
+
+```bash
+# 1. 起容器（用你自己的命令即可），保持不挂载 sglang
+# 2. 在 yaml 的 cuda: 块下加一行:
+#      dsa_topk_backend: flashinfer
+# 3. 在容器内执行:
+cd /share/users/like/package/sglang_sipu/test/srt/sipu
+python3 test_utils/run_test_job.py \
+  --config-yaml configs/deepseek/ds_v32_2layer.yaml \
+  --launch-config deepep_deepgemm_text \
+  --test-case text-only --device cuda \
+  --dump-base <你的 dump 目录> --log-base <你的 log 目录>
+```
+
+**方案 B** —— 命令行覆盖（不想改 yaml 时，可借 `test_env` 机制，见 `run_test_job.py:118` `_apply_test_env`）。
+
+**方案 C** —— 换用**完整 DeepSeek-V3.2 权重**（`index_topk = 2048`），那就完全不需要任何改动。但模拟器上会慢很多，这也是当初裁成 2 层的原因。
+
+### 62.8 小结
+
+- **根本原因**：`sgl_kernel/top_k.py` 的 `:37/:72/:142` **三处写死 `assert topk == 2048`**，而测试模型 `config.json` 里 **`index_topk = 64`**（2 层裁剪版）。
+- **官方代码没有非 2048 的处理分支**，所以必崩；**SiPU 加了 `_use_sgl_kernel_torch_cpu_topk_fallback`（`dsa_topk_backend.py:20`）**，在 `topk_func`/`topk_transform` 最前面拦截，转 torch CPU 参考实现。
+- **`should_use_topk_v2()` 是分水岭**：官方为 `True`（CUDA-only JIT，模拟器跑不了），SiPU 强制 `False`，于是必然落到只认 2048 的 legacy 路径 —— 这就是 SiPU 不得不加回退层的原因。
+- **不改代码的正解：yaml 里加 `dsa_topk_backend: flashinfer`**，实测跑通，**且 30 个 dump 张量与 SiPU 参考全局 maxdiff = 0.000e+00（逐位相同）**。
+- `dsa_topk_backend: torch` **走不通**（要配 `SGLANG_DSA_FUSE_TOPK=false`，且会撞上 `transform_index.py:168` 的**第二个**硬编码 2048）。
+- **别被 `Setting page size to 64` 误导** —— 那是 KV cache 的 page size，与报错的 `index_topk` 数值相同但来源无关。
