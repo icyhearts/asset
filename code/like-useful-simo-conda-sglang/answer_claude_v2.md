@@ -9125,3 +9125,314 @@ python3 test_utils/run_test_job.py \
 - **不改代码的正解：yaml 里加 `dsa_topk_backend: flashinfer`**，实测跑通，**且 30 个 dump 张量与 SiPU 参考全局 maxdiff = 0.000e+00（逐位相同）**。
 - `dsa_topk_backend: torch` **走不通**（要配 `SGLANG_DSA_FUSE_TOPK=false`，且会撞上 `transform_index.py:168` 的**第二个**硬编码 2048）。
 - **别被 `Setting page size to 64` 误导** —— 那是 KV cache 的 page size，与报错的 `index_topk` 数值相同但来源无关。
+
+---
+
+## 63. `MXINT8_COLS_ALIGNMENT = 128` 为什么不是 64 —— 以及硬件真正的要求是多少
+
+**问题**：`sipu` 的 tile format 一个 tile 是 32 行 × 32B，bf16 下每行 16 个 element；一个 supertile 是 `[1,4]` 个 tile，换算成 bf16 元素是 `[32, 64]` —— **看起来列方向 padding 到 64 就够了**。那么 `mxint8_utils.py:27` 为什么设 `MXINT8_COLS_ALIGNMENT = 128`？这个值能不能改小？
+
+**答：`128` 不是硬件对"列"的要求，而是 **`rows × cols` 必须凑够 1024 个元素（一个 MX block）** 这条约束，在 **`rows` 被固定为 32** 时的必然结果。** 真正的硬件对齐是 **`cols % 32 == 0`**（tile 宽度），但 `32 × 32 = 1024` 恰好等于一个 block，而对 pad 后的**权重**（`n` 被 pad 到 32）来说，`k=32` 是**做不到的** —— 原因是 MMA 的 tile 阶梯会把 `K<128` 的行映射到 **`Tile_M=128`** 的 kernel 分支上，而 `M=32 < 128` 会让 grid 变 0。
+
+**所以 128 这个数不能简单改小**；它同时兜住了三条约束。我能改小到 64 的唯一情形，是**同时把 `Tile_M` 也一起改** —— 但那是改 sikernel，不是改这个常量。
+
+### 63.0 一句话结论
+
+| 项 | 结果 |
+| --- | --- |
+| **tile / tensormap**（ISA 层） | **`cols % 32 == 0`**（元素）。由 `hp_to_mx_tensormap.hpp:88` 的 `dim1 % output_tile_dim0` 决定，而 `output_tile_dim0 = input_lmul(2) × input_tile_dim0(16) = 32` |
+| **supertile `[1,4]`** | = **`[32 行, 64 元素]`**（K 方向 4×32B = 128 **字节** = 64 元素，见 63.2） |
+| **MX block 存储约束** | **`rows*cols % 1024 == 0`**（1024 元素 + 64B header = **1088 B**/block）。`rows=32` 时代入得 **`cols % 32 == 0`** —— **推不出 128**（见 63.3） |
+| **MMA 的隐藏约束** | **`K` 决定 `Tile_M`**：`K>=128→Tile_M=32`、`K>=64→Tile_M=64`、`K<64→Tile_M=128`（`tile_mma_...su:42-59`） |
+| **★ 128 的真正来源** | 权重 pad 后 **`M=32`**，只有 **`K>=128`** 时 `Tile_M` 才 = 32；**`K=64` 会选 `Tile_M=64 > M=32` → `m_tile = M/Tile_M = 0` → "Grid dimensions must be non-zero"** |
+| 能否改小到 64 | **不能**（除非同时改 sikernel 的 tile 阶梯）。实测 `m=32,k=64`：`Tile_M=64,m_tiles=0` → 报错；`m=32,k=128`：`m_tiles=1` → 正常 |
+| vllm 是否 pad 多了 | **没有多 pad**。128 是三条约束共同的下界，在这个 `M=32` 的用法下**恰好是紧的** |
+
+### 63.1 先把 tile / supertile 的账算清楚
+
+ISA 文档 `/softhome/like/asset/code/isa/index.html`（"Tile Reg排布方式"一节）写得很明确：
+
+```
+32x32B的数据排布模式是行(M)方向32B排布，再按列(K)方向排布32个32B。
+16x64B的数据排布模式是行(M)方向32B排布，再按列(K)方向排布16个32B，再按行方向(M)方向排布2组16个32B。
+8x128B的数据排布模式是行(M)方向32B排布，再按列(K)方向排布8个32B，再按行方向(M)方向排布4组8个32B。
+```
+
+所以 **32 行布局** 的一个 tile reg 就是：
+
+- **32 行**，每行 **32 字节**
+- bf16 是 2 字节/元素 ⇒ **每行 16 个元素**
+- 整个 tile = **32 × 32B = 1024 字节 = 512 个 bf16 元素**
+
+你描述的"一个 tile = 32行 x 每行16 element" **完全正确**。但接下来"一个 tile = 32行x每行16 element" 这句里，**行数 32、每行 16 元素，所以一个 tile 是 32×16 = 512 个元素** —— 这里已经埋了后面要用的关键数字。
+
+### 63.2 你的 supertile 换算是对的（但这里有个字节/元素的陷阱）
+
+你写的 "supertile `[1,4]` 个 tile，以 bf16 元素为单位是 `[1x32, 4*16] = [32, 64]`" —— **这个换算完全正确**，我核对过：
+
+```
+一个 tile      : 32 行 × 32B/行 = 1024B = 512 个 bf16 元素（每行 16 个）
+supertile [1,4]: M = 1 tile × 32 行   = 32 行
+                 K = 4 tile × 32 B    = 128 B
+                 K 换成元素           = 128B / 2B = 64 个
+=> [32 行, 64 个元素]      ✓
+```
+
+**但正因为这个换算是对的，才更要小心 `128` 这个数字从哪冒出来** —— 因为同一句话里有两个 `128`：
+
+| 数字 | 含义 | 出处 |
+| --- | --- | --- |
+| **128 B** | supertile 在 **K 方向的总字节数**（4 个 tile × 32B） | 你的换算 |
+| **128 元素** | `MXINT8_COLS_ALIGNMENT` | `mxint8_utils.py:27` |
+
+**这两个 128 没有任何关系。** `MXINT8_COLS_ALIGNMENT` 讲的是**元素个数**（后面所有 `cols` 都是元素口径），而 supertile 的 128 是**字节数**。**把 supertile 的 128B 误当成 128 元素，是最容易得出的错误结论** —— 我第一遍就差点这么写。真实的 supertile 元素宽度是 **64**，比 128 小一半 —— 这也正是你 "只 padding 到 64 就够了" 这个直觉的来源，而且**从 tile/supertile 的角度看，它是对的**。
+
+**但 tile 不是唯一的约束**（63.3 给出另外两条），而且 **128 恰恰不是从 supertile 来的** —— 这个矛盾就是本节的答案，见 63.4。
+
+不过 `hp_to_mx_tensormap.hpp:103-112` 里 supertile 的形状是**按 MX 输出格式**选的，并不固定是 `[1,4]`：
+
+```cpp
+// hp_to_mx_tensormap.hpp:103-112
+if constexpr (Rows == 8 || Rows == 16) {
+    result.output_supertile_cols = 4;          // [*, 4]
+} else if (result.output_col_tiles > 2) {
+    result.output_supertile_cols = 4;          // Rows=32 且列 tile 数 > 2 → [1,4]
+} else if (result.output_col_tiles > 1) {
+    result.output_supertile_cols = 2;          // → [2,2]
+    result.output_supertile_rows = 2;
+} else {
+    result.output_supertile_rows = 4;          // 只有 1 个列 tile → [4,1]
+}
+```
+
+**也就是说，`[1,4]` 只是"列 tile 多于 2 个"时的典型值**（ISA 文档也写 `Valid: MX: [4,1] (typical), [2,2], [1,4]`）。当 K 很小、只有一个列 tile 时，supertile 会变成 `[4,1]` —— 后面会看到，**这正是 `k=32` 那条路会崩的另一个侧面**。
+
+### 63.3 那 128 到底是从哪来的？—— 三条约束
+
+`mxint8_utils.py:26-31` 定义的五个常量：
+
+```python
+MXINT8_ROWS_ALIGNMENT = 32      # 行对齐
+MXINT8_COLS_ALIGNMENT = 128     # ★ 列对齐（要解释的）
+MXINT8_BLOCK_ELEMS = 1024       # 一个 MX block 1024 个元素
+MXINT8_BLOCK_BYTES = 1088       # 一个 MX block 1088 字节（1024 数据 + 64 header）
+MXINT8_TILE_ROWS = 32
+MXINT8_TILE_BYTES = 32
+```
+
+**先看最硬的那条 —— `1088 = 1024 + 64`。** 每个 tile 的数据是 1024B，外加 **64B 的 header**（metadata / scale），所以：
+
+```
+tile 数据 1024B + tile header 64B = 1088B / block
+```
+
+这个是**逐字节可验证**的，`hp_to_output_traits.hpp:162` 那个宏展开就是：
+
+```cpp
+DEFINE_HP_TO_OUTPUT_TRAITS(sifmt::mxint8, 8, 64, 2, ...)
+//                          ↑类型         ↑8bit ↑header=64 ↑input_lmul=2
+```
+
+宏体在 `hp_to_output_traits.hpp:132-141`：
+
+```cpp
+static constexpr int tile_data_bytes =
+    INPUT_LMUL_16BIT * 512 * PACKED_BITS / 8;      // 2 * 512 * 8/8 = 1024
+static constexpr int tile_header_bytes = HEADER_BYTES;   // 64
+```
+
+**所以 1088 不是凑的，是 1024 + 64 算出来的。**
+
+**再看 128。** `get_mxint8_storage_size`（`mxint8_utils.py:113-126`）里有两条独立的检查：
+
+```python
+if cols % MXINT8_COLS_ALIGNMENT != 0:     # cols % 128 == 0
+    raise ValueError(...)
+return (rows * cols // MXINT8_BLOCK_ELEMS) * MXINT8_BLOCK_BYTES   # 必须整除 1024
+```
+
+**注意第二条：`rows*cols` 必须能被 1024 整除**，否则 `//` 会**静默截断**（Python 的 `//` 不报错！）。C++ 那边则是显式的：
+
+```cpp
+// csrc/jit/quantization/mxint8.cpp:49-52
+TVM_FFI_ICHECK(numel % kMxInt8InputBlockElems == 0)
+    << "rows * cols must be a multiple of " << kMxInt8InputBlockElems << ...;
+return (numel / kMxInt8InputBlockElems) * kMxInt8PackedBlockBytes;
+```
+
+**所以真正的硬件级约束是 `rows*cols % 1024 == 0`，不是 `cols % 128 == 0`。**
+
+把两条摆在一起，在 **`rows` 被 pad 到 32 的整数倍**这个前提下：
+
+| rows | `rows*cols % 1024 == 0` 要求 | tile 宽度要求 | 合起来 |
+| --- | --- | --- | --- |
+| 8 | `cols % 128 == 0` | `cols % 32 == 0` | **cols % 128** |
+| 16 | `cols % 64 == 0` | `cols % 32 == 0` | **cols % 64** |
+| **32** | **`cols % 32 == 0`** | `cols % 32 == 0` | **cols % 32** |
+| 64 | `cols % 16 == 0` | `cols % 32 == 0` | **cols % 32** |
+
+**看到问题了吗：`rows=32` 时，block 约束给出的其实是 `cols % 32`，和 tile 宽度要求一模一样 —— 根本推不出 128。**
+
+**所以 128 不是从这两条推出来的。它来自第三条：MMA 的 tile 阶梯。** 这才是本节的核心。
+
+### 63.4 128 的真正来源：MMA 把 K 和 M 耦合成一条阶梯
+
+`sikernel.h:277` 的 `mma_bf16_mxi8_universal` 声明里，K 的合法值写得很清楚：
+
+```
+@param m Height of matrix A (8 ) (16 ) (32 aligned, >=32)
+@param n Width of matrix B (32 aligned, >=32)
+@param k Inner dimension (128 aligned, >=128)
+                          (256 aligned, >=256)
+                          (512 aligned, >=512)
+```
+
+**`k` 的最小值是 128。** 而 `.su` 里那句注释 `//K should be 128*4 aligned` 也是同一个意思。
+
+**但真正的坑在实现里。** `tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor.su:42-59` 是这么选 tile 几何的：
+
+```cpp
+if (M >= 32) {
+    if (K >= 128) { Tile_M = 32;  Tile_K = 128; }
+    else if (K >= 64) { Tile_M = 64;  Tile_K = 64; }
+    else { Tile_M = 128; Tile_K = 32; }
+} else if (M >= 16) { Tile_M = 16; Tile_K = 64; }
+else { Tile_M = 8; Tile_K = 128; }
+```
+
+然后 `:61-63`：
+
+```cpp
+uint32_t m_tile = M / Tile_M;      // ★ 整数除法
+uint32_t n_tile = N / Tile_N;      // Tile_N 恒为 32
+int total_tiles = m_tile * n_tile;
+```
+
+**`K` 一变小，`Tile_M` 就变大。** 而 `m_tile = M / Tile_M` 是**整数除法** —— 只要 `Tile_M > M`，`m_tile` 就是 **0**，`total_tiles = 0`，于是 kernel 用 0 个 grid 启动：
+
+```
+[CHECK] .../sirt/src/umd/function.cpp:168 - Grid dimensions must be non-zero
+```
+
+**这正是我实测到的现象**（用 `ctypes` 直接调用 .so 里那个 `mma_bf16_mxi8_universal`，绕开 vllm 的 C++ 检查）：
+
+| `m` | `k` | 选中的 `Tile_M`/`Tile_K` | `m_tile = m/Tile_M` | 结果 |
+| --- | --- | --- | --- | --- |
+| 32 | **128** | 32 / 128 | **1** | ✅ 正常启动（`RESULT m=32 n=32 k=128`） |
+| 32 | 64 | **64** / 64 | **0** | ❌ `Grid dimensions must be non-zero` |
+| 32 | 96 | **64** / 64 | **0** | ❌ `Grid dimensions must be non-zero` |
+| 64 | **64** | 64 / 64 | **1** | ✅ 正常 |
+| 128 | **32** | 128 / 32 | **1** | ✅ 正常 |
+| 64 | 32 | 128 / 32 | **0** | ❌ 崩（`illegal read address`） |
+| 16 | 32 / 64 | 16 / 64 | 1 | ✅ 正常（走 `M>=16` 分支） |
+| 8 | 64 / 128 | 8 / 128 | 1 | ✅ 正常（走 `M<16` 分支） |
+
+（最后两行 `n` 都取 32 —— `Tile_N` 恒为 32，`n<32` 也会让 `n_tile=0` 崩，与本节的 K 问题无关。）
+
+**看第 1、2 行 —— 这就是答案。**
+
+**权重 pad 之后 `M = 32`（`MXINT8_ROWS_ALIGNMENT = 32`）。要让 MMA 走上 `Tile_M=32` 那条分支，必须 `K >= 128`。所以 K 必须 pad 到 128 的整数倍。**
+
+**如果按你说的只 pad 到 64**，`K=64` 会掉进 `Tile_M=64` 分支，而 `M=32 < 64` → `m_tile=0` → 启动失败。**实测确认。**
+
+> 这也解释了为什么 `MXINT8_ROWS_ALIGNMENT` 和 `Tile_M` 都是 32 却互不矛盾 —— 它们是**两条不同的路线**：前者是 padding 的粒度，后者是 kernel 内部的 tile 划分。128 的作用是**确保 `K` 大到能让 `Tile_M` 回落到 32**。
+
+### 63.5 那 `cols`（= K）的硬件下界到底是多少？
+
+把三层分开看：
+
+| 层 | 对 bf16 输入 `cols` 的要求 | 依据 |
+| --- | --- | --- |
+| **tile / tensormap** | **`cols % 32 == 0`** | `hp_to_mx_tensormap.hpp:88`；`output_tile_dim0 = input_lmul(2) × input_tile_dim0(16) = 32` |
+| **MX block 存储** | **`rows*cols % 1024 == 0`** | `mxint8.cpp:49`、`hp_to_output_traits.hpp:141`（1024 数据 + **64B header** = 1088） |
+| **MMA kernel 实现** | **`cols % 128 == 0`（当 `M=32` 时）** | `.su:42-59` 的 tile 阶梯 + `:61` 的整数除法 |
+
+**把前两条按 `rows` 展开，会看到一个反直觉的结果：**
+
+| rows | 存储约束要求 | tensormap 要求 | 前两条取交集 | **加上 MMA 的实测结果** |
+| --- | --- | --- | --- | --- |
+| 8 | `cols % 128` | `cols % 32` | **`cols % 128`** | `k=64/128` 实测**都能跑** → MMA 不是瓶颈 |
+| 16 | `cols % 64` | `cols % 32` | **`cols % 64`** | `k=32/64` 实测**都能跑** → MMA 不是瓶颈 |
+| **32** | **`cols % 32`** | `cols % 32` | **`cols % 32`** | **`k=64/96` 崩，`k=128` 才通 → MMA 才是瓶颈** ★ |
+| 64 | `cols % 16` | `cols % 32` | **`cols % 32`** | `k=64` 实测通（`Tile_M=64=M`） |
+
+**注意第 1、2 行：`rows=8/16` 时，实际下界由**存储约束**（128 / 64）决定，而不是 MMA** —— 因为 `M<32` 时 tile 阶梯走的是 `M>=16 → (16,64)` 或 `M<16 → (8,128)` 分支，和 `rows` 匹配得上。
+
+**只有 `rows=32` 这一行，前两条只给到 32，是 MMA 把它抬到 128 的。**
+
+**看第 3 行（也就是当前的实际用法）：前两条（tile + 存储）合起来只要求 `cols % 32`，离 128 差得远。** 是 **MMA 那条**把下界抬到了 128。
+
+**"硬件真正要求"的准确说法是：**
+
+- **指令 / 数据布局层面**：`cols % 32 == 0`（tensormap 的 tile 宽度），这是**最底层的**下界
+- **加上 MX 存储**：`rows*cols % 1024 == 0`（`rows=32` 时自动满足）
+- **要真正跑通 `mma_bf16_mxi8_universal`（`M=32`）**：必须 `cols >= 128` 且 `cols % 128 == 0`
+
+**128 不是"硬件的列对齐要求"，而是"这条特定 MMA 实现路径的有效性条件"。** 这个区别很关键 —— 它决定了你**能不能**改小（见 63.7）。
+
+### 63.6 vllm 有没有多 pad？—— 没有
+
+你的直觉"vllm 可能 pad 了超过硬件要求的数据"**在 ISA 层面对**（`cols%32` 确实小于 `cols%128`），**但在能跑通的前提下不多**：
+
+- **改小到 32 或 64 会直接崩**（63.4 实测）
+- **改小到 64 只有在 `M` 也变小时才成立** —— 例如 `M=64, K=64` 实测正常（上表第 4 行）。但那要求权重**不要** pad 到 32 的倍数而是 pad 到 64 —— 这与 `MXINT8_ROWS_ALIGNMENT=32` 冲突，等于把行对齐也放大一倍，**反而 pad 更多**
+
+**所以 128 在当前 `M=32` 的用法下是紧的下界，没有浪费。**
+
+**真正"多 pad"的地方不在 cols，而在两个别处**，这才是可能值得优化的点：
+
+1. **`get_padded_mxint8_shape`（`mxint8_utils.py:104-110`）对 cols 取 `max(cols, 128)`** —— 即使真实 K 只有 8，也会 pad 到 128。这是**为满足 MMA 最小 K** 付出的固定开销。
+2. **`supertile` 的 padding 浪费**：当列 tile 数 ≤ 2 时，supertile 会变成 `[2,2]` 或 `[4,1]`（`hp_to_mx_tensormap.hpp:103-112`），此时**物理存储按 supertile 对齐**，边角会有未写入的 tile —— `hp_to_mx_kernel.su:66-73` 那个 `ZERO_OUTPUT` 分支就是专门为"未访问到的 supertile padding 字节"准备的。
+
+### 63.7 想改小 128 的话，需要动什么
+
+**只改 `MXINT8_COLS_ALIGNMENT` 是行不通的** —— C++ 和 sikernel 里还有**四处**独立的硬检查：
+
+| 位置 | 检查 | 能否只改 Python |
+| --- | --- | --- |
+| `mxint8_utils.py:27` | `MXINT8_COLS_ALIGNMENT = 128` | ← 你想改的 |
+| `jit/mxint8.py:66` | `if cols % 128 != 0: raise` | 要一起改 |
+| `csrc/jit/quantization/mxint8.cpp:36,45` | `kMxInt8ColsAlignment = 128` + `ICHECK` | **要改 C++（需重编 JIT）** |
+| `csrc/jit/quantization/mxint8.cpp:129` | `k % kMxInt8ColsAlignment == 0` | **同上** |
+| `.deps/sikernel-src/.../tile_mma_...su:42-59` | tile 阶梯 `K>=128 → Tile_M=32` | **要改 sikernel**（且可能影响硬件正确性） |
+
+**真正的最小改法**是改 **sikernel 的 tile 阶梯**，让 `M=32, K=64` 也能选到 `Tile_M <= 32` 的分支（例如把 `K>=64` 那支的 `Tile_M` 从 64 改成 32）。但那等于**用新的 tile 划分去跑同一套指令**，**必须逐 shape 重新验证数值正确性**（不能只看"不崩了"）—— 这正是 `.su:168` 那句 `//K should be 128*4 aligned` 注释想表达的：**这些都是有意识的特化，不是随手写的。**
+
+**结论：站在"结果正确且能跑"的角度，128 不该改小。** 如果确实关心 padding 开销，更值得看的是 63.6 提到的那两点（最小 K 的固定开销、supertile 边角浪费），而不是这个对齐常量。
+
+### 63.8 复现这些实验的命令
+
+我用的方法值得记下来 —— **绕开 vllm 的 C++ 检查，直接 `ctypes` 调 `.so` 里的 sikernel 函数**：
+
+```bash
+# 1. 先进对的环境（缺一不可：conda 激活 → source setup → 补 archmodel 的 lib 路径）
+source /share_data/users/like/miniconda3/etc/profile.d/conda.sh
+conda activate vllm_dev
+cd /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+export LD_LIBRARY_PATH=/share_data/arch_cmodel_release/sipu1.5/2608270400/lib:$LD_LIBRARY_PATH
+
+# 2. 触发 JIT 编译，拿到 .so
+python -c "from vllm_sipu.ops.backends.sikernel.jit.mxint8 import get_mxint8_module; get_mxint8_module()"
+# -> ~/.cache/vllm_sipu/jit/quantization_mxint8-<hash>/build/quantization_mxint8.so
+
+# 3. 找到 mma 符号（mangled，可以直接 dlsym）
+nm -D <so> | grep mma_bf16_mxi8_universal
+# _Z23mma_bf16_mxi8_universalPvS_S_iiiP11SIstream_st
+
+# 4. ctypes 直接调，传任意 M/N/K
+```
+
+**两个坑要注意**：
+
+- **`source` 会继承调用脚本的位置参数。** 我第一次写包装脚本时，`python probe.py 32 32 128` 里的 `32` 被 `source sipu_sdk_setup.sh` 当成 **SDK 版本号**吃掉了（`sipu_sdk_setup.sh:7` 的 `resolve_version "$1"`），于是 `python` 收不到参数。解决：脚本里先 `set --` 清空，或改用环境变量传参。
+- **`source setup.sh` 必须在 `conda activate` 之后**（`sipu_sdk_setup.sh` 末尾会读 `CONDA_PREFIX` 拼 `LD_LIBRARY_PATH`），而且它**不明文导出 archmodel 的库路径**，要手动补 —— 否则 `import torch` 就报 `Failed to import torch_sipu._C`。
+
+### 63.9 小结
+
+- **tile 是 32 行 × 32B；bf16 下每行 16 个元素，一个 tile = 512 个元素。** supertile `[1,4]` 换算成元素是 **`[32, 64]`** —— **`64` 是元素数，`128` 是字节数**（4 × 32B），这两个数很容易混。
+- **`cols % 32 == 0` 才是 tile 宽度（ISA 级）的要求**；`rows*cols % 1024 == 0` 是 MX block 存储的要求（1024 数据 + **64B header** = 1088）。
+- **`128` 来自第三条约束：MMA 的 tile 阶梯把 `K` 和 `Tile_M` 绑在一起**（`.su:42-59`）。权重 pad 后 `M=32`，**只有 `K>=128` 才能选到 `Tile_M=32`**；`K=64` 会选 `Tile_M=64 > M=32`，`m_tile = M/Tile_M = 0`，**kernel 以 0 grid 启动**。
+- **实测确认**：`m=32,k=128` 正常（`m_tiles=1`）；`m=32,k=64` 和 `m=32,k=96` 都报 `Grid dimensions must be non-zero`；`m=64,k=64`、`m=128,k=32` 正常（它们各自落在阶梯的正确分支上）。
+- **所以 `MXINT8_COLS_ALIGNMENT = 128` 不多不少，在当前 `M=32` 用法下是紧的**。想改成 64 必须**同时改 sikernel 的 tile 阶梯**，并且**逐 shape 重新验证数值** —— 不能只改这个 Python 常量（C++ 和 sikernel 里还有 4 处独立硬检查）。
+- **真正可能的 padding 浪费不在 cols**，而在 `get_padded_mxint8_shape` 的 `max(cols, 128)` 固定开销，以及 supertile 边角（`hp_to_mx_tensormap.hpp:103-112`，对应 `hp_to_mx_kernel.su:66-73` 的 `ZERO_OUTPUT` 处理）。

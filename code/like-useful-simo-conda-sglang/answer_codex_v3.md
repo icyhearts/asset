@@ -844,3 +844,601 @@ CUDA_VISIBLE_DEVICES   = 应用层进一步屏蔽或重排逻辑 ordinal
 SGLang 在容器已经可见的逻辑设备中尝试绑定哪一个。脚本默认选择 `CUDA_GPUS=0`，
 所以最稳妥的单卡 CUDA baseline 配置是把 `base_gpu_id` 改成 `0`；若要选择主机
 物理 GPU 2，则设置 `CUDA_GPU/ CUDA_GPUS=2`，同时仍保持 `base_gpu_id=0`。
+
+## 5. `MXINT8_COLS_ALIGNMENT=128` 的硬件、格式和 sikernel 原因
+
+### 5.1 分析范围与直接结论
+
+本节使用以下路径作为相对路径基准：
+
+* `vllm-sipu/`：`/share/users/like/package/vllm-sipu`
+* `sikernel/`：`/share/users/like/package/vllm-sipu/.deps/sikernel-src`
+* `sdk/`：`/share_data/sicx_sdk/release/2609020046`
+* `compiler-toolchain/`：`/share/users/like/package/compiler-toolchain`
+* `isa/`：`/softhome/like/asset/code/isa`
+
+验证日期为 **2026-09-15**，SDK 为 `2609020046`，运行后端为日志中显示的
+`swemusp` CModel。
+
+先给出结论：
+
+1. **对当前未修改的 vllm-sipu + 当前 `mma_bf16_mxi8_universal`，K 维必须继续
+   padding 到 128 的整数倍。不能只把 `MXINT8_COLS_ALIGNMENT` 从 128 改成 64。**
+2. **128 不是 r32 MXINT8 ISA 的最小 K 粒度。**硬件的一个 r32 MXINT8 tile 是
+   `32 x 32` 个 MXINT8 element；`tmma` 有 m1、m2、m4 三种输入规模，对应
+   K=32、64、128。
+3. **单独看 `hp_to_mx` 量化器，r32 BF16 -> MXINT8 只要求 K 是 32 的整数倍。**
+   当前 sikernel 自测明确覆盖并通过 K=32、64、288。
+4. 128 同时解决了当前代码中的两个软件问题：
+   * universal GEMM 的主路径按 K=128、`tmxint8m4` 计算；
+   * vllm-sipu 的 packed buffer 大小公式只按“逻辑 tile 数 x 1088 B”计算，
+     没有按四个 tile 的完整 supertile 计算。`rows % 32 == 0` 且
+     `cols % 128 == 0` 时，1x4 supertile 总能被完整填满，因此这个简化公式成立。
+5. **硬件和内层 K=64 kernel 是可用的，但当前 universal wrapper 的 K=64 分支有
+   host/device 分块粒度不一致。**隔离实验修正该分块后，`64x64x64` GEMM 的平均
+   相对误差为 `0.01253165`；只放宽 128 校验、不修分块时结果包含 NaN。
+
+把不同层的要求分开看最清楚：
+
+| 层次 | r32 下的 K/列要求 | 说明 |
+| --- | --- | --- |
+| BF16 普通 tile | 16 个 BF16 element/tile | 32 行 x 每行 32 B，即 `32 x 16` BF16 |
+| BF16 -> MXINT8 `hp_to_mx` | K 是 32 的整数倍 | 两个 BF16 tile 转换成一个 MXINT8 tile |
+| 单条 r32 MXINT8 `tmma` | K=32/64/128 | 分别是 m1/m2/m4 |
+| MXINT8 物理存储 | 每个 supertile 固定 4 个 tile | supertile 可排成 4x1、2x2、1x4 |
+| 当前 vllm-sipu API | K 是 128 的整数倍 | Python、JIT C++ 都显式校验 |
+| 当前 universal GEMM 常用分支 | `M,N` 按 32，K 按 128 | `32x32x128` macro-kernel |
+
+### 5.2 需要先纠正的 tile/supertile 计算
+
+问题中的计算把 **BF16 tile 的列宽**用于解释 **MXINT8 supertile**，这两者不是
+同一种 format 下的 tile。
+
+`isa/index.html:569-575 - Tile Reg 排布方式` 给出 r32 tile 为 `32 x 32B`。
+因此：
+
+```text
+BF16:   每个 element 2B -> 一个 r32 tile = 32 x 16 element = 1024B
+MXINT8: 每个 element 1B -> 一个 r32 tile = 32 x 32 element = 1024B data
+```
+
+BF16 转成 MXINT8 是 2:1 压缩，所以一次 r32 转换是：
+
+```text
+2 个 BF16 tile = 32 x 32 BF16
+              -> tcvt.tt.mxi8.bf16.r32
+1 个 MXINT8 tile = 32 x 32 MXINT8 + 64B tile header
+```
+
+对应代码是：
+
+* `sikernel/source/source_builtin/misc/hp_to_mx/kernel/hp_to_output_traits.hpp:43-46`
+  定义 `tbfloat16m1/m2/...`。
+* 同文件 `:162-164 - HpToOutputTraits<mxint8, HP_T>` 把 MXINT8 的
+  `INPUT_LMUL_16BIT` 设为 2，并选择 `tcvt_mxi8`。
+* `compiler-toolchain/llvm-project/clang/test/CodeGen/RISCV/xsotile150g/wrappers/tcvt_test.cpp:4238-4241 - __rvv_tcvt_tt_mxi8_bf16_r32`
+  明确验证 `tbfloat16m2_t -> tmxint8m1_t` 生成
+  `tcvt.tt.mxi8.bf16.r32`。
+
+因此，若 supertile 是 MXINT8 的 1x4 tile：
+
+```text
+1 x 4 个 MXINT8 tile
+= [1 * 32, 4 * 32] 个 MXINT8 element
+= [32, 128]
+```
+
+它不是 `[32,64]`。`[32,64]` 是“4 个 BF16 tile”的元素范围，但一个 1x4
+MXINT8 supertile 对应的是 8 个 BF16 input tile。
+
+另外，1x4 也不是所有 r32 MX tensor 的唯一 supertile 形状：
+
+* `sdk/include/SiTe/site/adapter/sipu150.hpp:36-45 - site::adapter::sipu150::Traits::tile_columns`
+  对 8-bit、32-row format 算出每个 tile 为 32 列。
+* 同文件 `:48-61 - site::adapter::sipu150::Traits::supertile_shape` 规定：
+  * 总列数 `<= 32`：4x1；
+  * 总列数 `<= 64`：2x2；
+  * 总列数 `> 64`：1x4。
+* `isa/index.html:4809-4814 - superTileDim` 也列出 MX 合法形状
+  `[4,1]`、`[2,2]`、`[1,4]`，而 NonMX 是 `[1,1]`。
+
+所以，对 r32 MXINT8：
+
+```text
+K <= 32:  4x1 supertile，物理覆盖 128x32
+K <= 64:  2x2 supertile，物理覆盖 64x64
+K > 64:   1x4 supertile，单个 supertile 物理覆盖 32x128
+```
+
+“物理覆盖”不等于逻辑 shape 必须等于该值；不足部分由 tiled layout/DTE 作为
+padding，但分配仍以完整 supertile 为单位。
+
+### 5.3 从 vllm-sipu 到 sikernel 的调用链
+
+权重侧调用链：
+
+```text
+vllm_sipu/model_executor/layers/quantization/mxint8.py:156-174
+MXInt8LinearMethod::process_weights_after_loading
+  -> get_padded_mxint8_shape(output_size, input_size)
+  -> quantize_to_mxint8(weight, padded_shape)
+  -> 保存 packed_weight 和 mxint8_weight_shape
+```
+
+推理 activation 侧和 GEMM 调用链：
+
+```text
+vllm_sipu/model_executor/layers/quantization/mxint8.py:176-190
+MXInt8LinearMethod::apply
+  -> vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:202-224
+     apply_mxint8_linear
+       -> activation rows padding
+       -> quantize_to_mxint8(input, [M_pad, K_pad])
+       -> mxint8_bf16_matmul.sikernel(qinput, qweight, M_pad, N_pad, K_pad)
+       -> crop 回原始 M、N
+```
+
+量化调用链：
+
+```text
+vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:163-199
+quantize_to_mxint8
+  -> :129-160 build_mxint8_tile_tensor_on_cpu
+  -> :70-97 linear_to_tileformat
+  -> vllm_sipu/ops/quantization.py:108-110 quantize_to_mxint8
+  -> vllm_sipu/ops/op_list.yaml:971-978 provider dispatch
+  -> vllm_sipu/ops/backends/sikernel/jit/mxint8.py:104-117 quantize_to_mxint8
+  -> csrc/jit/quantization/mxint8.cpp:72-112 quantize_to_mxint8
+  -> csrc/jit/quantization/mxint8.cpp:55-60 launch_quantize_to_mxint8
+  -> sikernel/include/sikernel.h:2350-2354 hp_to_mx（默认 tiled input）
+  -> sikernel/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su:28-87 hp_to_mx
+  -> sikernel/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.hpp:55-108 hp_to_mx_kernel
+```
+
+GEMM 调用链：
+
+```text
+vllm_sipu/ops/quantization.py:113-115 mxint8_bf16_matmul
+  -> vllm_sipu/ops/op_list.yaml:979-985 provider dispatch
+  -> vllm_sipu/ops/backends/sikernel/jit/mxint8.py:120-130 mxint8_bf16_matmul
+  -> csrc/jit/quantization/mxint8.cpp:114-148 mxint8_bf16_matmul
+  -> csrc/jit/quantization/mxint8.cpp:62-68 launch_mxint8_matmul
+  -> sikernel/source/source_builtin/blas/L3/mma/
+     tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor/kernel/
+     tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor.su:33-96
+     mma_bf16_mxi8_universal
+  -> 同目录 tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor.hpp:154-203
+     universal::kernel_tile_mma_32x32_bf16_mxi8_mxi8_gmem_tiled_tensor
+  -> 同文件 :65-150
+     universal::tile_mma_32x32_bf16_mxi8_mxi8_tiled_tensor
+  -> tld_blk_global_m1/m2/m4 + tmma + tcvt_bf16 + tst_*
+```
+
+### 5.4 vllm-sipu 为什么选择 128
+
+#### 5.4.1 Python 和 JIT C++ 把 128 当成正式 API contract
+
+`vllm-sipu/vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:26-31`
+定义：
+
+```python
+MXINT8_ROWS_ALIGNMENT = 32
+MXINT8_COLS_ALIGNMENT = 128
+MXINT8_BLOCK_ELEMS = 1024
+MXINT8_BLOCK_BYTES = 1088
+```
+
+随后：
+
+* `:104-110 - get_padded_mxint8_shape` 把 K pad 到 128；
+* `:113-126 - get_mxint8_storage_size` 拒绝非 128 倍数的列，并用
+  `(rows * cols / 1024) * 1088` 算 packed bytes；
+* `:202-220 - apply_mxint8_linear` 把同一个 padded K 同时传给 A 和 B。
+
+JIT Python 在
+`vllm-sipu/vllm_sipu/ops/backends/sikernel/jit/mxint8.py:57-68 - _expected_storage_size`
+重复了相同的 128 校验和存储公式。
+
+JIT C++ 又在
+`vllm-sipu/csrc/jit/quantization/mxint8.cpp:35-52 - expected_mxint8_storage_size`
+第三次定义 128，并在 `:128-132 - mxint8_bf16_matmul` 强制：
+
+```text
+N % 32 == 0
+K % 128 == 0
+qinput bytes == expected(M, K)
+qweight bytes == expected(N, K)
+```
+
+因此只改 Python 常量会先被 JIT Python 或 C++ 拒绝；即使三处一起改，后面的
+physical storage 和 GEMM 分块仍然需要修改。
+
+#### 5.4.2 1088 B 公式隐含了“supertile 必须填满”
+
+一个 MXINT8 tile 是：
+
+```text
+1024 B data + 64 B header = 1088 B
+```
+
+但是硬件内存不是按任意一个独立 tile 分配，而是按四个 tile 的 supertile：
+
+```text
+4 * 1024 B data + 4 * 64 B header
+= 4096 B data + 256 B header
+= 4352 B
+```
+
+代码证据：
+
+* `sdk/include/SiTe/tensor/tensor.hpp:964-1005` 展示 MX8/4 的四个 64 B header，
+  以及 4x1、2x2、1x4 三种摆放；
+* 同文件 `:1006-1032 - SuperTile::storageSize` 对 MX format 固定使用 4 个 tile；
+* 同文件 `:1417-1423 - LayoutEngine::storageSize` 返回
+  `numSuperTiles * SuperTile::storageSize()`；
+* `sdk/include/SiTe/sifmt/sifmt.hpp:42-68 - sifmt::tensor::superTileSize`
+  对普通 MX8 返回 `4 * 1024 + 256 = 4352` B。
+
+比较几个 shape，可以看到当前公式为何需要 128：
+
+| MXINT8 logical shape | 逻辑 tile 数 | 选中的 supertile | 正确物理 bytes | 简化公式 bytes |
+| --- | ---: | --- | ---: | ---: |
+| 32x32 | 1 | 4x1 | 4352 | 1088 |
+| 32x64 | 2 | 2x2 | 4352 | 2176 |
+| 64x64 | 4 | 2x2 | 4352 | 4352 |
+| 32x128 | 4 | 1x4 | 4352 | 4352 |
+| 64x128 | 8 | 两个 1x4 | 8704 | 8704 |
+
+表中“简化公式”是假设放宽列校验后继续使用当前公式的结果。特别是
+`32x64`：如果只把列对齐改成 64，vllm-sipu 只分配 2176 B，而 `hp_to_mx`
+按一个完整 2x2 supertile 需要 4352 B，会造成输出 buffer 不足。
+
+当前 `rows % 32 == 0`、`cols % 128 == 0` 的组合会选择 1x4，并保证每个
+32-row slab 都填满四个列 tile，所以“逻辑 tile 数 x 1088 B”恰好等于真实
+supertile storage。这是 128 的重要原因，不只是 MMA 的计算粒度。
+
+### 5.5 `hp_to_mx` 的真实 r32 列对齐要求是 32
+
+`sikernel/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_tensormap.hpp:67-82 - HpToMxTensorMapGeometry`
+定义：
+
+```cpp
+input_tile_dim0  = 1024 / (Rows * input_element_bytes)
+input_box_dim0   = OutputPolicy::input_lmul
+output_tile_dim0 = input_box_dim0 * input_tile_dim0
+```
+
+代入 r32、BF16、MXINT8：
+
+```text
+Rows = 32
+input_element_bytes = 2
+input_lmul = 2
+
+input_tile_dim0  = 1024 / (32 * 2) = 16 BF16 columns
+output_tile_dim0 = 2 * 16 = 32 MXINT8 columns
+```
+
+同文件 `:84-90 - hp_to_mx_direct_shape_supported` 的直接条件就是：
+
+```cpp
+dim1 % output_tile_dim0 == 0
+```
+
+所以 r32 MXINT8 的 `dim1/K` 最小对齐是 32，不是 128。
+
+接下来，`hp_to_mx_physical_extents` 在同文件 `:92-113` 根据逻辑列 tile 数选择
+4x1、2x2 或 1x4；`hp_to_mx_checked_launch_extents` 在 `:126-165` 用
+`physical supertiles * 4 tiles * (1024 + 64)` 算真实存储大小。
+
+device code 的关键步骤位于
+`sikernel/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.hpp:55-108 - hp_to_mx_kernel`：
+
+1. `:61-62`：每个线程分配 `input_lmul * 1024 = 2048 B` shared staging；
+2. `:73-77`：一个循环迭代处理一个 logical MX output tile；
+3. `:82-86`：列坐标乘 `input_lmul=2`，DTE 取两个 BF16 input tile；
+4. `:88-89`：等待异步 DTE copy 完成；
+5. `:90`：以 `tbfloat16m2` 从 shared memory 加载；
+6. `:91`：执行 `tcvt_mxi8(..., t_r32)`，得到 `tmxint8m1`；
+7. `:92-105`：把逻辑 row/col tile 映射成 4x1、2x2 或 1x4 内的物理 tile id；
+8. `:106`：用 `tst_blk_global_m1` 写一个 MXINT8 tile。
+
+`hp_to_mx` wrapper 位于
+`sikernel/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su:28-87 - hp_to_mx`：
+
+* `:46-48` 检查上述 K=32 粒度；
+* `:49-57` 计算 physical extents、logical tile count 和真实 output bytes；
+* `:60-62` 编码 tiled/linear input tensor map；
+* `:79-80` 启动 device kernel；
+* `:84-86` 对 `dim0 > 16` 选择 Rows=32。
+
+注意：`hp_to_mx` API 接收的是调用者提供的裸 output pointer，没有接收 output
+buffer length。它虽然在内部算出了正确 `output_bytes`，但不能替调用者扩容；
+vllm-sipu 必须在调用之前使用相同的 physical-layout 规则分配 buffer。
+
+### 5.6 ISA 和生成头文件也证明 K=32/64/128 都存在
+
+`isa/index.html:6221 - tmma.ttt` 给出的助记符格式包含可选 `[m2/m4]`。
+`isa/index.html:6266-6321 - 32 Rows Layout` 的 normal 模式明确列出：
+
+| 模式 | A/B shape | A/B TileRegNum | 等效 K |
+| --- | --- | --- | ---: |
+| No-extend | 32x32B | 1 | 32 |
+| K-extend, micro_num=1 | 32x64B | 2 | 64 |
+| K-extend, micro_num=2 | 32x128B | 4 | 128 |
+
+SDK 生成头文件
+`sdk/bin/nds64le-elf-newlib-v5d/lib/clang/20/include/siorigin_tile_150g.h:8926-8946`
+提供了三套 r32 MXINT8 x MXINT8 overload：
+
+```text
+tmxint8m1 x tmxint8m1 -> tmma ... r32       (K=32)
+tmxint8m2 x tmxint8m2 -> tmma ... r32.m2    (K=64)
+tmxint8m4 x tmxint8m4 -> tmma ... r32.m4    (K=128)
+```
+
+编译器测试
+`compiler-toolchain/llvm-project/clang/test/CodeGen/RISCV/xsotile150g/autogenerated/xsotile_tmma_ttt_test.cpp:20243-20247 - __rvv_tmma_ttt_f32_mxi8_mxi8_r32_m1`
+也检查了 m1 最终生成无 m 后缀的
+`tmma.ttt.f32.mxi8.mxi8.r32`。
+
+对当前 vllm-sipu JIT ELF 使用 SDK 的 `llvm-objdump -d --demangle`，实际看到：
+
+```text
+量化：tcvt.tt.mxi8.bf16.r32
+K=128 分支：tmma.ttt.f32.mxi8.mxi8.r32.m4
+K=64 分支： tmma.ttt.f32.mxi8.mxi8.r32.m2
+K=32 分支： tmma.ttt.f32.mxi8.mxi8.r32
+```
+
+因此从 ISA、SDK declaration、compiler CodeGen test 和最终 ELF 四个层面，都不能
+把 128 解释为硬件最小 K 粒度。
+
+### 5.7 当前 universal GEMM 为什么仍然不能直接使用 K=64
+
+host wrapper 位于
+`sikernel/source/source_builtin/blas/L3/mma/tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor/kernel/tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor.su:33-96 - mma_bf16_mxi8_universal`。
+
+对 `M >= 32`，`:42-51` 选择：
+
+```text
+K >= 128 -> Tile_M=32,  Tile_K=128
+K >= 64  -> Tile_M=64,  Tile_K=64
+K < 64   -> Tile_M=128, Tile_K=32
+```
+
+但 `:38` 把 host 的 `Tile_N` 永久写成 32，`:61-63` 用它计算：
+
+```cpp
+m_tile = M / Tile_M;
+n_tile = N / 32;
+total_tiles = m_tile * n_tile;
+```
+
+device kernel 在同目录 `.hpp:154-177 - universal::kernel_tile_mma_32x32_bf16_mxi8_mxi8_gmem_tiled_tensor`
+却使用：
+
+```text
+K=128 template -> M_gran=32,  N_gran=32,  K_gran=128
+K=64 template  -> M_gran=64,  N_gran=64,  K_gran=64
+K=32 template  -> M_gran=128, N_gran=128, K_gran=32
+```
+
+也就是说 K=64 时 host 按 `N/32` 启动，device 按 `N/64` 解码 block id。
+以 `M=N=K=64` 为例：
+
+```text
+host:   m_tile=64/64=1, n_tile=64/32=2, total_tiles=2
+device: n_tile_num=64/64=1
+
+block_id=0 -> block_m=0, block_n=0，合法
+block_id=1 -> block_m=1, block_n=0，越过 M=64 的唯一 macro block
+```
+
+`.hpp:179-192` 随后会用这个多出来的 `block_m_id` 计算 A supertile 和 output
+地址。因此当前 K=64 分支不是只缺少上层校验，而是 wrapper 的 launch count 本身
+不匹配。K=32 分支同样存在固定 `Tile_N=32` 与 device `N_gran=128` 的差异。
+
+K=64 内层计算本身是完整的：`.hpp:96-132 -
+universal::tile_mma_32x32_bf16_mxi8_mxi8_tiled_tensor<64>` 加载两组
+`tmxint8m2`，执行四个 r32.m2 MMA，得到一个 `64x64x64` macro block。
+问题在其上层工作项数量和地址解码。
+
+另外，K=64 和 K=32 分支没有 K-loop，分别只适用于精确 K=64 和 K=32；
+K=96 不能通过简单地选择 K=64 分支处理。K>=128 分支才在 `.hpp:74-89`
+以 4 个 tile 为步长遍历 K，因此现有主路径要求 K 是 128 的整数倍，否则
+`K / 128` 会丢弃尾部。
+
+当前该 GEMM 自带测试
+`sikernel/source/source_builtin/blas/L3/mma/tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor/test/test_host.cpp:30-32 - main`
+只使用 `M=8,N=128,K=1024`，没有覆盖 r32 K=64/K=32 分支。
+
+### 5.8 2026-09-15 的运行验证
+
+#### 5.8.1 当前 vllm-sipu 基线
+
+按用户给出的环境和命令，使用 SDK `2609020046` 重新运行：
+
+```bash
+cd /share/users/like/package/vllm-sipu
+source /share_data/users/like/miniconda3/bin/activate \
+  /share_data/users/like/miniconda3/envs/vllm_dev
+source sipu_sdk_setup.sh
+python tests/kernels/quantization/test_mxint8_unpack_pytest.py
+```
+
+结果：
+
+```text
+test_quantize_to_mxint8(m=7, k=63)               PASSED
+test_mxint8_bf16_matmul(m=7, n=65, k=63)         PASSED
+test_mxint8_linear_method(seq_len=7, n=65, k=63) PASSED
+All 3 MXInt8 test cases passed.
+```
+
+这个测试实际把 M pad 到 32、N pad 到 96、K pad 到 128，所以证明的是当前
+128 contract 正确，不证明 K=64 路径正确。
+
+#### 5.8.2 `hp_to_mx` 的 K=32/64 量化验证
+
+使用同一 SDK 构建并运行
+`sikernel/source/source_builtin/misc/hp_to_mx/test/test_host.cpp:428-442 - main`。
+
+测试 shape 来自同文件 `:241-247 - kMxint8Shapes`，其中包含：
+
+```text
+(1,32,32)
+(1,32,64)
+(1,32,288)
+```
+
+tiled input 和 linear input 两组全部通过：
+
+```text
+mxint8/bf16/tiled  (1,32,32)  ok
+mxint8/bf16/tiled  (1,32,64)  ok
+mxint8/bf16/tiled  (1,32,288) ok
+mxint8/bf16/linear (1,32,32)  ok
+mxint8/bf16/linear (1,32,64)  ok
+mxint8/bf16/linear (1,32,288) ok
+```
+
+该测试在 `:173-218 - run_case` 使用 SiTe 的真实 `golden.storageSize()` 分配
+supertile storage，并在 buffer 前后放 guard bytes，因此不仅验证结果，还验证
+没有越过正确的 physical allocation。
+
+#### 5.8.3 K=64 隔离 GEMM 对照实验
+
+为了不修改主工作区，在 `/tmp` Git worktree 中做了两组 `M=N=K=64` CModel
+实验。这个 shape 的 A、B 都是 `64x64`，正好完整填满一个 2x2 supertile，
+每个 packed buffer 为 4352 B，不存在 `32x64` 的 buffer 少分配干扰。
+
+实验 A 只做以下放宽：
+
+```text
+Python MXINT8_COLS_ALIGNMENT: 128 -> 64
+JIT Python _expected_storage_size: 128 -> 64
+JIT C++ kMxInt8ColsAlignment: 128 -> 64
+```
+
+保持 sikernel universal GEMM 不变，结果：
+
+```text
+a_shape=(64, 64), qa_bytes=4352
+b_shape=(64, 64), qb_bytes=4352
+finite_ratio=0.93750000
+mean_relative_error=nan
+```
+
+实验 B 在此基础上，仅令 host launch 的 N tile 粒度和 K=64 device 分支一致，
+即 K=64 时使用 `Tile_N=64`，结果：
+
+```text
+a_shape=(64, 64), qa_bytes=4352
+b_shape=(64, 64), qb_bytes=4352
+finite_ratio=1.00000000
+mean_relative_error=0.01253165
+```
+
+这组实验说明：
+
+* r32.m2 指令和当前内层 `64x64x64` kernel 能正确计算；
+* “只把 128 改成 64”在当前代码上确实不正确；
+* 该临时修改只是定位和可行性验证，不是完整 production patch。
+
+### 5.9 最终回答：进入 quantize + MMA 前到底要 pad 到多少
+
+对矩阵：
+
+```text
+A: [M, K]
+B: [N, K]，当前 kernel 计算 A @ B^T
+C: [M, N]
+```
+
+应区分三种答案。
+
+#### 只调用当前 r32 `hp_to_mx`
+
+```text
+M/N 行方向：按所选 row family；本问题只讨论 r32 时按 32-row tile 处理
+K 列方向：32 的整数倍
+packed bytes：必须按完整 physical supertile grid 计算，不能只算逻辑 tile 数
+```
+
+所以量化器本身不要求 128。
+
+#### 调用当前未修改的 vllm-sipu `quantize_to_mxint8 + mma_bf16_mxi8_universal`
+
+```text
+A: [round_up(M, 32), round_up(K, 128)]
+B: [round_up(N, 32), round_up(K, 128)]
+```
+
+这就是当前正确且已验证的端到端 contract。这里 B 的“列”仍是 reduction K，
+output N 是 B 的行方向，只要求按 32 padding。
+
+#### 若专门启用当前内层 K=64 macro-kernel
+
+在修复 wrapper、validation 和 storage 计算后，可使用：
+
+```text
+A: [round_up(M, 64), 64]
+B: [round_up(N, 64), 64]
+```
+
+这是因为当前 K=64 分支一次计算 `64x64x64`，而不是任意 M/N 的
+`32x32x64` tail kernel。对于原始 M 或 N 只有 32 行，若仍只 pad 到 32，
+既不能完整填满 2x2 MX supertile，也不满足该 macro-kernel 的 M/N=64 粒度。
+
+同理，当前 K=32 内层分支对应 `M,N` 以 128 为 macro granularity；它也不能由
+一个全局 `COLS_ALIGNMENT=64` 自动、安全地启用。
+
+### 5.10 `MXINT8_COLS_ALIGNMENT` 能否改小及建议改法
+
+**不能直接把全局常量改成 64。**需要把“一个全局列对齐”改成“按 GEMM kernel
+variant 选择的 layout contract”。至少要同时完成：
+
+1. **按 variant 选择 shape。**例如：
+   * 通用主路径：M/N=32 granularity，K 为 128 的倍数；
+   * short-K64 路径：M/N=64 granularity，K 精确为 64；
+   * short-K32 路径：M/N=128 granularity，K 精确为 32。
+2. **重写 packed storage size。**复用 SiTe layout engine，或在 vllm-sipu 中按
+   tile shape、supertile shape 和 supertile grid 计算
+   `num_supertiles * 4352`，不能继续无条件使用
+   `(rows * cols / 1024) * 1088`。
+3. **修复 universal host launch。**`Tile_N`、`total_tiles` 必须与 device 的
+   `N_gran` 一致，并对 M/N/K 做完整 divisibility validation。
+4. **明确 K tail 策略。**K=96、160、192 等不能靠当前 K=64 分支解决；需要：
+   * 继续 pad 到下一个 128；或
+   * 新增 m4+m2/m1 混合 tail kernel；或
+   * 新增真正循环 K=64 chunk 的 kernel。
+5. **处理 partial supertile padding。**当前 `hp_to_mx` 默认 `ZERO_OUTPUT=false`；
+   `sikernel/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.hpp:110-118 - hp_to_mx_zero_output`
+   说明未访问的 supertile padding 默认不保证为零。若后续 kernel 可能读取
+   padding，应启用/实现确定性清零。
+6. **补齐测试。**至少覆盖：
+   * quantize：K=32、64、96、128、160、288，M/N=32、64、96；
+   * GEMM K128：K=128、256、384；
+   * GEMM K64：M/N 的 64 边界和 crop；
+   * 非法 K=96 不得静默漏算；
+   * packed buffer guard、NaN/Inf 检查及数值 reference。
+
+因此，最终建议是：
+
+```text
+当前代码立即使用：保持 MXINT8_COLS_ALIGNMENT = 128。
+
+若目标只是优化 K <= 64 的小矩阵：
+新增一个明确的 K64 layout/kernel variant，而不是修改全局常量；
+同时把 M/N pad 到 64、修复 host launch，并按 2x2 supertile 分配 4352B 的整数倍。
+
+若目标是让所有 K 都按 64 对齐：
+需要新增支持 K 循环和 K tail 的 GEMM 实现，属于 kernel/layout 接口改造，
+不是 padding 常量调整。
+```
+
+换句话说，vllm-sipu 当前的 128 对齐确实比 `hp_to_mx` 和单条 SIPU ISA 的
+最小要求更保守；但它并非纯粹无效 padding，而是在当前代码中同时保证
+**完整 1x4 supertile storage、正确的 K=128 MMA 循环和一致的 M/N=32
+工作项划分**。在这些配套逻辑改造前，不能把它安全地缩小为 64。
