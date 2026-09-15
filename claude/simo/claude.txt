@@ -4642,9 +4642,15 @@ docker run -itd   --name sgl0518-like-dump-v3-no-sipu-sglang   --gpus all --net=
 
 答案追加到 like-useful/answer_claude_v2.md 里面
 
-vllm-sipu 代码位于  /share/users/like/package/vllm-sipu
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/2609020046
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
 vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
-vllm-sipu 
+
+vllm-sipu 测试 mxint8 和 mxint8 gemm 的方式是:
 ```
 激活 conda 环境
 cd  /share/users/like/package/vllm-sipu
@@ -4653,6 +4659,14 @@ python tests/kernels/quantization/test_mxint8_unpack_pytest.py  > temp/unpack.lo
 
 ```
 日志位于 /share/users/like/package/vllm-sipu/temp/unpack.log.2
+
+vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py
+
+sipu 的 tile format, 支持 32/16/8行，这里先暂时讨论 32 行的情况。
+sipu 一个  tile 32行，每行 32Bytes, 对于 bf16, 32bytes =  16  element, 一个 tile = 32行x每行16 element, 一个 sipu supertile 的形状是  1x4个 tile, supertile 以 tile为单位，形状是[1,4],
+以元素为单位，[1x32, 4*16]=[32, 64], 即使要求 padding 到 supertile, 列方向，只padding到64就足够，
+vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py 为什么 设置 MXINT8_COLS_ALIGNMENT = 128 ?
+128 是 mxint8 gemm 的硬件指令上的要求，还是
 
 把答案追加到 like-useful/answer_codex_v3.md
 }
