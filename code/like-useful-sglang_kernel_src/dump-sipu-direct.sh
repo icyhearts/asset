@@ -15,5 +15,5 @@ source setup_triton.sh
 source setup_tilelang.sh
 unset TORCH_DEVICE_BACKEND_AUTOLOAD
 cd /sgl-workspace/sglang/test/srt/sipu
-python3 -u /sgl-workspace/sglang/test/srt/sipu/test_utils/run_test_job.py   --config-yaml /sgl-workspace/sglang/test/srt/sipu/configs/deepseek/ds_v32_2layer.yaml   --launch-config deepep_deepgemm_text   --test-case text-only   --device sipu   --dump-base /share_data/sglang_sipu/accuracy_verify/like.`nowstr.sh`   --log-base /sgl-workspace/sglang/test/srt/sipu/logs.`nowstr.sh` > temp/dump-sipu-direct.log.`nowstr.sh` 2>&1 &
-
+#python3 -u /sgl-workspace/sglang/test/srt/sipu/test_utils/run_test_job.py   --config-yaml /sgl-workspace/sglang/test/srt/sipu/configs/deepseek/ds_v32_2layer.yaml   --launch-config deepep_deepgemm_text   --test-case text-only   --device sipu   --dump-base /share_data/sglang_sipu/accuracy_verify/like.`nowstr.sh`   --log-base /sgl-workspace/sglang/test/srt/sipu/logs.`nowstr.sh` > temp/dump-sipu-direct.log.`nowstr.sh` 2>&1 &
+python3 -u /sgl-workspace/sglang/test/srt/sipu/test_utils/run_test_job.py   --config-yaml /sgl-workspace/sglang/test/srt/sipu/configs/llama/llama_3_1_8b_instruct_4layer.yaml   --launch-config general_text   --test-case text-only   --device sipu   --dump-base /share_data/sglang_sipu/accuracy_verify/like   --log-base /sgl-workspace/sglang/test/srt/sipu/logs.`nowstr.sh` > temp/dump-sipu-direct.log.`nowstr.sh` 2>&1 &
