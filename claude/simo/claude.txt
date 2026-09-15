@@ -4649,6 +4649,7 @@ sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
 
 vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
 vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
 
 vllm-sipu 测试 mxint8 和 mxint8 gemm 的方式是:
 ```
@@ -4660,16 +4661,17 @@ python tests/kernels/quantization/test_mxint8_unpack_pytest.py  > temp/unpack.lo
 ```
 日志位于 /share/users/like/package/vllm-sipu/temp/unpack.log.2
 
-vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py
 
-sipu 的 tile format, 支持 32/16/8行，这里先暂时讨论 32 行的情况。
-sipu 一个  tile 32行，每行 32Bytes, 对于 bf16, 32bytes =  16  element, 一个 tile = 32行x每行16 element, 一个 sipu supertile 的形状是  1x4个 tile, supertile 以 tile为单位，形状是[1,4],
-以元素为单位，[1x32, 4*16]=[32, 64], 即使要求 padding 到 supertile, 列方向，只padding到64就足够，
+# sipu 的 tile format, 支持 32/16/8行，这里先暂时讨论 32 行的情况。
+sipu 一个  tile 32行，每行 32Bytes, 对于 bf16, 32bytes =  16  个element, 一个 tile = 32行x每行16 element.
+一个 sipu supertile 的形状是  1x4个 tile, supertile 以 tile为单位，形状是[1,4], 以bf16元素为单位，[1x32, 4*16]=[32, 64], 即使要求 padding 到 supertile, 列方向，看上去只padding到64列就足够，
+
 vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py 为什么 设置 MXINT8_COLS_ALIGNMENT = 128 ? 即，为什么 vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py 要把 bf16 linear数据 padding到 128列的整数倍，不是64列的整数倍?
 
-只考虑padding 到 32行整数倍，不考虑8行，16行这些情况，bf16 input A/B 矩阵 先进行 vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py quantize_to_mxint8(实际调用的c++代码是csrc/jit/quantization/mxint8.cpp: quantize_to_mxint8 -> .deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su:hp_to_mx), 得到 mxint8 A/B 矩阵，再 vllm_sipu/ops/quantization.py mxint8_bf16_matmul(实际调用的c++代码是csrc/jit/quantization/mxint8.cpp: mxint8_bf16_matmul -> sikernel代码 mma_bf16_mxi8_universal) 进行 A/B 矩阵的matmul,得到 bf16 output, vllm-sipu当前的做法是把 A/B 的列都padding到 128整数倍. 实际 sikernel 的代码，有 128 整数倍限制吗？
+只考虑padding 到 32行整数倍，不考虑8行，16行这些情况，bf16 input A/B 矩阵 先进行 vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py quantize_to_mxint8(实际调用的c++代码是csrc/jit/quantization/mxint8.cpp: quantize_to_mxint8 -> .deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su:hp_to_mx), 得到 mxint8 A/B 矩阵，再 vllm_sipu/ops/quantization.py mxint8_bf16_matmul(实际调用的c++代码是csrc/jit/quantization/mxint8.cpp: mxint8_bf16_matmul -> sikernel代码 mma_bf16_mxi8_universal -> .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal ) 进行 A/B 矩阵的matmul,得到 bf16 output, vllm-sipu当前的做法是把 A/B 的列都padding到 128整数倍. 实际 sikernel 的代码或者 sipu指令集，bf16 input 在进入 quantize_to_mxint8 + mma 之前，要padding到多少?
 
-128 是 mxint8 gemm 的硬件指令上的要求，还是
+vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py 设置 MXINT8_COLS_ALIGNMENT = 128，对于 sipu硬件，这个数据可以改小一点吗?
 
+总之，我关心的是 sikernel/sipu硬件指令上的padding要求，vllm-sipu的padding可能是结果正确的，但是可能padding了超过硬件要求的数据。
 把答案追加到 like-useful/answer_codex_v3.md
 }
