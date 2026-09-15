@@ -4635,3 +4635,24 @@ docker run -itd   --name sgl0518-like-dump-v3-no-sipu-sglang   --gpus all --net=
 
 把答案追加到 like-useful/answer_codex_v3.md
 }
+
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+vllm-sipu 
+```
+激活 conda 环境
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+python tests/kernels/quantization/test_mxint8_unpack_pytest.py  > temp/unpack.log.2
+
+```
+日志位于 /share/users/like/package/vllm-sipu/temp/unpack.log.2
+
+把答案追加到 like-useful/answer_codex_v3.md
+}
