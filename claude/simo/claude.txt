@@ -4722,6 +4722,9 @@ cd /share/users/like/package/sikernel/
 source setup.sh
 cd /share/users/like/package/sikernel/mma_dte_tile_tensor
 bash build.sh 
+主库 build/libtile_mma_dte.so 已经编译成功，测试用途编译失败，在查找中，这个暂时不重要
+# 现在讨论 /share/users/like/package/sikernel/mma_dte_tile_tensor/include/simma.h 中的 api 取代 vllm-sipu 使用的 .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 的方案，暂时不执行方案.
+#  /share/users/like/package/sikernel/mma_dte_tile_tensor/include/simma.h mma_dte 函数有多个重载，取代  vllm-sipu的 .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal, 应该使用哪个重载?
 
 总之，我关心的是 sikernel/sipu硬件指令上的padding要求，vllm-sipu的padding可能是结果正确的，但是可能padding了超过硬件要求的数据。
 把答案追加到 like-useful/answer_codex_v3.md
