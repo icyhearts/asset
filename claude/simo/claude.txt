@@ -4675,3 +4675,54 @@ vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py 设置 MXINT8
 总之，我关心的是 sikernel/sipu硬件指令上的padding要求，vllm-sipu的padding可能是结果正确的，但是可能padding了超过硬件要求的数据。
 把答案追加到 like-useful/answer_codex_v3.md
 }
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/2609020046
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+
+
+最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
+其中有一个 submodule mma_dte_tile_tensor, 其构建方式是 
+激活conda : /share_data/users/like/miniconda3/envs/siinfer_dev/ 这个环境
+cd /share/users/like/package/sikernel/
+source setup.sh
+cd /share/users/like/package/sikernel/mma_dte_tile_tensor
+bash build.sh --all > cmake.log 2>&1 &
+日志位于  /share/users/like/package/sikernel/mma_dte_tile_tensor/cmake.log
+
+分析构建失败原因 
+把答案追加到 like-useful/answer_codex_v3.md
+}
+
+
+
+{
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/2609020046
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
+
+
+最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
+其中有一个 submodule mma_dte_tile_tensor 位于 /share/users/like/package/sikernel/mma_dte_tile_tensor, 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
+其构建方式是 
+cd /share/users/like/package/sikernel/
+source setup.sh
+cd /share/users/like/package/sikernel/mma_dte_tile_tensor
+bash build.sh 
+
+总之，我关心的是 sikernel/sipu硬件指令上的padding要求，vllm-sipu的padding可能是结果正确的，但是可能padding了超过硬件要求的数据。
+把答案追加到 like-useful/answer_codex_v3.md
+}
