@@ -1950,3 +1950,102 @@ TARGET_SIPU_ARCH=150
 这与本题提供的 SDK `2609020046` 不一致。因此这里只把 ELF 检查作为“已有构建包含显式重载、不包含简化重载”的辅助证据，**没有宣称这份库已能在指定的 2609020046/vllm_dev 环境中直接链接运行**。实施前需固定并验证双方 SDK、SiTe 类型 ABI 和目标架构；本次不处理测试构建失败，也不调整库位置。
 
 **最终建议：当前先选显式 layout、不带 workspace 的 R32 MXINT8->BF16 实例，A/B 保持 `(32,32,4,1,1)`，C 改为 `(16,32,1,1,0)`，同步取消 Python 输出重排。四类 MX 都能通过同一重载家族接入，区别在具体 inputT、layout、输出实例化与打包契约；无需为了支持不同 MX 类型选择不同函数重载。linear 写回能力已经在源码中实现，实际收益和跨 SDK 可用性留待正式接入时验证。**
+
+### 6.10 scalarT 表示哪个矩阵的类型？（2026-09-16 补充）
+
+**`scalarT` 不表示 A、B、C 中任何一个矩阵的类型。它表示两个标量参数 `alpha`、`beta` 的类型。** 本节重新核对的代码根目录是 `/share/users/like/package/sikernel/mma_dte_tile_tensor`，以下全部使用该目录的相对路径，不引用 vLLM 内的旧实现。
+
+#### 6.10.1 三个模板类型的对应关系
+
+`include/simma.h:180 / mma_dte` 的相关参数声明是：
+
+```cpp
+template <class inputT, class outputT, class scalarT,
+          mma_dte_api::tensor_layout layoutA,
+          mma_dte_api::tensor_layout layoutB,
+          mma_dte_api::tensor_layout layoutC>
+void mma_dte(mma_dte_api::Operation transa,
+             mma_dte_api::Operation transb,
+             int M, int N, int K,
+             scalarT alpha,
+             void* A, int lda,
+             void* B, int ldb,
+             scalarT beta,
+             void* C, int ldc,
+             sipuStream_t stream = nullptr);
+```
+
+同一函数的第 161 行注释明确把 `scalarT` 描述为 alpha 和 beta 的标量类型；第 182、185 行分别声明 `scalarT alpha`、`scalarT beta`。所以之前推荐的三个类型应当这样读：
+
+| 模板参数 | 推荐值 | 表示什么 |
+|---|---|---|
+| `inputT` | `sifmt::mxint8` | A 和 B 的输入元素格式，二者都为 packed MXINT8；不是只控制 A |
+| `outputT` | `sifmt::bfloat16` | 输出矩阵 C 的元素类型 |
+| `scalarT` | `sifmt::bfloat16` | `alpha`、`beta` 这两个数值参数的类型；不是另一个矩阵类型 |
+
+这里的 A/B/C 参数虽然写成 `void*`，其数据格式仍必须与模板类型及 layout 匹配，不能因为是无类型指针就任意混用数据。
+
+#### 6.10.2 alpha、beta 原本分别作用于什么
+
+按照 `include/simma.h:180 / mma_dte` 的接口设计，第 170 行将 alpha 描述为矩阵乘积的系数，第 175 行将 beta 描述为 C 的系数。沿用本题 A 为 `[M,K]`、B 为 `[N,K]` 的表示法，带这两个系数的数学形式应写为：
+
+```text
+C_new = alpha * (A @ B^T) + beta * C_old
+```
+
+alpha 是整个乘积的统一系数，不是 A 的 dtype；beta 是原有 C 的统一系数，也不是 C 的 dtype。它们各是一个按值传入的标量，不是矩阵、每行/每列的 scale 数组，也不是 MXINT8 packed 数据中每个 block 的共享 scale。
+
+对于你需要的纯 GEMM `C = A @ B^T`，表达调用意图时使用：
+
+```cpp
+sifmt::bfloat16 alpha(1.0f);
+sifmt::bfloat16 beta(0.0f);
+```
+
+**但这个带系数的公式是接口设计含义，不是当前实现已经完整支持的行为。**
+
+#### 6.10.3 当前代码实际上没有使用 alpha、beta
+
+`kernel/mma_dte_tiled_tensor.hpp:193 / mma_dte` 会把两个参数继续传给包装层，最终进入 `kernel/mma_dte_tiled_tensor.hpp:54 / mma_dte_implement_with_control`。该函数第 69 行仍明确写着：
+
+```cpp
+// TODO: Use transa, transb, alpha, beta, lda, ldb, ldc in implementation
+```
+
+这不仅是注释：该函数第 104 行调用 `mma_r32_dte<inputT, outputT, layoutA, layoutB, layoutC>` 时，既没有传入 `scalarT`，也没有传入 alpha、beta 的值。因此在本次讨论的 MXINT8 R32 路径上：
+
+- 改 alpha 为 2，当前不会得到两倍的矩阵乘积。
+- 改 beta 为 1，当前不会把调用前 C 的内容加到结果中。
+- 推荐仍传 `alpha=1,beta=0` 表达纯 GEMM 意图，但不要据此假定该接口已经实现一般的缩放与累加功能。
+
+#### 6.10.4 为什么 scalarT 推荐 BF16，而不是 FP32
+
+**原因是匹配现成的模板实例化，不是因为矩阵乘法必须用 BF16 标量或 BF16 累加。**
+
+`kernel/instantiations/mxint8/inst_mxint8_r32_4x1.su:29 / mma_dte` 已经显式实例化了：
+
+```cpp
+mma_dte<sifmt::mxint8, sifmt::bfloat16, sifmt::bfloat16,
+        MXINT8_LAYOUT_A_R32, MXINT8_LAYOUT_B,
+        MXINT8_LAYOUT_C_R32_R16BIT_LINEAR>(...);
+```
+
+这里第二个 BF16 是 C 的类型，第三个 BF16 才是 alpha/beta 的类型。这个文件还实例化了 FP16 输出搭配 FP16 标量、FP32 输出搭配 FP32 标量的组合，但没有为上述 BF16 输出 layout 实例化 `scalarT=sifmt::float32` 的组合。即使 alpha/beta 当前未用于计算，擅自更换 scalarT 仍会选择不同的 C++ 模板符号，不能假定已有库能链接它。
+
+`scalarT` 与 `outputT` 在模板声明中是两个独立参数；当前推荐组合取相同类型，是这个生产实例化的选择，不是“scalarT 就等于输出矩阵类型”的定义。
+
+#### 6.10.5 scalarT 也不是累加器类型
+
+本次 MXINT8 R32 路径的内部累加是 FP32，源码证据为：
+
+- `kernel/util/mma_dte_tiled_tensor_kernel_util_mxint8_mxfp6_r32.hpp:6086 / loadL2B_mma_r32_1m_1n_impl::load_mma_1st_stp`：第 6091 行起使用 `tmma.ttt.f32.mxi8.mxi8.r32...` 指令，两个输入是 MXINT8，累加结果为 FP32。
+- `kernel/util/mma_dte_tiled_tensor_kernel_util_mxint8_mxfp6_r32.hpp:6366 / loadL2B_mma_r32_1m_1n_impl::store_linear`：根据 `outputT` 选择写回类型；BF16 分支第 6369 行使用 `tcvt.tt.bf16.f32.r32`，将 FP32 结果转换为 BF16 后写出。
+
+因此正确的数据类型关系是：
+
+```text
+A/B: packed MXINT8 -> GEMM 内部 FP32 累加 -> C: BF16
+alpha/beta: BF16 标量参数，当前实现忽略它们
+```
+
+**一句话回答：`inputT` 管 A/B，`outputT` 管 C，`scalarT` 管 alpha/beta；`scalarT` 不表示任何矩阵的类型，也不决定这里的累加精度。** 本次仅追加说明，没有执行构建命令、修改算子或运行设备测试。
