@@ -4703,6 +4703,26 @@ bash build.sh --all > cmake.log 2>&1 &
 
 
 {
+1) 启动一个干净的 shell:
+cd /share/users/like/package//sikernel/
+source setup.sh
+cmake -S /tmp/test_gtest -B /tmp/test_gtest_build 能够成功找到 gtest
+这时cmake 位于/share_data/users/like/package/h100/package/cmake/github/cmake-4.2.0-rc2-linux-x86_64/bin//cmake
+
+2)
+启动一个干净的 shell:
+. /share/users/like/miniconda3/bin//activate  siinfer_dev
+cd /share/users/like/package//sikernel/
+source setup.sh
+cmake -S /tmp/test_gtest -B /tmp/test_gtest_build 无法找到 gtest
+/share_data/users/like/miniconda3/envs/siinfer_dev/bin/cmake 是cmake
+
+分析原因,  siinfer_dev 为什么会干扰 cmake 搜索 gtest, 不允许修改conda 环境.
+把答案追加到 like-useful/answer_codex_v3.md
+}
+
+
+{
 答案追加到 like-useful/answer_claude_v2.md 里面
 
 sipu 是自定义的一种AI芯片
@@ -4733,23 +4753,5 @@ bash build.sh
 
 
 讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。 讲解 mma_dte_tile_tensor 的代码时候，以 /share/users/like/package/sikernel/mma_dte_tile_tensor 代码为准， 这是最新 sikernel代码, vllm-sipu 更新代码不及时，没有用到新特性。
-把答案追加到 like-useful/answer_codex_v3.md
-}
-{
-1) 启动一个干净的 shell:
-cd /share/users/like/package//sikernel/
-source setup.sh
-cmake -S /tmp/test_gtest -B /tmp/test_gtest_build 能够成功找到 gtest
-这时cmake 位于/share_data/users/like/package/h100/package/cmake/github/cmake-4.2.0-rc2-linux-x86_64/bin//cmake
-
-2)
-启动一个干净的 shell:
-. /share/users/like/miniconda3/bin//activate  siinfer_dev
-cd /share/users/like/package//sikernel/
-source setup.sh
-cmake -S /tmp/test_gtest -B /tmp/test_gtest_build 无法找到 gtest
-/share_data/users/like/miniconda3/envs/siinfer_dev/bin/cmake 是cmake
-
-分析原因,  siinfer_dev 为什么会干扰 cmake 搜索 gtest, 不允许修改conda 环境.
-把答案追加到 like-useful/answer_codex_v3.md
+把答案追加到 like-useful/answer_codex_v4.md
 }

@@ -1747,3 +1747,338 @@ export CMAKE_PREFIX_PATH="$CONDA_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}
 
 **最终结论：先补齐并让测试子项目找到 host GTest 开发包，同时固定 SDK 版本。
 这份日志本身不支持将失败归因于 SIPU ISA、LLVM intrinsic 或 MMA device kernel。**
+
+## 7. 系统已安装 GTest，为什么激活 siinfer_dev 后 CMake 仍找不到？
+
+分析与实测日期：2026-09-16。本节针对 `/tmp/test_gtest` 的新现象，补充上一节，
+**没有安装、卸载或升级任何 Conda 包，也没有修改 Conda 激活脚本、系统文件或 sikernel 源码。**
+
+### 7.1 结论：直接原因是 host 编译器切换后，系统 multiarch 库目录未进入搜索候选
+
+**不是系统没有安装 GTest，也不是 Conda 的 CMake 4.0.3 比外部 CMake 4.2.0-rc2
+少了查找 GTest 的能力。关键变化是激活 siinfer_dev 时，编译器包的 activation hook
+把 `CXX` 设置成 Conda GCC 13.3.0。**
+
+本例的因果链是：
+
+```text
+activate siinfer_dev
+  -> activate-gxx_linux-64.sh 设置 CXX=.../x86_64-conda-linux-gnu-c++
+  -> project(test_gtest LANGUAGES CXX) 选用该编译器
+  -> 编译器的隐式链接目录来自 Conda 工具链/sysroot
+  -> CMake 未从这些目录探测出 CMAKE_LIBRARY_ARCHITECTURE
+  -> 不自动展开 /usr/lib/x86_64-linux-gnu 这个 multiarch 目录
+  -> 漏掉该目录中的 GTestConfig.cmake、libgtest.a、libgtest_main.a
+  -> find_package(GTest REQUIRED) 失败
+```
+
+这里的 multiarch 是主机发行版的库目录布局，例如 `lib/x86_64-linux-gnu`，
+**不是 SIPU 的 device architecture**。本次两种环境的 `CMAKE_CROSSCOMPILING` 都为 `FALSE`。
+
+你补充的 `dpkg -L libgtest-dev` 与实测完全一致，系统已有：
+
+```text
+/usr/include/gtest/gtest.h
+/usr/lib/x86_64-linux-gnu/libgtest.a
+/usr/lib/x86_64-linux-gnu/libgtest_main.a
+/usr/lib/x86_64-linux-gnu/cmake/GTest/GTestConfig.cmake
+```
+
+**也要区分前后两个时间点。** `/var/log/dpkg.log:1244` 记录系统在
+**2026-09-16 11:18:50** 开始安装 `libgtest-dev:amd64 1.11.0-3`，第 1255 行在
+**11:18:51** 记录 `status installed`。这晚于上一节分析的 10:44 构建日志。
+旧日志缺头文件和两个库；本次复现已经能找到 `/usr/include/gtest/gtest.h`，
+只缺两个库的查找结果。因此，不能用“现在已 apt 安装”反推旧日志生成时的状态，
+也不能再把本次问题简单归结为“机器上缺少 GTest”。
+
+### 7.2 交叉实验：失败随编译器变化，不随 CMake 可执行文件变化
+
+所有实验均使用 `env -i` 加 `bash --noprofile --norc`，按需要激活 `siinfer_dev`，
+再 source sikernel 的 `setup.sh`。每组使用独立的全新 build 目录，未复用或修改
+你的 `/tmp/test_gtest_build`。本次 setup 实际加载的 SDK 为 `2609161039`，各组一致。
+
+两个 CMake 的绝对路径为：
+
+```text
+外部：/share_data/users/like/package/h100/package/cmake/github/cmake-4.2.0-rc2-linux-x86_64/bin/cmake
+Conda：/share_data/users/like/miniconda3/envs/siinfer_dev/bin/cmake
+```
+
+| 实验 | 是否激活 siinfer_dev | CMake | 实际 CXX 编译器 | CMAKE_LIBRARY_ARCHITECTURE | GTest 配置结果 |
+| --- | --- | --- | --- | --- | --- |
+| clean-default | 否 | 外部 4.2.0-rc2 | `/usr/bin/c++`，GNU 11.4.0 | `x86_64-linux-gnu` | 成功，系统 GTest 1.11.0 |
+| clean-conda-cmake | 否 | 显式调用 Conda 4.0.3 | `/usr/bin/c++`，GNU 11.4.0 | `x86_64-linux-gnu` | 成功，系统 GTest 1.11.0 |
+| conda-default | 是 | Conda 4.0.3 | Conda GNU 13.3.0 | 空 | 失败 |
+| conda-external-cmake | 是 | 显式调用外部 4.2.0-rc2 | Conda GNU 13.3.0 | 空 | 失败 |
+| conda-system-cxx | 是 | Conda 4.0.3 | 用 `-DCMAKE_CXX_COMPILER=/usr/bin/c++` 指定系统编译器 | `x86_64-linux-gnu` | 成功 |
+| clean-conda-cxx | 否 | 外部 4.2.0-rc2 | 用 `-DCMAKE_CXX_COMPILER=.../x86_64-conda-linux-gnu-c++` 指定 Conda 编译器 | 空 | 失败 |
+
+后两行进一步隔离变量：保留 Conda 激活带来的其他设置、只换回系统编译器就能找到；
+不激活 Conda、只指定它的编译器又会失败。因此，**仅调整 PATH 优先使用外部 CMake，
+或仅清理 CMAKE_PREFIX_PATH，都不是本例的根本修复。**
+
+实验文件统一保存在：
+
+```text
+/tmp/codex-cmake-gtest-env-20260916.z51bwy/
+```
+
+其中 `<实验名>.env` 保存相关环境变量，`<实验名>.log` 保存 `--debug-find-pkg=GTest`
+日志，`<实验名>/` 是对应构建目录。`run-case.sh` 是实验脚本，`probe.cmake` 在
+`project()` 后输出 CMake 探测变量，不需要改动原测试工程。
+
+### 7.3 代码调用链：从 Conda 激活到 FindGTest
+
+以下路径分别相对三个根目录：
+
+- **[环境]**：`/share_data/users/like/miniconda3/envs/siinfer_dev`。
+- **[用例]**：`/tmp/test_gtest`。
+- **[sikernel]**：`/share/users/like/package/sikernel`。
+
+#### 第一步：激活 hook 不只是调整 PATH，还显式指定编译器
+
+`[环境] etc/conda/activate.d/activate-gxx_linux-64.sh:34 - _tc_activation`
+负责备份旧值并导出新的环境变量；第 106 行调用它，第 108 行明确传入：
+
+```bash
+"CXX,${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-c++"
+```
+
+所以，即使另一个 `cmake` 在 PATH 中排在前面，这个绝对路径形式的 `CXX` 仍然有效。
+
+`[环境] etc/conda/activate.d/activate-gcc_linux-64.sh:175 - _tc_activation 调用点`
+还会设置 `CC`、`CFLAGS`、`LDFLAGS`、`CMAKE_PREFIX_PATH` 和 `CONDA_BUILD_SYSROOT`。
+其中第 103 行构造的 prefix 是：
+
+```text
+${CONDA_PREFIX}:${CONDA_PREFIX}/x86_64-conda-linux-gnu/sysroot/usr
+```
+
+`[sikernel] setup.sh:63 - 顶层脚本` 调用 `set_sdk.sh`；
+`[sikernel] set_sdk.sh:67 - _sikernel_source_sdk` 加载 SDK setup。
+SDK 根目录下 `sipu_sdk_setup.sh:46 - sipu_sdk_setup_env` 在第 49 行给
+`CMAKE_PREFIX_PATH` 前面加上 SDK 路径，**没有把上述 CXX 恢复为系统编译器**。
+
+#### 第二步：project() 根据 CXX 选择 host 编译器
+
+`[用例] CMakeLists.txt:3 - project` 启用 CXX。
+
+`[环境] share/cmake-4.0/Modules/CMakeDetermineCXXCompiler.cmake:38 - 顶层配置`
+首先检查是否已有 `CMAKE_CXX_COMPILER`；没有时，第 42-43 行读取 `$ENV{CXX}`，
+第 70 行调用 `_cmake_find_compiler(CXX)`。因此，新的 build 目录在激活环境下
+会选中 Conda C++ 编译器，而不是 `/usr/bin/c++`。
+
+#### 第三步：CMake 从编译器实际链接路径推导库目录架构
+
+`[环境] share/cmake-4.0/Modules/CMakeTestCXXCompiler.cmake:26 - CMAKE_DETERMINE_COMPILER_ABI 调用点`
+执行 CXX ABI 检测。
+
+`[环境] share/cmake-4.0/Modules/CMakeDetermineCompilerABI.cmake:15 - CMAKE_DETERMINE_COMPILER_ABI`
+在第 275-276 行保存隐式链接信息；第 279 行调用
+`cmake_parse_library_architecture`，成功时第 281 行设置
+`CMAKE_CXX_LIBRARY_ARCHITECTURE`。
+
+`[环境] share/cmake-4.0/Modules/CMakeParseLibraryArchitecture.cmake:8 - cmake_parse_library_architecture`
+在第 12-18 行检查隐式链接目录是否以 `/lib/<架构名>` 结尾；第 20-27 行还检查
+隐式链接对象文件所在目录。**它不是简单截取编译器文件名中的 target triple。**
+
+本机实际比较：
+
+```text
+系统 C++ 的隐式链接目录包括：
+  /usr/lib/x86_64-linux-gnu
+  /lib/x86_64-linux-gnu
+  -> 匹配 /lib/<arch>，得到 x86_64-linux-gnu
+
+Conda C++ 的隐式链接目录包括：
+  $CONDA_PREFIX/lib/gcc/x86_64-conda-linux-gnu/13.3.0
+  $CONDA_PREFIX/x86_64-conda-linux-gnu/lib
+  $CONDA_PREFIX/x86_64-conda-linux-gnu/sysroot/lib
+  $CONDA_PREFIX/x86_64-conda-linux-gnu/sysroot/usr/lib
+  -> 未匹配上述布局，CMAKE_CXX_LIBRARY_ARCHITECTURE 为空
+```
+
+`[环境] share/cmake-4.0/Modules/CMakeCXXCompiler.cmake.in:80 - 顶层配置`
+将非空的语言级架构值传给 `CMAKE_LIBRARY_ARCHITECTURE`。
+因此本例的 Conda 结果是 **空值**，不是 `x86_64-conda-linux-gnu`。
+
+辅助检查也与此一致：系统 `/usr/bin/c++ -print-multiarch` 输出
+`x86_64-linux-gnu`，Conda C++ 的同一选项输出为空。但上述 CMake 代码的直接依据
+是隐式链接路径，不能把 `-print-multiarch` 误说成这里的实际调用链。
+
+#### 第四步：FindGTest 的 Config 和库文件搜索都漏掉 multiarch 目录
+
+`[用例] CMakeLists.txt:5 - find_package` 调用 `find_package(GTest REQUIRED)`。
+
+`[环境] share/cmake-4.0/Modules/FindGTest.cmake:197 - 顶层配置`
+先执行 `find_package(GTest QUIET NO_MODULE)`，查找 GTest 自带的 Config 文件。
+安装包附带的官方说明
+`[环境] share/cmake-4.0/Help/command/find_package.rst:400` 明确指出：
+只有设置了 `CMAKE_LIBRARY_ARCHITECTURE`，才搜索 `lib/<arch>` 分支。
+
+正常情况下：
+
+```text
+prefix=/usr
+arch=x86_64-linux-gnu
+  -> /usr/lib/x86_64-linux-gnu/cmake/GTest/GTestConfig.cmake
+```
+
+Conda 编译器下没有这个 arch 展开。实验日志 `clean-default.log:108` 确实搜索并命中
+该 Config 文件；`conda-default.log:97-122` 的完整 Config 候选列表中没有这个目录。
+
+Config 未命中后，`[环境] share/cmake-4.0/Modules/FindGTest.cmake:244 - 顶层配置`
+用 `find_path` 查头文件，第 263、265 行分别调用 `__gtest_find_library` 查两个库。
+`[环境] share/cmake-4.0/Modules/FindGTest.cmake:113 - __gtest_find_library`
+实际调用 `find_library`。
+
+`conda-default.log:902-905` 显示候选包含 `/usr/lib64` 和 `/usr/lib`，
+没有 `/usr/lib/x86_64-linux-gnu`。**find_library 不会因为搜索了 `/usr/lib`，
+就递归遍历其中所有子目录。** 最终 cache 为：
+
+```text
+GTEST_INCLUDE_DIR:PATH=/usr/include
+GTEST_LIBRARY:FILEPATH=GTEST_LIBRARY-NOTFOUND
+GTEST_MAIN_LIBRARY:FILEPATH=GTEST_MAIN_LIBRARY-NOTFOUND
+GTest_DIR:PATH=GTest_DIR-NOTFOUND
+```
+
+这正是“系统头文件可以找到，两个系统静态库找不到”的原因。
+
+### 7.4 两个容易误判的地方
+
+**不是 Conda 通过 CMAKE_FIND_ROOT_PATH 把整个 /usr 屏蔽了。**
+
+本次探测的 `CMAKE_SYSROOT`、`CMAKE_FIND_ROOT_PATH` 和各
+`CMAKE_FIND_ROOT_PATH_MODE_*` 都未设置；`CMAKE_SYSTEM_PREFIX_PATH` 仍包含 `/usr`，
+且上面已经实际找到了 `/usr/include/gtest/gtest.h`。
+
+非空的是编译器自身的 sysroot，以及 CMake 探测得到的
+`CMAKE_CXX_COMPILER_SYSROOT`。
+`[环境] share/cmake-4.0/Modules/CMakeDetermineCompiler.cmake:131 - _cmake_find_compiler_sysroot`
+在第 133 行执行 `-print-sysroot`，第 142 行记录结果对应的 `usr` 目录。
+`[环境] share/cmake-4.0/Modules/Platform/UnixPaths.cmake:100 - 顶层配置`
+将这个目录加入搜索前缀，**不是删除所有系统前缀**。
+
+因此，本例不能笼统解释为“Conda 完全隔离系统目录”；更准确的是
+**工具链布局改变了架构目录探测，而配置搜索与编译器头文件搜索又是两套过程**。
+
+**干净的 shell 不等于干净的 CMake build 目录。**
+
+`[环境] share/cmake-4.0/Help/envvar/CXX.rst:6` 说明，`CXX` 主要在首次配置时决定
+`CMAKE_CXX_COMPILER`，之后使用 cache。已有 `GTest_DIR` 也可能沿用旧结果。
+两种 shell 若一直使用同一个 `/tmp/test_gtest_build`，不能据此严格比较环境差异。
+本次全部用独立目录复现，排除了这一因素；切换 host 工具链时也应另建 build 目录。
+
+### 7.5 不修改 Conda 环境，怎样处理？
+
+先区分目标：**只让 find_package 成功**，还是**真正编译运行测试程序**。
+
+#### A. 只解决当前 configure 查找：直接指定 GTest Config 目录
+
+在已经激活 siinfer_dev 并 source sikernel setup 的 shell 中执行：
+
+```bash
+B=$(mktemp -d /tmp/test_gtest_config.XXXXXX)
+cmake -S /tmp/test_gtest -B "$B" \
+  -DGTest_DIR=/usr/lib/x86_64-linux-gnu/cmake/GTest
+```
+
+**实测配置成功。** 这是给本次构建传入 cache 参数，不会修改 Conda 安装。
+也实测验证了下面两种输入可以让配置成功：
+
+```bash
+# 单个命令的环境变量，子进程可以继承。
+GTest_DIR=/usr/lib/x86_64-linux-gnu/cmake/GTest \
+  cmake -S /tmp/test_gtest -B /tmp/test_gtest_config_env_new
+
+# 将配置文件所在目录作为显式搜索前缀。
+cmake -S /tmp/test_gtest -B /tmp/test_gtest_config_prefix_new \
+  -DCMAKE_PREFIX_PATH=/usr/lib/x86_64-linux-gnu/cmake/GTest
+```
+
+`GTest_DIR` 注意大小写，指向目录而不是 `GTestConfig.cmake` 文件。
+只传 `-DCMAKE_PREFIX_PATH=/usr` **实测仍失败**：缺的是 multiarch 子目录的展开，
+而 `/usr` 本来就在系统搜索前缀中。
+
+作为因果验证，单独传 `-DCMAKE_LIBRARY_ARCHITECTURE=x86_64-linux-gnu` 也能让配置成功。
+但不建议把它作为通用修复：它扩大所有包的架构目录搜索范围，不能保证这些宿主机库
+与 Conda sysroot 兼容，也不能解决下面的编译问题。优先显式指定所需 package。
+
+#### B. 要编译运行这个最小用例：保持 Conda 激活，只给该构建指定系统 C++
+
+```bash
+B=$(mktemp -d /tmp/test_gtest_system_cxx.XXXXXX)
+cmake -S /tmp/test_gtest -B "$B" \
+  -DCMAKE_CXX_COMPILER=/usr/bin/c++
+cmake --build "$B" -j2
+"$B/test_gtest"
+```
+
+**实测配置、编译、链接和执行全部成功，`Test.Basic` 1/1 通过。**
+仍使用 Conda 的 CMake 4.0.3，也没有卸载 Conda 编译器或修改 activation hook。
+用例只启用 CXX；其他同时启用 C 的项目还需考虑配套的 `CMAKE_C_COMPILER`。
+
+这证明无需退出 Conda 或替换 CMake 本身。但不要把此最小用例结果直接扩展为
+“完整 sikernel 可以无条件切换到系统 GCC 11”：主库、依赖和测试需保持工具链一致，
+完整工程的编译要求还应单独验证。
+
+#### C. 要保留 Conda C++ 工具链：使用同工具链构建、安装在环境外的 GTest
+
+这里有一项重要的负面实测：对方案 A 的成功配置继续执行 `cmake --build`，
+本机的结果是：
+
+```text
+/tmp/test_gtest/main.cpp:1:10: fatal error: gtest/gtest.h: No such file or directory
+```
+
+证据在 `conda-gtest-dir.build.log:15-16`。系统 GTest 导入目标声明的 include 目录是
+`/usr/include`，见以 `/usr` 为根的
+`lib/x86_64-linux-gnu/cmake/GTest/GTestTargets.cmake:66 - set_target_properties`；
+但实际编译命令没有显式加入该目录，Conda 编译器探测出的默认 include 列表也没有
+宿主机 `/usr/include`，而是使用自己的 sysroot。
+**因此不能把 `Found GTest` 当成已经解决整个构建。**
+
+本次复用了第 6.5 节中已经由同一 Conda 编译器构建、安装在环境外的 GTest 1.16.0：
+
+```text
+/tmp/codex-mma-dte-gtest-20260916.qvy8IG/gtest-prefix
+```
+
+将 `GTest_DIR` 指向其 `lib/cmake/GTest` 后，仍使用 Conda GNU 13.3.0，
+本次最小用例 **配置、编译、链接和运行全部成功，1/1 通过**，日志是
+`conda-external-gtest.log`、`conda-external-gtest.build.log`、
+`conda-external-gtest.run.log`。
+
+长期使用可采用第 6.6 节方法 A，在 `$HOME/.local/mma-dte-deps/` 中安装一份
+由当前工具链构建的 GTest，再通过 `GTest_DIR` 或 `CMAKE_PREFIX_PATH` 指定它。
+不需要向 siinfer_dev 内安装任何文件，也不需要重新 apt 安装已存在的 GTest。
+不要为图方便把整个 `/usr/include` 或 `/usr/lib` 强行混入 Conda 工具链来替代依赖匹配。
+
+### 7.6 对 mma_dte_tile_tensor 的实际含义与验证边界
+
+`[sikernel] mma_dte_tile_tensor/testcase/CMakeLists.txt:90 - 顶层配置`
+会把 `CMAKE_CXX_COMPILER`、`CMAKE_C_COMPILER` 转发到子项目，但没有转发
+`GTest_DIR` 或 `CMAKE_PREFIX_PATH` 这些 cache 参数。
+`[sikernel] mma_dte_tile_tensor/testcase/CMakeLists.txt:131 - mma_dte_add_testcase_project`
+在第 150-152 行构造独立的子 CMake 配置命令。
+
+因此，如果保留 Conda 工具链、使用环境外的匹配 GTest，可以给整个构建命令传递
+环境变量，让 ExternalProject 的 CMake 子进程继承，例如：
+
+```bash
+# 路径应指向已经按第 6.6 节方法 A 构建安装的匹配版本。
+GTest_DIR="$HOME/.local/mma-dte-deps/gtest-1.16.0-siinfer/lib/cmake/GTest" \
+  BUILD_JOBS=4 bash ./build.sh --test
+```
+
+这条完整测试构建命令是后续使用方式，**本轮没有执行 --test/--all 全量构建**。
+不要只在最外层 `cmake` 命令加一个 `-DGTest_DIR=...` 就认为所有子项目也会获得它；
+也不要只把系统 GTest 路径传进去，就忽略上面已经复现的 Conda 编译阶段失败。
+
+本轮仅在 `/tmp` 创建诊断文件和构建产物，并追加本答案；原始最小用例、原有 build
+cache、sikernel 和 Conda 环境均未修改。结论可以概括为：
+
+**apt 已安装解决的是“文件存在”；Conda activation hook 切换编译器后，CMake
+漏掉系统 multiarch 目录，造成“文件存在但找不到”。显式 package 路径可以修复查找；
+实际编译还需要让 GTest 与所用 host 工具链匹配。**
