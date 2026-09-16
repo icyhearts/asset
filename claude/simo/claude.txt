@@ -4820,8 +4820,8 @@ BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 
 # 对 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 逐行讲解
 #  sipu::make_shape, sipu::make_tensor sipu::make_layout 等所有的 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 使用的 sipu:: namespace下的 类型和函数，定义位于哪里?
-#   mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 在编译成可执行文件的时候，CMake 是如何把 device code 链接到可执行文件上的? 是先把 整个主库所有的 device code 编译成.so, 再 target_link_library， 还是仅仅把 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 用到的少数几个 device code 编译成.o 再和 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp生成的.o文件一起链接成可执行文件?
 # mma_dte<InputT, OutputT, OutputT, LayoutA, LayoutB, LayoutC> 在本例子中，实现位于哪里?
+#   mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 在编译成可执行文件的时候，CMake 是如何把 device code 链接到可执行文件上的? 是先把 整个主库所有的 device code 编译成.so, 再 target_link_library， 还是仅仅把 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 用到的少数几个 device code 编译成.o 再和 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp生成的.o文件一起链接成可执行文件? /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log 有一份旧的编译日志. mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 生成的可执行文件，里面是有所有的 device code 的实现，还是只有自己调用的少数几个实现?
 
 
 
