@@ -4755,3 +4755,38 @@ bash build.sh
 讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。 讲解 mma_dte_tile_tensor 的代码时候，以 /share/users/like/package/sikernel/mma_dte_tile_tensor 代码为准， 这是最新 sikernel代码, vllm-sipu 更新代码不及时，没有用到新特性。
 把答案追加到 like-useful/answer_codex_v4.md
 }
+
+
+{
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/2609020046
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
+vllm-sipu 测试mxin8 gemm算子的例子在 vllm-sipu code base tests/kernels/quantization/test_mxint8_unpack_pytest.py
+
+mma_dte_tile_tensor 是 sikernel 的一个 submodule 
+最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
+其中有一个 submodule mma_dte_tile_tensor 位于 /share/users/like/package/sikernel/mma_dte_tile_tensor, 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
+其构建方式是 
+cd /share/users/like/package/sikernel/
+source setup.sh
+cd /share/users/like/package/sikernel/mma_dte_tile_tensor
+bash build.sh 
+主库 build/libtile_mma_dte.so 已经编译成功，测试用途编译失败，在查找中，这个暂时不重要
+# 现在讨论 /share/users/like/package/sikernel/mma_dte_tile_tensor/include/simma.h 中的 api 取代 vllm-sipu 使用的 .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 的方案，暂时不执行方案.
+# /share/users/like/package/sikernel/mma_dte_tile_tensor/include/simma.h mma_dte 函数有多个重载，取代  vllm-sipu的 .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal, 应该使用哪个重载?
+# 能够取代  vllm-sipu的 .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universa 那个版本，能接受的输入包括哪些 mx 数据类型? mxfp4, mxfp6, mxfp8, mxint8都接受吗？ 分别要使用哪个重载 ？分别有哪些测试用例？把代码仓库的 mxfp4, mxfp6, mxfp8, mxint8 测试用例给我列出来
+# /share/users/like/package/sikernel/mma_dte_tile_tensor/include/simma.h mma_dte 能直接把输出转换成 linear format 吗?  vllm-sipu code base tests/kernels/quantization/test_mxint8_unpack_pytest.py 使用的旧代码，gemm只有输出 tile format，要得到 linear format,还要gemm结束后， 用  pytorch transpose + reshape 写一个 tile to linear 的转换，效率比较低。 /share/users/like/package/sikernel/mma_dte_tile_tensor/include/simma.h mma_dte如果直接输出 linear format,会提高效率,
+
+
+
+
+讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。 讲解 mma_dte_tile_tensor 的代码时候，以 /share/users/like/package/sikernel/mma_dte_tile_tensor 代码为准， 这是最新 sikernel代码, vllm-sipu 更新代码不及时，没有用到新特性。
+把答案追加到 like-useful/answer_codex_v4.md
+}
