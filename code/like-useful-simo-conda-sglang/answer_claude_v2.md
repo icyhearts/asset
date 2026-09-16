@@ -9436,3 +9436,491 @@ nm -D <so> | grep mma_bf16_mxi8_universal
 - **实测确认**：`m=32,k=128` 正常（`m_tiles=1`）；`m=32,k=64` 和 `m=32,k=96` 都报 `Grid dimensions must be non-zero`；`m=64,k=64`、`m=128,k=32` 正常（它们各自落在阶梯的正确分支上）。
 - **所以 `MXINT8_COLS_ALIGNMENT = 128` 不多不少，在当前 `M=32` 用法下是紧的**。想改成 64 必须**同时改 sikernel 的 tile 阶梯**，并且**逐 shape 重新验证数值** —— 不能只改这个 Python 常量（C++ 和 sikernel 里还有 4 处独立硬检查）。
 - **真正可能的 padding 浪费不在 cols**，而在 `get_padded_mxint8_shape` 的 `max(cols, 128)` 固定开销，以及 supertile 边角（`hp_to_mx_tensormap.hpp:103-112`，对应 `hp_to_mx_kernel.su:66-73` 的 `ZERO_OUTPUT` 处理）。
+
+## 64. `test_bf16_mxi8_host.cpp` 逐行讲解：`sipu::` 符号的来源、`mma_dte` 的实现位置，以及 device code 是怎么链进可执行文件的
+
+**问题**（四个）：
+
+1. 逐行讲解 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp`。
+2. 这份 `.cpp` 用到的所有 `sipu::` 命名空间下的类型和函数（`make_shape` / `make_tensor` / `make_layout` …）定义在哪里？
+3. `mma_dte<InputT, OutputT, OutputT, LayoutA, LayoutB, LayoutC>` 在本例子中的实现位于哪里？
+4. 编译成可执行文件时，CMake 是怎么把 device code 链上去的 —— 是**先把整个主库的 device code 编成一个 `.so` 再 `target_link_libraries`**，还是**只把这份 `.cpp` 用到的那几个 device code 编成 `.o` 再一起链接**？产物里是**全部 device 实现**还是**只调用的那几个**？
+
+**一句话结论（第 4 问，先讲，因为它最容易被想反）：两者都不是。** 真实路径是第三条：
+
+- 这份 test 目录下有一份**自己的 `.su`**（`testcase/func_test/test_bf16_mxint8_host/kernel/inst_bf16_mxi8.su`），它只做 **2 个 `mma_dte` 特化的显式实例化**；
+- 它由 `scc` 编成**一个 `.o`**，再被 `/usr/bin/c++ -shared` 打成一个**私有的小 `.so`**：`libtile_mma_dte_mxint8.so`（5.4 MB）；
+- 可执行文件 `test_bf16_mxi8_host`（542 KB）通过 `-ltile_mma_dte_mxint8` 链接这个 `.so`，**可执行文件里一个字节的 device code 都没有**（没有 `fatbin`、没有 `kernel_meta` 段 —— 见 64.4.2 的 `readelf` 实测）。
+- **而那个 `.so` 里装的不是"少数几个 device 实现"，是 mxint8 这一族几乎所有的实现：4214 个 device kernel 特化。** 因为显式实例化会连带把整个 dispatch 机制（`MMA_DTE_SINGLE_FAMILY_DISPATCH=1` + `dispatch_cases_mxint8_generated.hpp`）全部拉进来。**"只实例化用到的 2 个模板" ≠ "只生成 2 个 device kernel"。**
+
+另外要纠正一个常见误解：**这条路径完全没有碰生产库（主库）**。在 `testcase/` 下 74 个 testcase 项目里，**只有 4 个**真正调用 `mma_dte_get_main_object()` 去复用生产 `.o`（该函数定义在 `testcase/func_test/CMakeMmaDteCommon.cmake:209`）：`test_bf16_fp16_r32_host`、`test_bf16_fp16_fp32_r32_host`、`test_bf16_mxfp4_r32_host`、`test_int32_int8_r32_host`。`test_bf16_mxint8_host` **不在其中** —— 它的 `CMakeLists.txt` 里没有任何 `mma_dte_get_main_object` / `MMA_DTE_MAIN_BUILD_DIR` 引用（下面 64.4.4 有对照）。
+
+产物结构总览：
+
+| 产物 | 大小 | 含 device code？ | 来源 |
+| --- | --- | --- | --- |
+| `test_bf16_mxi8_host`（可执行文件） | 542 KB | **否**（无 `fatbin` 段） | `test_bf16_mxi8_host.cpp` → `/usr/bin/c++` |
+| `libtile_mma_dte_mxint8.so` | 5.4 MB | **是**，4.2 MB `__sipu_fatbin` + 180 KB `.sipu_kernel_meta` | `kernel/inst_bf16_mxi8.su` → `scc` → `/usr/bin/c++ -shared` |
+| 生产库 `libtile_mma_dte_<TYPE>.so`（**本 test 未使用**） | — | 是 | `kernel/instantiations/*/inst_*.su` → `scc`（40 个） |
+
+（`libtile_mma_dte_<TYPE>.so` 的数量以本次构建为准：`kernel/instantiations/` 下共 **40** 个 `inst_*.su`；`cmake.log:9` 里同时出现的 **74** 是 testcase 项目数，两个数不是一回事。）
+
+---
+
+### 64.0 四个问题的速查表
+
+| 问题 | 结论 | 关键位置 |
+| --- | --- | --- |
+| Q1 逐行讲解 | 见 64.1 | `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:1-147` |
+| Q2 `sipu::` 符号在哪 | **全在 SDK 的 `SiTe` 模板库里，不在 sikernel 仓库里** | `$SI_SDK_ROOT/include/SiTe/tensor/tensor.hpp:38`（`namespace sipu`） |
+| Q3 `mma_dte` 实现在哪 | 模板声明在 `include/simma.h`，实现全在 `kernel/mma_dte_tiled_tensor.hpp`，真正被编译的是本 test 自己的 `.su` 显式实例化 | `include/simma.h:179`、`kernel/mma_dte_tiled_tensor.hpp:193`、`testcase/.../kernel/inst_bf16_mxi8.su:24` |
+| Q4 device code 怎么链 | 本 test 的 `.su` → `scc` → 私有 `.so`；可执行文件只链 `.so`，**本身不含 device code** | `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:43-79` |
+
+---
+
+### 64.1 `test_bf16_mxi8_host.cpp` 逐行讲解
+
+先说这个例子在干什么：它把 **mxint8 输入的 A/B**（在 host 上用 gold 路径算出 float 参考解），再把 A/B 拷到设备上，调用 `mma_dte<mxint8, bf16|fp16, ...>` 做一次 `A × Bᵀ`，最后逐元素比对。里面有两个 case：**bf16 输出 / R8 通路** 和 **fp16 输出 / R32 通路**。
+
+#### 64.1.1 头部与 layout 常量（`test_bf16_mxi8_host.cpp:1-37`）
+
+```cpp
+ 1  #include <gtest/gtest.h>
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| `1` | `#include <gtest/gtest.h>` | 唯一的测试框架依赖 |
+| `19` | `#include <sipu_runtime.h>` | 运行时 API：`sipuMalloc` / `sipuMemcpy` / `sipuFree` |
+| `20` | `#include "sipu.h"` | 提供 `sipu::` 命名空间的入口头（见 64.2） |
+| `21` | `#include "SiTe.hpp"` | **关键**：它把 `SiTe/tensor/tensor.hpp` 带进来，`sipu::make_shape` 等全在这里面 |
+| `29` | `#include "simma.h"` | `mma_dte` 的模板**声明**（sikernel 仓库自己的头，`include/simma.h`） |
+| `24` | `#include <filesystem>` | 本文件里其实没用到，冗余包含 |
+
+Layout 常量（`test_bf16_mxi8_host.cpp:33-37`），构造自 `mma_dte_api::tensor_layout(tile_dim0, tile_dim1, supertile_shape0, supertile_shape1, tensor_format)`（定义在 `include/simma.h:41`，构造函数在 `:47`）：
+
+| 行 | 常量 | 值 | `tensor_format` |
+| --- | --- | --- | --- |
+| `33` | `kLayoutB` | `(32, 32, 4, 1, 1)` | 1 = Tiled |
+| `34` | `kLayoutA_R8` | `(128, 8, 4, 1, 1)` | 1 = Tiled |
+| `35` | `kLayoutC_R8` | `(64, 8, 1, 1, 0)` | **0 = Linear** |
+| `36` | `kLayoutA_R32` | `(32, 32, 4, 1, 1)` | 1 = Tiled |
+| `37` | `kLayoutC_R32` | `(16, 32, 1, 1, 1)` | 1 = Tiled |
+
+注意 `33`/`34`/`36` 的 `tile_dim1` 分别是 `32`/`8`/`32` —— 这三个数**决定了最终走哪条 kernel 通路**。`kernel/mma_dte_tiled_tensor.hpp:102-117` 的 `if constexpr (layoutA.tile_dim1 == 32) → mma_r32_dte / == 16 → mma_r16_dte / else → mma_r8_dte` 就是按它分派的。所以 `kLayoutA_R8`（`tile_dim1=8`）走 **r8**，`kLayoutA_R32`（`tile_dim1=32`）走 **r32**。
+
+#### 64.1.2 `run_case()` —— 模板参数与准备（`test_bf16_mxi8_host.cpp:39-50`）
+
+```cpp
+39  template <class OutputT, int CaseM, int CaseN, int CaseK,
+40            mma_dte_api::tensor_layout LayoutA,
+41            mma_dte_api::tensor_layout LayoutB,
+42            mma_dte_api::tensor_layout LayoutC>
+43  static int run_case() {
+44      using InputT = sifmt::mxint8;
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| `39-42` | 模板参数 | `OutputT` 是**输出类型**；`LayoutA/B/C` 是**非类型模板参数**（C++20 的结构化类型 NTTP），所以 `kLayoutA_R8` 这种 `constexpr auto` 能直接当模板实参传 |
+| `44` | `using InputT = sifmt::mxint8;` | 输入类型固定为 mxint8。`sifmt::mxint8` 的定义在 SDK：`$SI_SDK_ROOT/include/SiTe/sifmt/sifmt_mx.hpp:115` = `SiMxData<sifmt::int8, mxi8::MxQuantPolicy<>>` |
+| `45-50` | 随机 A | `std::uniform_real_distribution<float>(-100, 100)`；A 的**元素个数**是 `CaseM * CaseK`，注意这里填的是**逻辑形状**，不是 padded 后的存储形状 |
+
+#### 64.1.3 A / B 的 host 端构造（`test_bf16_mxi8_host.cpp:51-61`）
+
+```cpp
+51      auto shape_a = sipu::make_shape(CaseM, CaseK);
+52      auto layout_a = sipu::make_layout(shape_a, sipu::LayoutTag::Tiled);
+53      auto mx_tensor_a = sipu::make_tensor<InputT>(layout_a, arr_A);
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| `51` | `make_shape(CaseM, CaseK)` | 造一个 2 维 `Shape<2>` |
+| `52` | `make_layout(shape, LayoutTag::Tiled)` | 造 Tiled layout |
+| `53` | `make_tensor<InputT>(layout, arr_A)` | **这一步在 host 上就把 float→mxint8 量化 + 摆成 tiled 存储** 做完了（SDK 的 `Tensor` 走的是 `std::span<const float>` 那条构造） |
+| `59-61` | 同 B | B 也是 mxint8 / Tiled |
+
+**注意 A 和 B 在算术上的形状**：`shape_a = (M, K)`，`shape_b = (N, K)` —— B 用的也是 `(N, K)` 而不是常见的 `(K, N)`，因为后面 `mm_mnk` 和 `mma_dte` 算的都是 **`A × Bᵀ`**（`mma_dte_api::Operation::OP_N`）。
+
+#### 64.1.4 golden 参考解（`test_bf16_mxi8_host.cpp:63-72`）
+
+```cpp
+63      auto gold_tiled_tensor =
+64          sipu::tensor::mm_mnk(mx_tensor_a, mx_tensor_b, sipu::LayoutTag::Tiled);
+65      auto gold_linear = gold_tiled_tensor.toVector();
+66      auto shape_d = sipu::make_shape(CaseM, CaseN);
+67      auto layout_d = sipu::make_layout(shape_d, sipu::LayoutTag::Tiled);
+68      auto out_tensor_d = sipu::make_tensor<OutputT>(layout_d, gold_linear);
+69      auto gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true);
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| `63-64` | `tensor::mm_mnk(...)` | **host 上的参考矩阵乘**（把 mxint8 反量化成 float 再乘）。注意它**不是** device kernel，是纯 CPU 的循环；`sipu::tensor` 这个子命名空间在 SDK 里于 `tensor.hpp:2534` 打开 |
+| `65` | `.toVector()` | 结果摊成 `std::vector<float>`，**按逻辑顺序** |
+| `66-67` | 造 D 的 shape/layout | D 是 `(M, N)` |
+| `68` | `make_tensor<OutputT>(layout_d, gold_linear)` | 把 float 参考解 **转成 `OutputT`（bf16/fp16）并按 Tiled 摆放** |
+| `69` | `.toVectorAsMemoryOrder(true)` | 取出**按物理内存顺序**排列的 `gold_tiled` |
+
+**`70-72` 是理解整个对比逻辑的关键**：
+
+```cpp
+70      const size_t output_elements =
+71          LayoutC.tensor_format == 1 ? gold_tiled.size() : gold_linear.size();
+72      const size_t size_out = output_elements * sizeof(OutputT);
+```
+
+- `LayoutC.tensor_format == 1`（tiled 输出）→ 用 `gold_tiled`（物理序），元素个数取 `gold_tiled.size()`；
+- `LayoutC.tensor_format == 0`（linear 输出）→ 用 `gold_linear`（逻辑序）。
+
+对应到两个 case：`kLayoutC_R8 = tensor_layout(64,8,1,1,0)` 的 `tensor_format=0` → 走 linear 分支；`kLayoutC_R32 = tensor_layout(16,32,1,1,1)` 的 `tensor_format=1` → 走 tiled 分支。**同一条 评判代码，靠这个分支同时覆盖两种输出排布。**
+
+#### 64.1.5 设备内存与调用（`test_bf16_mxi8_host.cpp:74-99`）
+
+```cpp
+80      size_t tensor_size_a = mx_tensor_a.storageSize();
+81      size_t tensor_size_b = mx_tensor_b.storageSize();
+83      sipuMalloc(&d_A, tensor_size_a);
+...
+87      sipuMemcpy(d_A, mx_tensor_a.data(), tensor_size_a, sipuMemcpyHostToDevice);
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| `74` | `malloc(size_out)` | host 侧收结果的 buffer（注意是 `malloc` 不是 `sipuMalloc`） |
+| `80-81` | `.storageSize()` | **物理存储字节数**（padded + tile header 后的），不是 `M*K*sizeof`。这就是要拷多少字节的依据 |
+| `83-85` | `sipuMalloc` | 设备侧三块：`d_A`、`d_B`、`d_C` |
+| `87-88` | `sipuMemcpy(..., HostToDevice)` | `.data()` 返回的是 **host 侧**那块的指针 |
+
+核心调用（`test_bf16_mxi8_host.cpp:90-94`）：
+
+```cpp
+90      mma_dte<InputT, OutputT, OutputT, LayoutA, LayoutB, LayoutC>(
+91          mma_dte_api::Operation::OP_N, mma_dte_api::Operation::OP_N,
+92          CaseM, CaseN, CaseK, OutputT(0.1f), static_cast<void*>(d_A), CaseK,
+93          static_cast<void*>(d_B), CaseK, OutputT(0.2f),
+94          static_cast<void*>(d_C), CaseN);
+```
+
+- `90` 模板实参依次是 `inputT=mxint8`、`outputT=OutputT`、`scalarT=OutputT`（第 3 个），再是三个 layout —— 和 `include/simma.h:146` 的声明一一对应。
+- `91` `transa` / `transb` 都是 `OP_N`。
+- `92` 传 `alpha=OutputT(0.1f)`、`lda=CaseK`；`93` 传 `beta=OutputT(0.2f)`、`ldb=CaseK`；`94` 传 `ldc=CaseN`。
+- **这里选的是 13 个参数、不带 workspace 的那条重载**（`include/simma.h:179-187`），`stream` 走默认 `nullptr`。
+
+> ⚠️ **`alpha` / `beta` 实际上被忽略了**，所以这个例子拿纯 `A×B`（不带 `0.1*` / `+0.2*C`）的 golden 去比也能过。证据在实现里：`kernel/mma_dte_tiled_tensor.hpp:69` 明写着
+> ```cpp
+> 69    // TODO: Use transa, transb, alpha, beta, lda, ldb, ldc in implementation
+> ```
+> 同理 `transa`/`transb`/`lda`/`ldb`/`ldc` 也都没被真正使用。**读这个例子时不要把 `0.1f`/`0.2f` 当成有效语义**。
+
+收尾（`test_bf16_mxi8_host.cpp:96-99`）：`sipuMemcpy(host_C, d_C, size_out, DeviceToHost)` 然后三个 `sipuFree`。
+
+#### 64.1.6 校验与两个 case（`test_bf16_mxi8_host.cpp:101-146`）
+
+```cpp
+102     for (size_t i = 0; i < output_elements; ++i) {
+103         OutputT gold;
+104         if constexpr (LayoutC.tensor_format == 1) {
+105             gold = static_cast<OutputT>(gold_tiled[i]);
+106         } else {
+107             gold = OutputT(gold_linear[i]);
+108         }
+```
+
+| 行 | 说明 |
+| --- | --- |
+| `104-108` | 用 `if constexpr` 在**编译期**选 gold 来源，和 `70-71` 的 `output_elements` 完全对应 |
+| `109-113` | 相对误差 `err_rate = |(gold-result)/gold|`，`gold==0` 时退化为绝对误差 |
+| `114-119` | **`err_rate > 0.0f` 就算错** —— 也就是说这里要求**逐 bit 完全一致**，没有任何容差 |
+| `126-129` | `run_bf16_default_case()`：`<bf16, 8, 576, 1024, kLayoutA_R8, kLayoutB, kLayoutC_R8>` → M=8, N=576, K=1024，走 r8 |
+| `131-134` | `run_default_case()`：`<fp16, 32, 576, 1024, kLayoutA_R32, kLayoutB, kLayoutC_R32>` → M=32, 走 r32 |
+| `136-146` | 两个 `TEST_F`，各自 `EXPECT_EQ(run_*_case(), 0)` |
+
+---
+
+### 64.2 Q2：`sipu::` 下的类型和函数定义在哪里？
+
+**全部在 SDK 里，不在 sikernel 仓库里。** sikernel 只用一个**同名命名空间**的 `check()`（在 `$SI_SDK_ROOT/include/deprecated.h:78`，由 `$SI_SDK_ROOT/include/sipu.h:57` 的 `#include "deprecated.h"` 引入）。注意 `sipu.h` 里那个 `namespace sipu` 只开在 `:24-51`，且里面**只有 3 个 `__in_simulator__` / `__in_device__` / `__sipu_arch__` 的小函数**，`make_shape` 之类**一个字都没有** —— 它们全在 `SiTe/tensor/tensor.hpp` 里另开的同名命名空间中。
+
+命名空间本体在 **`$SI_SDK_ROOT/include/SiTe/tensor/tensor.hpp`**，`namespace sipu {` 开在 **`:38`**，闭在 **`:2765`**（其中嵌套的 `namespace detail` 在 `:373-441`，`namespace tensor` 在 `:2534-2763`）。
+
+| 例子里的用法（行号） | 定义位置 | 函数名 / 类型名 |
+| --- | --- | --- |
+| `sipu::make_shape`（`:51`, `:59`, `:66`） | `SiTe/tensor/tensor.hpp:343` | `make_shape` |
+| `sipu::LayoutTag::Tiled`（`:52`, `:60`, `:64`, `:67`） | `SiTe/tensor/tensor.hpp:473` | `LayoutTag`（枚举 `Manual` / `Linear` / `Tiled`） |
+| `sipu::make_layout`（`:52`, `:60`, `:67`） | `SiTe/tensor/tensor.hpp:597` | `make_layout(Shape_, LayoutTag)`（另有 `:591` 的 stride 版、`:603` 的 tiling-config 版） |
+| `sipu::make_tensor<InputT>`（`:53`, `:61`, `:68`） | `SiTe/tensor/tensor.hpp:2483` | `make_tensor(Layout_, T1)`（另有 `:2489` / `:2495` / `:2504` 重载） |
+| `sipu::tensor::mm_mnk`（`:64`） | `SiTe/tensor/tensor.hpp:2679` | `mm_mnk`（在 `namespace tensor`，`:2534` 开） |
+| `.toVector()`（`:65`） | `SiTe/tensor/tensor.hpp:2114` | `Tensor::toVector` |
+| `.toVectorAsMemoryOrder(true)`（`:69`） | `SiTe/tensor/tensor.hpp:2141` | `Tensor::toVectorAsMemoryOrder` |
+| `.storageSize()`（`:80`, `:81`） | `SiTe/tensor/tensor.hpp:2238` | `Tensor::storageSize` |
+| `.data()`（`:87`, `:88`） | `SiTe/tensor/tensor.hpp:2243` | `Tensor::data` |
+| `Tensor` 类本体 | `SiTe/tensor/tensor.hpp:1755` | `Tensor` |
+| `sifmt::mxint8`（`:44`） | `SiTe/sifmt/sifmt_mx.hpp:115` | `mxint8`（= `SiMxData<sifmt::int8, mxi8::MxQuantPolicy<>>`） |
+| `sifmt::bfloat16`（`:127`） | `SiTe/sifmt/sifmt_fp.hpp:278` | `bfloat16` |
+| `sifmt::float16`（`:132`） | `SiTe/sifmt/sifmt_fp.hpp:277` | `float16` |
+
+运行时 API 也在 SDK：
+
+| 用法 | 定义位置 | 函数名 |
+| --- | --- | --- |
+| `sipuMalloc`（`:83-85`） | `include/sipu_runtime.h:560` | `sipuMalloc<T>(T**, size_t)` —— 是个模板包装，转调 `::sipuMalloc((void**), size)`（`:562`） |
+| `sipuMemcpy`（`:87`, `:88`, `:96`） | `include/sipurt/sipu_runtime_api.h:4661` | `sipuMemcpy` |
+| `sipuMemcpyHostToDevice` / `MemcpyDeviceToHost` | 同文件，枚举 `sipuMemcpyKind` | — |
+| `sipuFree`（`:97-99`） | `include/sipurt/sipu_runtime_api.h:3752` | `sipuFree` |
+
+`make_shape` / `make_tensor` / `make_layout` 都带 `__SITE_SIFMT_HOST__ __SITE_SIFMT_DEVICE__` 宏（例如 `tensor.hpp:343`、`:2483`），所以**同一份代码 host 和 device 都能用**。
+
+---
+
+### 64.3 Q3：`mma_dte<InputT, OutputT, OutputT, LayoutA, LayoutB, LayoutC>` 的实现位置
+
+**声明**（sikernel 仓库，`include/simma.h`）—— 三条重载：
+
+| 行 | 签名 |
+| --- | --- |
+| `include/simma.h:146-156` | 带 `void* workspace, size_t workspaceSizeBytes` 的版本 |
+| `include/simma.h:179-187` | 不带 workspace 的版本（**本 test 用的就是这条**） |
+| `include/simma.h:201-203` | 简化版 `mma_dte(void* A, void* B, void* C, int M, int N, int K, stream)` |
+
+**实现**（`kernel/mma_dte_tiled_tensor.hpp`），调用链如下：
+
+```
+mma_dte<...>()                                    kernel/mma_dte_tiled_tensor.hpp:193   ← 本 test 命中
+  └─ mma_dte_implement<...>()                     kernel/mma_dte_tiled_tensor.hpp:165
+       └─ mma_dte_implement<...>()                kernel/mma_dte_tiled_tensor.hpp:151   ← 带 workspace 的重载
+            └─ mma_dte_implement_with_control<...>()   kernel/mma_dte_tiled_tensor.hpp:54
+                 ├─ sipu::check(...)      (5 处 shape/layout 校验，:71-87)
+                 ├─ get_best_solution<...>()        (:88-90)      → planner 搜索最优配置
+                 ├─ create_tensor_maps<...>()       (:91-97)      → 构造 A/B/D 的 TensorMap
+                 └─ if constexpr (layoutA.tile_dim1)  (:102-117)  ← 路由到 r32 / r16 / r8
+                      ├─ mma_r32_dte   kernel/detail/mma_dte_tiled_tensor_dispatch_entrypoints.hpp:1436
+                      ├─ mma_r16_dte   kernel/detail/mma_dte_tiled_tensor_dispatch_entrypoints.hpp:1321
+                      └─ mma_r8_dte    kernel/detail/mma_dte_tiled_tensor_dispatch_entrypoints.hpp:1211
+```
+
+对两个 case：
+
+- `kLayoutA_R8` 的 `tile_dim1 == 8` → `else` 分支 → `mma_r8_dte`（`dispatch_entrypoints.hpp:1211`）；由 `.su:18` 的 `mma_dte_tiled_tensor_kernel_util_mxint8_mxfp6_r8.hpp` 提供 r8 的 device 实现（该头 6216 行，实际 kernel 本体）。
+- `kLayoutA_R32` 的 `tile_dim1 == 32` → `mma_r32_dte`（`dispatch_entrypoints.hpp:1436`）；由 `.su:18` 的 `..._r32.hpp` 提供。
+
+**但是真正被编译器实例化的是哪一份？** 是 **test 目录下自己的 `inst_bf16_mxi8.su`**：
+
+```cpp
+// testcase/func_test/test_bf16_mxint8_host/kernel/inst_bf16_mxi8.su:18-36
+18  #include "util/mma_dte_tiled_tensor_kernel_util_mxint8_mxfp6_r32.hpp"
+19  #include "util/mma_dte_tiled_tensor_kernel_util_mxint8_mxfp6_r16.hpp"
+20  #include "util/mma_dte_tiled_tensor_kernel_util_mxint8_mxfp6_r8.hpp"
+21  #include "mma_dte_tiled_tensor.hpp"
+24  template void mma_dte<sifmt::mxint8, sifmt::bfloat16, sifmt::bfloat16,
+25                        mma_dte_api::tensor_layout(128,8,4,1,1),
+26                        mma_dte_api::tensor_layout(32,32,4,1,1),
+27                        mma_dte_api::tensor_layout(64,8,1,1,0)>( ... );
+31  template void mma_dte<sifmt::mxint8, sifmt::float16, sifmt::float16,
+32                        mma_dte_api::tensor_layout(32,32,4,1,1),
+33                        mma_dte_api::tensor_layout(32,32,4,1,1),
+34                        mma_dte_api::tensor_layout(16,32,1,1,1)>( ... );
+```
+
+**这 2 个 `template void` 就是 `.cpp:90` 调用的那 2 个特化。** `.cpp` 侧只有**声明**（`include/simma.h`），符号是 `U`（undefined），由这个 `.so` 提供。
+
+对照：生产库的同一族 `kernel/instantiations/mxint8/*.su` 每个文件有 **12** 个 `template void mma_dte`（`inst_mxint8_r16.su` / `_r32_1x4` / `_r32_2x2` / `_r32_4x1` / `_r8` 共 5 个文件、60 个特化），本 test 只要 **2** 个。
+
+---
+
+### 64.4 Q4（核心）：device code 是怎么链进可执行文件的？
+
+#### 64.4.1 CMake 侧的三个步骤
+
+`testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt`：
+
+**第一步（`:43-47`）—— 用 `scc` 把 `.su` 编成 object library：**
+
+```cmake
+43  scc_add_library(tile_mma_dte_mxint8 OBJECT
+44      ${TEST_INST_SRC}
+45  )
+46  scc_target_compile_options(tile_mma_dte_mxint8 ${COMMON_COMPILE_OPTIONS})
+47  scc_target_include_directories(tile_mma_dte_mxint8 ${COMMON_INCLUDE_DIRECTORIES})
+```
+
+`TEST_INST_SRC` 在 `:41` 定义（默认指向 `kernel/inst_bf16_mxi8.su`）。`scc_add_library` 由 `find_package(scc REQUIRED)` 引入，实现在 SDK：`$SI_SDK_ROOT/share/cmake/scc/sccConfig.cmake:315`。
+
+**第二步（`:52-62`）—— 用 host 编译器把它打成一个私有 `.so`：**
+
+```cmake
+52  add_custom_command(
+53      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libtile_mma_dte_mxint8.so
+54      COMMAND ${CMAKE_CXX_COMPILER} -shared -o ${CMAKE_CURRENT_BINARY_DIR}/libtile_mma_dte_mxint8.so
+55          ${TILE_MMA_DTE_MXINT8_O}
+56      DEPENDS tile_mma_dte_mxint8 ${TILE_MMA_DTE_MXINT8_O}
+57      COMMENT "Linking libtile_mma_dte_mxint8.so"
+58  )
+```
+
+**第三步（`:67-81`）—— 可执行文件只链这个 `.so`：**
+
+```cmake
+67  add_executable(test_bf16_mxi8_host
+68      ${TEST_HOST_SRC}
+69  )
+74  target_link_libraries(test_bf16_mxi8_host PRIVATE
+75      ${CMAKE_CURRENT_BINARY_DIR}/libtile_mma_dte_mxint8.so
+76      sipurt
+77      sipu
+78  )
+79  add_dependencies(test_bf16_mxi8_host tile_mma_dte_mxint8_so)
+81  mma_dte_test_enable_gtest(test_bf16_mxi8_host)
+```
+
+`sipurt` / `sipu` 是 SDK 的运行时导入库（`$SI_SDK_ROOT/lib/libsipurt.so.0.4.1`、`libsipu.so.0.4.1`）。
+
+**所以：不是"整个主库编成 `.so` 再链"，而是"本 test 自己的 `.su` 编成 `.so` 再链"。** 生产库的 40 个 `libtile_mma_dte_<TYPE>.so` **跟这个 test 一次都没关系**。
+
+#### 64.4.2 实测：可执行文件里没有 device code
+
+`temp/cxx.log:6116-6142` 记录的完整命令（`build-modify.sh --test`，SDK tag `2609161442`）：
+
+```
+6117  .../bin/scc -arch=sipu_150 -c
+        -o .../_SipuObj/tile_mma_dte_mxint8/kernel/inst_bf16_mxi8.su.o
+        .../testcase/func_test/test_bf16_mxint8_host/kernel/inst_bf16_mxi8.su
+        -I.../include -I.../include/SiTe -I.../include/sipurt -I.../include -I.../kernel -I.../kernel/util
+        --clangopt=-DSIRT_DEVICE_USE_PRINTF --clangopt=-fPIC --clangopt=-DDTE_DEV_MODE
+        --clangopt=-DMMA_DTE_TEST_GRID_DIM=16 --clangopt=-DTARGET_SIPU_ARCH=150
+        --clangopt=-DSITE_TARGET_SIPU_ARCH=150
+        --clangopt=-DMMA_DTE_SINGLE_FAMILY_DISPATCH=1
+        --clangopt=-DMMA_DTE_DISPATCH_CASES_HEADER=.../dispatch_cases_mxint8_generated.hpp
+
+6127  /usr/bin/c++ -shared -o .../test_bf16_mxint8_host/libtile_mma_dte_mxint8.so
+        .../_SipuObj/tile_mma_dte_mxint8/kernel/inst_bf16_mxi8.su.o
+
+6138  [ 75%] Linking CXX executable .../build/testcase/.../test_bf16_mxi8_host
+6140  /usr/bin/c++ ... CMakeFiles/test_bf16_mxi8_host.dir/test_bf16_mxi8_host.cpp.o
+        -o .../test_bf16_mxi8_host
+        -L.../sicx_sdk/.../lib -L.../func_test/test_bf16_mxint8_host
+        -ltile_mma_dte_mxint8 -lsipurt -lsipu
+        /usr/lib/x86_64-linux-gnu/libgtest.a /usr/lib/x86_64-linux-gnu/libgtest_main.a
+```
+
+逐条对照 `readelf` / `nm` 的实测结果：
+
+| 检查项 | `test_bf16_mxi8_host`（可执行） | `libtile_mma_dte_mxint8.so` |
+| --- | --- | --- |
+| `readelf -S` 有 `__sipu_fatbin`？ | **没有** | **有**，`[16]`，**4,245,288 字节** |
+| 有 `.sipu_kernel_meta`？ | **没有** | **有**，`[15]`，179,670 字节 |
+| `.text` 大小 | 258 KB | 366 KB（另有 `.rodata` 166 KB） |
+| `.so` 总大小 | 542 KB | 5,398,912 字节（≈5.4 MB） |
+| `mma_dte` 符号 | `nm -D --undefined-only` 里是 **`U`（未定义）**，共 2 个特化 | `nm --defined-only` 里有 **`W`（弱定义）**的实现 |
+
+可执行文件的 `DT_NEEDED`：
+
+```
+NEEDED  libtile_mma_dte_mxint8.so
+NEEDED  libsipurt.so.0
+NEEDED  libstdc++.so.6
+NEEDED  libm.so.6
+NEEDED  libgcc_s.so.1
+NEEDED  libc.so.6
+RPATH   [.../envs/siinfer_dev/lib : .../sicx_sdk/<tag>/lib : .../test_bf16_mxint8_host]
+```
+
+**`NEEDED libtile_mma_dte_mxint8.so` 就是答案**：device code 通过这一个 `.so` 在**运行时**被 `libsipurt.so.0` 加载。
+
+#### 64.4.3 那 `.so` 里到底有多少 device 实现？—— 4214 个，不是 2 个
+
+这是本问最容易踩的坑。把 `.so` 的 fatbin 段抽出来数：
+
+```bash
+objcopy -O binary --only-section=__sipu_fatbin libtile_mma_dte_mxint8.so fatbin.bin   # 4,245,288 字节
+strings -n 20 fatbin.bin | grep '^_Z' | grep 'kernel_tile_mma' | sort -u | wc -l
+# → 4214
+```
+
+按维度拆开：
+
+| 维度 | 分布 |
+| --- | --- |
+| 总量 | **4214** 个 `kernel_tile_mma_procon_v2_tiled_tensor_map<...>` 特化 |
+| 按 tile 通路（`loadL2B_mma_r*`） | r8 = 1498，**r16 = 0**，r32 = 2716 |
+| 按**输入** dtype | `4mxi8` = **4214**（全部），`mxf6e3m2` = 0，`mxf6e2m3` = 0 |
+| 按**输出** dtype | `SiFpBaseILj8ELj7Et`（bf16）= 1498，`SiFpBaseILj5ELj10Et`（fp16）= 2716 |
+
+**怎么读这张表**：
+
+- **输入 dtype 只有 mxint8** —— 这正是 `MMA_DTE_TEST_DISPATCH_FAMILY=mxint8` 的作用：`testcase/func_test/CMakeMmaDteCommon.cmake:37-56` 从**目录名**（`test_bf16_mxint8_host` 命中 `mxint8|mxi8` 正则，`:47-48`）自动推断出 family，`:65-67` 据此选 `dispatch_cases_mxint8_generated.hpp`，`:176-177` 再把它作为 `-DMMA_DTE_SINGLE_FAMILY_DISPATCH=1 -DMMA_DTE_DISPATCH_CASES_HEADER=...` 传给 `scc`。**所以别的族（mxfp8 / mxfp6 / mx4 / non_mx）一个都没进来** —— 这一层"裁剪"是生效的。
+- **但族内的 shape/schedule 组合一个都没裁** —— 1498 + 2716 对应 `kernel/detail/generated/dispatch_cases_mxint8_generated.hpp` 里那些 `GEN_CASES_*` 宏展开出的全部 case（该文件 38 个 `#define GEN_CASES`，每个再展开成几十个 2D 组合）。`kernel/mma_dte_tiled_tensor.hpp:88-90` 的 `get_best_solution()` 是**运行时**才选具体配置的，编译器无法在编译期把它折叠成唯一一个，所以**整族都留在二进制里**。
+- r16 = 0 是因为 `.su:19` 虽然 `#include` 了 r16 的头，但没有任何 r16 的 `template void` 实例化，所以没生成 device kernel。
+
+**结论（Q4 的完整回答）**：
+
+> 既不是"整主库的 device code 编成一个大 `.so`"，也不是"只把用到的少数几个编成 `.o`"。
+> 而是：**test 自己的一份 `.su`（只实例化 2 个 `mma_dte` 模板）→ `scc` 编成 1 个 `.o` → `/usr/bin/c++ -shared` 打成 1 个私有 `.so` → 可执行文件 `-l` 这个 `.so`**。
+> **可执行文件里 0 字节 device code**（无 fatbin 段）；**那个 `.so` 里有 4214 个 device kernel** —— 输入 dtype 被裁剪到只剩 mxint8，但 mxint8 族内的全部 shape/schedule 组合都在。
+
+device code 的注册是 host stub 干的：`.so` 的未定义符号里有 `__sipuRegisterFatBinary`、`__sipuRegisterFunction`、`sipuLaunchKernelExC`、`__sipuPushCallConfiguration`、`__sipuPopCallConfiguration`，这些都由 `libsipurt.so.0` 提供。
+
+#### 64.4.4 生产库走的是另一条路（本 test 未使用）
+
+作为对照，生产库 `CMakeLists.txt` 的做法是（`:322-340`）：
+
+```cmake
+322  foreach(TYPE IN LISTS OBJECT_LIB_TYPES)
+324      set(COMPONENT_SHARED_LIB "${CMAKE_CURRENT_BINARY_DIR}/${MMA_DTE_LIB_NAME}_${TYPE}.so")
+326      add_custom_command(
+327          OUTPUT ${COMPONENT_SHARED_LIB}
+328          COMMAND ${CMAKE_CXX_COMPILER} -shared
+329              -Wl,-soname,${MMA_DTE_LIB_NAME}_${TYPE}.so
+330              -o ${COMPONENT_SHARED_LIB}
+331              ${OBJECT_FILE} ...
+```
+
+即 **每个 `inst_*.su`（每个 `TYPE`）各自编成一个 `.o`，再各自打成一个 `libtile_mma_dte_<TYPE>.so`**，最后用一个 `mma_dte_umbrella`（`:363`）把 40 个 DSO 通过生成的 trampoline 暴露出去。注释里给了原因（`:318-321`）：
+
+> Linking every instantiation object into a single ELF overflows x86_64 PC-relative relocations. Build one private DSO per instantiation...
+
+**所以哪怕在"整个主库"这条路里，也不是一个大 `.so`，而是 40 个小 `.so` 加一个 umbrella。**
+
+`test_bf16_mxint8_host` 是否复用了生产库的 `.o`？**没有。** 复用机制在 `testcase/func_test/CMakeMmaDteCommon.cmake:209` 的 `mma_dte_get_main_object()`（它要求生产库的 `mma_dte_build_manifest.txt`、`mma_dte_build_inputs.stamp`、SDK 路径、arch、`MMA_DTE_ENABLE_SPLITK`、profile、`MMA_DTE_TMAP_LMUL` 全部对得上，还要过 `:302-313` 的逐文件时间戳检查）。全仓库只有 **4 个** testcase 调用它（`test_bf16_fp16_r32_host`、`test_bf16_fp16_fp32_r32_host`、`test_bf16_mxfp4_r32_host`、`test_int32_int8_r32_host`），**`test_bf16_mxint8_host/CMakeLists.txt` 里没有任何 `mma_dte_get_main_object` 或 `MMA_DTE_MAIN_BUILD_DIR` 引用**，所以它永远走 `:43` 的本地 `scc` 编译。
+
+---
+
+### 64.5 补充：`build.sh` vs `build-modify.sh`，以及和 74 个 testcase 的关系
+
+用到的命令是 `BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test`：
+
+| | `build.sh` | `build-modify.sh` |
+| --- | --- | --- |
+| `BUILD_CXX` 支持 | 有（`:67-69`） | 有 |
+| 构建目录 | `build/` | `build-cxx/`（`temp/cxx.log` 里可见） |
+| 构建成功了吗 | 曾失败过：16/74 个 testcase 子项目在 `find_package(GTest REQUIRED)` 处 CMake configure 失败（见 64.5.1） | **成功**，`temp/cxx.log` 末尾 `[100%] Built target mma_dte_all_testcases`，501 个 `Built target` |
+
+**为什么 `build-modify.sh` 能过而 `build.sh` 不能**：当时 gtest 没装，`build.sh` 挂在 `find_package(GTest REQUIRED)`（`testcase/func_test/CMakeMmaDteCommon.cmake:353`）。现在 `/usr/lib/x86_64-linux-gnu/libgtest.a` 与 `libgtest_main.a` 已经存在（`temp/cxx.log:6140` 的链接行里能看到），所以这条路通了。
+
+另外 `build-modify.sh` 的 `--test` 只构建 testcase 部分，**不构建主库**（`build_library()` 没被调用），所以 `build/` 下根本没有 `libtile_mma_dte_<TYPE>.so`。
+
+#### 64.5.1 顺带：`build.sh --all` 曾经挂在 gtest 上
+
+之前 `cmake.log` 那次的失败与本例代码无关，是环境缺 gtest：
+
+- 阶段 1（生产库）是成功的（`cmake.log:6-8`：`Built target mma_dte_build_manifest` / `mma_dte_umbrella` / `tile_mma_dte`）。
+- 阶段 2 挂在 CMake configure，`find_package(GTest REQUIRED)` 只有 **3 处直接调用**，但覆盖全部 74 个子项目：
+  - `testcase/func_test/CMakeMmaDteCommon.cmake:353` —— 在函数 `mma_dte_test_enable_gtest` 里（`:352` 定义）。**绝大多数 func_test 都走这个函数**，所以这一处就决定了几乎全部子项目的成败。
+  - `testcase/autotune/CMakeLists.txt:23`
+  - `testcase/func_test/test_validation_host/CMakeLists.txt:27`
+  - （`testcase/func_test/splitK/common/SplitKTest.cmake:54` 是在函数 `add_mma_dte_splitk_test` 里**转调** `mma_dte_test_enable_gtest`，不是独立的 `find_package` 点。）
+- 当时 `GTEST_LIBRARY` / `GTEST_INCLUDE_DIR` / `GTEST_MAIN_LIBRARY` / `GTest_DIR` 全是 `-NOTFOUND`，而 **`/usr/lib/x86_64-linux-gnu/libgtest.a` 现在已存在**，所以现在 `build.sh` 和 `build-modify.sh` 都能过。
+
+> 这也解释了一个现象：`build/` 下只有 `testcase/`，没有主库产物 —— 因为构建失败发生在阶段 2 的 configure，阶段 1 的 `.o`/`.so` 产物在**那次**构建的其他目录里，而本次 `--test` 又完全不碰主库。
+
+---
+
+### 64.6 小结
+
+- **`sipu::` 的那套 tensor API（`make_shape` / `make_layout` / `make_tensor` / `LayoutTag` / `Tensor` / `mm_mnk`）全部来自 SDK 的 `SiTe` 库**，不是 sikernel 仓库的代码。主文件是 `$SI_SDK_ROOT/include/SiTe/tensor/tensor.hpp`（`namespace sipu` 在 `:38-2765`）；`make_shape` 在 `:343`、`make_layout` 在 `:597`、`make_tensor` 在 `:2483`、`mm_mnk` 在 `:2679`。
+- **`mma_dte` 的模板声明在 sikernel 的 `include/simma.h:179`，实现在 `kernel/mma_dte_tiled_tensor.hpp:193 → 165 → 151 → 54`，再按 `layoutA.tile_dim1` 路由到 `mma_r32_dte` / `mma_r16_dte` / `mma_r8_dte`（`kernel/detail/mma_dte_tiled_tensor_dispatch_entrypoints.hpp:1436 / 1321 / 1211`）**；**被编译的实例只有** `testcase/func_test/test_bf16_mxint8_host/kernel/inst_bf16_mxi8.su:24` 和 `:31` 那 2 个显式实例化。
+- **device code 的链接方式（Q4）**：`inst_bf16_mxi8.su` →（`scc`）→ 1 个 `.o` →（`/usr/bin/c++ -shared`）→ `libtile_mma_dte_mxint8.so` →（`-ltile_mma_dte_mxint8`）→ 可执行文件。**可执行文件本身不含 device code**（实测无 `fatbin` 段，542 KB）；device code 在 `.so` 里（4.2 MB fatbin）。
+- **`.so` 里的 device 实现是 4214 个，不是 2 个。** 输入 dtype 被 `MMA_DTE_TEST_DISPATCH_FAMILY=mxint8` 裁剪到只剩 mxint8 一族，但**族内的全部 shape/schedule 组合都保留**（r8 = 1498，r32 = 2716），因为具体配置是运行期由 `get_best_solution()`（`kernel/mma_dte_tiled_tensor.hpp:88`）选的。
+- **生产库走的是完全不同的路子**：40 个 `inst_*.su` 各自一个 `.o`、各自一个 `.so`，再加一个 `mma_dte_umbrella`（`CMakeLists.txt:322-340`、`:363`）。本 test **不复用**生产对象 —— 全仓库只有 4 个 testcase 走 `mma_dte_get_main_object()`（`CMakeMmaDteCommon.cmake:209`）。
+- **例子里的 `alpha=0.1f` / `beta=0.2f` 是无效参数** —— `kernel/mma_dte_tiled_tensor.hpp:69` 的 `// TODO: Use transa, transb, alpha, beta, lda, ldb, ldc in implementation` 说明它们尚未接入，这也是为什么 golden 用纯 `A×B`（`mm_mnk`）就能逐 bit 对上。
