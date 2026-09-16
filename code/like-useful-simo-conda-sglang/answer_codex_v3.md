@@ -1442,3 +1442,308 @@ variant 选择的 layout contract”。至少要同时完成：
 最小要求更保守；但它并非纯粹无效 padding，而是在当前代码中同时保证
 **完整 1x4 supertile storage、正确的 K=128 MMA 循环和一致的 M/N=32
 工作项划分**。在这些配套逻辑改造前，不能把它安全地缩小为 64。
+
+## 6. 独立 sikernel 的 mma_dte_tile_tensor 构建失败分析
+
+分析日期：2026-09-16。分析对象是独立仓库
+`/share/users/like/package/sikernel`，不是前一节 vllm-sipu 的 `.deps/sikernel-src`。
+本次检查的 sikernel commit 为 `6d4797d4e49a`，
+`mma_dte_tile_tensor` submodule commit 为 `8e368c6f1dd2`。
+
+下文代码位置均相对独立 sikernel 根目录；CMake 的顶层语句标为“顶层配置”，
+脚本/CMake 函数使用其实际函数名。
+
+### 6.1 结论：缺少 host 测试依赖 GTest，不是 SIPU kernel 编译错误
+
+**这份 `mma_dte_tile_tensor/cmake.log` 中，主库目标已经成功；
+`--all` 随后构建测试项目时，因找不到 GoogleTest 的开发文件而失败。**
+准确的失败阶段是测试子项目的 **CMake configure**，还没有进入这些失败项目的
+C++ / SIPU device 源码编译阶段。
+
+关键证据：
+
+| 位置 | 日志内容 | 含义 |
+| --- | --- | --- |
+| `mma_dte_tile_tensor/cmake.log:5-8` | `Built target gen_dispatch_cases`、`mma_dte_build_manifest`、`mma_dte_umbrella`、`tile_mma_dte` | 本次增量构建的主库阶段成功 |
+| `mma_dte_tile_tensor/cmake.log:9` | `Configured 74 testcase projects` | 顶层测试工程登记了 74 个独立测试项目，并非这 74 个项目都已配置/编译成功 |
+| `mma_dte_tile_tensor/cmake.log:14` | `Performing configure step for ...` | 开始对子项目分别执行 CMake |
+| `mma_dte_tile_tensor/cmake.log:74-82` | 第一个 `Could NOT find GTest` 及调用栈 | 首个有效错误 |
+| `mma_dte_tile_tensor/cmake.log:307-308` | `mma_dte_all_testcases ... Error 2` | 下层配置失败向上层 make 传播的最终状态，不是新的根因 |
+
+第一个错误的核心内容：
+
+```text
+Could NOT find GTest (missing: GTEST_LIBRARY GTEST_INCLUDE_DIR
+GTEST_MAIN_LIBRARY)
+```
+
+整份日志共有 **16 次同类 GTest 错误**。这是多个测试子项目并行配置时重复暴露
+同一个依赖缺失，不是 16 个不同的 kernel bug，也不能据此说全部 74 个项目都已尝试构建。
+`mma_dte_tile_tensor/build.sh:13-20 - 顶层脚本` 将未指定时的并行数限制到最多 16。
+
+日志里的 `SiCrossCompiler Compile Options ...` 只是 CMake 注册 SCC 编译规则时
+打印的配置，不能当作对应 `.su` 已经编译完成的证据。
+当前日志没有提供 intrinsic 不存在、LLVM 后端失败、链接未定义符号或 OOM 的证据。
+
+### 6.2 从 build.sh 到 find_package(GTest) 的调用链
+
+```text
+bash mma_dte_tile_tensor/build.sh --all
+  |
+  +-- build.sh:40-41，BUILD_MODE="all"
+  |
+  +-- build.sh:118-120
+       |
+       +-- build_library()                      [build.sh:92]
+       |    +-- cmake -S . -B build             [build.sh:96]
+       |    +-- cmake --build build             [build.sh:97]
+       |         -> 本次日志中成功
+       |
+       +-- build_testcases()                    [build.sh:100]
+            +-- cmake -S testcase -B build/testcase
+            |                                  [build.sh:104-105]
+            +-- 构建 mma_dte_all_testcases      [build.sh:106-108]
+                 |
+                 +-- testcase/CMakeLists.txt:229
+                      -> mma_dte_publish_testcase_binaries
+                         -> 各 ExternalProject 子项目
+```
+
+继续展开一条实际失败的 SplitK 路径：
+
+1. `mma_dte_tile_tensor/testcase/CMakeLists.txt:197-204 - 顶层配置`：
+   扫描测试目录下的 `CMakeLists.txt`，对每个项目调用 `mma_dte_add_testcase_project`。
+2. `mma_dte_tile_tensor/testcase/CMakeLists.txt:131 - mma_dte_add_testcase_project`：
+   为每个测试建立独立 build/stamp 目录；第 150-152 行构造子项目
+   `cmake -S ... -B ...` 命令，第 173-185 行交给 `ExternalProject_Add`。
+3. `mma_dte_tile_tensor/testcase/func_test/splitK/test_bf16_mxfp6e3m2_r16_host/CMakeLists.txt:23-24 - 顶层配置`：
+   引入 SplitK 公共配置，再调用 `add_mma_dte_splitk_test`。
+4. `mma_dte_tile_tensor/testcase/func_test/splitK/common/SplitKTest.cmake:31 - add_mma_dte_splitk_test`：
+   第 45-48 行登记 SCC object，第 50-53 行登记 host 可执行文件及其依赖，
+   第 54 行调用 `mma_dte_test_enable_gtest`。
+5. `mma_dte_tile_tensor/testcase/func_test/CMakeMmaDteCommon.cmake:352 - mma_dte_test_enable_gtest`：
+   **第 353 行 `find_package(GTest REQUIRED)` 失败**，因而后面的
+   `GTest::gtest`、`GTest::gtest_main` 链接设置不能完成。
+
+另外两条日志中的路径直接调用 GTest 查找：
+
+- `mma_dte_tile_tensor/testcase/func_test/test_validation_host/CMakeLists.txt:27 - 顶层配置`。
+- `mma_dte_tile_tensor/testcase/autotune/CMakeLists.txt:23 - 顶层配置`。
+
+因此，单独排除 autotune 不会解决问题，SplitK 和 host validation 也需要 GTest。
+这里 GTest 用于 host 测试程序，不需要给 SIPU device 交叉编译一份 GoogleTest。
+
+### 6.3 缺的是哪些文件，为什么 source SDK 没有解决
+
+实际使用的 CMake 是：
+
+```text
+/share_data/users/like/miniconda3/envs/siinfer_dev/bin/cmake
+version: 4.0.3
+```
+
+其自带模块位于该环境下的 `share/cmake-4.0/Modules/FindGTest.cmake`。
+**有 `FindGTest.cmake` 只代表 CMake 知道如何查找 GTest，不代表已安装 GTest。**
+
+该模块的查找顺序可以直接由本地源码核对：
+
+| 相对 siinfer_dev 环境根目录的位置 | 行为 |
+| --- | --- |
+| `share/cmake-4.0/Modules/FindGTest.cmake:197 - 顶层配置` | 先执行 `find_package(GTest QUIET NO_MODULE)`，尝试读取安装好的 `GTestConfig.cmake` |
+| `share/cmake-4.0/Modules/FindGTest.cmake:244 - 顶层配置` | config package 不存在时，查找 `gtest/gtest.h` |
+| `share/cmake-4.0/Modules/FindGTest.cmake:263-265 - 顶层配置` | 查找 `gtest` 和 `gtest_main` 库 |
+| `share/cmake-4.0/Modules/FindGTest.cmake:273 - 顶层配置` | 要求 `GTEST_LIBRARY`、`GTEST_INCLUDE_DIR`、`GTEST_MAIN_LIBRARY` 全部有效 |
+
+本次检查中，`siinfer_dev` 下没有标准的 GTest 头文件、库及 config package；
+现有测试子项目 cache 也记录了查找失败。例如：
+
+```text
+mma_dte_tile_tensor/build/testcase/_build/2609151958/sipu_150/default/
+specialized/func_test/test_validation_host/CMakeCache.txt
+
+第 211 行：GTEST_INCLUDE_DIR:PATH=GTEST_INCLUDE_DIR-NOTFOUND
+第 214 行：GTEST_LIBRARY:FILEPATH=GTEST_LIBRARY-NOTFOUND
+第 220 行：GTEST_MAIN_LIBRARY:FILEPATH=GTEST_MAIN_LIBRARY-NOTFOUND
+第 226 行：GTest_DIR:PATH=GTest_DIR-NOTFOUND
+```
+
+使用 `--debug-find-pkg=GTest` 做最小复现时，确认 CMake **已经搜索了**
+`siinfer_dev/include`、`siinfer_dev/lib` 等目录，所以不是简单的
+“激活了 Conda，但 CMake 完全没搜索 Conda”问题。对应开发文件确实不在这些位置。
+
+SDK 中虽然存在 `lib/libsiGtestMain.so`，但当前项目要求的是标准 GTest package：
+
+```text
+include/gtest/gtest.h
+lib/libgtest.a 或 lib/libgtest.so
+lib/libgtest_main.a 或 lib/libgtest_main.so
+lib/cmake/GTest/GTestConfig.cmake   # config 模式的常见安装位置
+```
+
+`libsiGtestMain.so` 的名字不匹配上述模块的库搜索规则，单独存在这个文件也没有补齐
+标准 GTest 头文件/config。不能把它当成已经满足 `find_package(GTest REQUIRED)`。
+仅修改 `LD_LIBRARY_PATH` 也不会凭空产生这些缺失文件。
+
+同样，仓库其他位置有 GoogleTest 源码不代表它会被自动使用。
+`mma_dte_tile_tensor/testcase/CMakeLists.txt:178 - mma_dte_add_testcase_project`
+设置的是 `DOWNLOAD_COMMAND ""`；当前调用链没有下载、构建或安装 GTest 的步骤。
+
+### 6.4 独立的环境问题：日志使用的 SDK 不是 2609020046
+
+本次观察到三个不同的版本标识，必须分开：
+
+| 来源 | SDK |
+| --- | --- |
+| 问题描述中指定的目录 | `2609020046` |
+| 本次失败日志实际使用的目录 | **`2609151958`** |
+| 2026-09-16 本次检查时 `release/latest` 指向的目录 | `2609161039` |
+
+日志证据为 `mma_dte_tile_tensor/cmake.log:33` 的 include 路径；另有：
+
+- `mma_dte_tile_tensor/build/CMakeCache.txt:264`：`scc_DIR` 指向 `2609151958/share/cmake/scc`。
+- `mma_dte_tile_tensor/build/mma_dte_build_manifest.txt:2`：`SI_SDK_ROOT=.../2609151958`。
+- `mma_dte_tile_tensor/cmake.log:9`：testcase variant 也是 `2609151958/sipu_150/default/specialized`。
+
+原因是用户执行的**根仓库** setup 脚本会加载 `latest`：
+
+```text
+setup.sh:63 - 顶层脚本
+  -> source set_sdk.sh
+     set_sdk.sh:23 - 顶层脚本
+       _sikernel_sdk_setup=/share_data/sicx_sdk/release/latest/sipu_sdk_setup.sh
+     set_sdk.sh:67 / 98 - _sikernel_source_sdk
+       -> source 上述 SDK setup
+```
+
+SDK 自身的 `sipu_sdk_setup.sh:12-18 - sipu_sdk_get_loc` 使用 `readlink -f`
+解析实际目录并设置 `SI_SDK_ROOT`。因此，即使之前设置过 `SI_SDK_ROOT=.../2609020046`，
+再 source 根仓库的 `setup.sh` 也不能据此保证仍在用这个固定版本。
+
+**这不是本次 GTest 缺失的直接原因，但会使复现时发生工具链漂移。**
+本文最小验证显式固定在原日志的 `2609151958`，没有用更新的 SDK 来替代它。
+
+注意两个 setup 的参数不一样：
+
+- `setup.sh:34-54 - 顶层脚本`：根仓库版本只接受架构参数 `150|160|170`。
+- `mma_dte_tile_tensor/setup.sh:63-102 - 顶层脚本`：子模块版本支持显式 SDK 路径和架构。
+
+因此，在新的 shell 中复现原日志，应使用：
+
+```bash
+source /share_data/users/like/miniconda3/bin/activate \
+  /share_data/users/like/miniconda3/envs/siinfer_dev
+cd /share/users/like/package/sikernel/mma_dte_tile_tensor
+source ./setup.sh /share_data/sicx_sdk/release/2609151958 150
+```
+
+若确实需要测试 `2609020046`，将子模块 setup 的参数改为那个版本，
+并使用新的 `cmake -B` 构建目录核验，避免原有 `scc_DIR` cache 继续指向旧目录。
+`build.sh:96 - build_library` 的主库目录始终是 `build`，不会自动按 SDK 隔离；
+不要误以为切换了环境变量就一定清除了主库的历史配置。
+
+### 6.5 最小实测：只补 GTest 即可越过当前阻塞
+
+没有修改 Conda 环境、SDK 或业务源码，也没有覆盖原始 `cmake.log`。
+全部诊断产物放在：
+
+```text
+/tmp/codex-mma-dte-gtest-20260916.qvy8IG
+```
+
+测试条件：SDK `2609151958`，SIPU150，Conda 环境 `siinfer_dev`，
+host compiler GNU 13.3.0，CMake 4.0.3。
+
+| 实验 | 结果 | 诊断日志，均相对上述临时目录 |
+| --- | --- | --- |
+| 不补 GTest，单独配置 `test_validation_host` | 退出码 1，同样缺少三个 GTest 项 | `baseline.log` |
+| 用仓库已有 GoogleTest 1.16.0 源码离线构建并安装到临时 prefix | 成功生成 `libgtest.a`、`libgtest_main.a` 和 config package | `gtest-build.log`、`gtest-install.log` |
+| 只向 `CMAKE_PREFIX_PATH` 添加该 prefix，重新配置同一个 validation build 目录 | `Found GTest ... version "1.16.0"`，配置成功 | `validation-configure.log` |
+| 构建并运行 host validation | 构建成功，**11/11 测试通过** | `validation-build.log`、`validation-ctest.log` |
+| 使用相同依赖路径，单独配置 `splitK/test_bf16_fp32_host` | 找到 SCC 和 GTest，configure/generate 成功 | `splitk-configure.log` |
+
+离线源码来源为
+`sideepgemm/third_party/googletest/CMakeLists.txt:7 - 顶层配置`，其中版本明确为 `1.16.0`。
+构建它时只使用该目录作为 source，所有 build/install 输出都在 `/tmp`。
+
+这个对照验证足以确认当前 GTest 阻塞的原因和解决方向。
+**没有重跑完整的 74 个测试项目，也没有编译/执行 SplitK device kernel；
+不能把上述结果扩展成“整个 --all 构建和所有设备测试已经通过”。**
+补齐依赖后，后续阶段是否还有其他问题，应根据新的完整构建日志再判断。
+
+### 6.6 可直接采用的处理方法
+
+#### 方法 A：离线构建一份独立 GTest，避免改动 Conda 环境
+
+下面使用本机已经存在且本次实测过的源码，无需下载。
+安装目录改用持久目录，不依赖 `/tmp` 的保留时间。
+请在前述固定 SDK/Conda 的环境中执行：
+
+```bash
+GTEST_SRC=/share/users/like/package/sikernel/sideepgemm/third_party/googletest
+GTEST_PREFIX="$HOME/.local/mma-dte-deps/gtest-1.16.0-siinfer"
+GTEST_BUILD="$HOME/.cache/mma-dte-deps/gtest-1.16.0-siinfer"
+
+cmake -S "$GTEST_SRC" -B "$GTEST_BUILD" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_GMOCK=OFF \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_INSTALL_PREFIX="$GTEST_PREFIX"
+cmake --build "$GTEST_BUILD" -j2
+cmake --install "$GTEST_BUILD"
+
+export CMAKE_PREFIX_PATH="$GTEST_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+
+cd /share/users/like/package/sikernel/mma_dte_tile_tensor
+BUILD_JOBS=4 bash ./build.sh --test > cmake.gtest-fixed.log 2>&1
+```
+
+这里选择 `--test` 是因为原日志主库阶段已经成功，先检查测试构建即可；
+需要连主库一起构建时再使用 `--all`。`BUILD_JOBS=4` 是便于观察的并行设置，
+**不是修复 GTest 缺失所必需的条件**。
+
+只补 GTest、保持同一 SDK 时，通常不必删除 build 目录：本次实测就是在失败过的
+validation build 目录内重新配置成功的。新的日志另存，保留原始错误证据。
+
+#### 方法 B：把 GTest 安装到 siinfer_dev
+
+也可以通过环境所使用的 Conda channel 安装 `gtest`，随后确认这些文件存在：
+
+```bash
+conda install -p /share_data/users/like/miniconda3/envs/siinfer_dev \
+  -c conda-forge gtest
+
+ls "$CONDA_PREFIX/include/gtest/gtest.h"
+ls "$CONDA_PREFIX/lib/cmake/GTest/GTestConfig.cmake"
+export CMAKE_PREFIX_PATH="$CONDA_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+```
+
+这是可选的环境修改方案，**本次没有执行 Conda 安装**；实际安装前应检查 solver
+给出的依赖变更，避免顺带改变当前 host 工具链。方法 A 已完成对应离线验证。
+
+#### 不要只把 -DGTest_DIR 传给最外层测试工程
+
+这里有一个与 `--all` 构建结构有关的陷阱：
+
+`mma_dte_tile_tensor/testcase/CMakeLists.txt:90-112 - 顶层配置`
+列出了转发到各个 ExternalProject 的 cache 变量，但其中没有
+`GTest_DIR`、`GTEST_ROOT` 或 `CMAKE_PREFIX_PATH`。
+第 150-152 行又显式构造了每个子项目的独立 CMake 命令。
+
+因此：
+
+- 对某个具体测试的 `cmake -S testcase/func_test/... -B ... -DGTest_DIR=...` 有效，
+  不代表相同 `-D` 只传给外层 `testcase` 工程也会自动传给所有子项目。
+- 推荐如方法 A 那样 **export 环境变量 `CMAKE_PREFIX_PATH`**，让 make 启动的
+  子 CMake 进程共同继承依赖搜索路径，同时保留原 SDK prefix。
+- `mma_dte_tile_tensor/build.sh:35-50 - 顶层脚本` 只解析 `--test/--all/--help`，
+  不能写成 `bash build.sh --all -DGTest_DIR=...`。
+- `BUILD_TESTING=OFF` 也不是本脚本的跳过测试接口；只构建主库应直接
+  `bash build.sh`，见 `mma_dte_tile_tensor/build.sh:112-114 - 顶层脚本`。
+
+长期改进可以在测试聚合工程开始时提前检查 GTest，并统一传递其 package 路径；
+同时在 README/环境定义中注明测试构建依赖，避免先完成主库构建才发现测试依赖未安装。
+这些属于建议，本次按“分析并追加答案”的要求没有修改构建脚本。
+
+**最终结论：先补齐并让测试子项目找到 host GTest 开发包，同时固定 SDK 版本。
+这份日志本身不支持将失败归因于 SIPU ISA、LLVM intrinsic 或 MMA device kernel。**
