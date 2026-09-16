@@ -1604,3 +1604,349 @@ KV (mxfp8, mxfp4, mxfp6, mxint8, fp8_per_group_64, int8_per_group_64, nvfp4):
 DeepSeek-V2-Lite、TP=1、当前加载路径的总体精度没有明显影响；MMLU 完全一致，GSM8K 仅有
 两项相反方向的 0.30 个百分点波动。`resource_tracker` 的 `KeyError` 应另行清理，但不
 影响本次分数提取结论。
+
+## 6. 用新版 mma_dte 替换 vLLM-SIPU MXINT8 GEMM 的分析（2026-09-16）
+
+### 6.1 结论与引用范围
+
+**建议使用 `include/simma.h:180 / mma_dte`：显式指定 inputT、outputT、scalarT、layoutA、layoutB、layoutC，不带 workspace 的重载。** 对当前 vLLM-SIPU 的 MXINT8 路径，选择：
+
+```cpp
+inputT  = sifmt::mxint8
+outputT = sifmt::bfloat16
+scalarT = sifmt::bfloat16
+layoutA = mma_dte_api::tensor_layout(32, 32, 4, 1, 1)
+layoutB = mma_dte_api::tensor_layout(32, 32, 4, 1, 1)
+layoutC = mma_dte_api::tensor_layout(16, 32, 1, 1, 0)
+```
+
+最后一个 `0` 使 C 直接采用 linear format。对应的生产实例化已经存在于 `kernel/instantiations/mxint8/inst_mxint8_r32_4x1.su:29 / mma_dte`，不是需要重新开发的算子能力。
+
+本节引用约定：
+
+- **DTE** 根目录：`/share/users/like/package/sikernel/mma_dte_tile_tensor`。未注明 VLLM 的代码引用均相对此目录；绝不拿 vLLM 内旧 submodule 的实现解释新接口。核对时 HEAD 为 `8e368c6f1dd2aa41770583571e852b87449223c1`。
+- **VLLM** 根目录：`/share/users/like/package/vllm-sipu`，仅用于解释现有调用链、打包方式和将来的接入位置。
+- 引用格式为 `相对路径:行号 / 函数名`；类成员使用 `类名::函数名`。GTest 的 `TEST/TEST_F/TEST_P` 是注册宏，表中单独标明测试名，不把测试名误写成普通成员函数。
+- 这是源码与已有 ELF 符号的静态分析。本次没有修改算子、更新依赖、重新编译、执行 SIPU 测试或测量性能；下文“有测试”不等于“本次测试通过”。
+
+**四类 MX 输入都能用这一组显式 layout 重载，但必须选择正确的模板实例化和 packed layout。不是 MXFP4 使用一个重载、MXINT8 使用另一个重载。** 更具体地说，支持 MXFP4 E2M1、MXFP6 E2M3/E3M2、MXFP8 E4M3/E5M2 和 MXINT8；“支持”不能扩展解释成任意低比特编码、任意输入布局或 A/B 混合类型。
+
+### 6.2 三组重载应当如何选择
+
+| 声明位置 / 函数 | 实际实现 | 本次选择 |
+|---|---|---|
+| `include/simma.h:147 / mma_dte` | `kernel/mma_dte_tiled_tensor.hpp:179 / mma_dte`；显式 layout，额外传 workspace 和字节数 | 可用，但当前 workspace 参数已不参与 TensorMap 构造，不必为了性能选它 |
+| `include/simma.h:180 / mma_dte` | `kernel/mma_dte_tiled_tensor.hpp:193 / mma_dte`；显式 layout，不带 workspace | **推荐作为 vLLM 接入入口** |
+| `include/simma.h:202 / mma_dte` | `template<class inputT, class outputT, int tensor_format_in=0, int tensor_format_out=1>` 的简化声明 | **当前不要选**：在本次核对的 `include/src/kernel` 中未找到定义，生产实例化也不是这一签名 |
+
+简化版看起来最像旧的 `mma_bf16_mxi8_universal(A,B,C,M,N,K,stream)`，但不能仅根据头文件就写成 `mma_dte<sifmt::mxint8,sifmt::bfloat16,1,0>(...)` 并认为可以链接。当前找到的已有主库也没有这种 `(void*,void*,void*,int,int,int,stream)` 签名的 `mma_dte` 导出。它的默认值还是 linear 输入、tiled 输出，恰好不是本次所需的 tiled MX 输入、linear 输出。
+
+不带 workspace 的调用链为：
+
+```text
+kernel/mma_dte_tiled_tensor.hpp:193 / mma_dte
+  -> kernel/mma_dte_tiled_tensor.hpp:165 / mma_dte_implement
+  -> kernel/mma_dte_tiled_tensor.hpp:151 / mma_dte_implement
+  -> kernel/mma_dte_tiled_tensor.hpp:54 / mma_dte_implement_with_control
+```
+
+`kernel/detail/mma_dte_tiled_tensor_tensor_map.hpp:71 / create_tensor_maps` 在第 75 行起明确忽略 `workspace/workspaceSizeBytes/stream`，构造 host-side TensorMap，后续按值传给 kernel。`kernel/detail/mma_dte_tiled_tensor_tensor_map.hpp:38 / release_tensor_maps` 也是空操作。因此不能把两个显式重载的区别解释成“每次分配 workspace”和“复用 workspace”的性能区别。
+
+另外，**这是外形类似 BLAS 的接口，不是已实现全部 BLAS 语义的接口**：`kernel/mma_dte_tiled_tensor.hpp:54 / mma_dte_implement_with_control` 的第 69 行仍写着 TODO，`transa/transb/alpha/beta/lda/ldb/ldc` 当前尚未用于计算。替换时按已有测试传 `OP_N, OP_N`，A 逻辑形状为 `[M,K]`，B 逻辑形状为 `[N,K]`，计算 `A * B^T`。不要因数学上有 `B^T` 就把 B 的 packed buffer 再转置，也不要期望 `OP_T` 会执行转置、`beta` 会累加原 C、`ldc` 能控制任意输出 stride。
+
+这点有测试侧的交叉证据：`testcase/func_test/test_mxfp6e2m3_host/test_bf16_mxf6e2m3_host.cpp:152 / run_loop_k_one_identity_decode_case` 在第 172 行明确说明 B 按 `[N,K]` 存储，golden 使用 `mm_mnk` 计算 `A * B^T`。
+
+### 6.3 当前 vLLM 输入能否保持不变
+
+#### 6.3.1 旧调用链和输出重排的位置
+
+| VLLM 相对路径:行号 / 函数 | 当前行为 |
+|---|---|
+| `tests/kernels/quantization/test_mxint8_unpack_pytest.py:77 / test_mxint8_bf16_matmul` | 量化 activation 和 weight，调用 `mxint8_bf16_matmul.sikernel`，最后裁剪至原始 m、n |
+| `vllm_sipu/ops/backends/sikernel/jit/mxint8.py:120 / mxint8_bf16_matmul` | 分配 BF16 `[m,n]`，调用 C++，然后把 tiled 输出转换成 linear |
+| `csrc/jit/quantization/mxint8.cpp:114 / mxint8_bf16_matmul` | 检查 packed buffer、尺寸、设备和输出 dtype |
+| `csrc/jit/quantization/mxint8.cpp:62 / launch_mxint8_matmul` | 第 64 行实际调用旧 `::mma_bf16_mxi8_universal` |
+| `.deps/sikernel-src/include/sikernel.h:277 / mma_bf16_mxi8_universal` | 旧接口声明，C 为 BF16，A/B 为 MXINT8 packed 数据 |
+| `.deps/sikernel-src/source/source_builtin/blas/L3/mma/tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor/kernel/tile_mma_universal_bf16_mxi8_mxi8_tiled_tensor.su:33 / mma_bf16_mxi8_universal` | 按 M/K 选择旧 kernel；当前 padded M>=32、K>=128 的路径在第 83 行 |
+
+精确地说，重排不在测试文件本身，而在 **VLLM** `vllm_sipu/ops/backends/sikernel/jit/mxint8.py:80 / _tileformat_to_linear`：
+
+```python
+x.reshape(num_tile_m, num_tile_n, tile_rows, tile_cols) \
+ .permute(0, 2, 1, 3) \
+ .contiguous() \
+ .reshape(m, n)
+```
+
+主要数据搬运来自 `.contiguous()`；前面的 reshape/permute 是构造视图，不能把整个开销简单归因于 reshape。某些退化尺寸下视图本来连续，但一般多 tile 的情形会发生实际拷贝。
+
+#### 6.3.2 当前测试走 R32，不是 R8
+
+**VLLM** `vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:100 / get_padded_mxint8_rows` 把行数至少补到 32；`:104 / get_padded_mxint8_shape` 把 K 补到 128 的倍数。当前测试模块配置为 `m=7,n=65,k=63`，因此传到 GEMM 的是：
+
+```text
+M = 32, N = 96, K = 128
+A = packed MXINT8 [32,128]
+B = packed MXINT8 [96,128]
+C = BF16 [32,96]，随后由上层裁剪为 [7,65]
+```
+
+对应入口为 **VLLM** `tests/kernels/quantization/test_mxint8_unpack_pytest.py:77 / test_mxint8_bf16_matmul`；尺寸常量在该文件第 39 行起。不能根据原始 `m=7` 就选 DTE 的 R8 模板，因为量化时已经按 R32 的 padded shape 打包。
+
+#### 6.3.3 packed layout 的匹配依据
+
+**VLLM** `csrc/jit/quantization/mxint8.cpp:56 / launch_quantize_to_mxint8` 调用 `hp_to_mx<sifmt::mxint8, HPType, 0>`。其依赖的两个函数说明了输出布局：
+
+- `.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_kernel.su:28 / hp_to_mx`：第 84 行起，`dim0>16` 选择 Rows=32。
+- `.deps/sikernel-src/source/source_builtin/misc/hp_to_mx/kernel/hp_to_mx_tensormap.hpp:93 / hp_to_mx_physical_extents`：Rows=32 时，当输出 K tile 数大于 2，采用 4 个列向 tile 的 supertile。当前 K>=128，MXINT8 的一个 R32 数据 tile 为 32x32，符合这一路径。
+
+这与 DTE `kernel/instantiations/mxint8/inst_mxint8_r32_4x1.su:29 / mma_dte` 的 A/B `(32,32,4,1,1)` 一致。**第一阶段可以保留现有 MXINT8 量化、padding 和 packed buffer 契约，只替换 GEMM 与输出后处理。** 这是布局层面的源码匹配，接入后仍需用同一份 packed buffer 做新旧算子的交叉精度验证。
+
+存储大小也吻合：**VLLM** `csrc/jit/quantization/mxint8.cpp:40 / expected_mxint8_storage_size` 采用每 1024 个 MXINT8 元素占 1088 字节；DTE `kernel/detail/mma_dte_tiled_tensor_dtype_meta.hpp:149 / get_input_dtype_info` 的 MXINT8 分支返回 1024 字节 payload 加 64 字节 header。因此输入不是普通 INT8 数组，也不是一块数据加单独的 scale tensor，而是包含 MX metadata 的 SDK packed 存储。
+
+### 6.4 推荐调用示例及尺寸约束
+
+以下仅是方案示例，**没有写入 vLLM 源码，也没有执行**：
+
+```cpp
+#include "simma.h"
+
+constexpr mma_dte_api::tensor_layout a_layout{32, 32, 4, 1, 1};
+constexpr mma_dte_api::tensor_layout b_layout{32, 32, 4, 1, 1};
+constexpr mma_dte_api::tensor_layout c_layout{16, 32, 1, 1, 0};
+
+// M/N/K are padded dimensions; A/B are already packed MXINT8.
+::mma_dte<sifmt::mxint8, sifmt::bfloat16, sifmt::bfloat16,
+          a_layout, b_layout, c_layout>(
+    mma_dte_api::Operation::OP_N,
+    mma_dte_api::Operation::OP_N,
+    M, N, K,
+    sifmt::bfloat16(1.0f), A, K,
+    B, K,
+    sifmt::bfloat16(0.0f), C, N,
+    stream);
+```
+
+这里刻意传 `alpha=1,beta=0` 表达纯 GEMM 的意图；不要照搬部分测试里的 `0.1/0.2` 并以为当前实现真的应用了这两个系数。C 必须是符合当前实现的连续 padded `[M,N]` 存储；stream 应沿用 **VLLM** `csrc/jit/quantization/mxint8.cpp:62 / launch_mxint8_matmul` 取得的当前 SIPU stream，而不是擅自改成默认 stream。
+
+`tensor_layout` 字段顺序见 `include/simma.h:47 / tensor_layout::tensor_layout`：
+
+```text
+(tile_dim0, tile_dim1, supertile_shape0, supertile_shape1, tensor_format)
+```
+
+其中 dim0 是连续的列/K 方向，dim1 是行方向；不是日常写矩阵 shape 时的 `(rows,cols)`。`testcase/func_test/test_mxfp8_host/common/test_mxfp8_common.hpp:48 / run_case` 的第 62 行起专门说明：SiTe 的 tiling 配置使用 `(row,column)`，而这里的 `tensor_layout` 使用 `(column,row)`。所以 `(32,32,4,1,1)` 表示沿 K 放 4 个 tile；C 的 `(16,32,1,1,0)` 表示 32 行、16 列的 BF16 输出 tile 几何以及 **linear 全局输出**。
+
+尺寸对齐的实际检查在 `kernel/mma_dte_tiled_tensor.hpp:54 / mma_dte_implement_with_control` 第 77 行起：
+
+```text
+M % (A.tile_dim1 * A.supertile_shape1) == 0
+K % (A.tile_dim0 * A.supertile_shape0) == 0
+N % (B.tile_dim1 * B.supertile_shape1) == 0
+K % (B.tile_dim0 * B.supertile_shape0) == 0
+```
+
+对上面的 R32 MXINT8 组合，即 `M%32==0,N%32==0,K%128==0`。直接输出 linear **不等于** 自动支持未补齐的任意 m/n/k，也不等于直接写入原始 `[7,65]` 小 buffer。
+
+如果将来另外优化小 M，才考虑下面这些 A/C 实例，且必须同步调整量化打包与 K padding：
+
+| MXINT8 家族 | A layout | B layout | BF16 linear C layout | K 对齐 | 实例化位置 / 函数 |
+|---|---|---|---|---|---|
+| R32，当前方案 | `(32,32,4,1,1)` | `(32,32,4,1,1)` | `(16,32,1,1,0)` | 128 | `kernel/instantiations/mxint8/inst_mxint8_r32_4x1.su:29 / mma_dte` |
+| R16 | `(64,16,4,1,1)` | `(32,32,4,1,1)` | `(32,16,1,1,0)` | 256 | `kernel/instantiations/mxint8/inst_mxint8_r16.su:29 / mma_dte` |
+| R8 | `(128,8,4,1,1)` | `(32,32,4,1,1)` | `(64,8,1,1,0)` | 512 | `kernel/instantiations/mxint8/inst_mxint8_r8.su:29 / mma_dte` |
+
+不要把 R32 packed buffer 直接换模板当作 R8/R16 输入。也不要只因为原函数名含 `universal`，就假定一个固定 layout 的新模板能覆盖旧函数的全部 shape 分支。
+
+### 6.5 四类 MX 输入的具体模板选择
+
+下表均指 `include/simma.h:180 / mma_dte` 的 **同一个不带 workspace 的显式 layout 重载**，并以最适合先接入的 R32、K 方向 4-tile supertile 为例。A/B 均为 tiled packed 输入，C 为 BF16 linear 输出 `(16,32,1,1,0)`。
+
+| 输入类别 | inputT | A/B layout | M/N 对齐；K 对齐 | BF16 linear 生产实例化位置 / 函数 |
+|---|---|---|---|---|
+| MXINT8 | `sifmt::mxint8` | `(32,32,4,1,1)` | 32；128 | `kernel/instantiations/mxint8/inst_mxint8_r32_4x1.su:29 / mma_dte` |
+| MXFP4 E2M1 | `sifmt::mxfloat4e2m1` | `(64,32,4,1,1)` | 32；256 | `kernel/instantiations/mxfp4/inst_mxfp4.su:34 / mma_dte` |
+| MXFP6 E2M3 | `sifmt::mxfloat6e2m3` | `(128,32,4,1,1)` | 32；512 | `kernel/instantiations/mxfloat6e2m3/inst_mxfloat6e2m3_r32_4x1.su:28 / mma_dte` |
+| MXFP6 E3M2 | `sifmt::mxfloat6e3m2` | `(128,32,4,1,1)` | 32；512 | `kernel/instantiations/mxfloat6e3m2/inst_mxfloat6e3m2_r32_4x1.su:15 / mma_dte` |
+| MXFP8 E4M3 | `sifmt::mxfloat8e4m3` | `(32,32,4,1,1)` | 32；128 | `kernel/instantiations/mxfp8/inst_mxfp8_r32_4x1_bf16.su:9 / mma_dte` |
+| MXFP8 E5M2 | `sifmt::mxfloat8e5m2` | `(32,32,4,1,1)` | 32；128 | `kernel/instantiations/mxfp8/inst_mxfp8_r32_4x1_bf16.su:29 / mma_dte` |
+
+表中的 `outputT`、`scalarT` 都是 `sifmt::bfloat16`。如果需要改输出精度，必须选择已有的完整实例化，而不是任意替换一个模板参数：
+
+| 输入类别 | 本次检查到的生产实例化输出 | 依据 |
+|---|---|---|
+| MXINT8 | BF16、FP16、FP32 | `kernel/instantiations/mxint8/inst_mxint8_r32_4x1.su:29 / mma_dte`，同文件第 33、37 行分别是 FP16/FP32 linear |
+| MXFP6 两种编码 | BF16、FP16、FP32 | `kernel/instantiations/mxfloat6e2m3/inst_mxfloat6e2m3_r32_4x1.su:28 / mma_dte`；E3M2 对应文件第 15 行起 |
+| MXFP8 两种编码 | BF16、FP16 | `kernel/instantiations/mxfp8/inst_mxfp8_r32_4x1_bf16.su:9 / mma_dte` 和 `kernel/instantiations/mxfp8/inst_mxfp8_r32_4x1_f16.su:9 / mma_dte` |
+| MXFP4 E2M1 | BF16 | `kernel/instantiations/mxfp4/inst_mxfp4.su:25 / mma_dte` 起的生产实例化清单 |
+
+FP32 输出的 R32 C tile 应为 `(8,32,1,1,0)`，不是 BF16/FP16 的 `(16,32,1,1,0)`；对应 scalarT 也随已有实例化使用 FP32。公共枚举允许列出某个 dtype，不代表每个输入/输出/标量/layout 的笛卡尔积都已经生成了可链接符号。
+
+还需要明确四个边界：
+
+1. **A/B 必须是同一种 inputT。** 接口只有一个 `inputT`，不是分别声明 `inputA/inputB`；当前这些入口不是 W4A8、BF16 activation + MXFP4 weight 等混合输入接口。旧函数中的 `bf16` 也是输出类型，不是说 A 输入可以不量化。
+2. **MX 类型不等于普通低比特类型。** 这里的 MXFP4 具体是 E2M1，不包含 E1M2；MXFP8 不能用普通 `sifmt::float8e4m3` 或不含 metadata 的 FP8 数据冒充。`kernel/detail/mma_dte_tiled_tensor_dtype_meta.hpp:149 / get_input_dtype_info` 区分了普通 FP8 与 MXFP8 的 TensorMap dtype/header。
+3. **“支持 linear 输入/输出”是泛型接口能力，不代表本表 MX 生产实例化接受 linear MX 输入。** 上表全部使用 `layoutA/B.tensor_format=1`。现有 vLLM packed 输入就应保持 1，只把 C 的 format 设为 0。
+4. **MXFP6 需区分公开逻辑 layout 与芯片物理 tile。** `kernel/detail/mma_dte_tiled_tensor_dtype_meta.hpp:121 / mma_dte_physical_tile_k` 在 SIPU>=160 时把 R32/R16/R8 的物理 K tile 映射为 32/64/128；`kernel/detail/mma_dte_tiled_tensor_tensor_map.hpp:71 / create_tensor_maps` 的第 86 行起据此调整 TensorMap。不能看到物理 R32 是 32 就把公开 `(128,32,4,1,1)` 随意改成 `(32,32,4,1,1)`，也不能在不同架构之间沿用未经核对的 packed buffer。
+
+此外确实还有 `(2,2)`、`(1,4)` supertile 实例，但它们不是仅影响性能的任选开关：输入物理排布、M/N/K 对齐和 shape guard 都要匹配。`kernel/detail/mma_dte_tiled_tensor_layout_contracts.hpp:139 / mma_dte_mx_2x2_shape_supported` 对 2x2 额外要求 `K == 2 * physical_tile_k` 且行数大于 16；`kernel/mma_dte_tiled_tensor.hpp:54 / mma_dte_implement_with_control` 还会做前述逻辑对齐检查。当前 vLLM MXINT8 路径不需要引入这些分支。
+
+### 6.6 linear 输出究竟如何实现，能省掉什么
+
+**能直接输出 linear；不是先生成完整 tiled C，再在另一个 kernel 中把 C 转为 linear。** 有三层源码证据：
+
+| 层次 | 位置 / 函数 | 行为 |
+|---|---|---|
+| 描述符 | `kernel/detail/mma_dte_tiled_tensor_tensor_map.hpp:71 / create_tensor_maps` | 第 199 行起把 `layoutC.tensor_format==0` 映射为 `TMAP_FORMAT_LINEAR`；第 249 行起编码输出 TensorMap |
+| GEMM 写回分支 | `kernel/mma_dte_tiled_tensor_kernel.hpp:1546 / kernel_tile_mma_procon_v2_tiled_tensor_map` | 第 1726 行起在 `store_tile` 与 `store_linear` 之间编译期分支；其他 schedule 也有同样的分支，例如同文件第 106 行的 `kernel_tile_mma_smem_dte_tiled_tensor_map`，写回分支在第 318 行 |
+| MXINT8/MXFP6 R32 具体写回 | `kernel/util/mma_dte_tiled_tensor_kernel_util_mxint8_mxfp6_r32.hpp:6366 / loadL2B_mma_r32_1m_1n_impl::store_linear` | BF16 路径先 `tcvt.tt.bf16.f32.r32`，再用 `tst.trrr.stride.u32.global` 按 N 计算行步长和地址，直接写入 linear C |
+
+这里要区分两个概念：`tcvt` 做 FP32 累加结果到 BF16 的数值转换；随后带 stride 的 store 完成 row-major 写回。**不能因为函数名叫 mma_dte，就把这条 R32 输出路径说成一定由 DTE 执行独立 tile-to-linear copy。** 上面这条具体路径使用的是 kernel 内的 tile strided store。
+
+因此未来接入时，**VLLM** `vllm_sipu/ops/backends/sikernel/jit/mxint8.py:120 / mxint8_bf16_matmul` 应在 C++ 调用后直接返回 `out`，不再执行第 129 行起的 `_mxint8_output_tile_shape` 和 `_tileformat_to_linear`。保留旧重排会把已经是 linear 的结果再次错排，这不是单纯的性能浪费。
+
+性能上可以确定的是：一般需要物化重排的形状将不再需要这次额外输出分配、完整 C 的读取和再次写入。对于 BF16 padded `[M,N]`，这次 full-tensor reorder 的读写量约为 `4*M*N` 字节。**这不是整体提速比例的承诺**：新 kernel 的调度成本、shape、带宽和量化开销都需要单独测量。
+
+当前还有一项不能与本次收益混淆：**VLLM** `vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:145 / build_mxint8_tile_tensor_on_cpu` 会在 CPU 做 tile 重排，`:163 / quantize_to_mxint8` 又将其送回原设备。只替换 GEMM 不会消除这些输入侧传输。第一阶段可以不改它，但端到端收益不能只看 GEMM 时间。
+
+### 6.7 MXFP4、MXFP6、MXFP8、MXINT8 功能测试清单
+
+以下列出 DTE 当前源码中的 **29 个类型专用功能测试 `.cpp` 文件**：MXFP4 6 个、MXFP6 8 个、MXFP8 11 个、MXINT8 4 个。包括普通功能测试和 SplitK 功能测试；参数化文件用 shape 集合描述，不逐行展开笛卡尔积。后面另外列出辅助测试与 JSON 配置，避免把配置文件或模板实例化文件误算成一个执行测试。
+
+所有路径均相对 `/share/users/like/package/sikernel/mma_dte_tile_tensor`。除特别标注外，输入都是相应 MX 类型的 tiled packed A/B。
+
+#### 6.7.1 MXFP4 E2M1：普通功能测试
+
+| 相对路径:行号 / 执行函数 | GTest 名称 | 输出与 shape 覆盖 |
+|---|---|---|
+| `testcase/func_test/test_bf16_mxfp4_r32_host/test_bf16_mxfp4_r32_host.cpp:202 / run_param_case`；`:182 / launch_mma` | `MmaDteBf16Mxfp4R32Test.Computes`，注册宏在第 1024 行 | BF16 tiled/linear；标准布局 M/N=`32,64,...,256`，K=`256,512,768,1024,1280,1536`；2x2 布局 M/N=`64,128,192,256`，K=128；另一个 1x4 API 布局 M/N=`128,256,384,512`，K=64 |
+| `testcase/func_test/test_bf16_mxfp4_r16_host/test_bf16_mxfp4_r16_host.cpp:123 / run_test_case` | `MmaDteBf16Mxfp4R16Test.Computes`，第 259 行 | BF16 tiled/linear；M=16，N=`32,64,...,256`，K=`512,1024,1536,2048` |
+| `testcase/func_test/test_bf16_mxfp4_r8_host/test_bf16_mxfp4_r8_host.cpp:129 / run_test_case` | `MmaDteBf16Mxfp4R8Test.Computes`，第 272 行 | BF16 tiled/linear；M=8，K=`1024,2048,3072,4096`；tiled 的 N=`32,64,...,256`，linear 的 N=`64,128,192,256` |
+
+R32 参数生成函数为 `testcase/func_test/test_bf16_mxfp4_r32_host/test_bf16_mxfp4_r32_host.cpp:102 / make_shape_params`。当前 GTest 调用的是 `:1013 / MmaDteBf16Mxfp4R32Test::run_current_shape`，再进入表中的 `run_param_case`；不要把同文件保留的老 `run_tests*` 大循环重复统计为额外 GTest。
+
+注意 R32 测试里的 `SubTile4x1` 是按 SiTe 行列方向命名，其 `launch_mma` 第 196/198 行实际传的是 `tensor_layout(64,32,1,4,1)`。这与“API 的 supertile_shape0=4、shape1=1”不是同一个方向。
+
+#### 6.7.2 MXFP6：普通功能测试
+
+| 相对路径:行号 / 执行函数 | GTest 名称 | 输出与 shape |
+|---|---|---|
+| `testcase/func_test/test_mxfp6e2m3_host/test_bf16_mxf6e2m3_host.cpp:51 / run_default_case` | `MmaDteBf16Mxfp6e2m3Test.ComputesDefaultShape`，第 249 行 | E2M3 -> BF16，R32，**tiled 输出**，`(M,N,K)=(32,1024,1024)` |
+| 同文件 `:152 / run_loop_k_one_identity_decode_case` | `MmaDteBf16Mxfp6e2m3Test.DecodesSingleKPanelIdentity`，第 253 行 | E2M3 -> BF16，**tiled 输出**，`(32,512,512)`；先运行上一个多 K 用例，再用 identity B 验证单 K panel 的累加器初始化 |
+| `testcase/func_test/test_bf16_mxfp6e3m2_host/test_bf16_mxf6e3m2_host.cpp:50 / run_default_case` | `MmaDteBf16Mxfp6e3m2Test.ComputesDefaultShape`，第 155 行 | E3M2 -> BF16，R32，**tiled 输出**，`(1024,256,1024)` |
+
+上表是两个源文件、三个注册用例。它们不能单独作为 MXFP6 linear 输出已验证的证据；linear 的现成例子在下一组 SplitK 测试。
+
+#### 6.7.3 MXFP8：普通功能测试
+
+| 相对路径:行号 / 执行函数或注册宏 | GTest 名称 | 输出与 shape |
+|---|---|---|
+| `testcase/func_test/test_mxfp8_host/r32/test_mxfp8_r32.cpp:35 / run_param` | `MmaDteMxfp8R32Test.Computes`，第 51 行 | E5M2 -> FP16 tiled `(96,96,256)`；E4M3 -> FP16 **linear** `(96,96,256)`；daily 增加 E4M3 linear `(128,128,256)` 和 E5M2 tiled `(128,128,1024)`、`(512,1024,2048)` |
+| 同文件 `:63 / TEST`，执行 `run_case` | `MmaDteMxfp8R32Regression.SingleFullChunkReinitializesAccumulator` | E4M3 -> FP16 **linear**，重复运行 `(96,96,256)`，验证每次 launch 的累加器初始化 |
+| `testcase/func_test/test_mxfp8_host/r16/test_mxfp8_r16.cpp:30 / TEST_P`，执行 `run_case` | `MmaDteMxfp8R16Test.Computes` | E4M3 -> FP16 **tiled**；默认 `(16,128,512)`；daily 为 `(16,128,1024)`、`(16,256,2048)`、`(16,6144,2048)` |
+| `testcase/func_test/test_mxfp8_host/r8/test_mxfp8_r8.cpp:30 / TEST_P`，执行 `run_case` | `MmaDteMxfp8R8Test.Computes` | E5M2 -> FP16 **tiled**；默认 `(8,96,512)`；daily 为 `(8,32,512)`、`(8,160,1024)`、`(8,2560,2048)` |
+| 同文件 `:41 / TEST`，执行 `run_case` | `MmaDteMxfp8R8Regression.SingleFullChunkReinitializesAccumulator` | E5M2 -> FP16 **tiled**，重复运行 `(8,32,512)` |
+| `testcase/func_test/test_mxfp8_host/r32/test_mxfp8_r32_shape_2x2.cpp:48 / TEST_P`，执行 `run_case` | `MmaDteMxfp8R32Shape2x2Test.Computes` | E4M3 -> FP16 **linear**，API supertile `(2,2)`；默认 `(64,64,64)`，daily `(128,128,64)` |
+| 同文件 `:28 / invoke_2x2`；注册宏在第 36、40、44 行 | `MmaDteMxfp8R32LayoutDeathTest.RejectsMultipleKSupertiles`、`.RejectsSmallM`、`.RejectsSmallN` | 错误参数拒绝测试：分别传 `(128,128,256)`、`(16,64,64)`、`(64,16,64)`，不是正常 GEMM 精度用例 |
+| `testcase/func_test/test_mxfp8_host/r32/test_mxfp8_r32_shape_4x1.cpp:26 / TEST_P`，执行 `run_case` | `MmaDteMxfp8R32Shape4x1Test.Computes` | E4M3 -> FP16 **linear**，`(128,128,32)`；这里 API layout 实际是 `(32,32,1,4,1)` |
+
+上表对应五个源文件。共享执行函数为 `testcase/func_test/test_mxfp8_host/common/test_mxfp8_common.hpp:48 / run_case`：第 99 行调用显式 layout、不带 workspace 的 `mma_dte`；第 113 行起按 LayoutC 决定比较 tiled memory order 还是 linear golden。daily 开关在同文件 `:41 / is_daily_suite`，读取 `SITEST_CASE_LEVEL=daily`。
+
+不要把文件名、旧 `.su` 实例化清单或 BF16 相关常量当作当前 GTest 全部覆盖 BF16 输出的证据；上表这些 MXFP8 普通执行用例实际使用 FP16 输出。**BF16 linear 生产实例化存在，但若接入 MXFP8->BF16，仍应补相应 vLLM contract 回归。**
+
+#### 6.7.4 MXINT8：普通功能测试
+
+| 相对路径:行号 / 执行函数 | GTest 名称 | 输出与 shape |
+|---|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:126 / run_bf16_default_case` | `MmaDteBf16Mxint8Test.ComputesDefaultShape`，第 138 行 | R8 MXINT8 -> BF16 **linear**，`(8,576,1024)`；源码说明这是 linear-store 回归 |
+| 同文件 `:131 / run_default_case` | `MmaDteFloat16Mxint8Test.ComputesDefaultShape`，第 144 行 | R32 MXINT8 -> FP16 **tiled**，`(32,576,1024)` |
+
+实际执行在同文件 `:43 / run_case`，第 90 行调用 `mma_dte`。虽然文件位于 `test_bf16_mxint8_host`，其中第二个用例已经是 FP16 输出，不能只按目录名判断覆盖范围。
+
+#### 6.7.5 SplitK 功能测试：四类 MX 均有 linear 输出例子
+
+下面 18 个文件全部以 `run_default_cases` 为执行入口，全部使用显式 layout、不带 workspace 的 `mma_dte`，全部配置 **linear 输出**。这些文件的 GTest case 名都是 `ComputesDefaultCases`；fixture 名包含相应目录/文件名。MXINT8 的注册宏位于各文件第 32 行，其余位于第 33 行。
+
+| 输入 -> 输出 | 家族 | 相对路径:行号 / 函数 |
+|---|---|---|
+| MXFP4 E2M1 -> BF16 | R32 | `testcase/func_test/splitK/test_bf16_mxfp4_host/test_bf16_mxfp4_splitK_host.cpp:21 / run_default_cases` |
+| MXFP4 E2M1 -> BF16 | R16 | `testcase/func_test/splitK/test_bf16_mxfp4_r16_host/test_bf16_mxfp4_splitK_host_r16.cpp:21 / run_default_cases` |
+| MXFP4 E2M1 -> BF16 | R8 | `testcase/func_test/splitK/test_bf16_mxfp4_r8_host/test_bf16_mxfp4_splitK_host_r8.cpp:21 / run_default_cases` |
+| MXFP6 E2M3 -> BF16 | R32 | `testcase/func_test/splitK/test_bf16_mxfp6e2m3_host/test_bf16_mxfp6e2m3_splitK_host.cpp:21 / run_default_cases` |
+| MXFP6 E2M3 -> BF16 | R16 | `testcase/func_test/splitK/test_bf16_mxfp6e2m3_r16_host/test_bf16_mxfp6e2m3_splitK_host_r16.cpp:21 / run_default_cases` |
+| MXFP6 E2M3 -> BF16 | R8 | `testcase/func_test/splitK/test_bf16_mxfp6e2m3_r8_host/test_bf16_mxfp6e2m3_splitK_host_r8.cpp:21 / run_default_cases` |
+| MXFP6 E3M2 -> BF16 | R32 | `testcase/func_test/splitK/test_bf16_mxfp6e3m2_host/test_bf16_mxfp6e3m2_splitK_host.cpp:21 / run_default_cases` |
+| MXFP6 E3M2 -> BF16 | R16 | `testcase/func_test/splitK/test_bf16_mxfp6e3m2_r16_host/test_bf16_mxfp6e3m2_splitK_host_r16.cpp:21 / run_default_cases` |
+| MXFP6 E3M2 -> BF16 | R8 | `testcase/func_test/splitK/test_bf16_mxfp6e3m2_r8_host/test_bf16_mxfp6e3m2_splitK_host_r8.cpp:21 / run_default_cases` |
+| MXFP8 E4M3 -> FP16 | R32 | `testcase/func_test/splitK/test_fp16_mxfp8e4m3_host/test_fp16_mxfp8e4m3_splitK_host.cpp:21 / run_default_cases` |
+| MXFP8 E4M3 -> FP16 | R16 | `testcase/func_test/splitK/test_fp16_mxfp8e4m3_r16_host/test_fp16_mxfp8e4m3_splitK_host_r16.cpp:21 / run_default_cases` |
+| MXFP8 E4M3 -> FP16 | R8 | `testcase/func_test/splitK/test_fp16_mxfp8e4m3_r8_host/test_fp16_mxfp8e4m3_splitK_host_r8.cpp:21 / run_default_cases` |
+| MXFP8 E5M2 -> FP16 | R32 | `testcase/func_test/splitK/test_fp16_mxfp8e5m2_host/test_fp16_mxfp8e5m2_splitK_host.cpp:21 / run_default_cases` |
+| MXFP8 E5M2 -> FP16 | R16 | `testcase/func_test/splitK/test_fp16_mxfp8e5m2_r16_host/test_fp16_mxfp8e5m2_splitK_host_r16.cpp:21 / run_default_cases` |
+| MXFP8 E5M2 -> FP16 | R8 | `testcase/func_test/splitK/test_fp16_mxfp8e5m2_r8_host/test_fp16_mxfp8e5m2_splitK_host_r8.cpp:21 / run_default_cases` |
+| MXINT8 -> BF16 | R32 | `testcase/func_test/splitK/test_bf16_mxint8_host/test_bf16_mxint8_splitK_host.cpp:21 / run_default_cases` |
+| MXINT8 -> BF16 | R16 | `testcase/func_test/splitK/test_bf16_mxint8_r16_host/test_bf16_mxint8_splitK_host_r16.cpp:21 / run_default_cases` |
+| MXINT8 -> BF16 | R8 | `testcase/func_test/splitK/test_bf16_mxint8_r8_host/test_bf16_mxint8_splitK_host_r8.cpp:21 / run_default_cases` |
+
+共享执行函数为 `testcase/func_test/splitK/common/test_splitk_mx_common.hpp:95 / run_mx_case`，第 134 行调用 `mma_dte`，第 154 行起选择 linear golden。shape 遍历分别在同文件 `:214 / run_mx_cases`、`:221 / run_r8_mx_cases`、`:228 / run_r16_mx_cases`，再调用 `:182 / run_mx_cases_for_shapes`。
+
+核对时真正启用的 shape 常量位于 `testcase/func_test/splitK/common/test_splitk_shapes.hpp`：第 28 行的 R32 集合只有 `(64,64,2048)`，第 37 行的 R8 集合只有 `(8,64,16384)`，第 43 行的 R16 集合只有 `(16,64,16384)`。注释掉的 `(32,32,2048)` 等不能算成当前实际测试覆盖。
+
+**最适合参考本次 MXINT8 替换调用的用例**是 `testcase/func_test/splitK/test_bf16_mxint8_host/test_bf16_mxint8_splitK_host.cpp:21 / run_default_cases`：A/B `(32,32,4,1,1)`，C `(16,32,1,1,0)`，正好与建议一致。
+
+但 SplitK 测试还有专用编译控制，例如 `testcase/func_test/splitK/test_bf16_mxint8_host/kernel/inst_bf16_mxint8_splitK.su:18` 定义 `MMA_DTE_SPLITK_TEST_FORCE_SPLITK`。所以这些用例是调用与 linear 输出契约的参考，不代表普通生产 planner 在所有相同 shape 上也必定选择 SplitK，更不代表主库的全部调度路径已经被本次验证。
+
+#### 6.7.6 辅助测试与配置文件
+
+下列辅助测试不能替代上面的设备 GEMM 数值测试：
+
+| 相对路径:行号 / 注册宏 | 测试名与用途 |
+|---|---|
+| `testcase/autotune/tests/test_autotune_shape_guard_mxint8.cpp:5 / TEST` | `AutotuneShapeGuardMxint8Test.AcceptsValidMxint8Shape`，MXINT8 shape guard |
+| `testcase/autotune/tests/test_autotune_override_candidates_mxfp8.cpp:5 / TEST` | `AutotuneOverrideCandidatesMxfp8Test.FiltersKnownBadMxfloat8Overrides`，MXFP8 候选过滤 |
+| `testcase/autotune/tests/test_autotune_layout_contracts.cpp:5 / TEST` | `AutotuneLayoutContractsTest.ValidatesSupportedLayouts`，包含 MXINT8/MXFP6 layout 静态契约 |
+| `testcase/autotune/tests/test_autotune_case_buffers_layout.cpp:35 / TEST` | `AutotuneCaseBuffersLayoutTest.SupportsMxSupertileLayouts`，MXINT8 buffer 布局 |
+| `testcase/autotune/tests/test_autotune_shape_guard_manifest_coverage.cpp:9 / TEST` | `AutotuneShapeGuardManifestCoverageTest.CoversManifestInputDtypes`，包括六个目标 MX 编码的 manifest 覆盖 |
+
+此外还有 `testcase/func_test/test_validation_host/test_validation_host.cpp:40 / TEST` 起的参数校验测试，其目标函数是 `src/simma_validation.cpp:251 / mma_dte_validate_inputs`，不是运行 GEMM。校验 API 与实际 kernel 入口不是完全同一组规则：例如 `src/simma_validation.cpp:177 / validate` 第 229 行仍保留 R8 非 MXFP8 的 BF16/FP16 linear 奇数 N tile 拒绝条件，而 `kernel/mma_dte_tiled_tensor.hpp:54 / mma_dte_implement_with_control` 第 86 行已说明 kernel 写回可以处理此情形。第一阶段采用 R32 不受此差异影响；以后扩展 R8 时应专门核对，不能把 helper 的结果当成所有 kernel 能力的完整定义。
+
+仓库还保留以下 MXINT8/MXFP6 JSON 数据集，都是配置文件，无函数名；不能从文件名直接推断上述 GTest 会读取它们：
+
+```text
+testcase/func_test/test_bf16_mxint8_host/config_mxint8_full.json
+testcase/func_test/test_mxfp6e2m3_host/config_mxfp6e2m3_full.json
+testcase/func_test/test_mxfp6e2m3_host/config_mxfp6e2m3_exact_full.json
+testcase/func_test/test_mxfp6e2m3_host/config_mxfp6e2m3_structural_full.json
+testcase/func_test/test_mxfp6e2m3_host/config_mxfp6e2m3_supertile.json
+testcase/func_test/test_mxfp6e2m3_host/config_mxfp6e2m3_all.json
+testcase/func_test/test_bf16_mxfp6e3m2_host/config_mxfp6e3m2_full.json
+testcase/func_test/test_bf16_mxfp6e3m2_host/config_mxfp6e3m2_exact_full.json
+testcase/func_test/test_bf16_mxfp6e3m2_host/config_mxfp6e3m2_structural_full.json
+testcase/func_test/test_bf16_mxfp6e3m2_host/config_mxfp6e3m2_supertile.json
+testcase/func_test/test_bf16_mxfp6e3m2_host/config_mxfp6e3m2_all.json
+```
+
+这里将“可执行功能测试”“辅助规则测试”“配置数据”分开列出，避免把存在大量 JSON shape 等同于当前测试全部已经编译、执行和通过。
+
+### 6.8 将来接入时需要改动的边界（本次不执行）
+
+1. **C++ GEMM 入口**：在 **VLLM** `csrc/jit/quantization/mxint8.cpp:62 / launch_mxint8_matmul` 改用第 6.4 节的 `mma_dte`，保留当前 stream、packed buffer 检查和 BF16 输出契约。不要同时改变 MX 量化语义。
+2. **Python 输出契约**：在 **VLLM** `vllm_sipu/ops/backends/sikernel/jit/mxint8.py:120 / mxint8_bf16_matmul` 直接返回 linear `out`；上层 **VLLM** `vllm_sipu/model_executor/layers/quantization/utils/mxint8_utils.py:202 / apply_mxint8_linear` 的裁剪、bias、最终形状恢复继续保留。当前 `beta` 未实现，不能借它融合 bias。
+3. **构建与依赖**：不能只换一个 include。**VLLM** `vllm_sipu/ops/backends/sikernel/jit/mxint8.py:26` 的 `MXINT8_MODULE` 仍声明旧 GEMM `.su/.hpp`；`:53 / get_mxint8_module` 通过 JIT builder 构建。**VLLM** `vllm_sipu/ops/backends/sikernel/jit/_runtime/builder.py:165 / build_module` 当前第 222 行调用 `generate_ninja_build` 时没有传外部 GEMM 库链接参数；`vllm_sipu/ops/backends/sikernel/jit/_runtime/cpp_ext.py:201 / generate_ninja_build` 已使用 C++20，但默认只链接 TVM FFI 和 SIPU runtime。接入需明确固定 DTE revision、头文件、库和运行时搜索路径，不能假定头文件模板声明会自动产生实现。
+4. **共享库部署**：当前主库是 umbrella DSO，不能只复制一个 `libtile_mma_dte.so`。DTE `CMakeLists.txt:318` 起的构建逻辑生成各实例化 component DSO；`tools/generate_mma_dte_umbrella.py:47 / write_cpp` 生成的 `__mma_dte_resolve_component_symbol` 会从主库所在目录 `dlopen` 对应 component。至少要携带用到的 component 及其匹配的 SDK runtime；这是打包契约，不是要求把整个新 DTE 再放进 vLLM JIT 编译一遍。
+5. **分层验证**：先用同一批 packed A/B 比较旧 GEMM+tiled-to-linear 与新 GEMM linear，再比较模型输出，最后分别测 GEMM、reorder 和端到端时间。至少覆盖当前 `(32,96,128)` padded 案例以及更大的 M/N/K，验证非默认 stream 和错误尺寸。**VLLM** `tests/kernels/quantization/test_mxint8_unpack_pytest.py:148 / main` 有手动参数遍历入口，而且该文件第 34 行设置 `__test__=False`；不要只运行文件名对应的 pytest 命令就以为真正执行了这些用例。
+
+### 6.9 本次只读核对的构建快照与最终判断
+
+2026-09-16 核对时，指定目录下的 `build/` 只有测试构建子目录，未找到 `build/libtile_mma_dte.so`；已有的主库及 component 位于 `build-old/`。这只是本次文件系统快照，不推断是谁移动了目录，也没有触碰这些构建产物。
+
+只读检查 `build-old/libtile_mma_dte.so` 的动态符号表得到 504 个 `mma_dte` 模板导出，未发现简化重载的 `(A,B,C,M,N,K,stream)` 签名。更重要的是 `build-old/mma_dte_build_manifest.txt:2` 记录：
+
+```text
+SI_SDK_ROOT=/share_data/sicx_sdk/release/2609151958
+TARGET_SIPU_ARCH=150
+```
+
+这与本题提供的 SDK `2609020046` 不一致。因此这里只把 ELF 检查作为“已有构建包含显式重载、不包含简化重载”的辅助证据，**没有宣称这份库已能在指定的 2609020046/vllm_dev 环境中直接链接运行**。实施前需固定并验证双方 SDK、SiTe 类型 ABI 和目标架构；本次不处理测试构建失败，也不调整库位置。
+
+**最终建议：当前先选显式 layout、不带 workspace 的 R32 MXINT8->BF16 实例，A/B 保持 `(32,32,4,1,1)`，C 改为 `(16,32,1,1,0)`，同步取消 Python 输出重排。四类 MX 都能通过同一重载家族接入，区别在具体 inputT、layout、输出实例化与打包契约；无需为了支持不同 MX 类型选择不同函数重载。linear 写回能力已经在源码中实现，实际收益和跨 SDK 可用性留待正式接入时验证。**
