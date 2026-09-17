@@ -2916,3 +2916,499 @@ R = build/testcase/2609161442/sipu_150/default/specialized
 - `testcase/func_test/CMakeMmaDteCommon.cmake:209 / mma_dte_get_main_object` 虽然定义了复用主库 object 的 helper，**本文件没有调用它**。不能因 include 了公共文件，就认为这个测试正在复用整个主库或主库 object。
 
 本次只读检查了当前源码、指定 SDK、CMake 模块、现有生成规则和日志，并追加本文；没有修改 CMake/算子代码，没有重新编译，也没有执行设备测试。
+
+## 9. MXINT8 GEMM golden 的逻辑顺序、物理顺序与精度转换（2026-09-17）
+
+### 9.1 先回答三个问题
+
+本节项目源码路径以 **DTE** `/share/users/like/package/sikernel/mma_dte_tile_tensor` 为根；**SDK** 路径以 `/share_data/sicx_sdk/release/2609151958` 为根。行号按本次含新增打印的源码重新核对。
+
+1. **逻辑顺序按矩阵坐标 `[m,n]` 展开，物理顺序按实际存储的 tile/subtile/block 顺序展开。**两者都返回 `std::vector<float>`，不是一种返回 FP32、另一种返回 BF16/FP16。
+2. **`gold_tiled_tensor.toVector()` 没有发生 FP32 -> BF16/FP16 转换。**降精度发生在后面的 `make_tensor<OutputT>`。因此 `gold_linear` 与 `gold_tiled` 同时存在顺序差异和精度差异，不能保证逐位相同；即使先恢复相同逻辑顺序，也不能保证与原 FP32 相同。
+3. **`mm_mnk(A, B, LayoutTag::Tiled)` 的第三个参数指定返回结果 Tensor 的 layout。**它不是声明或覆盖 A/B 的输入 layout，也不控制后面设备 `mma_dte` 的输出格式。严格说，它在 C++ 中仍是一个按值传入的配置参数，不是输出引用参数；配置对象是返回值。
+
+还需区分运行环境：`temp/run.log:1` 显示加载的 runtime 位于 SDK **2609161442**；`build/testcase/test_bf16_mxi8_host` 当前也是指向该版本子目录 executable 的符号链接。`temp/run.log:121` 显示本次运行采用 `swemusp` shim。日志与题目指定的 SDK 2609151958 不完全同源；只读比较确认两版的 `tensor/tensor.hpp`、`sifmt_fp.hpp`、`quantize/quantize.hpp`、`quantize/nonmx.hpp` 这四份相关 SiTe 文件相同。下文源码语义以指定 SDK 为准，日志事实另行标注。
+
+### 9.2 四个变量的真实类型与数据流
+
+相关代码集中在 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:67 / run_case` 至第 73 行：
+
+| 相对路径:行号 / 函数名 | 变量或操作 | 类型、顺序与精度 |
+|---|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:68 / run_case` | `gold_tiled_tensor = mm_mnk(..., Tiled)` | `Tensor<sifmt::float32, ...>`；保存 CPU FP32 计算结果，物理 layout 为 tiled |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:69 / run_case` | `gold_linear = gold_tiled_tensor.toVector()` | `std::vector<float>`；逻辑 row-major 顺序；仍为 FP32，没有降低到 OutputT 精度 |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:72 / run_case` | `out_tensor_d = make_tensor<OutputT>(layout_d, gold_linear)` | `Tensor<OutputT, ...>`；每个 FP32 值转换为 BF16/FP16，再存入该 dtype 对应的 tiled 存储 |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:73 / run_case` | `gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true)` | `std::vector<float>`；按 **OutputT tensor 的物理数据顺序**导出；BF16/FP16 数值重新扩展为 FP32 |
+
+```text
+MXINT8 A/B, each with its own layout
+        |
+        | toVector(): decode layout + dequantize MXINT8 to float
+        v
+CPU float dot products: X[m,n]
+        |
+        | mm_mnk(..., Tiled)
+        v
+gold_tiled_tensor
+  dtype = FP32, storage = FP32 tiled
+        |
+        | toVector(): read by logical coordinates, no FP16/BF16 rounding
+        v
+gold_linear
+  dtype = float, order = row-major, values = X[m,n]
+        |
+        | make_tensor<OutputT>(layout_d, gold_linear)
+        | round to BF16/FP16 + pack into OutputT tiled layout
+        v
+out_tensor_d
+  dtype = BF16/FP16, storage = OutputT tiled
+        |                                  |
+        | toVectorAsMemoryOrder(true)      | toVector() [not in original code]
+        v                                  v
+gold_tiled                             rounded_linear
+  dtype = float                          dtype = float
+  order = physical data order            order = row-major
+  values = widened rounded values        values = widened rounded values
+```
+
+两个 exporter 都是在 host 上构造新的 vector，既不修改原 Tensor 的 layout，也不启动 SIPU kernel。`gold_tiled_tensor`、`gold_linear`、`out_tensor_d`、`gold_tiled` 是不同对象，不是同一块内存的不同 view。
+
+这里的“原 FP32 golden”指**已经量化为 MXINT8 的 A/B 解量化后，再用 float 计算的结果**，不是未量化的 `arr_A @ arr_B^T`，也不是任意精度实数结果。依据是 **SDK** `include/SiTe/tensor/tensor.hpp:2698 / mm_mnk` 对输入先调用 `toVector()`，以及 `:2711 / mm_mnk` 使用 `float sum` 累加。
+
+### 9.3 两种导出的实现区别
+
+#### 9.3.1 Tensor::toVector：先确定逻辑坐标，再找物理地址
+
+**SDK** `include/SiTe/tensor/tensor.hpp:2114 / Tensor::toVector` 的核心行为：
+
+```cpp
+std::vector<float> buffer(shape.size(), 0.0f);
+for (uint64_t i = 0; i < shape.size(); i++) {
+    auto data = a.at(i);
+    // MX type: dequantize(0); ordinary FP type: cast to float.
+    ...
+}
+```
+
+关键不是 `i` 自增，而是 `at(i)` 的含义：
+
+| SDK 相对路径:行号 / 成员函数 | 行为 |
+|---|---|
+| `include/SiTe/tensor/tensor.hpp:1839 / Tensor::at` | 把一维逻辑 index 交给 `Shape::indexToCoord`，不是直接读 `data()[i]` |
+| `include/SiTe/tensor/tensor.hpp:218 / Shape::indexToCoord` | 从最后一维开始做除余；对于 `[M,N]`，得到 `m=i/N`、`n=i%N` |
+| `include/SiTe/tensor/tensor.hpp:1851 / Tensor::at` | 根据坐标通过 layout engine 找到 block 地址和 block 内元素位置，读取该元素 |
+| `include/SiTe/tensor/tensor.hpp:1524 / LayoutEngine::tensorCoord2StoragePtrOffset` | 根据 Tensor dtype/layout 计算实际存储地址；会处理 tile、subtile、block 等层次 |
+| `include/SiTe/tensor/tensor.hpp:2129 / Tensor::toVector` | 非 MX 类型转为 `float`，放入 `buffer[i]` |
+
+因此，二维矩阵的导出顺序一定是这里的逻辑顺序：
+
+```text
+Matrix coordinates:
+          n=0       n=1       ...       n=N-1
+m=0       X[0,0]    X[0,1]    ...       X[0,N-1]
+m=1       X[1,0]    X[1,1]    ...       X[1,N-1]
+ ...
+m=M-1     X[M-1,0]  X[M-1,1]  ...       X[M-1,N-1]
+
+toVector():
+  [ X[0,0], X[0,1], ..., X[0,N-1],
+    X[1,0], X[1,1], ..., X[1,N-1], ... ]
+
+logical_index(m,n) = m*N + n
+```
+
+源 Tensor 即使是 tiled，导出结果仍会按这个坐标顺序排列；`toVector` 没有把源 Tensor 本身改为 Linear。
+
+#### 9.3.2 Tensor::toVectorAsMemoryOrder：按数据 block 的存储位置遍历
+
+**SDK** `include/SiTe/tensor/tensor.hpp:2141 / Tensor::toVectorAsMemoryOrder` 的流程不同：
+
+| SDK 相对路径:行号 / 成员函数 | 行为 |
+|---|---|
+| `include/SiTe/tensor/tensor.hpp:2143 / Tensor::toVectorAsMemoryOrder` | 如果源 Tensor 已是 `Linear`，直接返回 `toVector()` |
+| `include/SiTe/tensor/tensor.hpp:2157 / Tensor::toVectorAsMemoryOrder` | 遍历有效逻辑坐标，用 layout engine 建立“物理 block 地址 -> 该 block 的有效坐标”映射 |
+| `include/SiTe/tensor/tensor.hpp:2184 / Tensor::toVectorAsMemoryOrder` | 按 plane、supertile、数据 block 的存储顺序遍历 |
+| `include/SiTe/tensor/tensor.hpp:2189 / Tensor::toVectorAsMemoryOrder` | 跳过 supertile header，定位数据区；输出的是数值序列，不是包含 header 的完整字节镜像 |
+| `include/SiTe/tensor/tensor.hpp:2203 / Tensor::toVectorAsMemoryOrder` | 对当前物理位置对应的有效坐标调用 `at` |
+| `include/SiTe/tensor/tensor.hpp:2210 / Tensor::toVectorAsMemoryOrder` | 普通 FP 类型扩展成 `float`，按访问顺序追加到 vector |
+| `include/SiTe/tensor/tensor.hpp:2215 / Tensor::toVectorAsMemoryOrder` | `true` 控制是否追加 block 尾部的 padding 标记，标记值为 `quiet_NaN()` |
+
+**`true` 的参数名是 `hasPaddingData`。它不表示“转成 FP32”，也不表示“启用 tiled”；是否 tiled 由源 Tensor 已有的 layout 决定。**
+
+本例输出是普通 BF16/FP16，supertile 没有 MX scale header，且 M/N 整齐覆盖完整 tiles。于是它可以理解成：依物理地址顺序读出各个 16-bit 浮点元素，再把每个元素的数值扩展为一个 32-bit `float`。
+
+注意，`gold_tiled` 自身的内存仍是连续的 32-bit floats；并不是可直接 `memcpy` 到 `OutputT*` 的 16-bit Tensor 原始字节。Tensor 原始存储入口是 **SDK** `include/SiTe/tensor/tensor.hpp:2243 / Tensor::data`。
+
+### 9.4 结合实际日志画出 tile/subtile 顺序
+
+#### 9.4.1 先核对两种 dtype 的 tile 大小
+
+`testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:140 / run_bf16_default_case` 选择 BF16、`M=8,N=576,K=1024`；`:145 / run_default_case` 选择 FP16、`M=32,N=576,K=1024`。
+
+两种输出都是 16-bit，但 CPU 中间 golden 是 32-bit，所以同一个 `[M,N]`、同一个 `LayoutTag::Tiled`，不代表相同 tile 形状：
+
+| 用例与对象 | dtype | 逻辑 shape | tile shape `[rows,cols]` | subtile shape | tile 数 | Tensor 存储字节 |
+|---|---|---|---|---|---|---|
+| BF16/R8：`gold_tiled_tensor` | FP32 | `[8,576]` | `[8,32]` | `[8,8]` | 18 | 18432 |
+| BF16/R8：`out_tensor_d` | BF16 | `[8,576]` | `[8,64]` | `[8,16]` | 9 | 9216 |
+| FP16/R32：`gold_tiled_tensor` | FP32 | `[32,576]` | `[32,8]` | `[8,8]` | 72 | 73728 |
+| FP16/R32：`out_tensor_d` | FP16 | `[32,576]` | `[32,16]` | `[8,16]` | 36 | 36864 |
+
+日志依据：`temp/run.log:68`、`:78`、`:96`、`:106`、`:188`、`:198`、`:216`、`:226`。这些是日志位置，不是函数定义。
+
+源码依据是 **SDK** `include/SiTe/tensor/tensor.hpp:1097 / LayoutEngine::getTileShape`：第 1126 行处理 R8，第 1154 行处理 R32，列数都依赖 `DataType::kBitWidth`。`:1235 / LayoutEngine::LayoutEngine` 的第 1278 行选 tile shape；普通非 MX 类型在第 1287 行设置 supertile shape 为 `[1,1]`。本表每个 tile 都是 1024 字节，16-bit tile 能容纳的元素数是 32-bit tile 的两倍。
+
+下面统一用 `Y[m,n]` 表示**已经舍入为 OutputT 后的数值**，暂时只讨论顺序。
+
+#### 9.4.2 BF16/R8：8 行，tile 内的 4 个 subtile 横向排列
+
+一张 `[8,576]` 输出有 9 个 `[8,64]` tiles。每个 tile 包含 4 个 `[8,16]` subtiles；每个 subtile 是 8 个 block，每个 block 是一行的 16 个 BF16 元素。
+
+```text
+Output matrix [8,576]:
+
+cols    0........63 64......127                 512......575
+       +----------+----------+----- ... -------+----------+
+rows   |  tile 0  |  tile 1  |                 |  tile 8  |
+0..7   |  [8,64]  |  [8,64]  |                 |  [8,64]  |
+       +----------+----------+----- ... -------+----------+
+
+Inside tile 0:
+
+cols     0..15      16..31      32..47      48..63
+       +----------+----------+----------+----------+
+rows   | subtile0 | subtile1 | subtile2 | subtile3 |
+0..7   |  [8,16]  |  [8,16]  |  [8,16]  |  [8,16]  |
+       +----------+----------+----------+----------+
+
+Physical element order:
+  subtile0: Y[0,0..15], Y[1,0..15], ..., Y[7,0..15]
+  subtile1: Y[0,16..31], Y[1,16..31], ..., Y[7,16..31]
+  subtile2: Y[0,32..47], ...
+  subtile3: Y[0,48..63], ...
+  then tile1, tile2, ..., tile8
+
+Logical row-major order:
+  row0: Y[0,0..15], Y[0,16..31], ..., Y[0,560..575]
+  row1: Y[1,0..15], Y[1,16..31], ..., Y[1,560..575]
+  ...
+```
+
+**不要把这个 R8 tile 想成“先连续存满一整行 64 个元素”。**实际会先连续存完 subtile0 的 8 行，再存 subtile1。SDK 对应位置是 `include/SiTe/tensor/tensor.hpp:1650 / LayoutEngine::tensorCoord2StoragePtrOffset` 的 R8 分支；subtile 和 block 偏移分别在第 1615、1628 行计算。
+
+只对本例 `[8,576]`、BF16、无 padding 的输出，物理元素索引可化简为：
+
+```text
+L(m,n) = m*576 + n
+P8(m,n) = (n/16)*128 + m*16 + (n%16)   // integer division
+byte_offset = 2 * P8(m,n)
+```
+
+例如：
+
+| 逻辑坐标 | `L` | `P8` | 说明 |
+|---|---:|---:|---|
+| `[0,0]` | 0 | 0 | 起点相同 |
+| `[1,0]` | 576 | 16 | 物理序列第 16 项已经切到下一行，不是 `[0,16]` |
+| `[0,16]` | 16 | 128 | 下一个 subtile 起点 |
+| `[0,64]` | 64 | 512 | 下一个 tile 起点 |
+
+所以 `gold_linear[16]` 对应原 FP32 的 `[0,16]`；`gold_tiled[16]` 对应经过 BF16 舍入的 `[1,0]`。直接用相同下标比较，首先就不是同一个矩阵元素。
+
+#### 9.4.3 FP16/R32：32 行，tile 内的 4 个 subtile 纵向排列
+
+一张 `[32,576]` 输出有 36 个 `[32,16]` tiles，每个 tile 内部的 4 个 `[8,16]` subtiles 沿行方向排布。
+
+```text
+Output matrix [32,576]:
+
+cols       0..15       16..31                560..575
+         +----------+----------+--- ... ---+----------+
+rows     |  tile 0  |  tile 1  |           | tile 35  |
+0..31    | [32,16]  | [32,16]  |           | [32,16]  |
+         +----------+----------+--- ... ---+----------+
+
+Inside tile 0:                    Physical element order:
+             +----------+
+rows  0.. 7  | subtile0 |         Y[0,0..15], ..., Y[7,0..15]
+             +----------+
+rows  8..15  | subtile1 |         Y[8,0..15], ..., Y[15,0..15]
+             +----------+
+rows 16..23  | subtile2 |         Y[16,0..15], ..., Y[23,0..15]
+             +----------+
+rows 24..31  | subtile3 |         Y[24,0..15], ..., Y[31,0..15]
+             +----------+
+                                 then tile1: Y[0,16..31], ...
+```
+
+R32 分支位于 **SDK** `include/SiTe/tensor/tensor.hpp:1657 / LayoutEngine::tensorCoord2StoragePtrOffset`。本例每个 tile 内部碰巧等价于按 32 行依次存储，但整个矩阵仍是先存完 16 列宽的 tile，再到下一个 tile，并非先存完整的 576 列长行。
+
+只对本例 `[32,576]`、FP16、无 padding 的输出：
+
+```text
+L(m,n) = m*576 + n
+P32(m,n) = (n/16)*512 + m*16 + (n%16)
+byte_offset = 2 * P32(m,n)
+
+P32(1,0)  = 16
+P32(8,0)  = 128
+P32(0,16) = 512
+```
+
+同样，`gold_tiled[16]` 不是逻辑第 16 项，而是 `[1,0]`；只是这次 `gold_tiled[128]` 对应 `[8,0]`，不是 R8 情形下的 `[0,16]`。
+
+这两条物理索引公式针对当前完整 shape 推导，**不能把其中的 `8/32` 直接替换成任意 M，就当成通用 SiTe 布局公式**。通用定位仍应调用 layout engine。
+
+#### 9.4.4 为什么两个 vector 的 size 相同，顺序却不同
+
+`temp/run.log:63` 给出 `4608/4608`，`:183` 给出 `18432/18432`，因为本例完整覆盖所有输出 tiles：
+
+```text
+BF16: 8*576 = 9 * (8*64) = 4608 elements
+FP16: 32*576 = 36 * (32*16) = 18432 elements
+```
+
+没有 padding 时，重排不会改变元素数量。`gold_tiled` 的 vector payload 按 4 字节/项计算，而 `out_tensor_d` 按 2 字节/项存储；元素数量相同不代表字节数相同，更不代表值序列逐位相同。
+
+此外，日志 `stride=[1,1]` 不能按普通矩阵 stride 理解成地址公式 `m+n`。**SDK** `include/SiTe/tensor/tensor.hpp:498 / Layout::Layout` 只保存 shape/tag；tiled 地址由 `LayoutEngine` 另外计算。日志中的 `Shape(SubTile): (NULL)` 也是 `include/SiTe/tensor/tensor.hpp:2442 / Tensor::print` 固定打印的字符串，并不是没有 subtile。
+
+### 9.5 精度变化：两个 vector 能否 bitwise 相同
+
+#### 9.5.1 先用公式把两类变化分开
+
+定义：
+
+```text
+X[m,n]    = CPU FP32 golden
+Q_T(x)    = convert float x to OutputT (16-bit encoding)
+U_T(q)    = widen an OutputT value back to float
+Y[m,n]    = U_T(Q_T(X[m,n]))
+L(m,n)    = logical row-major index
+P_T(m,n)  = physical element index in the OutputT tensor
+```
+
+则对于本例有效元素：
+
+```text
+gold_linear[L(m,n)]                 = X[m,n]
+out_tensor_d.toVector()[L(m,n)]     = Y[m,n]
+gold_tiled[P_T(m,n)]                = Y[m,n]
+```
+
+因此要区分三个问题：
+
+| 比较方式 | 结论 |
+|---|---|
+| `gold_linear[i]` 与 `gold_tiled[i]` | 通常连坐标都不同，不能保证相同 |
+| 把 `gold_tiled` 重排回 row-major 后，与 `gold_linear` 比 | 坐标相同，但还隔着 FP32 -> OutputT -> FP32 的舍入，不能保证逐位相同 |
+| 对**同一个 `out_tensor_d`**分别调用两个 exporter，再按坐标对齐 | 没有额外降精度差异；当前无 padding 的 BF16/FP16 数据，是同一批已经舍入的数值，仅顺序不同 |
+
+#### 9.5.2 真正的降精度发生在哪里
+
+**SDK** `include/SiTe/tensor/tensor.hpp:1772 / Tensor::Tensor` 接收 float 数据并调用 `fillWithContainer`。`:1950 / Tensor::fillWithContainer` 的普通浮点分支在第 2063 行执行：
+
+```cpp
+nonMxBlock[i] = DataType::FromFloat(inputBlock[i]);
+```
+
+本例 `DataType` 就是 `OutputT`。这一步产生 BF16/FP16 编码，然后由 `include/SiTe/tensor/tensor.hpp:2402 / Tensor::fillBlock` 按布局写入存储。
+
+转换定义可继续定位：
+
+| SDK 相对路径:行号 / 函数名或类型 | 含义 |
+|---|---|
+| `include/SiTe/sifmt/sifmt_fp.hpp:277 / float16（类型别名）` | FP16 的指数位 5、尾数字段 10 |
+| `include/SiTe/sifmt/sifmt_fp.hpp:278 / bfloat16（类型别名）` | BF16 的指数位 8、尾数字段 7 |
+| `include/SiTe/sifmt/sifmt_fp.hpp:279 / float32（类型别名）` | FP32 的指数位 8、尾数字段 23 |
+| `include/SiTe/sifmt/sifmt_fp.hpp:85 / SiFpBase::SiFpBase` | `OutputT(float)` 使用同一个 `FromFloat` 转换 |
+| `include/SiTe/sifmt/sifmt_fp.hpp:113 / SiFpBase::operator InterFpType` | 转回 float 时调用 `ToFloat` |
+| `include/SiTe/sifmt/quantize/quantize.hpp:307 / sifmt::f16::fromFloat` | 调用 FP32 -> FP16 软件转换 |
+| `include/SiTe/sifmt/quantize/quantize.hpp:322 / sifmt::bf16::fromFloat` | 调用 FP32 -> BF16 软件转换 |
+| `include/SiTe/sifmt/quantize/nonmx.hpp:364 / f32_to_f16` | 选择 round-to-nearest-even 舍入模式 |
+| `include/SiTe/sifmt/quantize/nonmx.hpp:515 / f32_to_bf16` | 同样选择 round-to-nearest-even |
+| `include/SiTe/sifmt/quantize/nonmx.hpp:95 / f16_to_f32` | 将已有 FP16 数值扩展为 FP32；有限 FP16 数值可以精确表示于 FP32 |
+| `include/SiTe/sifmt/quantize/nonmx.hpp:162 / bf16_to_f32` | 将已有 BF16 数值扩展为 FP32；有限值的尾数字段在第 198 行左移 16 位 |
+| `include/SiTe/sifmt/quantize/quantize.hpp:331 / sifmt::f32::toFloat` | FP32 wrapper 到 float 只做位表示转换，不会执行 BF16/FP16 舍入 |
+
+**扩展回 FP32 并不能恢复第一次降精度时丢弃的信息。**有限 BF16/FP16 值转成 FP32 本身可精确，但“已舍入值的精确扩展”不等于“找回舍入前的 FP32”。
+
+两个精确可复现的小例子，分别标明 FP32 的 32-bit 编码与中间 OutputT 的 16-bit 编码：
+
+```text
+BF16 path:
+  FP32 1.00390625  [0x3f808000]
+      -> BF16 1.0 [16-bit encoding 0x3f80]
+      -> FP32 1.0 [0x3f800000]
+
+FP16 path:
+  FP32 1.00048828125 [0x3f801000]
+      -> FP16 1.0   [16-bit encoding 0x3c00]
+      -> FP32 1.0   [0x3f800000]
+```
+
+它们正好位于两个目标精度值的中点，由 ties-to-even 舍入到 1.0。若原 FP32 值恰好可由 OutputT 精确表示，则对齐坐标后可以相同；但这是对数据的条件，不是所有 GEMM 结果都有的保证。NaN 的 payload/canonicalization 另有规则，也不能承诺任意 NaN 编码逐位保真。
+
+同样，不能为了省步骤而把 `gold_tiled_tensor.toVectorAsMemoryOrder(true)` 的每项直接转成 OutputT，就认为一定得到需要的 OutputT 物理 golden：**FP32 tensor 和 OutputT tensor 的 tile/subtile 形状不同**，9.4.1 的表格已经显示这种差异。当前代码先导出逻辑顺序再按 OutputT 布局重新构造，正是为了同时处理 dtype 和 layout。
+
+### 9.6 现有比较为什么还要再次转为 OutputT
+
+`testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:118 / run_case` 的分支是：
+
+```cpp
+if constexpr (LayoutC.tensor_format == 1) {
+    gold = static_cast<OutputT>(gold_tiled[i]);
+} else {
+    gold = OutputT(gold_linear[i]);
+}
+```
+
+这不是在验证 `gold_linear` 和 `gold_tiled` 两个 FP32 vectors 相同，而是在选择与设备输出一致的**存储顺序和输出精度**：
+
+| 当前用例 | 设备 C 格式 | 比较所用 golden |
+|---|---|---|
+| BF16/R8，`testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:140 / run_bf16_default_case` | `kLayoutC_R8.tensor_format=0`，linear | 第 121 行：对 `gold_linear` 按需执行一次 BF16 转换 |
+| FP16/R32，`testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:145 / run_default_case` | `kLayoutC_R32.tensor_format=1`，tiled | 第 119 行：把 `gold_tiled` 中已舍入、又扩展为 float 的值转回 FP16 |
+
+对于有限、已经可由 OutputT 表示的值，同一转换下有：
+
+```text
+Q_T(U_T(Q_T(x))) = Q_T(x)
+```
+
+所以 tiled 分支最后这次回到 OutputT 一般不是再损失一轮有效信息，而是恢复之前已经得到的 16-bit 输出编码。正确的对应关系是：
+
+```text
+OutputT(gold_linear[L(m,n)])
+      == OutputT(gold_tiled[P_T(m,n)])
+```
+
+这里两边要比较同一个逻辑坐标；它**不等价于** `gold_linear[L]` 与 `gold_tiled[P]` 的 FP32 编码相同。
+
+还有一点容易从打印误判：BF16 用例虽然也构造并打印了 tiled 的 `out_tensor_d`，但它的设备 C 输出仍是 linear。这个 host reference tensor 的 layout，不会修改 `mma_dte` 的 `LayoutC`。相应常量在 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:35 / kLayoutC_R8（常量）` 和 `:37 / kLayoutC_R32（常量）`。
+
+### 9.7 mm_mnk 的 LayoutTag 明确作用于返回值
+
+**SDK** `include/SiTe/tensor/tensor.hpp:2679 / mm_mnk` 定义为：
+
+```cpp
+mm_mnk(const TensorT1& t1,
+       const TensorT2& t2,
+       sipu::LayoutTag layoutTag = sipu::LayoutTag::Linear)
+```
+
+可以沿数据使用位置直接判断参数语义：
+
+| SDK 相对路径:行号 / 函数名 | 对应行为 |
+|---|---|
+| `include/SiTe/tensor/tensor.hpp:2685 / mm_mnk` | 从 A/B 自身的 `layout().shape()` 取 shape |
+| `include/SiTe/tensor/tensor.hpp:2698 / mm_mnk` | 调用 A/B 的 `toVector()`；它们各自已有的 layout 决定如何取数据，第三个参数不参与这一步 |
+| `include/SiTe/tensor/tensor.hpp:2702 / mm_mnk` | 建立结果 shape `[A.rows, B.rows]`，即 `[M,N]` |
+| `include/SiTe/tensor/tensor.hpp:2703 / mm_mnk` | `make_layout(shapeC, layoutTag)`：第三个参数首次用于创建 C 的 layout |
+| `include/SiTe/tensor/tensor.hpp:2707 / mm_mnk` | 按 `i,j,k` 遍历，计算 `sum += A[i,k] * B[j,k]`，即 `C=A@B^T` |
+| `include/SiTe/tensor/tensor.hpp:2722 / mm_mnk` | `make_tensor<sifmt::float32>(layoutC, buffer)`：返回 **FP32、所选 layout** 的 Tensor |
+
+所以：
+
+```text
+mm_mnk(A, B)          -> FP32 Tensor, Linear
+mm_mnk(A, B, Linear)  -> FP32 Tensor, Linear
+mm_mnk(A, B, Tiled)   -> FP32 Tensor, Tiled
+
+For the same A/B:
+  logical matrix result: unchanged
+  result dtype:          FP32 in all three calls
+  result storage layout: selected by the third argument
+  input layouts:         remain properties of A/B
+```
+
+第 2687 行拒绝 `LayoutTag::Manual`；不应把 Manual 当成这里可任意指定的结果布局。源码第 2668 行注释写着 “always return float32 tensor with linear layout”，但它没有反映当前带 `layoutTag` 参数的实现，**应以第 2703、2722 行执行代码为准**。
+
+本例在 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:52 / run_case`、`:62 / run_case` 已分别为 A/B 选择 tiled；第 68 行的 `Tiled` 选择 CPU golden 的布局；第 71 行的 `Tiled` 又独立选择 `out_tensor_d` 的布局；设备 `mma_dte` 输出则由第 104 行模板实参 `LayoutC` 选择。这是四个不同位置的配置，不能混用。
+
+### 9.8 纯 CPU 复现结果与两个重要边界
+
+#### 9.8.1 用指定 SDK 验证索引与精度，不重跑设备 kernel
+
+本次在临时目录 `/tmp/sipu-layout-check-elGl9E` 创建了独立 host 检查程序。临时代码相对该目录的 `check.cpp:14 / run_case` 复用了当前测试的随机生成顺序、MXINT8 Tensor 构造、两组 M/N/K 以及上述 golden 链路；`check.cpp:65 / padding_case` 检查 padding；`check.cpp:77 / main` 检查舍入反例。没有改动 DTE 测试文件。
+
+编译器为 `/usr/bin/c++` GCC 11.4.0，使用指定 SDK 2609151958 的 SiTe 头文件和 `SITE_TARGET_SIPU_ARCH=150`。执行命令是：
+
+```bash
+/usr/bin/c++ -std=c++20 -O2 -DSITE_TARGET_SIPU_ARCH=150 -DTARGET_SIPU_ARCH=150 \
+  -I/share_data/sicx_sdk/release/2609151958/include/SiTe \
+  /tmp/sipu-layout-check-elGl9E/check.cpp -o /tmp/sipu-layout-check-elGl9E/check
+/tmp/sipu-layout-check-elGl9E/check
+```
+
+复现结果如下，统计的是**本次 CPU 检查**，不是 `run.log` 中未打印的设备数据：
+
+| 检查项目 | BF16/R8 | FP16/R32 |
+|---|---:|---:|
+| 元素数 | 4608 | 18432 |
+| 同逻辑坐标的原 FP32 与舍入后 FP32，编码不同的元素数 | 4561 | 17495 |
+| 舍入后值为正/负 Inf 的元素数 | 0 | 10063 |
+| 9.4 的索引公式与 layout engine 地址结果不一致数 | 0 | 0 |
+| 对齐坐标后 `out_tensor_d.toVector()` 与 `gold_tiled` 的 float 编码不一致数 | 0 | 0 |
+| `gold_tiled` 转回 OutputT 后与 tensor 内原始 16-bit 编码不一致数 | 0 | 0 |
+| `OutputT(gold_linear[L])` 与相应物理位置 16-bit 编码不一致数 | 0 | 0 |
+| `mm_mnk(...,Linear).toVector()` 与 `mm_mnk(...,Tiled).toVector()` 编码不一致数 | 0 | 0 |
+
+这也说明：**逻辑矩阵可以相同，存储顺序可以不同；最终 16-bit 编码可以相同，而中途的原 FP32 与扩展后的 FP32 可以不同。**
+
+本次 CPU 检查的具体元素反例：
+
+```text
+BF16/R8, [0,0], logical index = physical index = 0:
+  gold_linear[0] = 22715   (FP32 0x46b17600)
+  gold_tiled[0]  = 22656   (FP32 0x46b10000)
+  stored BF16 encoding = 0x46b1
+
+FP16/R32, [0,0], logical index = physical index = 0:
+  gold_linear[0] = 87832   (FP32 0x47ab8c00)
+  gold_tiled[0]  = +Inf    (FP32 0x7f800000)
+  stored FP16 encoding = 0x7c00
+
+FP16/R32, [0,2], logical index = physical index = 2:
+  gold_linear[2] = -34408 (FP32 0xc7066800)
+  gold_tiled[2]  = -34400 (FP32 0xc7066000)
+```
+
+这些例子故意选在逻辑/物理索引相同的位置，排除了“只是顺序不同”的解释，直接展示舍入或溢出造成的差别。随机分布实现和编译环境变化可能改变具体统计数值，不影响前面的源码结论。
+
+#### 9.8.2 true 不保证返回完整 padding 字节布局
+
+虽然参数注释称包含 padding，当前 **SDK** `include/SiTe/tensor/tensor.hpp:2194 / Tensor::toVectorAsMemoryOrder` 对完全没有有效坐标的 block 会直接 `continue`；第 2217 行仅补已有有效元素 block 的剩余位置，而且补的是新构造的 NaN，**不是读取物理 padding 字节**。
+
+因此不能泛化成 `toVectorAsMemoryOrder(true).size() == storageSize()/sizeof(OutputT)` 对所有 shape 都成立。本次 `check.cpp:65 / padding_case` 的 BF16 `[3,17]` 反例是：
+
+```text
+logical elements                    = 3*17 = 51
+allocated tiled storage elements    = 8*64 = 512
+toVector().size()                   = 51
+toVectorAsMemoryOrder(false).size()  = 51
+toVectorAsMemoryOrder(true).size()   = 96
+NaN placeholders in the last vector = 45
+```
+
+当前两组 `[8,576]`、`[32,576]` 无此 padding 问题，9.4 的物理索引对应关系成立。但将 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:83 / run_case` 的输出大小计算直接推广到任意未对齐 shape 时，需要重新核对 padding 约定。
+
+#### 9.8.3 日志 PASS 不能解释成 bitwise 一致
+
+`temp/run.log:122`、`:242`、`:247` 确实记录两项测试通过；但当前 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:125 / run_case` 至第 128 行计算浮点相对误差，再判断 `err_rate > 0.0f`，不是比较原始编码。
+
+至少有两个区别：
+
+- `+0.0` 和 `-0.0` 数值比较相等，但编码不同。
+- NaN 不满足 `> 0`。例如 golden 是 `+Inf`、结果却是某个有限值时，`(Inf-finite)/Inf` 得到 NaN，这个条件不会报告失败；结果自身是 NaN 时同样可能漏报。
+
+FP16 范围溢出的实现依据是 **SDK** `include/SiTe/sifmt/quantize/nonmx.hpp:205 / softfloat_roundPackToF16_sub`，第 219 行采用 overflow 模式，第 257 行可生成无穷大。上面的 CPU 复现证明这不是与当前数据无关的理论边界，而是本例 FP16 golden 中确实会发生的情况。
+
+若今后要验证真正 bitwise 相同，应先让两边对应相同物理/逻辑坐标，再比较 OutputT 的 16-bit 编码，并明确 NaN、Inf、signed zero 的测试政策；若验证数值误差，则应单独处理非有限数。这里指出的是测试判据的边界，**没有据此断言本次设备输出错误，也没有修改测试代码**。
+
+### 9.9 最终结论
+
+`gold_linear` 是 FP32 CPU golden 的逻辑顺序导出；`gold_tiled` 是同一逻辑结果先舍入成 OutputT、按 OutputT 布局存储，再按物理数据顺序扩展回 float 的导出。它们不能保证原 FP32 编码相同。当前测试真正需要的是“与设备输出格式一致的、舍入到 OutputT 后的 golden”，因此两个比较分支分别使用不同顺序，并最终都转到 OutputT。
+
+`mm_mnk` 的第三个 `LayoutTag::Tiled` 仅选择返回的 **FP32 CPU Tensor** 的存储 layout。它既不重设输入 A/B 的 layout，也不替代设备 `mma_dte` 的 `LayoutC`。
+
+本次已完成源码和日志核对、独立 CPU SiTe 验证，并追加本文；没有修改算子或测试源码，没有重新构建主库或运行设备 GEMM。

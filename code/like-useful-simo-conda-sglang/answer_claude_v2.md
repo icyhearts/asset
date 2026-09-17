@@ -10207,3 +10207,471 @@ test_bf16_mxi8_host  ←──────────────────  
 - **`mma_dte_test_enable_gtest`**（`CMakeMmaDteCommon.cmake:352`）给测试可执行文件接上 gtest，三步：`find_package(GTest REQUIRED)`（**整个 testcase 阶段最常见的失败点**）、链 `GTest::gtest` + `GTest::gtest_main`（后者提供 `main()`）、`gtest_discover_tests(DISCOVERY_MODE PRE_TEST)` 注册进 CTest。选 `PRE_TEST` 而不是默认的 `POST_BUILD`，是因为这套测试要在 cmodel 上跑，构建期不该执行目标程序。
 - **整份 `CMakeLists.txt` 的主线只有一条**：把一份**本 test 私有的 `.su`**（只做 2 个 `mma_dte` 显式实例化）用 `scc` 编成 `.o`、用 `/usr/bin/c++ -shared` 打成私有 `.so`、再让一个标准 `add_executable` 链上它。生产库的 40 个 `libtile_mma_dte_<TYPE>.so` 完全不参与。
 - **这次构建是成功的**：`temp/cxx.log.nodir` 末尾 `[100%] Built target mma_dte_all_testcases`，0 个 error。日志里用的 SDK 是 **`2609161442`**（不是提问里写的 `2609151958`）—— 因为 `setup.sh` 走的是会漂移的 `release/latest` 软链。两个版本的 `sccConfig.cmake` 内容一致（md5 相同），所以本文引用的行号通用。
+
+## 66. `gold_linear` vs `gold_tiled`：逻辑序导出与物理序导出的区别、精度是否 bitwise 相同、以及 `mm_mnk` 第三个参数到底是输入还是输出
+
+**问题**（三个，都围绕 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp` 的 67-73 行）：
+
+1. `gold_tiled_tensor.toVector()`（逻辑序导出）和 `out_tensor_d.toVectorAsMemoryOrder(true)`（物理内存序导出）有什么区别？用 ASCII 图说明。
+2. `gold_linear` 是 **原始 fp32 tile tensor → fp32**，而 `gold_tiled` 是 **`gold_linear`(fp32) → `out_tensor_d`(fp16/bf16) → `gold_tiled`(fp32)**，中间多了 fp32→bf16/fp16→fp32 的精度往返。这两个 vector 还能保证 bitwise 相同吗？
+3. `sipu::tensor::mm_mnk(mx_tensor_a, mx_tensor_b, sipu::LayoutTag::Tiled)` 里的 `LayoutTag::Tiled`，是用来描述**输入** tensor 的 layout，还是用来指定**输出** tensor 要求的 layout？
+
+**三个问题的简答**：
+
+| # | 结论 |
+| --- | --- |
+| 1 | **同一个 tensor 的两种"读法"**：`toVector()` 按**逻辑坐标 `(row, col)` 行优先**遍历，`toVectorAsMemoryOrder()` 按**物理字节偏移从小到大**遍历。tiled 存储下这两者是一个**置换**。 |
+| 2 | **不是"还"能 bitwise 相同 —— 它们本来就不再是同一批数了，但也**不是**精度丢了：`gold_tiled` 恰好是 `(OutputT)gold_linear` 的一个**精确置换**。** 我实测确认：多重集完全相等，差异 **100% 来自顺序重排，0% 来自精度**。所以真正的问题不是精度，而是**代码里那个所谓的"精度往返"根本没发生** —— `toVectorAsMemoryOrder()` 在**反量化之后**才被 `cast` 回 `float`，不是先 cast 再反量化。 |
+| 3 | **是"输出"**。它被传给 `mm_mnk` 的第三个参数 `layoutTag`，只用在 `tensor.hpp:2703` 给**返回值 C** 建 layout；**输入的 A/B 用的是它们自己带的 layout**（`tensor.hpp:2698-2699` 的 `a.toVector()` / `b.toVector()` 直接读 `t1`/`t2` 自己的 layout），`layoutTag` 完全不参与输入的读取。 |
+
+---
+
+### 66.0 先看代码：三行关键语句
+
+`testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp`：
+
+```cpp
+67  auto gold_tiled_tensor =
+68      sipu::tensor::mm_mnk(mx_tensor_a, mx_tensor_b, sipu::LayoutTag::Tiled);
+69  auto gold_linear = gold_tiled_tensor.toVector();
+70  auto shape_d = sipu::make_shape(CaseM, CaseN);
+71  auto layout_d = sipu::make_layout(shape_d, sipu::LayoutTag::Tiled);
+72  auto out_tensor_d = sipu::make_tensor<OutputT>(layout_d, gold_linear);
+73  auto gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true);
+```
+
+注意一个容易看错的点：**`gold_tiled_tensor` 和 `out_tensor_d` 不是同一个 tensor，但它们有相同的 `[M,N]` shape 和相同的 `Tiled` tag**（`:67-68` 里 `mm_mnk` 拿 `LayoutTag::Tiled` 建的 C，和 `:71` 里显式建的 `layout_d`）。区别只在**元素类型**：前者 `float32`，后者 `OutputT`（bf16/fp16）。这正是问题 2 里那个"精度往返"的来源。
+
+用运行日志 `temp/run.log` 验证（这是加了 print 之后跑出来的）：
+
+```
+=== R8 case（bf16 输出，M=8, N=576, K=1024）===
+gold_linear size:4608, gold_tiled size:4608        <- 两者元素个数相同
+fp32 gold_linear_tensor:  Layout shape=[8, 576]   tag=Tiled  StorageSize: 18432
+bf16/fp16 out_tensor_d:   Layout shape=[8, 576]   tag=Tiled  StorageSize: 9216
+
+=== R32 case（fp16 输出，M=32, N=576, K=1024）===
+gold_linear size:18432, gold_tiled size:18432
+fp32 gold_linear_tensor:  Layout shape=[32, 576]  tag=Tiled  StorageSize: 73728
+bf16/fp16 out_tensor_d:   Layout shape=[32, 576]  tag=Tiled  StorageSize: 36864
+```
+
+**两个 log 里的 `StorageSize` 差正好 2 倍**（18432/9216、73728/36864），就是 fp32→16bit 的位宽比。而 `MemoryOrder` 导出的元素个数**没有变化**，说明这个例子里的 N（576）正好落在 tile 宽度的整数倍上、没有产生 padding 元素（下面 66.4 有反例 `N=88`）。
+
+---
+
+### 66.1 问题 1：两种导出方式的区别（ASCII 图）
+
+#### 66.1.1 代码层面
+
+两个函数都在 `$SI_SDK_ROOT/include/SiTe/tensor/tensor.hpp` 的 `Tensor` 类里（类定义在 `:1755`）：
+
+| 方法 | 位置 | 遍历依据 |
+| --- | --- | --- |
+| `Tensor::toVector` | `tensor.hpp:2114` | `for(uint64_t i = 0; i < shape.size(); i++) { auto data = a.at(i); ... }`（`:2120-2122`）—— **按线性索引 `i`** |
+| `Tensor::toVectorAsMemoryOrder` | `tensor.hpp:2141` | `for(auto coord : mLayout.shape())`（`:2157`）先建 block 索引，再 `:2184-2192` **按 `plane / superTile / block` 的物理偏移顺序**拼 buffer |
+
+关键在 `Tensor::at(uint64_t index)`（`tensor.hpp:1839`）：
+
+```cpp
+1839  DataType at(const uint64_t index)
+1840  {
+1841      auto tensorCoord = mLayout.shape().indexToCoord(index);   // <-- 把线性索引还原成 (row,col)
+1842      return at(tensorCoord);
+1843  }
+```
+
+而 `Shape::indexToCoord`（`tensor.hpp:218-232`）是**行优先（row-major）**：
+
+```cpp
+224      for(int dim = Rank - 1; dim >= 0; dim--)
+225      {
+226          uint64_t dimSize = this->mData[dim];
+227          coord[dim] = remaining % dimSize;
+228          remaining /= dimSize;
+229      }
+```
+
+我实测验证过 `indexToCoord` 确实是行优先：
+
+```
+i= 0 -> (0,0)  i= 1 -> (0,1)  i= 2 -> (0,2)  i= 3 -> (0,3)
+i= 4 -> (1,0)  i= 5 -> (1,1)  i= 6 -> (1,2)  i= 7 -> (1,3)
+i= 8 -> (2,0)  i= 9 -> (2,1)  i=10 -> (2,2)  i=11 -> (2,3)
+```
+
+**所以 `toVector()` 就是"把 `[M,N]` 矩阵按 `(row, col)` 行优先铺开成一个 vector"** —— 也就是数学上最自然的那个顺序，跟存储格式无关。
+
+#### 66.1.2 物理存储长什么样
+
+要理解 `toVectorAsMemoryOrder`，得先知道 tiled 存储的层级。`LayoutEngine` 在 `tensor.hpp:1036`，它的层级（来自 `:1042-1046` 的注释和 `:1586-1599` 的常量）是：
+
+```
+SuperTile  ──┬── Tile ×(supertile_shape[0] × supertile_shape[1])
+             │      └── SubTile ×4
+             │             └── Block ×8        (每 block 16 或 32 个元素)
+             └── SuperTile Header（MX 类型才有）
+```
+
+每个层级在 `tensor.hpp` 里都有对应的 `storageSize()`，实际寻址在 `LayoutEngine::tensorCoord2StoragePtrOffset`（`tensor.hpp:1524`）里做。`toVectorAsMemoryOrder` 的遍历顺序（`:2184-2192`）就是**照抄这个物理布局**：
+
+```cpp
+2184  for(int plane = 0; plane < planeCount; plane++)
+2186      uint64_t planePtr = plane * superTileDim.product() * SuperTile<DataType>::storageSize();
+2187      for(int i = 0; i < superTileDim.product(); i++)
+2189          auto superTileDataPtr = planePtr + SuperTile<DataType>::storageSize() * i +
+2190                                  SuperTile<DataType>::headerStorageSize();
+2191          for(int j = 0; j < SuperTile<DataType>::dataStorageSize();
+2192              j += Block<DataType>::kDataStorageSize)
+```
+
+即 **plane → superTile → block 三层循环，每个 block 内部连续 16 个元素**。
+
+#### 66.1.3 ASCII 对比图（M=8, N=64, 16-bit）
+
+用 `M=8, N=64` 做一个刚好一个 tile 的干净例子。这个形状下（从 `perm3`/`dump3` 探针实测）：
+
+- tile = `[8 行 × 64 列]`
+- 4 个 subtile，每个 `[8 行 × 16 列]`
+- 32 个 block，每个 16 个元素
+
+**逻辑顺序（`toVector()`）** —— 行优先，一行 64 个数：
+
+```
+        col: 0    1    2    3   ...   63
+row 0:      0    1    2    3   ...   63
+row 1:     64   65   66   67   ...  127
+row 2:    128  129  130  131   ...  191
+row 3:    192  193  194  195   ...  255
+row 4:    256  257  258  259   ...  319
+row 5:    320  321  322  323   ...  383
+row 6:    384  385  386  387   ...  447
+row 7:    448  449  450  451   ...  511
+
+  gold_linear = [ 0, 1, 2, ..., 63, 64, 65, ..., 511 ]
+                 └──── row 0 ────┘ └──── row 1 ────┘
+```
+
+**物理顺序（`toVectorAsMemoryOrder()`）** —— 按 tile → subtile → block 走：
+
+```
+                        ┌──────────── Tile [8 x 64] ────────────┐
+                        │                                       │
+  memory[0..127]   =   subtile 0  =  cols  0..15, 全部 8 行
+  memory[128..255] =   subtile 1  =  cols 16..31, 全部 8 行
+  memory[256..383] =   subtile 2  =  cols 32..47, 全部 8 行
+  memory[384..511] =   subtile 3  =  cols 48..63, 全部 8 行
+
+  再往下，每个 subtile 内部是 8 个 block，每个 block 16 个元素（= 1 行的 16 列）:
+
+  memory[  0.. 15] = block 0 : row0, col 0..15      <- 第 0 个 subtile 的第 0 行
+  memory[ 16.. 31] = block 1 : row1, col 0..15
+  memory[ 32.. 47] = block 2 : row2, col 0..15
+     ...
+  memory[112..127] = block 7 : row7, col 0..15
+  memory[128..143] = block 8 : row0, col16..31      <- 第 1 个 subtile 重新从 row0 开始
+     ...
+```
+
+用探针 `dump3.cpp`（把逻辑索引当成值写进去，16-bit 输出可以精确表示）打印出的实际物理顺序，前 24 个是：
+
+```
+mem j:  0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
+       r0c0 r0c1 r0c2 r0c3 r0c4 r0c5 r0c6 r0c7 r0c8 r0c9 r0c10 r0c11 r0c12 r0c13 r0c14 r0c15
+mem j: 16   17   18   19   20   21   22   23  ...
+       r1c0 r1c1 r1c2 r1c3 r1c4 r1c5 r1c6 r1c7 ...
+```
+
+**`mem[16]` 是 `r1,c0`（逻辑索引 64），而逻辑序里 `index[16]` 是 `r0,c16`。** 这就是最直观的差别。
+
+**一图总结**（同一个 `[8,576]` 的 fp32 tensor，两种读法）：
+
+```
+                        ┌─────────────────────────────┐
+                        │   gold_tiled_tensor          │
+                        │   shape [8, 576]  tag=Tiled  │
+                        │   dtype = float32            │
+                        └──────────────┬──────────────┘
+                                       │
+              ┌────────────────────────┴────────────────────────┐
+              │                                                 │
+     .toVector()                                    .toVectorAsMemoryOrder(true)
+     （:2114，按 (row,col) 行优先）                    （:2141，按物理字节偏移）
+              │                                                 │
+              ▼                                                 ▼
+   ┌───────────────────────┐                     ┌───────────────────────┐
+   │  gold_linear          │                     │  gold_tiled           │
+   │  = [r0c0..r0c575,     │                     │  = [tile0.sub0.blk0.. │
+   │     r1c0..r1c575,     │                     │     tile0.sub0.blk7,  │
+   │     ...               │                     │     tile0.sub1.blk0..]│
+   │     r7c0..r7c575]     │                     │  每个 block 连续 16 个 │
+   └───────────────────────┘                     └───────────────────────┘
+      "数学上的顺序"                                  "内存里的顺序"
+```
+
+---
+
+### 66.2 问题 2：两者还能保证 bitwise 相同吗？
+
+**先把问题里的描述纠正一下。** 问题 2 说：
+
+> `gold_linear` 是 原始 fp32 tile tensor → fp16/bf16
+> `gold_tiled` 是 `gold_linear`(fp32) → `out_tensor_d`(fp16/bf16) → `gold_tiled`(fp32)
+
+按代码（`:69` 和 `:73`），**实际是**：
+
+```
+gold_linear = gold_tiled_tensor.toVector()          // float32 -> std::vector<float>，没有任何量化
+out_tensor_d = make_tensor<OutputT>(layout_d, gold_linear)  // vector<float> -> 量化成 bf16/fp16 并打包
+gold_tiled  = out_tensor_d.toVectorAsMemoryOrder(true)      // 反量化回 float，并按物理序排
+```
+
+所以**两条路径确实都从同一个 `gold_tiled_tensor`(fp32) 出发**，差别只在 `gold_tiled` 多走了 `OutputT` 这一趟。问题 2 的直觉是"多了精度往返，可能就不 bitwise 相同了"。
+
+**答案：两者不可能 bitwise 相同（因为顺序不同），但差异 100% 来自顺序置换，0% 来自精度。** 也就是说：
+
+> **`gold_tiled` 恰好等于 `(OutputT)gold_linear` 的一个精确置换。**
+
+实测（探针 `perm2.cpp`，用和测试完全相同的输入分布 `uniform(-100,100)`）：
+
+```
+### PRECISION bf16 M=8 N=576 K=1024
+  gold_linear.size=4608  gold_tiled.size=4608
+  multiset(gold_tiled) == multiset((OutputT)gold_linear) ?  YES  (exact permutation)
+  index-wise equal (logical vs physical): 0 / 4608
+  differ but value present elsewhere (pure reorder): 4608
+  differ and value NOT in the rounded set (precision-only): 0
+
+### PRECISION fp16 M=32 N=576 K=1024
+  gold_linear.size=18432  gold_tiled.size=18432
+  multiset(gold_tiled) == multiset((OutputT)gold_linear) ?  YES  (exact permutation)
+  index-wise equal (logical vs physical): 1 / 18432
+  differ but value present elsewhere (pure reorder): 18431
+  differ and value NOT in the rounded set (precision-only): 0
+```
+
+**关键那两行是 `precision-only: 0`** —— 每一个"看起来不一样"的位置，它的值都在 `(OutputT)gold_linear` 这个集合里找得到，只是换了位置。
+
+#### 66.2.1 为什么"精度往返"不会引入额外误差
+
+关键在 `toVectorAsMemoryOrder` 里那几行（`tensor.hpp:2203-2211`）：
+
+```cpp
+2203                      DataType aa = this->at(paddingCoord);
+2204                      if constexpr(kIsMxType)
+2205                      {
+2206                          buffer.emplace_back(aa.dequantize(0));
+2207                      }
+2208                      else
+2209                      {
+2210                          buffer.emplace_back((float)aa);
+2211                      }
+```
+
+**`aa` 是 `DataType`（这里就是 `OutputT` = bf16/fp16），先 `dequantize`/`cast` 成 `float` 再 push 进 vector。** 换句话说：
+
+- `gold_tiled[i]` 的值 = `(float)(OutputT)gold_linear[j]`，其中 `j` 是**某个**逻辑索引；
+- 而这**恰好就是**测试期望的语义 —— `:119` 的 `gold = static_cast<OutputT>(gold_tiled[i])` 和 `:121` 的 `gold = OutputT(gold_linear[i])` 想表达的也正是"kernel 吐出的 16-bit 值应该等于把 fp32 golden 舍入到 16-bit"。
+
+> 注意 `:2203-2211` 这段是**先取到 `OutputT` 再转 float**，而不是反过来的 "先转 float 再转 OutputT"。由于 `OutputT` 本身只有 16 bit，这个转换**不丢失任何信息**（float32 能精确表示所有 bf16/fp16 值）。所以这一趟 `OutputT → float` 是**无损的**，它不会在"舍入"之后再加一次误差。
+
+**结论**：那趟 `fp32 → OutputT → fp32` 的损失**只有一次舍入**（在 `:72` 的 `make_tensor<OutputT>` 里），发生在 `gold_linear` 被写进 `out_tensor_d` 的时候；之后再读出来纯粹是搬运。**两次导出方式共享同一次舍入**，所以它们的值集合完全相同。
+
+#### 66.2.2 那 `:121` 和 `:119` 到底在比什么？
+
+回到测试的对比逻辑（`test_bf16_mxi8_host.cpp:116-122`）：
+
+```cpp
+116  for (size_t i = 0; i < output_elements; ++i) {
+117      OutputT gold;
+118      if constexpr (LayoutC.tensor_format == 1) {
+119          gold = static_cast<OutputT>(gold_tiled[i]);
+120      } else {
+121          gold = OutputT(gold_linear[i]);
+122      }
+```
+
+- **`tensor_format == 1`（tiled 输出，即 R32 case）**：kernel 的输出 `d_C` 是**按物理序**摆放的，所以拿 `gold_tiled[i]`（物理序）来比；
+- **`tensor_format == 0`（linear 输出，即 R8 case）**：kernel 输出是**按逻辑序**摆放的，所以拿 `gold_linear[i]`（逻辑序）来比。
+
+**所以两个 golden 不是"两个都要用"，而是二选一** —— 取决于 `LayoutC.tensor_format`。`gold_linear` 和 `gold_tiled` 都算出来，是为了同时覆盖两种输出格式。
+
+> 这也解释了为什么测试能过：对 tiled 输出，比的是**物理序**；对 linear 输出，比的是**逻辑序**。两者各自的 `i` 都与 kernel 侧对齐。
+
+#### 66.2.3 顺带：这个例子的 fp16 走了运
+
+我在验证过程中发现一个**隐藏的脆弱点**，值得单独记一笔。测试的数据是 `uniform_real_distribution<float>(-100.0f, 100.0f)`（`test_bf16_mxi8_host.cpp:45-46`），而 mxint8 的量化步长是 1（实测 `magp.cpp`：round-trip 后 `min=-100.000 max=100.000`，元素精确到整数），K = 1024，所以单个输出的量级是：
+
+```
+单元素 ≈ 100，K=1024 项相加
+|C| ≈ 100 × 100 × sqrt(1024) ≈ 3.2e5   （随机游走估计）
+实测 fp16 case 确实大量溢出：
+   M=32 N=576 K=1024 : 18432 个输出，其中 10015 个在转成 fp16 后是 ±inf
+```
+
+**fp16 的最大有限值是 65504**（bf16 是 3.39e38，所以 bf16 case 0 个溢出）。**超过一半的 fp16 golden 变成了 `inf`。** 那测试为什么还能 PASS？因为错误公式（`:125-127`）：
+
+```cpp
+125  const float err_rate =
+126      (gold_f == 0.0f) ? std::fabs(result_f)
+127                       : std::fabs((gold_f - result_f) / gold_f);
+128  if (err_rate > 0.0f) {
+```
+
+当 `gold_f = ±inf` 时，`(gold_f - result_f) / gold_f` = `inf/inf` = **NaN**，而 **`NaN > 0.0f` 恒为 `false`**，所以这些位置**根本不参与判定**。我实测确认了这个行为：
+
+```
+inf  vs inf  : err_rate = NaN  (err>0)=false  -> **SILENTLY PASSES**
+inf  vs -inf : err_rate = NaN  (err>0)=false  -> **SILENTLY PASSES**
+-inf vs inf  : err_rate = NaN  (err>0)=false  -> **SILENTLY PASSES**
+inf  vs 1.0  : err_rate = NaN  (err>0)=false  -> **SILENTLY PASSES**
+```
+
+更量化的证据（探针 `final2.cpp`，把 kernel 输出人为设成全 0 来看测试能抓多少错）：
+
+```
+(c) M=8  N=576 K=1024 out=bf16 :  4608 个输出,  0 个 inf
+    errors vs identical output : 0       (期望 0，正确)
+    errors vs ALL-ZERO output  : 4608    (全抓到了)
+
+(c) M=32 N=576 K=1024 out=fp16 : 18432 个输出, 10015 个 inf   <- 54% 是 inf
+    errors vs identical output : 0       (期望 0，正确)
+    errors vs ALL-ZERO output  : 8417    (应该 ~18432，只抓到 46%)
+```
+
+**fp16 case 里，即使把 kernel 输出全设成 0，测试也只能发现 8417/18432 个错误 —— 另外 10015 个被 `inf` 屏蔽掉了。** 所以这个测试的 fp16 分支**实际只覆盖了 46% 的元素**。
+
+这不是本次提问的内容，但它是理解"为什么改了打印、golden 里有 inf 但测试仍 PASS"的关键。修法是给错误公式加 `std::isfinite` 检查，或者把输入幅度调小（比如 `uniform(-1, 1)`）让 K=1024 的部分和落在 fp16 范围内。
+
+---
+
+### 66.3 问题 3：`mm_mnk` 的第三个参数是输入还是输出？
+
+**答：是"输出"。** 更准确地说，它**只决定返回的 C 用什么 layout 造**，跟输入的 A/B 怎么读完全无关。
+
+看 `mm_mnk` 的实现（`tensor.hpp:2679`）：
+
+```cpp
+2679  auto __SITE_SIFMT_HOST__ __SITE_SIFMT_DEVICE__ mm_mnk(const TensorT1& t1,
+2680                                                        const TensorT2& t2,
+2681                                                        sipu::LayoutTag layoutTag = sipu::LayoutTag::Linear)
+2682  {
+2683      auto& a = const_cast<TensorT1&>(t1);
+2684      auto& b = const_cast<TensorT2&>(t2);
+2685      const auto& shapeA = a.layout().shape();       // <-- A 的 shape 来自 t1 自己
+2686      const auto& shapeB = b.layout().shape();       // <-- B 的 shape 来自 t2 自己
+```
+
+| 行 | 用了 `layoutTag` 吗？ | 说明 |
+| --- | --- | --- |
+| `2683-2686` | **没有** | 取 A/B 的 shape 用的是 `t1.layout()` / `t2.layout()`，即**每个 tensor 自己带的 layout** |
+| `2698-2699` | **没有** | `a.toVector()` / `b.toVector()` 内部用各自的 `mLayout`，跟参数无关 |
+| `2702` | 没有 | `shapeC = make_shape(shapeA[0], shapeB[0])` |
+| **`2703`** | **有** | `auto layoutC = sipu::make_layout(shapeC, layoutTag);` ← **唯一用到的地方** |
+| `2722` | — | `return make_tensor<sifmt::float32>(layoutC, buffer);` |
+
+**`tensor.hpp:2703` 是 `layoutTag` 在这个函数里的唯一使用点**，而且它只服务于 `:2722` 的返回值。
+
+函数上方的文档注释（`tensor.hpp:2667-2677`）也直接写了：
+
+```
+2667  /**
+2668   * @brief Matrix mul, always return float32 tensor with linear layout
+2669   * Mat A(m, k), Mat B(n, k), Mat C(m, n)
+2670   * C = A * (B^t)
+...
+2676   * @return Tensor<float32, LinearLayout>
+2677   */
+```
+
+**注意这里有个文档与实现不一致的地方**：注释说"always return ... with linear layout"、`@return Tensor<float32, LinearLayout>`，但 `:2703` 明明用的是 `layoutTag`（默认值确实是 `Linear`，但可以被调用者改）。**实际行为是"按第三个参数来"，不是"永远 linear"。** 所以本测试传 `Tiled` 是完全有效的 —— 它拿到的是 `tag=Tiled` 的 fp32 C，这也和 run.log 里打印的 `Layout: Layout[shape=[8,576], stride=[1,1], tag=Tiled]` 对上。
+
+我实测验证了 `layoutTag` 确实**不影响数值**（探针 `final2.cpp`）：
+
+```
+(b) mm_mnk(...,Tiled).toVector() == mm_mnk(...,Linear).toVector() ?  IDENTICAL
+    Tiled  C: storageSize  = 73728
+    Linear C: storageSize  = 73728
+```
+
+**两种 tag 下 `toVector()` 结果完全相同**，正是因为 `toVector()` 按逻辑序读、与存储格式无关。差异只体现在 `toVectorAsMemoryOrder()` 上（Linear 会直接 `return toVector()`，见 `tensor.hpp:2143-2146`）。
+
+#### 66.3.1 那为什么测试要传 `Tiled`？
+
+因为**这个测试要验证的是 tiled 输出的 kernel 路径**。看 `:82-83` 和 `:118-121`：
+
+```cpp
+ 82  const size_t output_elements =
+ 83      LayoutC.tensor_format == 1 ? gold_tiled.size() : gold_linear.size();
+...
+118  if constexpr (LayoutC.tensor_format == 1) {
+119      gold = static_cast<OutputT>(gold_tiled[i]);
+```
+
+`gold_tiled_tensor` 的 tag 必须和 `LayoutC.tensor_format` 代表的**输出格式**一致，`gold_tiled`（物理序）才能和 kernel 的输出 `d_C` **逐字节对齐**。R32 case 的 `kLayoutC_R32 = tensor_layout(16, 32, 1, 1, 1)` 最后一位是 1（tiled），所以 golden 也必须按 tiled / 物理序准备。
+
+> 换句话：`mm_mnk` 的第三个参数在这里**不是**"描述输入"，而正是"我期望的输出格式"。它和 `LayoutC` 配合，让 `gold_tiled` 的物理顺序与 device 侧 `d_C` 的物理顺序一致。
+
+#### 66.3.2 `layoutTag` 还会被用来做校验
+
+虽然在 `mm_mnk` 内部只用于建 C，但它**在函数早期还参与一次合法性检查**（`tensor.hpp:2687-2690`）：
+
+```cpp
+2687      if((shapeA[1] > shapeB[1]) || (layoutTag == sipu::LayoutTag::Manual))
+2688      {
+2689          SITE_CHECK(false, "Tensor B column size must be greater than or equal to A column size");
+2690      }
+```
+
+**传 `LayoutTag::Manual` 会直接触发 `SITE_CHECK(false, ...)`** —— 这个宏定义在 `SiTe/tensor/tensor.hpp:40-44`，展开后是 `if(!(cond)) { __builtin_trap(); }`，**直接 `__builtin_trap()` 让进程挂掉**（注意它和 `sipu::check` 不是一回事：后者在 `$SI_SDK_ROOT/include/deprecated.h:78`，会打印 `[ERROR] file:line - msg` 再 `std::abort()`）。所以 `Manual` 是被明确拒绝的，只能用 `Linear` / `Tiled`。
+
+---
+
+### 66.4 补充：padding 元素与 `hasPaddingData` 参数
+
+`toVectorAsMemoryOrder(bool hasPaddingData = false)` 有个默认参数（`tensor.hpp:2141`），`:2215-2221` 里当它为 `true` 时会把 block 里**没用到的位置填 `NaN`**：
+
+```cpp
+2215                      if(hasPaddingData)
+2216                      {
+2217                          for(int k = paddingFlag->second.size(); k < Block<DataType>::kElements; k++)
+2218                          {
+2219                              buffer.emplace_back(std::numeric_limits<float>::quiet_NaN());
+2220                          }
+2221                      }
+```
+
+**本测试传的是 `true`**（`:73`），所以 `gold_tiled` 的长度是**含 padding 的物理长度**。这也是为什么 `:82-83` 敢直接用 `gold_tiled.size()` 当 `output_elements` —— 它和 `d_C` 的实际字节数一致。
+
+什么时候会有 padding？我实测了规律（探针 `final2.cpp`）：
+
+```
+M=8, 16-bit:  N -> memory(true).size()
+  N= 64 ->  512   M*N= 512   roundup16= 64  match=YES
+  N= 65 ->  640   M*N= 520   roundup16= 80  match=YES   <- 多出 120 个
+  N= 80 ->  640   M*N= 640   roundup16= 80  match=YES
+  N= 81 ->  768   M*N= 648   roundup16= 96  match=YES   <- 多出 120 个
+  N= 88 ->  768   M*N= 704   roundup16= 96  match=YES
+  N= 96 ->  768   M*N= 768   roundup16= 96  match=YES
+  N=576 -> 4608   M*N=4608   roundup16=576  match=YES   <- 本例，无 padding
+```
+
+**规律是 `size = M × roundup(N, 16)`**（16 = 一个 block 的元素数，即 sub-tile 的列方向粒度）。本测试的 `N=576` 正好是 16 的整数倍（576 = 36×16），所以**没有任何 padding**，这也和 run.log 里 `gold_linear size:4608, gold_tiled size:4608` 完全吻合。
+
+作为对照，`N=88` 时会真的产生 NaN：
+
+```
+M=8 N=88 : logical=704 | memory(false)=704 | memory(true)=768 | NaN=64
+```
+
+**注意 `memory(false)` 返回 704，`memory(true)` 返回 768，差 64 个** —— 这就是 `hasPaddingData` 开关的实际效果。（`(false)` 不是简单地少，它是按 block 里实际存在的逻辑元素数拼的；`:2194-2198` 里未登记到 `paddingFlagForBlocks` 的 block 会被 `continue` 跳过。）
+
+---
+
+### 66.5 小结
+
+- **两种导出的区别是"读的顺序"，不是"读的内容"**：`Tensor::toVector`（`SiTe/tensor/tensor.hpp:2114`）按 `Shape::indexToCoord`（`:218`）的**行优先逻辑序**；`Tensor::toVectorAsMemoryOrder`（`:2141`）按 **plane → superTile → block 的物理偏移序**（`:2184-2192`）。对 tiled 存储，两者相差一个确定的置换。
+- **`gold_linear` 和 `gold_tiled` 不可能 bitwise 相同**（顺序不同），**但 `gold_tiled` 是 `(OutputT)gold_linear` 的精确置换** —— 实测多重集相等、`precision-only` 差异为 0。代码里那趟 `OutputT → float` 是**无损**的（`:2203-2211` 先取 `DataType` 再转 float，而 float32 能精确表达所有 16-bit 浮点值），所以"精度往返"的说法不成立：**只有一次舍入**（在 `:72` 写进 `out_tensor_d` 时），两条路径共享它。
+- **`mm_mnk` 的第三个参数是"输出"**：`tensor.hpp:2703` 是它在函数体里唯一的使用点，只用来给返回的 C 建 layout；A/B 的读取完全依赖各自的 `t1.layout()` / `t2.layout()`（`:2683-2699`）。函数注释（`:2676`）写"always return ... LinearLayout"与实现不符 —— 实现是"按参数来"。传 `Manual` 会触发 `:2687-2690` 的 `SITE_CHECK` 直接失败。
+- **顺带发现一个测试盲区**：fp16 case（M=32,N=576,K=1024）的 18432 个输出里有 **10015 个（54%）在转 fp16 时溢出成 `±inf`**，而错误公式（`:125-128`）的 `inf/inf = NaN`、`NaN > 0.0f` 恒为 false，这些位置**完全不参与判定**。实测把 kernel 输出全设成 0，测试只能抓到 8417/18432 个错误 —— **fp16 分支实际只覆盖了 46% 的元素**。bf16 case 没有这个问题（bf16 最大值 3.39e38，0 个溢出）。
+- 复现用的探针代码已放在 `mma_dte_tile_tensor/temp/probe_gold/`（`probe.cpp` 两种导出对比、`perm2.cpp` 精度置换验证、`dump3.cpp` 物理序图、`final2.cpp` padding 与 inf 盲区、`mag.cpp` mxint8 量级），全部在 `mma_dte_tile_tensor/temp/run.log` 那次构建的同一 SDK 下实测通过。
