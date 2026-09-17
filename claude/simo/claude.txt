@@ -4921,7 +4921,8 @@ BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 
 构建日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log.nodir
 
-# 在 逻辑上shape = 8 x 576 
+# 在 逻辑上shape = 8 x 576, tile format
+# 在 逻辑上shape = 32 x 576 
 
 32 x 576
 把答案追加到 like-useful/answer_codex_v4.md
