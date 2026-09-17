@@ -4884,10 +4884,14 @@ cd /share/users/like/package/sikernel/mma_dte_tile_tensor
 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test 
 
 构建日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log.nodir
+其中例子 build/testcase/test_bf16_mxi8_host 运行日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/run.log
 
 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp
-auto gold_linear = gold_tiled_tensor.toVector(); 按 按逻辑顺序导出 和auto gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true);  按 按物理内存顺序导出, 两种导出有什么区别 ？
+# auto gold_linear = gold_tiled_tensor.toVector(); 按 按逻辑顺序导出 和auto gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true);  按 按物理内存顺序导出, 两种导出有什么区别 ？
 
+# auto gold_linear = gold_tiled_tensor.toVector();  是从  原始fp32 tile tensor -> fp16/bf16, 
+  auto gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true);  是 gold_linear(fp32)-> out_tensor_d(fp16/bf16) -> gold_tiled(fp32), 除了经过 layout上的变化，还经过精度上 fp32 -> bf16/fp16 -> fp32 再次变换，gold_linear 和 gold_tiled 本身还能保证 bitwise 相同吗?
+#sipu::tensor::mm_mnk(mx_tensor_a, mx_tensor_b, sipu::LayoutTag::Tiled); sipu::LayoutTag::Tiled 是用来作为输入参数，表明输入tensor layout, 还是作为输出参数，表明输出tensor 要求的layout?
 讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。 讲解 mma_dte_tile_tensor 的代码时候，以 /share/users/like/package/sikernel/mma_dte_tile_tensor 代码为准， 这是最新 sikernel代码, vllm-sipu 更新代码不及时，没有用到新特性。
 把答案追加到 like-useful/answer_codex_v4.md
 }
