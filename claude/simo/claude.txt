@@ -4828,3 +4828,34 @@ BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。 讲解 mma_dte_tile_tensor 的代码时候，以 /share/users/like/package/sikernel/mma_dte_tile_tensor 代码为准， 这是最新 sikernel代码, vllm-sipu 更新代码不及时，没有用到新特性。
 把答案追加到 like-useful/answer_codex_v4.md
 }
+
+
+{
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/2609151958
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
+vllm-sipu 测试mxin8 gemm算子的例子在 vllm-sipu code base tests/kernels/quantization/test_mxint8_unpack_pytest.py
+
+mma_dte_tile_tensor 是 sikernel 的一个 submodule 
+最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
+其中有一个 submodule mma_dte_tile_tensor 位于 /share/users/like/package/sikernel/mma_dte_tile_tensor, 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
+其构建方式是 
+cd /share/users/like/package/sikernel/
+source setup.sh
+cd /share/users/like/package/sikernel/mma_dte_tile_tensor
+BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test 
+
+构建日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log.nodir
+# mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt, scc_target_get_output (tile_mma_dte_mxint8 TILE_MMA_DTE_MXINT8_O) 有什么功能, add_custom_target, mma_dte_test_enable_gtest 有什么功能?
+# 对 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt 逐行讲解,忽略注释
+讲解代码的时候要以 相对code base路径 + 行号 + 函数名的形式讲解,  普通函数的函数名就是函数名，类的成员函数的函数名是类::函数名形式。 讲解 mma_dte_tile_tensor 的代码时候，以 /share/users/like/package/sikernel/mma_dte_tile_tensor 代码为准， 这是最新 sikernel代码, vllm-sipu 更新代码不及时，没有用到新特性。
+把答案追加到 like-useful/answer_codex_v4.md
+}
+
