@@ -4921,9 +4921,24 @@ BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 
 构建日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log.nodir
 
-# 在 逻辑上shape = 8 x 576, tile format
-# 在 逻辑上shape = 32 x 576 
+在 /share/users/like/temp/sifmt/ 进行下面测试 ：
+test 1)
+构造一个vector<float> arr_A, 长度为  8 x 576,填充逻辑如下:
+for (int i = 0; i < 8*576; i++) {
+vector[i] = i;
+}, 
+然后  auto shape_a = sipu::make_shape(8, 576)
+auto layout_a = sipu::make_layout(shape_a, sipu::LayoutTag::Tiled);
+auto tile_tensor = sipu::make_tensor<simt::bfloat16>(layout_a, arr_A);
+把 arr_A 转换成一个tile tensor.
+然后把 tile_tensor 用 
+auto tile_tensor_to_vector = tile_tensor.toVector();
+auto tile_tensor_to_vector_physical = tile_tensor.toVectorAsMemoryOrder(true);
+导出两个vector.
+把两个 vector打印出来。576 个元素一行。
 
-32 x 576
+test 2) 把上面的 shape 8x576换成 32x576, 其他不变, sipu::make_tensor<simt::bfloat16>仍旧使用 bfloat16, 仍旧tile_tensor.toVector + tile_tensor.toVectorAsMemoryOrder导出2个 tensor打印，同上面1)
+然后编译运行
+
 把答案追加到 like-useful/answer_codex_v4.md
 }
