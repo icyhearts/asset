@@ -3412,3 +3412,222 @@ FP16 范围溢出的实现依据是 **SDK** `include/SiTe/sifmt/quantize/nonmx.h
 `mm_mnk` 的第三个 `LayoutTag::Tiled` 仅选择返回的 **FP32 CPU Tensor** 的存储 layout。它既不重设输入 A/B 的 layout，也不替代设备 `mma_dte` 的 `LayoutC`。
 
 本次已完成源码和日志核对、独立 CPU SiTe 验证，并追加本文；没有修改算子或测试源码，没有重新构建主库或运行设备 GEMM。
+
+## 10. SiTe uint16 Tiled Layout 与 CUTLASS CuTe Layout 对比验证（2026-09-17）
+
+### 10.1 验证文件和测试范围
+
+本次从 `temp/sifmt/test_sifmt_uint16_layout.cpp` 复制出：
+
+```text
+temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp
+```
+
+原来的逻辑保持不变：
+
+- `test_sifmt_uint16_layout_vs_cute_layout.cpp:144 / run_test` 创建 `std::vector<uint16_t>`。
+- `test_sifmt_uint16_layout_vs_cute_layout.cpp:145 / run_test` 遍历完整逻辑范围。
+- `test_sifmt_uint16_layout_vs_cute_layout.cpp:146 / run_test` 填充 `arr_A[i] = i`。
+- `test_sifmt_uint16_layout_vs_cute_layout.cpp:149 / run_test` 构造 SiTe `sifmt::uint16` tiled Tensor。
+- `test_sifmt_uint16_layout_vs_cute_layout.cpp:150 / run_test` 导出 logical vector。
+- `test_sifmt_uint16_layout_vs_cute_layout.cpp:151 / run_test` 导出 physical memory-order vector。
+- `test_sifmt_uint16_layout_vs_cute_layout.cpp:159 / run_test` 仍保留原有 vector 打印。
+
+新增比较覆盖两个 shape：
+
+```text
+8 x 576:  4608 logical indices
+32 x 576: 18432 logical indices
+```
+
+### 10.2 CuTe Layout API 的使用方式
+
+CUTLASS 本地实现位于 `include/cute/layout.hpp`，相关接口为：
+
+| 相对 CUTLASS 路径:行号 / 函数或类型 | 作用 |
+|---|---|
+| `include/cute/layout.hpp:47 / cute::Shape` | `cute::tuple` 的 shape 别名 |
+| `include/cute/layout.hpp:56 / cute::Coord` | `cute::tuple` 的 coordinate 别名 |
+| `include/cute/layout.hpp:64 / cute::make_shape` | 构造可能嵌套的 shape |
+| `include/cute/layout.hpp:70 / cute::make_stride` | 构造与 shape 对应的 stride |
+| `include/cute/layout.hpp:98 / cute::Layout` | 保存 shape 与 stride 的 layout 类型 |
+| `include/cute/layout.hpp:161 / cute::Layout::operator()` | 接收 coordinate，并在第 171 行调用 `crd2idx` 得到 linear physical index |
+| `include/cute/layout.hpp:332 / cute::make_layout` | 用 shape 与 stride 创建 `cute::Layout` |
+| `include/cute/stride.hpp:47 / cute::crd2idx` | 对整数或嵌套 tuple coordinate 执行 coordinate-to-index 映射 |
+| `include/cute/stride.hpp:52 / cute::crd2idx` | 当 coordinate 是整数、shape/stride 是 tuple 时，对 logical mode 做 div/mod 分解 |
+| `include/cute/stride.hpp:54 / cute::crd2idx` | 当 coordinate、shape、stride 都是 tuple 时，分别计算每个 mode 并求和 |
+
+因此本验证没有假设 CuTe `Layout` 的 `operator()` 能直接接收 SiTe 的扁平 `(row,col)` 并用一组二维常量 stride 完成映射。SiTe 物理 index 含有：
+
+```text
+tile_n      = col / tile_width
+subtile_n   = (col % tile_width) / block_width
+element_n   = col % block_width
+```
+
+所以用 CuTe 的嵌套 shape/stride 表示分解后的 coordinate，再让 `cute::Layout::operator()` 计算 physical index。这仍是标准 CuTe Layout 映射，只是 logical coordinate 使用层次形式。
+
+### 10.3 8x576 的 CuTe Layout
+
+新增代码位于 `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:37 / make_cute_layout` 至第 41 行：
+
+```cpp
+shape  = (8, (9, 4, 16))
+stride = (16, (512, 128, 1))
+```
+
+逻辑坐标在 `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:55 / make_cute_coord` 至第 59 行构造成：
+
+```cpp
+coord = (row, (col / 64, (col % 64) / 16, col % 16))
+```
+
+CuTe `operator()` 的结果为：
+
+```text
+P8(row,col)
+  = row * 16
+  + (col / 64) * 512
+  + ((col % 64) / 16) * 128
+  + (col % 16)
+```
+
+这等价于 SiTe 当前 16-bit、M=8、tile `[8,64]` 的 physical 顺序：
+
+```text
+tile0/subtile0: [0,0..15], [1,0..15], ..., [7,0..15]
+tile0/subtile1: [0,16..31], ..., [7,16..31]
+tile0/subtile2: [0,32..47], ..., [7,32..47]
+tile0/subtile3: [0,48..63], ..., [7,48..63]
+tile1:         columns 64..127
+...
+```
+
+### 10.4 32x576 的 CuTe Layout
+
+新增代码位于 `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:42 / make_cute_layout` 至第 47 行：
+
+```cpp
+shape  = ((4, 8), (36, 16))
+stride = ((128, 16), (512, 1))
+```
+
+逻辑坐标在 `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:60 / make_cute_coord` 至第 62 行构造成：
+
+```cpp
+coord = ((row / 8, row % 8), (col / 16, col % 16))
+```
+
+CuTe `operator()` 的结果为：
+
+```text
+P32(row,col)
+  = (row / 8) * 128
+  + (row % 8) * 16
+  + (col / 16) * 512
+  + (col % 16)
+```
+
+这等价于 SiTe 当前 16-bit、M=32、tile `[32,16]` 的 physical 顺序：
+
+```text
+tile0: [0,0..15], [1,0..15], ..., [31,0..15]
+tile1: [0,16..31], [1,16..31], ..., [31,16..31]
+tile2: columns 32..47
+...
+```
+
+### 10.5 逐 logical index 的实际比较
+
+比较函数位于 `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:66 / compare_with_cute`：
+
+| 相对路径:行号 / 函数名 | 行为 |
+|---|---|
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:69 / compare_with_cute` | 创建当前 shape 对应的 CuTe layout |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:73 / compare_with_cute` | 从 `logical_index=0` 遍历到 logical vector 末尾，覆盖全部逻辑元素 |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:75 / compare_with_cute` | 计算 `row = logical_index / 576` |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:76 / compare_with_cute` | 计算 `col = logical_index % 576` |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:77 / compare_with_cute` | 将 flat `(row,col)` 拆成 CuTe 层次 coordinate |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:78 / compare_with_cute` | 调用 `cute_layout(cute_coord)`，得到 physical index |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:81 / compare_with_cute` | 检查 CuTe physical index 是否超出 SiTe physical vector |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:86 / compare_with_cute` | 从 SiTe logical vector 取当前 logical value，并转换为 `uint16_t` |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:88 / compare_with_cute` | 用 CuTe physical index 索引 SiTe physical vector，并转换为 `uint16_t` |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:90 / compare_with_cute` | 比较两个 `uint16_t` value；不相等时记录 mismatch |
+| `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:102 / compare_with_cute` | 输出当前 shape 的元素数、mismatch 数、越界数和最终结果 |
+
+比较逻辑对应用户要求的关系：
+
+```text
+site_logical_index_value
+    = tile_tensor_to_vector[logical_index]
+
+cute_physical_index
+    = cute_layout(cute_coord(row, col))
+
+cute_index_value
+    = tile_tensor_to_vector_physical[cute_physical_index]
+
+compare(cute_index_value, site_logical_index_value)
+```
+
+当前两个 SiTe exporter 返回类型实际是 `std::vector<float>`；由于 Tensor 中存的是 `sifmt::uint16`，这些 float 是精确的整数值。代码在 `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:86 / compare_with_cute` 和第 88 行显式转换成 `uint16_t` 后比较，避免把本次验证误解为 BF16/FP16 浮点误差比较。
+
+### 10.6 编译命令
+
+第一次没有 CUDA include 路径的编译命令会在 CUTLASS `include/cute/util/debug.hpp:38 / include` 因找不到 `cuda_runtime_api.h` 失败。最终成功编译命令为：
+
+```bash
+cd /share/users/like/temp/sifmt
+env SI_SDK_ROOT=/share_data/sicx_sdk/release/2609151958 \
+  /usr/bin/c++ \
+  -std=c++20 -O2 \
+  -DSITE_TARGET_SIPU_ARCH=150 \
+  -DTARGET_SIPU_ARCH=150 \
+  -I/share_data/sicx_sdk/release/2609151958/include/SiTe \
+  -I/share/users/like/package/cutlass/include \
+  -I/usr/local/cuda-12.8/include \
+  test_sifmt_uint16_layout_vs_cute_layout.cpp \
+  -o test_sifmt_uint16_layout_vs_cute_layout
+```
+
+运行命令为：
+
+```bash
+cd /share/users/like/temp/sifmt
+./test_sifmt_uint16_layout_vs_cute_layout > run_vs_cute.log 2>&1
+```
+
+这里使用的是 CUTLASS 本地头文件，不需要编译或链接 CUDA kernel；CuTe layout 的这部分代码可以由 host C++ 编译器实例化。CUDA include 目录只是满足 CUTLASS 的公共 debug/config 头文件依赖。
+
+### 10.7 实际运行结果
+
+运行日志位于：
+
+```text
+temp/sifmt/run_vs_cute.log
+```
+
+关键结果在日志第 21 行和第 93 行：
+
+```text
+cute_layout_compare shape=8x576 \
+  logical_elements=4608 physical_elements=4608 \
+  mismatches=0 out_of_range=0 result=PASS
+
+cute_layout_compare shape=32x576 \
+  logical_elements=18432 physical_elements=18432 \
+  mismatches=0 out_of_range=0 result=PASS
+```
+
+本次比较覆盖：
+
+| shape | logical index 范围 | physical vector 长度 | mismatch | 越界 | 结论 |
+|---|---:|---:|---:|---:|---|
+| `8x576` | `0..4607` | 4608 | 0 | 0 | PASS |
+| `32x576` | `0..18431` | 18432 | 0 | 0 | PASS |
+
+因此，在本次验证的两个完整 shape、`sifmt::uint16`、SIPU 1.5/`SITE_TARGET_SIPU_ARCH=150` 布局条件下，SiTe 的 tiled physical layout **可以用 CUTLASS CuTe Layout 表示**。更准确地说，是用嵌套的 shape/stride 和对应的层次 coordinate 表示；不是用一个扁平二维 `(M,N):(stride_m,stride_n)` affine layout 直接表示。
+
+`temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:84 / main` 运行 `run_test<8>` 和 `run_test<32>`；原始 vector 的打印也仍然保留，physical vector 现在每个 tile 打印一行，每个 element 宽度为 5 个字符。
+
+本次追加只修改了 `/share/users/like/temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp` 和本答案文档，没有修改 CUTLASS、SiTe SDK 或 mma_dte_tile_tensor 源码。
