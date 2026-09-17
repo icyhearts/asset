@@ -2552,3 +2552,367 @@ void __device_stub__kernel_tile_mma_procon_v2_tiled_tensor_map<...> 定义数：
 因此，只拷贝 `test_bf16_mxi8_host` 文件并不能保证换目录后独立运行，还需要这份局部 `.so` 和兼容的 SIPU runtime，并确保动态库搜索路径有效。
 
 本次旧日志和已存在产物使用 `2609161442`，编译 flags 还出现 `siinfer_dev` 路径；不能据此宣称题目指定的 `2609020046/vllm_dev` 组合已完成构建或设备测试。这里的源码解释已按指定 SDK 定位，动态链接结论则由旧日志和当前 ELF 分别验证，二者的范围没有混用。
+
+## 8. MXINT8 Host 测试 CMake 逐行说明与三个关键命令（2026-09-17）
+
+### 8.1 范围与结论
+
+本节依据本次读取的文件，不沿用旧版本的行号。根目录约定如下：
+
+| 标记 | 相对路径所对应的根目录 |
+|---|---|
+| **DTE** | `/share/users/like/package/sikernel/mma_dte_tile_tensor`，以下未加标记的项目源码路径均相对该目录 |
+| **SDK** | `/share_data/sicx_sdk/release/2609151958`，题目指定版本 |
+| **CMAKE** | `/share_data/users/like/package/h100/package/cmake/github/cmake-4.2.0-rc2-linux-x86_64/share/cmake-4.2`，日志使用的 CMake 安装所带模块和文档 |
+| **GTEST** | `/usr/src/googletest`，本机 GoogleTest 源码 |
+
+**版本区别：**`temp/cxx.log.nodir:15` 记录的是 `BUILD_MODE=test`；`:18`、`:26` 和 `:5781` 显示该次实际 SDK 是 **2609161442**，不是题目指定的 **2609151958**。本节以 2609151958 定位 SCC 函数；只读比较确认这两个 SDK 的 `share/cmake/scc/sccConfig.cmake` 内容完全相同，所以这里的 SCC CMake 行号和行为也一致。不能由此推断两个 SDK 的编译器、头文件或运行库全部相同。
+
+三个重点命令的直接答案：
+
+| 调用位置 / 函数名或 CMake 命令名 | 本例作用 |
+|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:50 / scc_target_get_output` | 读取 SCC target 保存的输出路径，把本例 `.su.o` 的绝对路径写入变量 `TILE_MMA_DTE_MXINT8_O`；**不执行编译或链接** |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:60 / add_custom_target` | 创建名为 `tile_mma_dte_mxint8_so` 的构建入口，使默认构建检查并按需生成局部 `.so`；**这个 target 本身不是共享库文件，也不是原生 SHARED library target** |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:81 / mma_dte_test_enable_gtest` | 找到并链接 GoogleTest 与默认 `main()`，通过 `gtest_discover_tests(... DISCOVERY_MODE PRE_TEST)` 接入 CTest；**不在这一行立即运行 GEMM 测试** |
+
+完整构建结果仍是：**测试专用 `.su` -> SCC 编译 `.o` -> 普通 C++ 编译器链接测试专用 `.so` -> host executable 动态链接该 `.so`。**不是链接整个主库 `libtile_mma_dte.so`。
+
+### 8.2 scc_target_get_output 到底取出什么
+
+调用点是 `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:50 / scc_target_get_output`：
+
+```cmake
+scc_target_get_output(tile_mma_dte_mxint8 TILE_MMA_DTE_MXINT8_O)
+```
+
+这里两个参数的身份不同：`tile_mma_dte_mxint8` 是已经定义的 target 名；`TILE_MMA_DTE_MXINT8_O` 是接收结果的**变量名**，不是文件名，也不是另一个 target。传入变量名而不是 `${TILE_MMA_DTE_MXINT8_O}`，是为了让函数给调用者设置这个变量。
+
+**SDK** `share/cmake/scc/sccConfig.cmake:876 / scc_target_get_output` 的实际步骤：
+
+| 实现位置 / 函数名 | 行为 |
+|---|---|
+| `share/cmake/scc/sccConfig.cmake:878 / scc_target_get_output` | 检查 target 参数非空 |
+| `share/cmake/scc/sccConfig.cmake:883 / scc_target_get_output` | 检查输出变量名非空 |
+| `share/cmake/scc/sccConfig.cmake:888 / scc_target_get_output` | 用 `get_target_property` 读取 target 的 `SIPU_LIBRARY_TYPE` 属性 |
+| `share/cmake/scc/sccConfig.cmake:891 / scc_target_get_output` | 如果类型是 `OBJECT`，进入本例使用的分支 |
+| `share/cmake/scc/sccConfig.cmake:892 / scc_target_get_output` | 从 `SIPU_OBJECT_FILES` 属性读取 object 路径列表 |
+| `share/cmake/scc/sccConfig.cmake:893 / scc_target_get_output` | 属性为空时报错；这里不是逐个检查 `.o` 文件是否已经存在 |
+| `share/cmake/scc/sccConfig.cmake:899 / scc_target_get_output` | `set(${OUTPUT_VARIABLE} ${OBJ_FILES} PARENT_SCOPE)`：把列表写回调用者作用域，不是写入 Cache |
+| `share/cmake/scc/sccConfig.cmake:905 / scc_target_get_output` | 非 OBJECT 分支读取 `SIPU_OUTPUT_FILE`，再在第 912 行写回；可用于取共享库、静态库或 executable 的单个输出路径 |
+
+**这些路径为什么在编译之前就已知？**
+
+**SDK** `share/cmake/scc/sccConfig.cmake:311 / scc_add_library` 在 CMake 配置阶段就构造了输出路径，并创建将来执行的编译规则：
+
+| 实现位置 / 函数名 | 本例结果 |
+|---|---|
+| `share/cmake/scc/sccConfig.cmake:347 / scc_add_library` | 识别调用参数 `OBJECT`，设置 `LIBRARY_TYPE=OBJECT` |
+| `share/cmake/scc/sccConfig.cmake:426 / scc_add_library` | 根据 source 相对路径，构造 `${CMAKE_CURRENT_BINARY_DIR}/_SipuObj/${TARGET}/${REL_SOURCE_SAFE}.o` |
+| `share/cmake/scc/sccConfig.cmake:431 / scc_add_library` | 建立 `scc ... -c ...` 的 `add_custom_command(OUTPUT ...)`；第 439、440 行同时记录源文件依赖和编译器生成的 `.d` 依赖文件 |
+| `share/cmake/scc/sccConfig.cmake:449 / scc_add_library` | OBJECT 模式实际创建的是 `add_custom_target(${TARGET} ALL DEPENDS ${OBJECT_FILES})` |
+| `share/cmake/scc/sccConfig.cmake:492 / scc_add_library` | 保存 `SIPU_SOURCE_FILES`、`SIPU_OBJECT_FILES`、`SIPU_COMPILER_OPTIONS`、`SIPU_LIBRARY_TYPE` 等自定义 target 属性 |
+
+所以，本例默认 source 只有一个时，返回的列表只有一个元素：
+
+```text
+TILE_MMA_DTE_MXINT8_O =
+  <当前测试子项目的 build 目录>/_SipuObj/tile_mma_dte_mxint8/kernel/inst_bf16_mxi8.su.o
+```
+
+它返回的是**约定的输出位置**，不是通过扫描磁盘找到已经编好的文件。未来 target 含多个源文件时，这个变量可以是多个 `.o` 路径组成的 CMake 列表，后面的 `${TILE_MMA_DTE_MXINT8_O}` 会把它们作为多个参数展开。
+
+还要注意：本 SDK 的 `scc_add_library(... OBJECT ...)` **不是**对 CMake 原生 `add_library(... OBJECT ...)` 的简单转发。因此应使用 SDK 的 `scc_target_get_output` 取它的 object 路径，不能把它直接当成原生 OBJECT library，照搬 `$<TARGET_OBJECTS:tile_mma_dte_mxint8>`。
+
+### 8.3 add_custom_command、add_custom_target 与 add_dependencies 的分工
+
+本例相关代码分别在：
+
+- `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:52 / add_custom_command`：定义“如何生成 `.so`”的文件生成规则。
+- `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:60 / add_custom_target`：创建可被默认构建或其他 target 请求的入口。
+- `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:79 / add_dependencies`：让 host executable 的构建依赖上述入口。
+
+#### 8.3.1 add_custom_command 负责实际的链接命令
+
+```cmake
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libtile_mma_dte_mxint8.so
+    COMMAND ${CMAKE_CXX_COMPILER} -shared -o ${CMAKE_CURRENT_BINARY_DIR}/libtile_mma_dte_mxint8.so
+        ${TILE_MMA_DTE_MXINT8_O}
+    DEPENDS tile_mma_dte_mxint8 ${TILE_MMA_DTE_MXINT8_O}
+    COMMENT "Linking libtile_mma_dte_mxint8.so"
+)
+```
+
+这段是在配置时**登记规则**。真正执行 `${CMAKE_CXX_COMPILER}` 是之后的 build 阶段。本例由脚本选中 `/usr/bin/c++` 后，核心命令就是：
+
+```text
+/usr/bin/c++ -shared -o <build>/libtile_mma_dte_mxint8.so <build>/_SipuObj/.../inst_bf16_mxi8.su.o
+```
+
+`testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:56 / add_custom_command` 同时写 target 和 object 文件，目的不同：
+
+| DEPENDS 项 | 作用 |
+|---|---|
+| `tile_mma_dte_mxint8` | target 级依赖，保证 SCC object 构建目标先完成 |
+| `${TILE_MMA_DTE_MXINT8_O}` | 文件级依赖，object 更新后使 `.so` 需要重新链接 |
+
+这不是把同一件事重复写两次。尤其本例的 SCC OBJECT target 实际是 custom target，没有一个原生 library 输出可供 CMake 自动当作文件依赖，所以显式列出 `.o` 很重要。CMake 通用规则对应 **CMAKE** `Help/command/add_custom_command.rst:163 / add_custom_command` 的 `DEPENDS` 定义。
+
+#### 8.3.2 add_custom_target 提供构建入口，不等于每次重链
+
+```cmake
+add_custom_target(tile_mma_dte_mxint8_so ALL
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/libtile_mma_dte_mxint8.so
+)
+```
+
+`testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:60 / add_custom_target` 的含义是：
+
+1. 创建 target `tile_mma_dte_mxint8_so`。它是构建图中的节点，不会产生同名 executable，也不会自动按名字创建 `.so`。
+2. `ALL` 把它加入**当前子项目的默认构建目标**，不是“编译主库的全部 kernels”。即使不显式指定 `--target tile_mma_dte_mxint8_so`，默认 build 也会检查它。
+3. `DEPENDS` 要求 `.so` 存在且满足依赖；如果缺失或 object 更新，由第 52 行的规则重新生成。
+4. 这里没有写 `COMMAND`。custom target 本身总是被视为需要处理，但它依赖的 `.so` 是有时间戳的文件，**并不因为 target 带 `ALL` 就每次执行链接命令**。
+
+CMake 的对应说明位于 **CMAKE** `Help/command/add_custom_target.rst:20 / add_custom_target`、`:30 / add_custom_target`。现有生成物也能验证：在当前测试子构建目录的 `CMakeFiles/tile_mma_dte_mxint8_so.dir/build.make:69`，入口依赖 `.so`；`:71` 是 `.so` 对 `.o` 的文件依赖；`:73` 才是链接命令；`:81` 把入口标为 `.PHONY`。这些是生成的 Make 规则，不是 CMake 函数定义。
+
+#### 8.3.3 链接库和构建顺序不能混为一谈
+
+`testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:74 / target_link_libraries` 告诉 linker：host executable 要链接哪个 `.so` 和哪些 runtime 库。
+
+`testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:79 / add_dependencies` 则明确告诉 build system：先完成 `tile_mma_dte_mxint8_so` 这个构建目标，再构建依赖它的 executable。它本身不添加 `-l` 参数，也不把 `.so` 内容复制到 executable。
+
+这里没有 `add_library(tile_mma_dte_mxint8_so SHARED ...)`。因此不能把 `tile_mma_dte_mxint8_so` 当成一个原生库 target 去调用 `target_link_libraries`；当前代码选择把实际 `.so` 路径列入链接输入。
+
+### 8.4 mma_dte_test_enable_gtest 的完整作用
+
+`testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:81 / mma_dte_test_enable_gtest` 调用的不是 CMake 内建函数，而是项目自定义函数。其定义在 `testcase/func_test/CMakeMmaDteCommon.cmake:352 / mma_dte_test_enable_gtest`：
+
+```cmake
+function(mma_dte_test_enable_gtest target_name)
+    find_package(GTest REQUIRED)
+    include(GoogleTest)
+    target_link_libraries(${target_name} PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+    )
+    gtest_discover_tests(${target_name}
+        DISCOVERY_MODE PRE_TEST
+    )
+endfunction()
+```
+
+| 实现位置 / 函数名 | 本例作用 |
+|---|---|
+| `testcase/func_test/CMakeMmaDteCommon.cmake:352 / mma_dte_test_enable_gtest` | 定义函数，接收已有 target 的名称 `test_bf16_mxi8_host` |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:353 / mma_dte_test_enable_gtest` | `find_package(GTest REQUIRED)` 查找 GoogleTest，找不到则配置失败；这里没有下载或源码构建 GoogleTest 的逻辑 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:354 / mma_dte_test_enable_gtest` | 加载 CMake 的 `GoogleTest` 模块，以获得 `gtest_discover_tests` 等 CMake 函数；不是 C++ 的 `#include <gtest/gtest.h>` |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:355 / mma_dte_test_enable_gtest` | 为 host target 增加 PRIVATE 链接依赖，不覆盖前面已经添加的局部 `.so`、`sipurt`、`sipu` |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:356 / mma_dte_test_enable_gtest` | `GTest::gtest` 是 GoogleTest 核心 imported target，提供断言、测试注册和运行框架及对应使用要求 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:357 / mma_dte_test_enable_gtest` | `GTest::gtest_main` 提供默认 `main()`，所以测试 `.cpp` 不必自己写主函数 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:358 / mma_dte_test_enable_gtest` | 结束本次 `target_link_libraries` 参数列表 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:359 / mma_dte_test_enable_gtest` | 注册针对该 executable 的 GoogleTest 测试发现机制，使每个测试用例可以作为独立 CTest 条目 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:360 / mma_dte_test_enable_gtest` | `DISCOVERY_MODE PRE_TEST`：把测试发现延迟到 CTest 准备测试时，不在 executable 刚链接完后立即发现 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:361 / mma_dte_test_enable_gtest` | 结束 `gtest_discover_tests` 参数列表 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:362 / mma_dte_test_enable_gtest` | 结束函数定义 |
+
+默认主函数可直接核对 **GTEST** `googletest/src/gtest_main.cc:49 / main`：调用 `testing::InitGoogleTest(&argc, argv)`，然后返回 `RUN_ALL_TESTS()` 的结果。
+
+#### 8.4.1 PRE_TEST 是“延迟发现”，不是“提前执行 GEMM”
+
+**CMAKE** `Modules/GoogleTest.cmake:552 / gtest_discover_tests` 是实际模块函数；`:718 / gtest_discover_tests` 是 PRE_TEST 分支。它生成供 CTest 读取的脚本，在需要更新测试列表时调用 executable，核心参数是：
+
+```text
+test_bf16_mxi8_host --gtest_list_tests
+```
+
+实际执行列表查询的位置是 **CMAKE** `Modules/GoogleTestAddTests.cmake:360 / gtest_discover_tests_impl`。列表查询不执行 `TEST_F` 测试体，但 executable 必须能够启动，因此它需要的动态库和初始化环境仍须可用。不能把 PRE_TEST 理解成“不再需要 SIPU runtime”。
+
+本例当前测试体位于：
+
+- `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:146 / TEST_F(MmaDteBf16Mxint8Test, ComputesDefaultShape)`。
+- `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:152 / TEST_F(MmaDteFloat16Mxint8Test, ComputesDefaultShape)`。
+
+上面的 `TEST_F` 是 GoogleTest 宏，不是手写类成员函数名。发现后的 CTest 名称分别是 `MmaDteBf16Mxint8Test.ComputesDefaultShape` 和 `MmaDteFloat16Mxint8Test.ComputesDefaultShape`；正式执行时才按对应 `--gtest_filter` 运行测试体。
+
+`enable_testing()` 已在 `testcase/func_test/CMakeMmaDteCommon.cmake:74 / enable_testing` 调用。还需区分：`build-modify.sh:105 / build_testcases` 执行的是 CMake configure/build，并没有运行 `ctest`。所以 `bash build-modify.sh --test` 中的 `--test` 表示**构建测试项目**，不能单凭构建成功认定这些 GEMM 用例已运行通过。
+
+#### 8.4.2 为什么日志出现 discovery mode 变量未使用的警告
+
+`temp/cxx.log.nodir:5740` 给子项目传了 `-DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE:STRING=PRE_TEST`，但 `:5756` 至 `:5759` 警告这个变量未使用。
+
+原因可直接从实现解释：**CMAKE** `Modules/GoogleTest.cmake:585 / gtest_discover_tests` 只有在调用者**没有显式指定** `DISCOVERY_MODE` 时才读取这个默认变量。项目 helper 在 `testcase/func_test/CMakeMmaDteCommon.cmake:360 / mma_dte_test_enable_gtest` 已明确传入 `PRE_TEST`，所以本调用不需要读取 Cache 中的默认值。
+
+因此，该警告不表示 PRE_TEST 失效，也不是链接失败。当前子构建目录的 `test_bf16_mxi8_host[1]_include.cmake:1` 起确实生成了“检查 executable 与测试列表时间戳，再发现测试”的 PRE_TEST 脚本；这里是生成脚本行号，不是源函数定义。
+
+### 8.5 CMakeLists.txt 逐行说明，跳过注释和空行
+
+以下覆盖 `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt` 的全部非注释、非空行。CMake 顶层不是 C++ 类成员函数，因此使用“相对路径:行号 / CMake 命令或函数名”；跨行参数和结束括号按其所属命令标注。第 57 行 `COMMENT` 是有效参数，**不是 `#` 注释**，仍需解释。
+
+#### 8.5.1 第 2 至 16 行：项目和路径
+
+| 相对路径:行号 / 命令名 | 代码及作用 |
+|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:2 / cmake_minimum_required` | `cmake_minimum_required(VERSION 3.27)`：要求 CMake 至少为 3.27，并设置相应 policy 基线；不是要求 C++ 编译器版本为 3.27 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:3 / set` | `set(CMAKE_CXX_STANDARD 20)`：为后续原生 C++ targets 初始化 C++20 标准设置。日志中的 host 编译因此有 `-std=gnu++20`；不要据此认为自定义 SCC 命令自动继承这项设置 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:6 / project` | `project(mma_dte_mxint8_test`：开始定义 CMake 项目，项目名为 `mma_dte_mxint8_test`；它不是 executable target 的名字 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:7 / project` | `VERSION 1.0.0`：设置项目版本信息，不表示 SDK、GEMM 算法或 GoogleTest 的版本 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:8 / project` | `DESCRIPTION "MMA DTE Tiled Tensor - MXINT8 Test"`：设置项目描述元数据 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:9 / project` | `LANGUAGES CXX`：启用 C++ 语言及 host 编译器检测；没有在这里把 SIPU 注册成 CMake 原生语言，`.su` 后面由 SCC helper 的自定义命令处理 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:10 / project` | `)`：结束 `project` 参数列表 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:12 / find_package` | `find_package(scc REQUIRED)`：加载 SCC CMake 包，提供 `scc_add_library`、`scc_target_*` 等函数；找不到包则停止配置。这一行不是开始编译 kernel |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:13 / include` | 加载并执行同级上一层的 `CMakeMmaDteCommon.cmake`；它既定义 helper，也立即执行查找 DTE 根目录、选择架构/dispatch family、设置 SDK 链接目录、启用 CTest 等配置 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:16 / set` | `set(FUNC_TEST_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernel")`：把测试源码目录下的 `kernel` 子目录保存为普通变量；这是源码路径，不是输出目录 |
+
+第 12 行使用的 **SDK** `share/cmake/scc/sccConfig.cmake:19 / set` 从环境变量 `SI_SDK_ROOT` 设置 `SCC_ROOT`；`:33 / find_program` 在未预设 `SCC_EXECUTABLE` 时查找 SDK 的 `bin/scc`。`scc_DIR`、`SI_SDK_ROOT` 和缓存的 `SCC_EXECUTABLE` 应保持一致；只在文字中指定 SDK 路径不会改变已有 CMake Cache。
+
+#### 8.5.2 第 19 至 36 行：编译配置
+
+| 相对路径:行号 / 命令名 | 代码及作用 |
+|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:19 / option` | `option(MMA_DTE_GENERIC_TAIL "..." OFF)`：定义默认关闭的布尔配置项；开启后由第 34 行加入宏，使 dispatch 选择 generic tail 路径 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:20 / set` | `set(TEST_GRID_DIM "16" CACHE STRING`：定义可缓存的字符串配置，默认值 16；它随后被拼成编译宏，不是 `-j16` 编译并行度，也不是 GPU 设备编号 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:21 / set` | `"Test-only grid dim ...")`：给上述 Cache 项设置说明并结束 `set`；这段字符串不是传给 SCC 的参数 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:22 / set` | `set(TEST_ENABLE_DEBUG_PRINT OFF CACHE BOOL`：定义默认关闭的调试打印布尔配置 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:23 / set` | 给 `TEST_ENABLE_DEBUG_PRINT` 设置 Cache 说明并结束 `set` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:24 / mma_dte_test_setup_compile_options` | 调用公共 helper，将后续参数与公共宏合并，写回普通列表变量 `COMMON_COMPILE_OPTIONS`；这里仍未编译 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:25 / mma_dte_test_setup_compile_options` | `-DSIRT_DEVICE_USE_PRINTF`：定义 SDK 设备 printf 开关；它与第 31 行的 `KERNEL_DBG` 是两个不同层次的开关 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:26 / mma_dte_test_setup_compile_options` | `-fPIC`：要求位置无关代码，为后续将 object 链接成共享库准备。这里 SCC target 是 OBJECT 模式，不能依赖 SDK 仅对 SHARED 模式自动补的 PIC 选项 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:27 / mma_dte_test_setup_compile_options` | `-DDTE_DEV_MODE`：启用代码中的开发分支；例如绕过 production layout contract 的特定静态断言，并允许下面的测试 grid 配置生效，不等于关闭所有参数校验 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:28 / mma_dte_test_setup_compile_options` | `-DMMA_DTE_TEST_GRID_DIM=${TEST_GRID_DIM}`：默认展开为 `-DMMA_DTE_TEST_GRID_DIM=16`，传给 planner 的测试 grid 配置 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:29 / mma_dte_test_setup_compile_options` | `)`：结束 helper 调用 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:30 / if` | `if(TEST_ENABLE_DEBUG_PRINT)`：在 CMake 配置时判断布尔选项，而不是 executable 运行时判断 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:31 / list` | `list(APPEND COMMON_COMPILE_OPTIONS -DKERNEL_DBG)`：选项为真时追加调试打印宏 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:32 / endif` | 结束调试打印条件块 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:33 / if` | `if(MMA_DTE_GENERIC_TAIL)`：判断是否启用 generic tail 编译路径 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:34 / list` | `list(APPEND COMMON_COMPILE_OPTIONS -DMMA_DTE_GENERIC_TAIL)`：为真时追加宏；单纯有一个 CMake Cache 项不会自动产生同名 C++ 宏，需要这里的 `-D` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:35 / endif` | 结束 generic tail 条件块 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:36 / mma_dte_test_setup_include_dirs` | 将公共 include 目录去重后写到 `COMMON_INCLUDE_DIRECTORIES`，留给 SCC 和 host 两侧分别使用 |
+
+这些配置的源码落点：
+
+| 相对路径:行号 / 函数名 | 补充解释 |
+|---|---|
+| `testcase/func_test/CMakeMmaDteCommon.cmake:173 / mma_dte_test_setup_compile_options` | 合并调用者的 flags、架构宏、`MMA_DTE_SINGLE_FAMILY_DISPATCH=1` 和当前 family 的 dispatch header；还会按配置添加 SplitK、TMAP LMUL 宏；第 193 行用 `PARENT_SCOPE` 回传 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:47 / elseif` | 当前 source 目录命中 `mxint8/mxi8`，选择 `MMA_DTE_TEST_DISPATCH_FAMILY=mxint8`，第 65 行形成 `dispatch_cases_mxint8_generated.hpp` 路径 |
+| `testcase/func_test/CMakeMmaDteCommon.cmake:164 / mma_dte_test_setup_include_dirs` | 从公共目录列表出发，追加可选额外目录、去重，第 170 行回传；本例没有传额外目录 |
+| `cmake/MmaDteConfig.cmake:41 / mma_dte_common_include_directories` | 公共 include 包括 SDK include 目录和 DTE 的 `include`、`kernel`、`kernel/util` |
+| `cmake/MmaDteConfig.cmake:19 / mma_dte_collect_sdk_include_directories` | 在多个 SDK 目录结构候选中，只收集实际存在的 include 目录 |
+| `cmake/MmaDteConfig.cmake:96 / mma_dte_configure_sipu_arch` | 为 SCC 设置规范化架构参数，例如本次日志的 `-arch=sipu_150` |
+| `kernel/mma_dte_tiled_tensor.hpp:54 / mma_dte_implement_with_control` | 第 64 行的 `#ifndef DTE_DEV_MODE` 只保护 production layout contract 静态断言；之后仍有形状等检查 |
+| `kernel/detail/mma_dte_tiled_tensor_planner.hpp:2471 / get_best_solution_heuristic` | 第 2474 行同时检查 `DTE_DEV_MODE` 和 `MMA_DTE_TEST_GRID_DIM`，然后取测试 grid 值参与规划 |
+| `kernel/sipu_kernel_debug.h:9 / DEBUG_PRINT（宏）` | 未定义 `KERNEL_DBG` 时打印宏为空操作；定义后按 host/device 分支调用打印函数 |
+| **SDK** `include/sipu_dev_apis/utils/libc.h:21 / sipu::printf` | 第 27 行用 `SIRT_DEVICE_USE_PRINTF` 控制设备打印逻辑；全局 `printf` 的对应实现位于第 72 行 |
+
+这里的 `CACHE` 值是可配置的默认值，已有 Cache 或调用者的 `-DNAME=...` 可决定实际取值；当前这些 `set(... CACHE ...)` 没有 `FORCE`，不是每次重新配置都强制恢复默认值。
+
+#### 8.5.3 第 41 至 62 行：SCC object 与局部共享库
+
+| 相对路径:行号 / 命令名 | 代码及作用 |
+|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:41 / set` | `set(TEST_INST_SRC "${FUNC_TEST_KERNEL_DIR}/inst_bf16_mxi8.su" CACHE STRING "...")`：设置测试设备代码实例化源文件默认路径；可覆盖，不是递归收集整个主库源码 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:43 / scc_add_library` | `scc_add_library(tile_mma_dte_mxint8 OBJECT`：定义 SCC OBJECT 构建目标；只安排源文件编译为 `.o`，这里不生成 `.so` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:44 / scc_add_library` | `${TEST_INST_SRC}`：把选中的 `.su` 作为该目标的源输入 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:45 / scc_add_library` | `)`：结束 SCC target 定义调用 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:46 / scc_target_compile_options` | 把 `COMMON_COMPILE_OPTIONS` 加到 SCC target 属性；SDK 编译规则在生成阶段读取这些属性，最终转为 `--clangopt=...` 参数 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:47 / scc_target_include_directories` | 把公共 include 路径加到 SCC target，最终在 SCC 命令中形成 `-I...` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:50 / scc_target_get_output` | 把该 OBJECT target 的输出 `.o` 路径列表写到 `TILE_MMA_DTE_MXINT8_O`；详见 8.2 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:52 / add_custom_command` | 开始登记生成 `.so` 的自定义规则，不在 CMake 配置过程中直接执行 linker |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:53 / add_custom_command` | `OUTPUT .../libtile_mma_dte_mxint8.so`：声明该规则的输出文件；路径在当前测试子构建目录 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:54 / add_custom_command` | `COMMAND ${CMAKE_CXX_COMPILER} -shared -o ...`：使用 host C++ compiler driver 生成共享库，不是再次用 SCC 编译 `.su` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:55 / add_custom_command` | `${TILE_MMA_DTE_MXINT8_O}`：是上一行链接命令的续行参数，即输入 object 列表，不是第二条命令 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:56 / add_custom_command` | `DEPENDS tile_mma_dte_mxint8 ${TILE_MMA_DTE_MXINT8_O}`：同时添加构建顺序依赖和 object 文件更新依赖，详见 8.3.1 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:57 / add_custom_command` | `COMMENT "Linking libtile_mma_dte_mxint8.so"`：该规则执行时显示的进度提示，不是源码注释，也不是额外 shell 命令 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:58 / add_custom_command` | `)`：结束自定义命令定义 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:60 / add_custom_target` | `add_custom_target(tile_mma_dte_mxint8_so ALL`：创建默认构建会处理的共享库构建入口，入口本身不是库文件 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:61 / add_custom_target` | `DEPENDS .../libtile_mma_dte_mxint8.so`：让入口依赖前面规则的输出，因此能按需触发生成规则 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:62 / add_custom_target` | `)`：结束 custom target 定义 |
+
+第 46、47 行为何可以写在第 43 行后面：**SDK** `share/cmake/scc/sccConfig.cmake:705 / scc_target_compile_options` 在第 783 行保存 `SIPU_ALL_COMPILE_OPTIONS`；`:512 / scc_target_include_directories` 在第 610 行保存 `SIPU_ALL_INCLUDE_DIRECTORIES`。`:431 / scc_add_library` 创建的命令使用 `$<TARGET_PROPERTY:...>` generator expressions，在生成时取得这些后续设置的属性。它没有在第 43 行当场执行一条缺少 flags/includes 的 SCC 命令。
+
+默认 `.su` 中有两个公开 API 显式实例化，见 `testcase/func_test/test_bf16_mxint8_host/kernel/inst_bf16_mxi8.su:24 / mma_dte` 和 `:31 / mma_dte`，分别对应 MXINT8 输入的 BF16/R8 与 FP16/R32 测试路径。因此“一个实例化源文件”不等于“只实例化一个函数”，更不等于“只有一个底层 device kernel”。
+
+#### 8.5.4 第 66 至 81 行：host executable、runtime 和测试框架
+
+| 相对路径:行号 / 命令名 | 代码及作用 |
+|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:66 / set` | `set(TEST_HOST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test_bf16_mxi8_host.cpp" CACHE STRING "...")`：设置 host 测试源文件默认路径，可覆盖；与 device 实例化源 `TEST_INST_SRC` 是不同输入 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:67 / add_executable` | 创建原生 C++ executable target `test_bf16_mxi8_host`，由 `${CMAKE_CXX_COMPILER}` 编译和链接 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:68 / add_executable` | `${TEST_HOST_SRC}`：把当前选中的 host `.cpp` 加入 executable 源文件列表 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:69 / add_executable` | `)`：结束 executable 定义 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:70 / target_include_directories` | 为 host target 添加 PRIVATE include 目录，服务于该 target 的源码编译，不作为公共使用要求向外传播 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:71 / target_include_directories` | `${COMMON_INCLUDE_DIRECTORIES}`：使用 SDK 与 DTE 的公共 include 路径；这一次是 host 编译器的 include 设置，不是第 47 行的 SCC target 设置 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:72 / target_include_directories` | `${MMA_DTE_ROOT}`：额外加入 DTE 根目录，允许从该根目录起解析相对 include 路径 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:73 / target_include_directories` | `)`：结束 include 设置 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:74 / target_link_libraries` | 开始设置 host executable 的 PRIVATE 链接依赖；这是 CMake 内建命令，不是 SDK 的 `scc_target_link_libraries` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:75 / target_link_libraries` | 链接当前测试生成的 `libtile_mma_dte_mxint8.so` 文件，提供 host 调用的 `mma_dte` 实现及其设备程序；不是主库 `libtile_mma_dte.so` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:76 / target_link_libraries` | `sipurt`：加入 SIPU runtime 库链接项，日志中对应 `-lsipurt` |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:77 / target_link_libraries` | `sipu`：加入另一项 SDK 库依赖，日志中对应 `-lsipu`；这里写的是库名，实际由链接器按搜索路径定位文件 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:78 / target_link_libraries` | `)`：结束这组链接项设置 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:79 / add_dependencies` | 显式建立 `test_bf16_mxi8_host` 对 `tile_mma_dte_mxint8_so` 的 target 依赖，保证所需共享库构建先完成；它不替代第 74 行的链接项 |
+| `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:81 / mma_dte_test_enable_gtest` | 为这个 executable 链接 GoogleTest/default main，并设置 PRE_TEST 测试发现，详见 8.4 |
+
+第 76、77 行的 SDK 库搜索路径来自 `testcase/func_test/CMakeMmaDteCommon.cmake:70 / if` 和 `:71 / link_directories`：当 `$ENV{SI_SDK_ROOT}/lib` 存在时加入该目录。**include 路径解决编译时找头文件，library 路径解决链接时找库，target dependency 解决构建顺序，这三者不能互相替代。**
+
+### 8.6 用实际构建日志把各阶段串起来
+
+先约定本次日志里的两个输出目录，均相对 **DTE** 根目录：
+
+```text
+B = build/testcase/_build/2609161442/sipu_150/default/specialized/func_test/test_bf16_mxint8_host
+R = build/testcase/2609161442/sipu_150/default/specialized
+```
+
+这里 `B` 是当前测试子项目的 `CMAKE_CURRENT_BINARY_DIR`；`R` 是外层传入的 `CMAKE_RUNTIME_OUTPUT_DIRECTORY`。因此 `.so` 和 executable **不一定在同一个目录**。该外层设置位于 `testcase/CMakeLists.txt:85 / set`，子构建目录在 `testcase/CMakeLists.txt:131 / mma_dte_add_testcase_project` 中构造，并由第 173 行的 `ExternalProject_Add` 使用。
+
+```text
+配置/生成阶段：
+  读取 CMakeLists、设置 Cache、加载 SDK/helper
+  定义 SCC 编译规则、SO 链接规则、host target、CTest 发现脚本
+  scc_target_get_output 在此阶段取回预定 object 路径
+
+构建阶段的产物流程：
+  kernel/inst_bf16_mxi8.su
+      -> scc -c
+      -> B/_SipuObj/tile_mma_dte_mxint8/kernel/inst_bf16_mxi8.su.o
+      -> /usr/bin/c++ -shared
+      -> B/libtile_mma_dte_mxint8.so
+
+  test_bf16_mxi8_host.cpp
+      -> /usr/bin/c++ -c
+      -> B/CMakeFiles/test_bf16_mxi8_host.dir/test_bf16_mxi8_host.cpp.o
+      + B/libtile_mma_dte_mxint8.so
+      + sipurt / sipu / gtest / gtest_main
+      -> /usr/bin/c++ 链接
+      -> R/test_bf16_mxi8_host
+
+之后的 CTest 阶段：
+  按需用 --gtest_list_tests 发现测试
+      -> 注册各条 CTest 测试
+      -> 正式执行选中的测试体
+```
+
+日志行号与源码对应如下。日志不是函数定义，表格同时给出对应的源码入口：
+
+| 日志位置 | 实际记录 | 对应源码位置 / 命令名 |
+|---|---|---|
+| `temp/cxx.log.nodir:15`、`:44` | test 模式，只进入 `build_testcases` | `build-modify.sh:105 / build_testcases` |
+| `temp/cxx.log.nodir:5740` | 配置当前测试子项目，host compiler 为 `/usr/bin/c++` | `testcase/CMakeLists.txt:131 / mma_dte_add_testcase_project` |
+| `temp/cxx.log.nodir:5750` | SCC target 类型 OBJECT，初始选项是 `-arch=sipu_150;-c` | `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:43 / scc_add_library` |
+| `temp/cxx.log.nodir:5751`、`:5752` | 追加 printf/PIC/dev/grid/arch/dispatch flags 与 include 目录 | `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:46 / scc_target_compile_options`、`:47 / scc_target_include_directories` |
+| `temp/cxx.log.nodir:5753` | 找到系统 GoogleTest 1.11.0 的 CMake package | `testcase/func_test/CMakeMmaDteCommon.cmake:353 / mma_dte_test_enable_gtest` |
+| `temp/cxx.log.nodir:5781` | SDK 2609161442 的 SCC 将测试 `.su` 编成 `.su.o` | **SDK** `share/cmake/scc/sccConfig.cmake:431 / scc_add_library` |
+| `temp/cxx.log.nodir:5852` | `/usr/bin/c++ -shared -o B/libtile_mma_dte_mxint8.so B/_SipuObj/.../inst_bf16_mxi8.su.o` | `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:52 / add_custom_command` |
+| `temp/cxx.log.nodir:5854` | `Built target tile_mma_dte_mxint8_so` | `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:60 / add_custom_target` |
+| `temp/cxx.log.nodir:5862` | `/usr/bin/c++ ... -std=gnu++20 ... -c test_bf16_mxi8_host.cpp` | `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:67 / add_executable` |
+| `temp/cxx.log.nodir:5945` | 链接 host `.o`、`-ltile_mma_dte_mxint8 -lsipurt -lsipu` 及系统 `libgtest.a`、`libgtest_main.a`，输出到 `R` | `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:74 / target_link_libraries`、`:81 / mma_dte_test_enable_gtest` |
+| `temp/cxx.log.nodir:5947` | `Built target test_bf16_mxi8_host` | 表示该 executable 构建成功，不能当作 GEMM 测试通过的记录 |
+
+虽然第 75 行写的是 `.so` 的绝对路径，现有生成的链接命令采用了 `-L<该目录> -ltile_mma_dte_mxint8`，并带该目录的运行时搜索路径；这是同一个库，不是换成了主库。
+
+最后补充两个边界：
+
+- `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:54 / add_custom_command` 是手工拼接的链接命令，并不会像原生 `add_library(... SHARED ...)` 那样自动注入全部 `CMAKE_CXX_FLAGS`、`CMAKE_SHARED_LINKER_FLAGS` 或 target link options。应以该行写出的参数和实际日志为准。
+- `testcase/func_test/CMakeMmaDteCommon.cmake:209 / mma_dte_get_main_object` 虽然定义了复用主库 object 的 helper，**本文件没有调用它**。不能因 include 了公共文件，就认为这个测试正在复用整个主库或主库 object。
+
+本次只读检查了当前源码、指定 SDK、CMake 模块、现有生成规则和日志，并追加本文；没有修改 CMake/算子代码，没有重新编译，也没有执行设备测试。
