@@ -5062,3 +5062,39 @@ R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output �
 
 重新完善 like-useful/answer_codex_v4.md 最后一节
 }
+
+
+
+{
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/v0.4.2
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
+vllm-sipu 测试mxin8 gemm算子的例子在 vllm-sipu code base tests/kernels/quantization/test_mxint8_unpack_pytest.py
+
+mma_dte_tile_tensor 是 sikernel 的一个 submodule 
+最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
+为方便 debug mma_dte_tile_tensor,  mma_dte_tile_tensor 单独 clone到   独立目录: /share/users/like/package/oplib/mma_dte_tile_tensor
+mma_dte_tile_tensor 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
+
+其构建方式是 
+
+. /share/users/like/miniconda3/bin/activate  vllm_dev
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+
+cd /share/users/like/package/oplib/mma_dte_tile_tensor
+
+BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test > temp/build.test.log 2>&1  &
+BUILD_JOBS=80 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --all > temp/build.all.log 2>&1  &
+
+构建日志位于 /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.all.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.test.log
+
+重新完善 like-useful/answer_codex_v4.md 最后一节
+}
