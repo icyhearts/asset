@@ -5027,7 +5027,7 @@ BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 
 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 会调用 mma_dte include/simma.h 180行 void mma_dte(mma_dte_api::Operation transa, mma_dte_api::Operation transb 函数
 讨论下面条件
-A/B 
+对于 A/B 都是 mxint8，
 
 
 把答案追加到 like-useful/answer_codex_v4.md
