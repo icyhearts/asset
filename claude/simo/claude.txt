@@ -5026,9 +5026,32 @@ BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 构建日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log.nodir
 
 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 会调用 mma_dte include/simma.h 180行 void mma_dte(mma_dte_api::Operation transa, mma_dte_api::Operation transb 函数
-讨论下面条件
-对于 A/B 都是 mxint8，
+下面约定，include/simma.h 180行 void mma_dte 叫做 mma_dte
+sipu tile format 一个 tile 可以是8行，16行，32行,对应的mma有 R8 mma_dte, R16 mma_dte, R32 mma_dte
 
+like-useful/answer_codex_v3.md  ## 5. `MXINT8_COLS_ALIGNMENT=128` 的硬件、格式和 sikernel 原因 有解释, mma_bf16_mxi8_universal 旧的接口，要求MXINT8_COLS_ALIGNMENT=128，即 K最小是128.
+
+现在讨论 新的 void mma_dte  接口在不同数据类型下，不同row对齐下，支持的最小M,N,K形状
+# 对于 A/B 矩阵都是 mxint8，
+R8 mma_dte 支持的最小M, N, K是多少 ？
+R16 mma_dte 支持的最小M, N, K是多少 ？
+R32 mma_dte 支持的最小M, N, K是多少 ？
+
+# 对于 A/B 矩阵都是 mxfp8，
+R8 mma_dte 支持的最小M, N, K是多少 ？
+R16 mma_dte 支持的最小M, N, K是多少 ？
+R32 mma_dte 支持的最小M, N, K是多少 ？
+
+# 对于 A/B 矩阵都是 mxfp6，
+R8 mma_dte 支持的最小M, N, K是多少 ？
+R16 mma_dte 支持的最小M, N, K是多少 ？
+R32 mma_dte 支持的最小M, N, K是多少 ？
+
+
+# 对于 A/B 矩阵都是 mxfp4，
+R8 mma_dte 支持的最小M, N, K是多少 ？
+R16 mma_dte 支持的最小M, N, K是多少 ？
+R32 mma_dte 支持的最小M, N, K是多少 ？
 
 把答案追加到 like-useful/answer_codex_v4.md
 }
