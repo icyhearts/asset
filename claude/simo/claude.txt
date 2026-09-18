@@ -5078,9 +5078,11 @@ vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
 vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
 vllm-sipu 测试mxin8 gemm算子的例子在 vllm-sipu code base tests/kernels/quantization/test_mxint8_unpack_pytest.py
 
-mma_dte_tile_tensor 是 sikernel 的一个 submodule 
-最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
+mma_dte_tile_tensor 是 sikernel 的一个 submodule, sikernel 代码仓库位于 /share/users/like/package/sikernel/
+
 为方便 debug mma_dte_tile_tensor,  mma_dte_tile_tensor 单独 clone到   独立目录: /share/users/like/package/oplib/mma_dte_tile_tensor
+注意； 本次任务  mma_dte_tile_tensor 代码 都用   /share/users/like/package/oplib/mma_dte_tile_tensor 里面的代码
+
 mma_dte_tile_tensor 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
 
 其构建方式是 
@@ -5100,9 +5102,16 @@ bash build_release.sh --skip-build > temp/build_release.log 2>&1 &
 release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte.so 和 其他的带数据类型的  .so: release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte_bf16_r16.so release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte_bf16_r32_bf16out.so release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte_bf16_r32_fp32out.so release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte_bf16_r8.so release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte_fp16_r16.so 有什么区别?
 
 如果我要建立一个 应用程序 使用 mma_dte_tiled_tensor 提供的 mma_dte 函数，在应用程序的 CMakeLists.txt 里面  应该链接哪个库?
-然后, 帮我建一个 应用程序，包含 main函数
+然后, 帮我建一个 应用程序, 放到 /share/users/like/shareVR//mma_dte_call 里面，包含 main函数, 把  testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 里面的测试用例，改成在main函数中直接调用 run_case 函数 的形式，不用 gtest 框架。
+并完成 CMakeLists.txt 编写,  /share/users/like/package/oplib/mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt 提供了一些 cmake 例子, sdk 目录的 share/cmake/下面有 sipu特有的 cmake 函数，你可以使用.
 
-/usr//bin/c++
+写完 c++ 代码和 CMakeLists.txt 后，完成项目的编译和运行，验证 mma 结果正确性。 
+
+conda 和 sdk 环境:
+. /share/users/like/miniconda3/bin/activate  vllm_dev
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+注意: 执行 cmake 命令一定要有  -DCMAKE_CXX_COMPILER=/usr/bin/c++ 参数, 原因是 conda 环境激活脚本会覆盖系统的 /usr/bin/c++, 使用conda 自己安装的c++, 导致错误.
 
 重新完善 like-useful/answer_codex_v4.md 最后一节
 }
