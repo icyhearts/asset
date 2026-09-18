@@ -4001,6 +4001,8 @@ C: [M,N] = A @ B^T
 
 下表回答的是当前模板 `mma_dte<...>` 主执行路径在 **A/B 都是 tiled MX input** 时的 layout/API 最小形状。它不是旧接口 `mma_bf16_mxi8_universal` 的 `K >= 128` 规则，也不是把三个 R32 layout 的最小分量强行合并成一个不存在的形状。
 
+如果 A/B 使用 `tensor_format=0` 的 linear input，不能直接套用本节的 layout 元组；linear input 还要满足 `kernel/mma_dte_tiled_tensor.hpp:83-85 / mma_dte_implement_with_control` 的 R32 偶数 K-tile stride 约束，并使用另一组 A/B TensorMap 语义。本节沿用当前 MX testcase 的 tiled A/B 输入场景，只比较 C 的 linear/tiled 输出。
+
 ### 12.2 形状约束来源和计算公式
 
 当前主入口在 `kernel/mma_dte_tiled_tensor.hpp:54-119 / mma_dte_implement_with_control` 中检查：
@@ -4249,3 +4251,27 @@ MXINT4: 与 MXFP4 相同
 validation API：R8 + 非 MXFP8 + BF16/FP16 linear output 仍额外要求 N >= 64，
                  这是当前辅助验证逻辑与主 dispatch 不一致，不能解释成硬件 A/B shape 对齐要求。
 ```
+
+### 12.12 已有 SIPU150 构建的最小 shape smoke check
+
+以下检查使用当前仓库已有的 `build/testcase/2609161442/sipu_150/default/specialized` 可执行文件，目标架构是 SIPU150；运行时 SDK 是日志中携带的 `2609161442`，不是题目指定的 `2609151958`。
+
+已通过的最小组合：
+
+| testcase | 形状 | 输出 |
+|---|---|---|
+| `test_bf16_mxi4_r32_host` | standard `(M,N,K)=(32,32,256)` | tiled、linear |
+| `test_bf16_mxi4_r32_host` | 2x2 `(64,64,128)` | tiled、linear |
+| `test_bf16_mxi4_r32_host` | 1x4 `(128,128,64)` | tiled、linear |
+| `test_mxfp8_r8` | `(8,32,512)` | tiled FP16 |
+| `test_mxfp8_r32_shape_2x2` | `(64,64,64)` | linear FP16 |
+| `test_mxfp8_r32_shape_4x1` | `(128,128,32)` | linear FP16 |
+
+例如 MXINT4 R32 的过滤运行命令为：
+
+```bash
+./build/testcase/2609161442/sipu_150/default/specialized/test_bf16_mxi4_r32_host \
+  '--gtest_filter=*Standard*Out_M32_N32_K256:*SubTile2x2*Out_M64_N64_K128:*SubTile4x1*Out_M128_N128_K64'
+```
+
+该次运行结果为 6 个测试全部通过，覆盖三种 R32 input supertile 和两种 C output format。MXFP8 三个最小 shape 也分别通过对应的 R8、R32 2x2、R32 1x4 testcase。
