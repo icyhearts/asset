@@ -4985,8 +4985,16 @@ BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 我想验证  sipu::tensor::mm_mnk 的输出 gold_tiled_tensor 直接 用 gold_tiled_tensor.toVectorAsMemoryOrder 去export 出 gold_tiled_like_debug， 是否和 gold_tiled 结果一致.
 
 std::vector gold_tiled 现有的导出流程是 ： gold_tiled_tensor(site tensor) -> std::vector ->  sipu::make_tensor (site tensor) -> toVectorAsMemoryOrder  (std::vector)
-我想探索一个直接的方式： gold_tiled_tensor (site tensor) -> toVectorAsMemoryOrder (std::vecto)
- gold_tiled_like_debug[i] 是从
+我想探索一个直接的方式： gold_tiled_tensor (site tensor) -> toVectorAsMemoryOrder (std::vector):
+方式是 auto gold_tiled_like_debug = gold_tiled_tensor.toVectorAsMemoryOrder(true); 
+
+在 siinfer_dev conda 环境中
+增量编译命令: BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test > temp/inc.log 2>&1  &
+修改后，增量编译日志：/share/users/like/package/sikernel/mma_dte_tile_tensor/temp/inc.log
+编译成功，运行日志 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/run.lo
+
+日志看, gold_tiled_like_debug[i] gold_tiled[i] 打印出来不一样，数据对不上, 为什么失败了？我的  gold_tiled_tensor (site tensor) -> toVectorAsMemoryOrder (std::vector) 这个思路 有bug吗？是思路有bug还是实现有bug?  帮我查一下是什么原因.
+
 
 把答案追加到 like-useful/answer_codex_v4.md
 }
