@@ -4275,3 +4275,335 @@ validation API：R8 + 非 MXFP8 + BF16/FP16 linear output 仍额外要求 N >= 6
 ```
 
 该次运行结果为 6 个测试全部通过，覆盖三种 R32 input supertile 和两种 C output format。MXFP8 三个最小 shape 也分别通过对应的 R8、R32 2x2、R32 1x4 testcase。
+
+## 13. release DSO 的区别、应用链接方式和无 GTest 调用示例（2026-09-18）
+
+本节以独立 debug 目录
+`/share/users/like/package/oplib/mma_dte_tile_tensor`
+为准。release 包目录为：
+
+```text
+/share/users/like/package/oplib/mma_dte_tile_tensor/release/mma_dte_tiled_tensor-1.0.0
+```
+
+### 13.1 先给结论：应用应该链接哪个 `.so`
+
+普通应用应该链接：
+
+```text
+libtile_mma_dte.so
+libsipurt.so
+libsipu.so
+```
+
+也就是：
+
+```cmake
+target_link_libraries(app PRIVATE
+    /path/to/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte.so
+    /path/to/sipu-sdk/lib/libsipurt.so
+    /path/to/sipu-sdk/lib/libsipu.so
+    ${CMAKE_DL_LIBS}
+)
+```
+
+`libtile_mma_dte_bf16_r16.so`、`libtile_mma_dte_bf16_r32_bf16out.so` 等是 device kernel 的 component DSO，不是普通应用的首选公共链接入口。它们必须和 `libtile_mma_dte.so` 放在同一个 `lib` 目录，因为 umbrella DSO 在第一次调用具体模板实例时，会按完整 C++ symbol 名称动态打开对应的 component DSO。
+
+release 包自己的 pkg-config 文件也只导出 umbrella 库，见
+`release/mma_dte_tiled_tensor-1.0.0/lib/pkgconfig/mma_dte_tiled_tensor.pc:1-13`：
+
+```text
+Libs: -L${libdir} -ltile_mma_dte
+Cflags: -I${includedir}
+```
+
+### 13.2 `libtile_mma_dte.so` 和 component DSO 的关系
+
+根 CMake 的构建关系如下。
+
+1. `CMakeLists.txt:192-230 / foreach(INST_FILE IN LISTS INST_FILES)` 为每个
+   `kernel/instantiations/*/inst_*.su` 创建一个 SCC 编译动作。每个 `.su` 被
+   `scc` 编译成一个包含 SIPU device fatbin 的 x86-64 object，而不是把所有实例
+   直接编译进应用的 host object。
+
+2. `CMakeLists.txt:318-341 / foreach(TYPE IN LISTS OBJECT_LIB_TYPES)` 把每个
+   instantiation object 单独链接成一个 component DSO，并链接 `sipurt`、`sipu`。
+   这就是 `libtile_mma_dte_bf16_r16.so` 等文件的来源。
+
+3. `CMakeLists.txt:343-390 / add_custom_command` 生成 umbrella 的 C++/汇编
+   trampoline，再构建 `mma_dte_umbrella`，输出名设置为
+   `libtile_mma_dte.so`。这里的 umbrella 只承载 host 侧的符号转发、校验和
+   workspace 辅助代码；device implementation 仍在 component DSO 中。
+
+4. `build_release.sh:108-123 / package_release` 把 umbrella 复制到 release 包，
+   并把所有 `build/libtile_mma_dte_*.so` component DSO 复制到同一个 `lib/` 目录。
+   `build_release.sh:125-137 / package_release` 生成的 pkg-config 只写
+   `-ltile_mma_dte`，这进一步说明公共入口是 umbrella。
+
+umbrella 的动态分发实现位于：
+
+- `tools/generate_mma_dte_umbrella.py:20-44 / collect_symbols`：扫描每个
+  component DSO 的动态符号，把每个 `_Z7mma_dte...` symbol 映射到组件文件名。
+- `tools/generate_mma_dte_umbrella.py:47-101 / write_cpp`：生成
+  `__mma_dte_resolve_component_symbol()`，用 `dladdr()` 找到 umbrella 的目录，
+  再用 `dlopen(base_dir + component_name)` 和 `dlsym()` 找到真正实现。
+- `tools/generate_mma_dte_umbrella.py:104-181 / write_asm`：为每个模板符号
+  生成 trampoline。第一次调用保存参数、解析并缓存函数地址；后续调用直接跳转
+  到缓存地址。
+
+因此它不是下面这种结构：
+
+```text
+应用 -> 一个包含所有 device code 的单体 libtile_mma_dte.so
+```
+
+而是：
+
+```text
+应用
+  |
+  +-- link -> libtile_mma_dte.so       host umbrella/trampoline
+                    |
+                    +-- first call: dlopen 同目录 component DSO
+                    |       |
+                    |       +-- libtile_mma_dte_bf16_r8.so
+                    |       +-- libtile_mma_dte_mxint8_r32_2x2.so
+                    |       +-- ...
+                    |
+                    +-- component DSO -> SIPU device fatbin + sipurt + sipu
+```
+
+当前 release 中 `libtile_mma_dte.so.1.0.0` 大约 0.85 MB，而各 component
+DSO 通常是数 MB 到数十 MB；这也与“umbrella 是转发层、component 携带具体
+device code”的结构相符。`readelf -d` 还显示 umbrella 本身没有把
+`libsipurt.so.0`、`libsipu.so.0` 作为静态的 `DT_NEEDED` component 依赖，
+因为 component 是通过 `dlopen()` 延迟加载的。
+
+### 13.3 题目中几个 component DSO 的精确区别
+
+文件名中的 `bf16`/`fp16` 是输入数据类型，`r8`/`r16`/`r32` 是 kernel
+row family；`r32_bf16out` 和 `r32_fp32out` 才明确区分 R32 的输出类型。
+每个 component 内仍可能包含多个 A/B/C layout 和 linear/tiled format 的显式
+模板实例。
+
+| DSO | 输入类型 | row family | 输出实例 | 主要来源 |
+|---|---|---:|---|---|
+| `libtile_mma_dte_bf16_r16.so` | BF16 | R16 | BF16 output、FP32 output | `kernel/instantiations/bf16/inst_bf16_r16.su:8-26 / mma_dte` |
+| `libtile_mma_dte_bf16_r32_bf16out.so` | BF16 | R32 | BF16 output | `kernel/instantiations/bf16/inst_bf16_r32_bf16out.su:8-16 / mma_dte` |
+| `libtile_mma_dte_bf16_r32_fp32out.so` | BF16 | R32 | FP32 output | `kernel/instantiations/bf16/inst_bf16_r32_fp32out.su:8-16 / mma_dte` |
+| `libtile_mma_dte_bf16_r8.so` | BF16 | R8 | BF16 output、FP32 output | `kernel/instantiations/bf16/inst_bf16_r8.su:8-26 / mma_dte` |
+| `libtile_mma_dte_fp16_r16.so` | FP16 | R16 | FP16 output、FP32 output | `kernel/instantiations/fp16/inst_fp16_r16.su:21-39 / mma_dte` |
+
+#### `libtile_mma_dte_bf16_r16.so`
+
+`kernel/instantiations/bf16/inst_bf16_r16.su:8-16 / mma_dte` 是 BF16 input
+到 BF16 output 的 R16 实例；`kernel/instantiations/bf16/inst_bf16_r16.su:18-26 / mma_dte`
+是 BF16 input 到 FP32 output 的 R16 实例。也就是说，文件名没有写
+`bf16out`/`fp32out`，不是因为只支持一种输出，而是这两个 R16 输出族被放在同一个
+component DSO 中。
+
+其中典型布局是：
+
+```text
+R16 BF16 output: A=(32,16), B=(16,32), C=(32,16)
+R16 FP32 output: A=(32,16), B=(16,32), C=(16,16)
+```
+
+每个布局还分别有 `tensor_format=0` 的 linear 和 `tensor_format=1` 的 tiled
+组合；完整组合以 `.su` 中的显式 template line 为准。
+
+#### `libtile_mma_dte_bf16_r32_bf16out.so`
+
+`kernel/instantiations/bf16/inst_bf16_r32_bf16out.su:8-16 / mma_dte` 只显式
+实例化 BF16 input、BF16 output、FP32 scalar 的 R32 kernel。典型布局是：
+
+```text
+A=(16,32), B=(16,32), C=(16,32)
+```
+
+其中 `C` 可以是 tiled 或 linear，A/B 也包含相应 format 组合。
+
+#### `libtile_mma_dte_bf16_r32_fp32out.so`
+
+`kernel/instantiations/bf16/inst_bf16_r32_fp32out.su:8-16 / mma_dte` 只显式
+实例化 BF16 input、FP32 output、FP32 scalar 的 R32 kernel。典型布局是：
+
+```text
+A=(16,32), B=(16,32), C=(8,32)
+```
+
+FP32 element 是 32 bit，因此同样的 R32 行组织下，C 的 tile_dim0 与 BF16 C
+不同，这是输出类型导致的物理 tile 容量差异，不是另一个 GEMM 算法。
+
+#### `libtile_mma_dte_bf16_r8.so`
+
+`kernel/instantiations/bf16/inst_bf16_r8.su:8-16 / mma_dte` 是 BF16 input
+到 BF16 output 的 R8 实例；`kernel/instantiations/bf16/inst_bf16_r8.su:18-26 / mma_dte`
+是 BF16 input 到 FP32 output 的 R8 实例。
+
+典型布局为：
+
+```text
+BF16 output: A=(64,8), B=(16,32), C=(64,8)
+FP32 output: A=(64,8), B=(16,32), C=(32,8)
+```
+
+这也是为什么 R8 的 output 不能只按 `M*N` 物理元素数分配，必须按选定的
+`layoutC` 和 output element size 计算 buffer。
+
+#### `libtile_mma_dte_fp16_r16.so`
+
+`kernel/instantiations/fp16/inst_fp16_r16.su:21-29 / mma_dte` 是 FP16 input
+到 FP16 output 的 R16 实例；`kernel/instantiations/fp16/inst_fp16_r16.su:31-39 / mma_dte`
+是 FP16 input 到 FP32 output 的 R16 实例。典型布局分别是：
+
+```text
+FP16 output: A=(32,16), B=(16,32), C=(32,16)
+FP32 output: A=(32,16), B=(16,32), C=(16,16)
+```
+
+它与 `libtile_mma_dte_bf16_r16.so` 的结构相同，差异是 inputT 从
+`sifmt::bfloat16` 换成 `sifmt::float16`。
+
+### 13.4 为什么不能只链接某个 component DSO
+
+如果应用显式调用的模板实例正好只存在于某一个 component DSO，理论上可以直接
+链接该 DSO。但这不是 release API 的稳定使用方式，原因有三点：
+
+1. 模板符号包含 `inputT`、`outputT`、`scalarT`、`layoutA`、`layoutB`、`layoutC`
+   的完整编码。只要 C layout 或 linear/tiled format 改变，就是另一个符号。
+2. 一个看似相同的 `R8`/`R16` component 可能包含多个 output type 和多个 format
+   组合，但不会保证未来所有新增实例仍放在同一个文件里。
+3. release 的 `build_release.sh:113-123 / package_release` 明确把 component
+   作为 umbrella 的 sibling private implementation 打包；应用只通过 umbrella
+   获得统一的符号入口。
+
+因此推荐：
+
+```text
+应用链接 libtile_mma_dte.so
+release/lib 中保留所有 libtile_mma_dte_*.so
+应用同时链接 SDK 的 libsipurt.so 和 libsipu.so
+```
+
+### 13.5 无 GTest 应用的目录和源码
+
+已经创建：
+
+```text
+/share/users/like/shareVR/mma_dte_call/main.cpp
+/share/users/like/shareVR/mma_dte_call/CMakeLists.txt
+```
+
+`/share/users/like/shareVR/mma_dte_call/main.cpp` 的关键部分：
+
+- `main.cpp:15-19` 定义与原 testcase 相同的 `kLayoutB`、R8/R32 A/C layout。
+- `main.cpp:21-129 / run_case` 保留原测试的完整流程：构造随机 FP32 输入、用
+  `sipu::make_shape`、`sipu::make_layout`、`sipu::make_tensor` 转成 tiled MXINT8，
+  用 `sipu::tensor::mm_mnk` 生成 gold，再分配 SIPU device buffer，调用
+  `mma_dte`，D2H 拷贝并逐元素比较。
+- `main.cpp:131-134 / run_bf16_default_case` 调用原 BF16/R8：
+  `M=8,N=576,K=1024`，C 为 linear BF16。
+- `main.cpp:136-139 / run_fp16_default_case` 调用原 FP16/R32：
+  `M=32,N=576,K=1024`，C 为 tiled FP16。
+- `main.cpp:143-155 / main` 直接顺序调用两个 `run_case`，失败返回
+  `EXIT_FAILURE`，不依赖 GTest。
+
+原 GTest testcase 的对应位置是：
+
+- `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:39-124 / run_case`
+- `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:126-134 /
+  run_bf16_default_case、run_default_case`
+- 原来的 GTest wrapper 在 `:136-146`，新应用删除了这些 class/`TEST_F`，改成
+  `main.cpp:143-155 / main`。
+
+### 13.6 应用 CMake 的作用
+
+`/share/users/like/shareVR/mma_dte_call/CMakeLists.txt`：
+
+- `CMakeLists.txt:9-18` 设置 release 包和 SIPU SDK 根目录；默认 SDK 是
+  `/share_data/sicx_sdk/release/v0.4.2`。
+- `CMakeLists.txt:20-34 / find_library` 查找 `tile_mma_dte`、`sipurt`、`sipu`。
+- `CMakeLists.txt:38-43 / target_include_directories` 加入 release public header
+  和 SDK 的 `include`、`include/SiTe`、`include/sipurt`。
+- `CMakeLists.txt:45-50 / target_link_libraries` 链接 umbrella、SIPU runtime、
+  SIPU host library 和 `dl`。
+- `CMakeLists.txt:52-55 / set_target_properties` 把 release `lib` 和 SDK `lib`
+  写入 build/install RPATH，保证 executable 能找到 umbrella、component 以及
+  `libsipurt.so.0`、`libsipu.so.0`。
+
+和原 testcase CMake 的差异是有意的：
+
+- 原 testcase `testcase/func_test/test_bf16_mxint8_host/CMakeLists.txt:43-61`
+  先用 SCC 编译测试专用 `inst_bf16_mxi8.su` object，再在
+  `:52-61 / add_custom_command、tile_mma_dte_mxint8_so` 中生成测试专用 DSO。
+- 原 testcase `:74-79 / target_link_libraries、add_dependencies` 链接的是这个
+  测试专用 DSO，因此适合源码测试，不适合一个已经使用 release package 的普通
+  应用。
+- 新应用不重新编译 device `.su`，直接消费 release 包的 public header、umbrella
+  和 sibling component DSO。
+
+### 13.7 实际编译命令
+
+使用的命令是：
+
+```bash
+source /share_data/users/like/miniconda3/bin/activate vllm_dev
+cd /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+
+cmake \
+  -S /share/users/like/shareVR/mma_dte_call \
+  -B /share/users/like/shareVR/mma_dte_call/build \
+  -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
+  -DSIPU_SDK_ROOT=/share_data/sicx_sdk/release/v0.4.2
+
+cmake --build /share/users/like/shareVR/mma_dte_call/build --parallel 8
+```
+
+这里必须显式传 `-DCMAKE_CXX_COMPILER=/usr/bin/c++`。本次配置输出确认：
+
+```text
+MMA_DTE_LIBRARY=/share/users/like/package/oplib/mma_dte_tile_tensor/release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte.so
+SIPURT_LIBRARY=/share_data/sicx_sdk/release/v0.4.2/lib/libsipurt.so
+SIPU_LIBRARY=/share_data/sicx_sdk/release/v0.4.2/lib/libsipu.so
+```
+
+注意：`vllm-sipu/sipu_sdk_setup.sh` 在其内部又把 SDK 解析为
+`/share_data/sicx_sdk/release/v0.4.2_2609111541` 并打印了 override warning；
+本次 CMake 通过 `-DSIPU_SDK_ROOT=/share_data/sicx_sdk/release/v0.4.2` 固定了
+应用实际使用的 include/library 路径。运行时 `ldd` 也确认 executable 解析到：
+
+```text
+libtile_mma_dte.so.1 -> .../release/mma_dte_tiled_tensor-1.0.0/lib/libtile_mma_dte.so.1
+libsipurt.so.0      -> /share_data/sicx_sdk/release/v0.4.2/lib/libsipurt.so.0
+libsipu.so.0        -> /share_data/sicx_sdk/release/v0.4.2/lib/libsipu.so.0
+```
+
+### 13.8 实际运行和正确性结果
+
+运行命令：
+
+```bash
+source /share_data/users/like/miniconda3/bin/activate vllm_dev
+cd /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+/share/users/like/shareVR/mma_dte_call/build/mma_dte_call
+```
+
+输出摘要：
+
+```text
+case M=8, N=576, K=1024 passed
+[MMA_DTE_DISPATCH] R32 schedule=ONE_PRO_ONE_CON_V2 ...
+case M=32, N=576, K=1024 passed
+all mma_dte cases passed
+```
+
+这次运行验证了两件事：
+
+1. 应用只链接 `libtile_mma_dte.so`，仍能通过 umbrella 的 `dlopen/dlsym`
+   找到需要的 component DSO，并成功执行 SIPU kernel。
+2. 原 testcase 的两个 `run_case` 在不使用 GTest 的普通 `main()` 中均通过：
+   BF16/R8 linear output 和 FP16/R32 tiled output 的 device 结果都与 SiTe gold
+   逐元素一致。
