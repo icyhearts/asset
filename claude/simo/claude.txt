@@ -5032,32 +5032,33 @@ sipu tile format 一个 tile 可以是8行，16行，32行,对应的mma有 R8 mm
 like-useful/answer_codex_v3.md  ## 5. `MXINT8_COLS_ALIGNMENT=128` 的硬件、格式和 sikernel 原因 有解释, mma_bf16_mxi8_universal 旧的接口，要求MXINT8_COLS_ALIGNMENT=128，即 K最小是128.
 
 现在讨论 新的 void mma_dte  接口在不同数据类型下，不同row对齐下，支持的最小M,N,K形状
-# 对于 A/B 矩阵都是 mxint8，
-R8 mma_dte 支持的最小M, N, K是多少 ？
-R16 mma_dte 支持的最小M, N, K是多少 ？
-R32 mma_dte 支持的最小M, N, K是多少 ？
 
-# 对于 A/B 矩阵都是 mxfp8，
-R8 mma_dte 支持的最小M, N, K是多少 ？
-R16 mma_dte 支持的最小M, N, K是多少 ？
-R32 mma_dte 支持的最小M, N, K是多少 ？
+对于 A/B 矩阵都是 mxint8，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
 
-# 对于 A/B 矩阵都是 mxfp6，
-R8 mma_dte 支持的最小M, N, K是多少 ？
-R16 mma_dte 支持的最小M, N, K是多少 ？
-R32 mma_dte 支持的最小M, N, K是多少 ？
+对于 A/B 矩阵都是 mxfp8，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
 
-
-# 对于 A/B 矩阵都是 mxfp4，
-R8 mma_dte 支持的最小M, N, K是多少 ？
-R16 mma_dte 支持的最小M, N, K是多少 ？
-R32 mma_dte 支持的最小M, N, K是多少 ？
+对于 A/B 矩阵都是 mxfp6，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
 
 
-* 追加讨论 对于 A/B 矩阵都是 mxint4，
-R8 mma_dte 支持的最小M, N, K是多少 ？
-R16 mma_dte 支持的最小M, N, K是多少 ？
-R32 mma_dte 支持的最小M, N, K是多少 ？
+对于 A/B 矩阵都是 mxfp4，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
 
-把答案追加到 like-useful/answer_codex_v4.md
+
+ 对于 A/B 矩阵都是 mxint4，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+
+重新完善 like-useful/answer_codex_v4.md 最后一节
 }
