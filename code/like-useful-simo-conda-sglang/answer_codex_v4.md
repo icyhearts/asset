@@ -3810,3 +3810,169 @@ i=16: gold_tiled_like_debug=-130823, gold_tiled=-7316
 - `i=16` 更明显：FP32 physical 序列对应 `[2,0]`，FP16 physical 序列对应 `[1,0]`。
 
 所以日志中的大差值不是 `toVectorAsMemoryOrder` 把一个数组随机打乱，而是两个不同 layout 的 physical index 被错误地拿来对齐。
+
+#### 11.4.2 BF16/R8 也存在同样问题
+
+虽然当前代码对 BF16/R8 的 `LayoutC_R8.tensor_format=0` 走 linear 分支，不打印 debug 比较，但如果比较：
+
+```cpp
+gold_tiled_tensor.toVectorAsMemoryOrder(true)
+```
+
+与 BF16 tiled `out_tensor_d.toVectorAsMemoryOrder(true)`，也会遇到：
+
+```text
+FP32 source tile:  [8,32]
+BF16 target tile:  [8,64]
+```
+
+对应物理索引：
+
+```text
+P_fp32_R8(m,n)
+  = (n/32) * 256
+  + ((n%32)/8) * 64
+  + m * 8
+  + (n%8)
+
+P_bf16_R8(m,n)
+  = (n/64) * 512
+  + ((n%64)/16) * 128
+  + m * 16
+  + (n%16)
+```
+
+例如 `physical index=8`：
+
+```text
+FP32 source: [1,0]
+BF16 target: [0,8]
+```
+
+### 11.5 toVectorAsMemoryOrder 的实现是否有 bug
+
+从当前现象判断，**不是本次 mismatch 的主要原因**。
+
+**SDK** `include/SiTe/tensor/tensor.hpp:2141 / Tensor::toVectorAsMemoryOrder` 使用的是当前对象自己的 `mLayoutEngine`：
+
+| SDK 相对路径:行号 / 成员函数 | 作用 |
+|---|---|
+| `include/SiTe/tensor/tensor.hpp:2148 / Tensor::toVectorAsMemoryOrder` | 读取当前 Tensor 自己的 tiled shape |
+| `include/SiTe/tensor/tensor.hpp:2184 / Tensor::toVectorAsMemoryOrder` | 遍历当前 Tensor 自己的 plane/supertile |
+| `include/SiTe/tensor/tensor.hpp:2189 / Tensor::toVectorAsMemoryOrder` | 按当前 dtype 的 supertile data storage 遍历 |
+| `include/SiTe/tensor/tensor.hpp:2203 / Tensor::toVectorAsMemoryOrder` | 调用当前 Tensor 的 `at(coord)` 取值 |
+| `include/SiTe/tensor/tensor.hpp:2210 / Tensor::toVectorAsMemoryOrder` | 将当前 Tensor 的元素转换为 float 放入 vector |
+
+它没有目标 dtype 或目标 layout 参数，因此：
+
+```text
+gold_tiled_tensor.toVectorAsMemoryOrder(true)
+```
+
+必然按 FP32 source 的 layout 导出；它不可能自动按 `out_tensor_d` 的 FP16/BF16 layout 导出。
+
+另外，SDK 实现中有一处独立的代码可疑点，值得后续单独修复/核对：
+
+- `include/SiTe/tensor/tensor.hpp:2159 / Tensor::toVectorAsMemoryOrder` 将第三个返回值命名为 `blockIndex`，但该返回参数实际对应 `tensorCoord2StoragePtrOffset` 的 `indexInBlock`。
+- `include/SiTe/tensor/tensor.hpp:2161 / Tensor::toVectorAsMemoryOrder` 用 `blockIndex` 查 map。
+- `include/SiTe/tensor/tensor.hpp:2165 / Tensor::toVectorAsMemoryOrder` 却用 `dataPtr` 作为 map key 插入。
+
+这会造成 map 查找 key 不一致，可能带来额外插入和 padding 路径风险。但对于本次两个完整对齐 shape，日志中的差异已经被 dtype/layout 公式完全解释，不能把这个独立问题当成当前 mismatch 的根因。
+
+### 11.6 当前 GTest 为什么仍然 PASS
+
+`temp/run.log:18674` 记录：
+
+```text
+[       OK ] MmaDteFloat16Mxint8Test.ComputesDefaultShape
+```
+
+`temp/run.log:18679` 记录：
+
+```text
+[  PASSED  ] 2 tests.
+```
+
+原因是 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:122 / run_case` 至 `:124 / run_case` 只打印 debug 差异；没有修改 `err`。正式测试错误计数从 `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:116 / run_case` 开始，仍然只在 `:128 / run_case` 以后根据设备输出和已经正确转换/重排的 `gold` 判定。
+
+此外，FP16 golden 中有 `inf`。当前 `run_case` 的相对误差逻辑对非有限值存在盲区：`inf` 与 `inf` 的减法/除法可能得到 NaN，而 `err_rate > 0.0f` 不会成立。因此 debug mismatch 与 GTest PASS 可以同时出现；PASS 不能证明 `gold_tiled_like_debug` 和 `gold_tiled` 相等。
+
+### 11.7 正确的直接优化方向
+
+#### 11.7.1 不能直接替换成这一行
+
+下面这行只能得到 FP32 source Tensor 的 physical vector：
+
+```cpp
+auto gold_tiled_like_debug = gold_tiled_tensor.toVectorAsMemoryOrder(true);
+```
+
+它不能替换当前目标输出 golden：
+
+```cpp
+auto out_tensor_d = sipu::make_tensor<OutputT>(layout_d, gold_linear);
+auto gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true);
+```
+
+#### 11.7.2 可以设计一个“目标 dtype/layout 感知”的直接转换 API
+
+真正可以优化的是去掉中间 `gold_linear` vector，但仍必须同时完成两件事：
+
+1. 按 source Tensor 的逻辑坐标读取 FP32 值。
+2. 按目标 `OutputT + layout_d` 将值转换、打包并按目标 physical 顺序输出。
+
+抽象上应类似：
+
+```text
+source FP32 tiled Tensor
+  -- logical coordinate read --> float value
+  -- OutputT conversion ------> BF16/FP16 value
+  -- target layout write -----> target physical vector
+```
+
+可以新增一个明确带目标类型和目标 layout 的 helper，例如概念上的：
+
+```cpp
+exportAsMemoryOrder<OutputT>(source_tensor, target_layout, true);
+```
+
+这个 helper 不能只调用 source 的 `toVectorAsMemoryOrder`；它必须使用 target Tensor 的 `LayoutEngine` 或等价的 target layout mapping。现有 `out_tensor_d` 路径虽然多了一个 logical `std::vector<float>`，但语义是正确的。
+
+#### 11.7.3 什么时候 direct export 才能直接复用
+
+只有以下条件同时成立时，source direct export 才能直接与目标 physical vector 比较：
+
+```text
+source dtype == target dtype
+source tiled layout == target tiled layout
+source padding policy == target padding policy
+```
+
+例如 source 和 target 都是同一个 FP32 tiled layout，直接 export 才能按同一 physical index 对齐。当前测试是 FP32 source 对 BF16/FP16 target，不满足前两个条件。
+
+### 11.8 构建版本范围
+
+题目指定 SDK 是 `2609151958`，但本次提供的实际日志使用的是 SDK **2609161442**：
+
+- `temp/inc.log:18` 的 `SI_SDK_ROOT` 是 `/share_data/sicx_sdk/release/2609161442`。
+- `temp/inc.log:26` 的 testcase SDK tag 是 `2609161442`。
+- `temp/inc.log:5918` 显示 `Built target test_bf16_mxi8_host`。
+- `temp/run.log:1` 加载的 runtime 是 `/share_data/sicx_sdk/release/2609161442/lib/libsipu.so.0`。
+
+本次检查确认指定 SDK `2609151958` 与日志 SDK `2609161442` 的相关 `SiTe/tensor/tensor.hpp`、`sifmt/sifmt_fp.hpp`、`sifmt/quantize/nonmx.hpp` 内容相同；但运行时结论严格属于日志中的 2609161442 环境，不能把它描述成已经在 2609151958 runtime 上执行。
+
+### 11.9 最终结论
+
+```text
+gold_tiled_tensor.toVectorAsMemoryOrder(true)
+```
+
+这个调用思路作为“导出 FP32 source Tensor 的 physical layout”没有问题；问题在于把它当成了“导出 OutputT 目标 Tensor 的 physical golden”。
+
+本次失败的根因按优先级是：
+
+1. **dtype 不同**：FP32 vs FP16/BF16，导致舍入和 FP16 overflow。
+2. **tile layout 不同**：FP32 的 tile shape 与 OutputT 的 tile shape 不同，导致同一 vector 下标对应不同逻辑坐标。
+3. **debug 比较没有做 logical coordinate 对齐，也没有做 OutputT 转换**。
+
+因此，应判断为**替换思路的语义不成立**，不是当前观察到的主要 SiTe exporter bug。若目标是优化性能，应实现一个显式的“source logical read + target dtype conversion + target layout pack”接口，而不是直接调用 source Tensor 的 `toVectorAsMemoryOrder`。
