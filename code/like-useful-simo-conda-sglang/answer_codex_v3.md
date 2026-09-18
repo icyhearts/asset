@@ -2082,3 +2082,164 @@ cache、sikernel 和 Conda 环境均未修改。结论可以概括为：
 **apt 已安装解决的是“文件存在”；Conda activation hook 切换编译器后，CMake
 漏掉系统 multiarch 目录，造成“文件存在但找不到”。显式 package 路径可以修复查找；
 实际编译还需要让 GTest 与所用 host 工具链匹配。**
+
+## 8. `MANIFEST.in` 为什么被引入、有什么功能、现在是否还需要？
+
+### 8.1 直接结论
+
+当前仓库的 `MANIFEST.in` 不是 Python 导入配置，也不是 editable 安装的入口配置；它主要
+控制 **source distribution（sdist，通常是 `*.tar.gz`）里面有哪些源码文件**。
+
+当前文件只有 5 条规则，见 `[simo_conda_sglang] MANIFEST.in:1-5`：
+
+| 行 | 规则 | 作用 |
+|---|---|---|
+| `:1` | `include simo/onnx/ort_plugin/*.cc` | 把 ONNX Runtime 插件的 C++ 源文件放入 sdist |
+| `:2` | `include simo/onnx/ort_plugin/*.cu` | 把 LSTM CUDA 源文件放入 sdist |
+| `:3` | `include simo/onnx/ort_plugin/*.h` | 把插件目录顶层头文件放入 sdist |
+| `:4` | `include simo/onnx/ort_plugin/*.lds` | 把链接器 version-script 放入 sdist |
+| `:5` | `recursive-include .../include *.h` | 把 vendored ONNX Runtime 头文件递归放入 sdist |
+
+**结论：如果 SIMO 仍然支持发布 sdist，或支持用户从 sdist 安装/重新构建 ONNX 插件，
+`MANIFEST.in` 仍然需要保留。**
+
+如果团队明确只使用 Git checkout 的 `pip install -e .`，或者只发布已经编译好的 wheel，
+那么它对日常 editable 运行不是必需的；但删除前必须接受 sdist 不再包含这些构建源码，
+并重新验证 wheel 和安装流程。对当前仓库的保守建议是：**暂时保留，不要直接删除。**
+
+### 8.2 它为什么在 ONNX 重构时被引入
+
+Git 历史显示，4 条初始规则是在提交 `ee319fc`（2026-07-17，`refactor_onnx`）中加入的；
+`*.cu` 规则随着 LSTM CUDA custom op 的引入加入，关联提交为 `32a74aa`/`5e4709e`。
+
+这和当前构建代码是一一对应的：
+
+1. `[simo_conda_sglang] pyproject.toml:1-3` 选择 `setuptools.build_meta` 作为构建后端。
+2. `[simo_conda_sglang] setup.py:103-119 - SimoBuildExtension::run` 在安装/构建时调用
+   `build_runtime.py`，生成 `libSimoOnnxCustomOps_sm90.so`。
+3. `[simo_conda_sglang] simo/onnx/ort_plugin/build_runtime.py:71-146 - build_sm90_runtime`
+   需要从插件目录读取 C++、CUDA、头文件和 linker script：
+   - `:10-14` 定位插件目录、ONNX Runtime 头文件目录和 `simo_lstm_layout.cu`；
+   - `:93-100` 枚举 `custom_op_library.cc`、`simo_qdq_ops.cc`、
+     `simo_qdq_cpu_ops.cc`、`simo_lstm_ops.cc`、`triton_loader.cc` 以及生成源码；
+   - `:101-106` 设置插件头文件、vendored ONNX Runtime 头文件和 CUDA 头文件目录；
+   - `:113-125` 用 `nvcc` 编译 `simo_lstm_layout.cu`；
+   - `:127-145` 用 C++ 编译器链接，并在 `:140` 使用
+     `custom_op_library.lds`。
+
+因此，从 sdist 安装时的调用链是：
+
+```text
+pip install simo-*.tar.gz
+  -> 解压 sdist
+  -> setuptools 读取 setup.py
+  -> setup.py:SimoBuildExtension::run
+  -> build_runtime.py:build_sm90_runtime
+  -> 编译 .cc/.cu，读取 .h/.lds
+  -> 生成 libSimoOnnxCustomOps_sm90.so
+```
+
+如果 sdist 中没有 `MANIFEST.in` 指定的源码，最后的编译阶段就可能缺少源文件、头文件
+或 version-script。也就是说，`MANIFEST.in` 解决的是“源码包是否自洽”，不是“运行时是否
+需要把 C++ 源码安装给用户”。
+
+### 8.3 它与 wheel、editable 安装的关系
+
+要区分三种产物：
+
+#### A. sdist：`MANIFEST.in` 是关键输入
+
+本地实测用相同的仓库快照分别保留/删除 `MANIFEST.in`，执行：
+
+```bash
+python -m build --sdist --no-isolation ...
+```
+
+保留 manifest 的 tarball 包含了 `simo/onnx/ort_plugin` 下的 `.cc`、`.cu`、`.h`、`.lds`
+和 `include/onnxruntime/.../*.h`；删除 manifest 后，这些插件构建文件都不在 sdist 中。
+
+#### B. wheel：运行时真正需要的是生成的 `.so`
+
+`[simo_conda_sglang] setup.py:122-134 - setup` 中的打包配置很明确：
+
+- `:126-129` 的 `package_data` 声明最终运行时库
+  `libSimoOnnxCustomOps_sm90.so` 和 GEMM 配置 JSON；
+- `:130-132` 的 `exclude_package_data` 排除 `README.md`、`*.cc`、`*.h`、`*.lds`
+  以及 vendored `include/**/*.h`。
+
+所以正常 wheel 的运行路径是：先由 `SimoBuildExtension::run` 构建 `.so`，再把 `.so`
+作为 package data 放入 wheel；安装后的运行时由
+`[simo_conda_sglang] simo/onnx/runtime.py:7-26 - get_custom_ops_library_path`
+定位这个 `.so`，不需要重新编译 C++/CUDA 源码。
+
+当前配置有一个容易忽略的副作用：`MANIFEST.in:2` 纳入了 `simo_lstm_layout.cu`，而
+`setup.py:130-132` 没有把 `*.cu` 列入排除项。在当前 setuptools/pyproject 行为下，
+它会进入 `egg_info/SOURCES.txt`，进而被 `build_py` 带入 wheel。实测 wheel 文件清单中：
+
+- 有 manifest：包含 `simo/onnx/ort_plugin/simo_lstm_layout.cu`；
+- 去掉 manifest：不包含该 `.cu`；
+- `*.cc`、`*.h`、`*.lds` 仍被 `exclude_package_data` 排除。
+
+如果设计目标是“wheel 只带编译好的运行库，不带 CUDA 源码”，建议保留 manifest 供 sdist
+使用，同时在 `setup.py:130-132` 的 `exclude_package_data` 中追加 `"*.cu"`。这属于
+打包边界修正，不是删除 manifest 的理由。
+
+#### C. editable：源码映射和 `setup.py` 构建逻辑起作用
+
+当前 `simo_sglang` 环境的 editable 元数据是：
+
+```text
+/share_data/users/like/miniconda3/envs/simo_sglang/lib/python3.12/site-packages/
+  __editable__.simo-*.pth
+  __editable___simo_*_finder.py
+```
+
+finder 把 `simo` 直接映射到本仓库的 `simo/` 目录。因此 editable 导入并不是从
+`MANIFEST.in` 中读取文件列表。
+
+editable 构建真正相关的是 `[simo_conda_sglang] setup.py:103-119 - SimoBuildExtension::run`：
+`self.editable_mode` 或 `self.inplace` 时，`:110-113` 把 `output_root` 设为源码目录，
+然后把生成的 `.so` 写到源码目录的 `simo/onnx/ort_plugin/` 下。运行时再由
+`[simo_conda_sglang] simo/onnx/runtime.py:8-26 - get_custom_ops_library_path`
+按源码相对路径找到它。
+
+因此：
+
+```text
+pip install -e .
+  -> editable .pth/finder 映射 Python 源码
+  -> SimoBuildExtension::run 构建并写入源码目录的 .so
+  -> runtime.py 从源码目录加载 .so
+```
+
+这条 editable 调用链本身不依赖 `MANIFEST.in` 来完成 Python 导入。
+
+### 8.4 当前是否可以删除
+
+按使用场景判断：
+
+| 使用场景 | 删除 `MANIFEST.in` 的影响 | 判断 |
+|---|---|---|
+| 只在源码 checkout 中 `pip install -e .` | 通常不影响源码导入；源码文件本来就在 checkout 中 | 可以不依赖，但需验证 editable 重装 |
+| `pip install .`，直接从 checkout 构建 wheel | 构建阶段可从 checkout 读取源码；运行 wheel 主要依赖 `.so` | 通常可工作，但仍需验证 wheel 清单 |
+| 发布/安装 sdist | 插件 `.cc/.cu/.h/.lds` 不再进入源码包，后续重建可能失败 | 不应删除 |
+| 只发布预编译 wheel | 可以删除，但应明确不再支持 sdist，并检查 `.cu` 是否应保留 | 取决于发布策略 |
+
+**对当前 SIMO 仓库的建议：**
+
+1. 保留 `MANIFEST.in`，因为 `setup.py` 仍然支持从源码构建 ONNX custom-op，且 sdist
+   需要这些文件。
+2. 如果不希望 wheel 携带 `simo_lstm_layout.cu`，在
+   `[simo_conda_sglang] setup.py:130-132 - setup` 的 `exclude_package_data` 中追加
+   `"*.cu"`，然后重新检查 wheel 内容。
+3. 只有在项目正式宣布“只支持 editable checkout 或预编译 wheel，不再发布/安装 sdist”
+   后，才考虑删除 `MANIFEST.in`；删除后至少重新验证：
+
+```bash
+python -m build --sdist --no-isolation
+python -m build --wheel --no-isolation
+python -m pip install -e . --no-build-isolation
+```
+
+本次分析只在 `/tmp` 创建了打包验证副本和文件清单，没有修改 simo 源码、editable
+环境或 Conda 环境。
