@@ -5053,5 +5053,11 @@ R8 mma_dte 支持的最小M, N, K是多少 ？
 R16 mma_dte 支持的最小M, N, K是多少 ？
 R32 mma_dte 支持的最小M, N, K是多少 ？
 
+
+* 追加讨论 对于 A/B 矩阵都是 mxint4，
+R8 mma_dte 支持的最小M, N, K是多少 ？
+R16 mma_dte 支持的最小M, N, K是多少 ？
+R32 mma_dte 支持的最小M, N, K是多少 ？
+
 把答案追加到 like-useful/answer_codex_v4.md
 }
