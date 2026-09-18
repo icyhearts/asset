@@ -3631,3 +3631,182 @@ cute_layout_compare shape=32x576 \
 `temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp:84 / main` 运行 `run_test<8>` 和 `run_test<32>`；原始 vector 的打印也仍然保留，physical vector 现在每个 tile 打印一行，每个 element 宽度为 5 个字符。
 
 本次追加只修改了 `/share/users/like/temp/sifmt/test_sifmt_uint16_layout_vs_cute_layout.cpp` 和本答案文档，没有修改 CUTLASS、SiTe SDK 或 mma_dte_tile_tensor 源码。
+
+## 11. 直接从 gold_tiled_tensor 导出失败的原因（2026-09-18）
+
+### 11.1 结论先行
+
+这次 mismatch 的**主要原因是比较思路不等价，不是 `Tensor::toVectorAsMemoryOrder` 的直接实现错误**。
+
+当前两条链路实际处理的是两个不同的 Tensor：
+
+```text
+链路 A：gold_tiled_tensor
+  Tensor<sifmt::float32, FP32 tiled layout>
+      -> toVectorAsMemoryOrder(true)
+      -> gold_tiled_like_debug
+
+链路 B：out_tensor_d
+  gold_tiled_tensor.toVector()
+      -> gold_linear: std::vector<float>，逻辑顺序
+      -> make_tensor<OutputT>(layout_d, gold_linear)
+      -> Tensor<OutputT, OutputT tiled layout>
+      -> toVectorAsMemoryOrder(true)
+      -> gold_tiled
+```
+
+因此 `gold_tiled_like_debug[i]` 与 `gold_tiled[i]` 同时存在两类不等价：
+
+1. **dtype 不同**：前者是 FP32 原值，后者已经转换成 BF16/FP16 并重新扩展为 float。
+2. **physical layout 不同**：FP32 和 16-bit dtype 的 SiTe tiled tile shape 不同，physical vector 的同一个下标 `i` 不代表同一个逻辑坐标。
+
+所以当前代码的直接比较：
+
+```cpp
+gold_tiled_like_debug[i] == gold_tiled[i]
+```
+
+不是合法的同坐标比较。`gold_tiled_tensor.toVectorAsMemoryOrder(true)` 本身仍然是对**源 FP32 Tensor 自己的 layout**进行正确导出；它不能自动知道目标设备 C 是 FP16/BF16，也不会自动转换到 `LayoutC`。
+
+### 11.2 当前源码中的实际链路
+
+当前测试源码相对 DTE 根目录的路径是：
+
+```text
+testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp
+```
+
+| 相对路径:行号 / 函数名 | 实际行为 |
+|---|---|
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:67 / run_case` | 调用 `sipu::tensor::mm_mnk(..., LayoutTag::Tiled)`，生成 `gold_tiled_tensor` |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:68 / run_case` | `gold_tiled_tensor` 是 host CPU 计算得到的 FP32 tiled Tensor |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:69 / run_case` | `gold_linear = gold_tiled_tensor.toVector()`，得到逻辑顺序 FP32 vector |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:72 / run_case` | 调用 `make_tensor<OutputT>(layout_d, gold_linear)`，完成 FP32 -> BF16/FP16 和目标 tiled layout 打包 |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:73 / run_case` | `gold_tiled = out_tensor_d.toVectorAsMemoryOrder(true)`，导出目标 OutputT Tensor 的 physical order |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:74 / run_case` | 新增的 `gold_tiled_like_debug = gold_tiled_tensor.toVectorAsMemoryOrder(true)`，导出源 FP32 Tensor 的 physical order |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:120 / run_case` | 只有 `LayoutC.tensor_format == 1` 的 tiled C 分支才比较 debug vector；当前 BF16/R8 的 C 是 linear，不进入该 debug 比较 |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:121 / run_case` | 正式 golden 使用 `gold_tiled[i]`，不是 `gold_tiled_like_debug[i]` |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:122 / run_case` | 计算两个 debug vector 的差值，但没有把 mismatch 加入 `err` |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:123 / run_case` | 只更新 `like_debug_err`，没有 `EXPECT`、`ASSERT` 或失败返回 |
+| `testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp:128 / run_case` | 正式设备结果仍与 `gold` 比较 |
+
+因此日志中的 GTest PASS 不能说明两个 debug vector 相等。当前 debug 仅打印诊断信息，不参与测试判定。
+
+### 11.3 两个 Tensor 的 dtype 和 tile shape 确实不同
+
+#### 11.3.1 gold_tiled_tensor 是 FP32 Tensor
+
+**SDK** `include/SiTe/tensor/tensor.hpp:2679 / mm_mnk` 的返回路径如下：
+
+| SDK 相对路径:行号 / 函数名 | 行为 |
+|---|---|
+| `include/SiTe/tensor/tensor.hpp:2698 / mm_mnk` | 把 A 解码成 FP32 vector |
+| `include/SiTe/tensor/tensor.hpp:2699 / mm_mnk` | 把 B 解码成 FP32 vector |
+| `include/SiTe/tensor/tensor.hpp:2711 / mm_mnk` | 用 `float sum` 做累加 |
+| `include/SiTe/tensor/tensor.hpp:2703 / mm_mnk` | 用 `layoutTag` 创建结果 C layout |
+| `include/SiTe/tensor/tensor.hpp:2722 / mm_mnk` | 明确返回 `make_tensor<sifmt::float32>(layoutC, buffer)` |
+
+所以：
+
+```text
+gold_tiled_tensor.dtype = sifmt::float32
+```
+
+#### 11.3.2 out_tensor_d 是 BF16/FP16 Tensor
+
+**SDK** `include/SiTe/tensor/tensor.hpp:1772 / Tensor::Tensor` 接收 float span 并分配目标 dtype 的存储；`include/SiTe/tensor/tensor.hpp:1950 / Tensor::fillWithContainer` 的普通非 MX 分支在第 2063 行调用 `DataType::FromFloat`。
+
+所以：
+
+```text
+out_tensor_d.dtype = OutputT
+OutputT = sifmt::bfloat16  // R8 test
+OutputT = sifmt::float16   // R32 test
+```
+
+目标 dtype 定义在：
+
+| SDK 相对路径:行号 / 类型 | 说明 |
+|---|---|
+| `include/SiTe/sifmt/sifmt_fp.hpp:277 / sifmt::float16` | 16-bit FP16 |
+| `include/SiTe/sifmt/sifmt_fp.hpp:278 / sifmt::bfloat16` | 16-bit BF16 |
+| `include/SiTe/sifmt/sifmt_fp.hpp:279 / sifmt::float32` | 32-bit FP32 |
+
+#### 11.3.3 Tile shape 依赖 dtype bit width
+
+**SDK** `include/SiTe/tensor/tensor.hpp:1097 / LayoutEngine::getTileShape` 根据 `DataType::kBitWidth` 计算 tile shape；`include/SiTe/tensor/tensor.hpp:1235 / LayoutEngine::LayoutEngine` 在第 1278 行选中该 tile shape。
+
+当前日志中的实际 shape 是：
+
+| 用例 | `gold_tiled_tensor`：FP32 tiled | `out_tensor_d`：OutputT tiled |
+|---|---|---|
+| BF16/R8，M=8 | tile `[8,32]`，18 个 tile | BF16 tile `[8,64]`，9 个 tile |
+| FP16/R32，M=32 | tile `[32,8]`，72 个 tile | FP16 tile `[32,16]`，36 个 tile |
+
+证据来自 `temp/run.log`：
+
+- `temp/run.log:68` 至 `:90`：BF16/R8 的 FP32 `gold_tiled_tensor` 显示 `Shape(tile): [8,32]`、`BitWidth: 32`。
+- `temp/run.log:96` 至 `:118`：BF16/R8 的 BF16 `out_tensor_d` 显示 `Shape(tile): [8,64]`、`BitWidth: 16`。
+- `temp/run.log:188` 至 `:210`：FP16/R32 的 FP32 `gold_tiled_tensor` 显示 `Shape(tile): [32,8]`、`BitWidth: 32`。
+- `temp/run.log:216` 至 `:238`：FP16/R32 的 FP16 `out_tensor_d` 显示 `Shape(tile): [32,16]`、`BitWidth: 16`。
+
+这已经说明：两个 Tensor 的 physical vector 不能按同一个 `i` 直接比较。
+
+### 11.4 首个 layout 错位点可以精确算出来
+
+#### 11.4.1 FP16/R32 当前实际 debug 路径
+
+FP32 源 Tensor 的 tile 是 `[32,8]`，所以其物理索引为：
+
+```text
+P_fp32_R32(m,n)
+  = (n/8) * 256
+  + (m/8) * 64
+  + (m%8) * 8
+  + (n%8)
+```
+
+FP16 目标 Tensor 的 tile 是 `[32,16]`，所以其物理索引为：
+
+```text
+P_fp16_R32(m,n)
+  = (n/16) * 512
+  + (m/8) * 128
+  + (m%8) * 16
+  + (n%16)
+```
+
+因此相同 physical index `i` 的逻辑坐标从 `i=8` 开始就不一样：
+
+| physical index | FP32 source `gold_tiled_like_debug` | FP16 target `gold_tiled` |
+|---:|---|---|
+| `0..7` | `[0,0..7]` | `[0,0..7]` |
+| `8..15` | `[1,0..7]` | `[0,8..15]` |
+| `16..23` | `[2,0..7]` | `[1,0..7]` |
+| `128..135` | `[16,0..7]` | `[8,0..7]` |
+| `256..263` | `[0,8..15]` | `[16,0..7]` |
+
+日志也显示了这个模式叠加精度变化后的结果：
+
+```text
+temp/run.log:242
+i=0: gold_tiled_like_debug=87832, gold_tiled=inf
+
+temp/run.log:244
+i=2: gold_tiled_like_debug=-34408, gold_tiled=-34400
+
+temp/run.log:252
+i=10: gold_tiled_like_debug=55688, gold_tiled=-57280
+
+temp/run.log:258
+i=16: gold_tiled_like_debug=-130823, gold_tiled=-7316
+```
+
+其中：
+
+- `i=0` 仍是同一个逻辑坐标，但 FP32 的 `87832` 转成 FP16 已经溢出为 `inf`。
+- `i=2` 仍是同一个逻辑坐标，但 FP16 发生舍入：`-34408 -> -34400`。
+- `i=10` 已经不是同一个逻辑坐标：FP32 physical 序列对应 `[1,2]`，FP16 physical 序列对应 `[0,10]`。
+- `i=16` 更明显：FP32 physical 序列对应 `[2,0]`，FP16 physical 序列对应 `[1,0]`。
+
+所以日志中的大差值不是 `toVectorAsMemoryOrder` 把一个数组随机打乱，而是两个不同 layout 的 physical index 被错误地拿来对齐。
