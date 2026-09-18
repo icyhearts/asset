@@ -4607,3 +4607,129 @@ all mma_dte cases passed
 2. 原 testcase 的两个 `run_case` 在不使用 GTest 的普通 `main()` 中均通过：
    BF16/R8 linear output 和 FP16/R32 tiled output 的 device 结果都与 SiTe gold
    逐元素一致。
+
+## 14. MXFP8 R32 测试中的 `TEST`、`run_case` 和 `INSTANTIATE_TEST_SUITE_P`（2026-09-18）
+
+本节以 `/share/users/like/package/oplib/mma_dte_tile_tensor` 为准。
+
+### 14.1 `SingleFullChunkReinitializesAccumulator` 是否调用 `run_case`
+
+是。`testcase/func_test/test_mxfp8_host/r32/test_mxfp8_r32.cpp:63-74 / MmaDteMxfp8R32Regression::SingleFullChunkReinitializesAccumulator` 中调用了两次：
+
+```text
+run_case<mxfloat8e4m3, float16, R32, linear C>(
+    "r32_e4m3_f16_linear_single_full_chunk_first", 96, 96, 256)
+
+run_case<mxfloat8e4m3, float16, R32, linear C>(
+    "r32_e4m3_f16_linear_single_full_chunk_repeat", 96, 96, 256)
+```
+
+之后 `:72-73 / SingleFullChunkReinitializesAccumulator` 用 `EXPECT_TRUE` 检查两次返回值。
+
+`temp/run_mxfp8.log:5-12` 明确显示该测试实际运行，并且两次调用都通过：
+
+```text
+[ RUN      ] MmaDteMxfp8R32Regression.SingleFullChunkReinitializesAccumulator
+[PASS] r32_e4m3_f16_linear_single_full_chunk_first (M=96, N=96, K=256)
+[PASS] r32_e4m3_f16_linear_single_full_chunk_repeat (M=96, N=96, K=256)
+[       OK ] MmaDteMxfp8R32Regression.SingleFullChunkReinitializesAccumulator
+```
+
+因此它不是“只定义未调用”。这个回归用例让相同的 `M=96,N=96,K=256` 连续执行两次，用于检查单个完整 K chunk 的第一次 launch 会重新初始化 accumulator，而不会错误地复用上一次 launch 的累加状态。
+
+### 14.2 `run_case` 的定义和功能
+
+定义位于 `testcase/func_test/test_mxfp8_host/common/test_mxfp8_common.hpp:46-48 / run_case`：
+
+```cpp
+template <class MX_T, class OUT_T,
+          mma_dte_api::tensor_layout LayoutA,
+          mma_dte_api::tensor_layout LayoutB,
+          mma_dte_api::tensor_layout LayoutC>
+bool run_case(const char* name, int M, int N, int K);
+```
+
+模板参数含义：`MX_T` 是 A/B 的 MX 输入类型，`OUT_T` 是 C 和 alpha/beta 类型，三个 `Layout*` 是 A/B/C 的 `mma_dte_api::tensor_layout`。`LayoutC.tensor_format=0` 表示 linear C，`1` 表示 tiled C。
+
+函数流程：
+
+1. `testcase/func_test/test_mxfp8_host/common/test_mxfp8_common.hpp:49-59 / run_case` 使用固定 seed `7` 生成 A `[M,K]` 和 B `[N,K]` 的随机 FP32 输入。
+2. `:61-74 / run_case` 用 `sipu::make_shape`、`sipu::make_tiling_config`、`sipu::make_layout` 和 `sipu::make_tensor` 把 A/B 转成 MX tiled tensor；`:62` 特别说明 SiTe 的 `(row,column)` 与 `tensor_layout` 的 `(column,row)` 需要交换。
+3. `:76-82 / run_case` 用 `sipu::tensor::mm_mnk` 生成 gold，再导出 `gold_linear` 和 `gold_tiled`，分别对应 logical/linear 与 physical/tiled 校验。
+4. `:84-95 / run_case` 按 `LayoutC` 计算输出物理元素数，并分配对齐的 device A/B/C buffer。
+5. `:96-103 / run_case` H2D 拷贝 A/B，然后调用：
+
+   ```cpp
+   mma_dte<MX_T, OUT_T, OUT_T, LayoutA, LayoutB, LayoutC>(
+       OP_N, OP_N, M, N, K,
+       OUT_T(0.1f), d_a, K, d_b, K,
+       OUT_T(0.2f), d_c, N);
+   ```
+
+6. `:105-108 / run_case` 将 C D2H 并释放 device buffer。
+7. `:110-136 / run_case` 逐元素比较结果；普通有限值使用 `kErrThreshold=0.0076f`，阈值定义在 `:21 / kErrThreshold`，同时处理 NaN/Inf。
+8. `:138-143 / run_case` 释放 host 输出；成功打印 `[PASS]` 并返回 `true`，失败返回 `false`。
+
+因此 `run_case` 是一个完整的端到端单 case 测试函数：
+
+```text
+随机输入 -> SiTe MX tensor -> SiTe gold GEMM
+-> SIPU device allocation/H2D -> mma_dte -> D2H
+-> linear/tiled gold comparison -> bool
+```
+
+### 14.3 参数化测试的调用链
+
+`testcase/func_test/test_mxfp8_host/r32/test_mxfp8_r32.cpp:49 / MmaDteMxfp8R32Test` 继承 `::testing::TestWithParam<CaseParam>`；`:51-58 / MmaDteMxfp8R32Test::Computes` 是 `TEST_P` body：
+
+```text
+Computes -> GetParam() -> daily_only 判断 -> run_param(param) -> run_case(...)
+```
+
+`run_param` 位于 `:35-47 / run_param`，根据 `CaseKind` 选择 E5M2 tiled 或 E4M3 linear 的 `run_case` 模板实例。
+
+如果 `param.daily_only` 且 `is_daily_suite()` 为 false，`:52-55 / MmaDteMxfp8R32Test::Computes` 执行 `GTEST_SKIP()`，此时不会调用 `run_param`，也不会调用 `run_case`。`is_daily_suite` 的环境变量判断位于 `testcase/func_test/test_mxfp8_host/common/test_mxfp8_common.hpp:41-44 / is_daily_suite`。
+
+### 14.4 `INSTANTIATE_TEST_SUITE_P` 的功能
+
+调用位于 `testcase/func_test/test_mxfp8_host/r32/test_mxfp8_r32.cpp:76-78 / INSTANTIATE_TEST_SUITE_P`：
+
+```cpp
+INSTANTIATE_TEST_SUITE_P(DefaultCases, MmaDteMxfp8R32Test,
+                         ::testing::ValuesIn(case_params()), case_param_name);
+```
+
+它不会直接调用 `run_case`，而是把 `TEST_P` 的一个测试 body 按参数集合展开成多个独立 GTest test instance：
+
+- `DefaultCases` 是测试 prefix。
+- `MmaDteMxfp8R32Test` 是待实例化的 parameterized fixture。
+- `::testing::ValuesIn(case_params())` 使用 `test_mxfp8_r32.cpp:20-29 / case_params` 返回的 5 个 `CaseParam`。
+- `case_param_name` 位于 `:31-33 / case_param_name`，把 `CaseParam::name` 作为测试名后缀。
+
+生成的测试名类似：
+
+```text
+DefaultCases/MmaDteMxfp8R32Test.Computes/r32_e5m2_f16_tiled_m96n96k256
+DefaultCases/MmaDteMxfp8R32Test.Computes/r32_e4m3_f16_linear_m96n96k256
+```
+
+概念上相当于为每个 `CaseParam` 注册一个带参数的 `Computes`，运行时由 GTest 调用该实例的 `Computes`；真正调用 `run_case` 的位置仍是 `run_param`，不是 `INSTANTIATE_TEST_SUITE_P` 本身。
+
+### 14.5 本次日志的实际调用次数
+
+`temp/run_mxfp8.log` 显示总共运行 6 个测试：1 个 regression test 加 5 个参数化 test。当前非 daily 环境下：
+
+| 测试 | 状态 | `run_case` 调用次数 |
+|---|---|---:|
+| `MmaDteMxfp8R32Regression.SingleFullChunkReinitializesAccumulator` | PASS | 2 |
+| `.../r32_e5m2_f16_tiled_m96n96k256` | PASS | 1 |
+| `.../r32_e4m3_f16_linear_m96n96k256` | PASS | 1 |
+| 3 个 `daily_only` 参数 | SKIPPED | 0 |
+
+所以这次运行中：
+
+```text
+run_case 实际调用次数 = 2 + 1 + 1 = 4
+```
+
+日志末尾 `temp/run_mxfp8.log:40-44` 也确认了 `3 tests passed`、`3 tests skipped`。若运行前设置 `SITEST_CASE_LEVEL=daily`，3 个 daily-only 参数才会继续进入 `run_param` 和 `run_case`。

@@ -5150,3 +5150,13 @@ INSTANTIATE_TEST_SUITE_P 有什么功能?
 
 问答问题时候，答案追加到 like-useful/answer_codex_v4.md
 }
+
+{
+simo 代码位于 /share/users/like/package/simo_conda_sglang
+
+simo conda 环境位于 /share_data/users/like/miniconda3/envs/simo_sglang/
+simo以 editable方式安装
+ MANIFEST.in 是为什么被引入？有什么功能？现在还需要吗?
+回答问题时候，答案追加到 like-useful/answer_codex_v3.md
+
+}
