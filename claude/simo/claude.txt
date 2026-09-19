@@ -5190,39 +5190,31 @@ mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host
 下面约定，include/simma.h 180行 void mma_dte 叫做 mma_dte
 sipu tile format 一个 tile 可以是8行，16行，32行,对应的mma有 R8 mma_dte, R16 mma_dte, R32 mma_dte
 
-完善like-useful/answer_codex_v4.md 12.4 MXINT8, 在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
+完善like-useful/answer_codex_v4.md 12.4 MXINT8, 在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加的时候，步长分别是多少?
 比如 MXINT8 表格, row family=R8, 允许用户输入 A 矩阵 大于8并且是8的整数倍吗？
 比如 MXINT8 表格, row family=R32 1x4, 最小M,N,K=128,128,32 允许用户输入 K > 32 吗? K > 32意味着 K>1个 tile.
 比如 MXINT8 表格, row family=R32 2x2, 最小M,N,K=64 	64 	64, 允许用户输入 K > 64 吗? K > 64意 味着 K>2个 tile.
 
-现在讨论 新的 void mma_dte  接口在不同数据类型下，不同row对齐下，支持的最小M,N,K形状
-
-对于 A/B 矩阵都是 mxint8，
-R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-
-对于 A/B 矩阵都是 mxfp8，
-R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-
-对于 A/B 矩阵都是 mxfp6，
-R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+"最小 M"  一列改成:[M_min_value, M_max_value, M_step], M_min_value, M_max_value 的区间是 "左闭右闭" 区间，M_step表示的增加步长, 如果没有上界，用 inf 表示上界, 比如[8, inf, 8]表示最小8，没有上界，step=8. 如果M只允许唯一的值，则上界和下界相同，step=None,比如写成[M_min_value=8, M_max_value=0, M_step=None]
+"最小 N"  一列同样方式修改[min_value, max_value, step].
+"最小 K"  一列同样方式修改[min_value, max_value, step].
 
 
-对于 A/B 矩阵都是 mxfp4，
-R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+完善like-useful/answer_codex_v4.md 12.5 MXFP8 ,  在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
+"最小 M"  一列同样方式修改[min_value, max_value, step].
+"最小 N"  一列同样方式修改[min_value, max_value, step].
+"最小 K"  一列同样方式修改[min_value, max_value, step].
 
+完善like-useful/answer_codex_v4.md 12.6 MXFP6,  在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
+"最小 M"  一列同样方式修改[min_value, max_value, step].
+"最小 N"  一列同样方式修改[min_value, max_value, step].
+"最小 K"  一列同样方式修改[min_value, max_value, step].
 
- 对于 A/B 矩阵都是 mxint4，
-R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
-R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+完善like-useful/answer_codex_v4.md 12.7 MXFP4,  在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
+"最小 M"  一列同样方式修改[min_value, max_value, step].
+"最小 N"  一列同样方式修改[min_value, max_value, step].
+"最小 K"  一列同样方式修改[min_value, max_value, step].
+
 
 重新完善 like-useful/answer_codex_v4.md 最后一节
 }
