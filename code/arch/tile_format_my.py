@@ -126,5 +126,10 @@ def main():
     tile_shape_config([1000,8], 6)
 
 
+    tile_shape_config([64, 32], 8)
+    tile_shape_config([128, 32], 8)
+    tile_shape_config([64, 64], 8)
+    tile_shape_config([512, 8], 8)
+
 if __name__ == '__main__':
     main()
