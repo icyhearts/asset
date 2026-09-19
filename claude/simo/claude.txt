@@ -5231,8 +5231,6 @@ BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 # 本次任务，先打通 PyTorch Tensor -> mma_dte c++ 函数调用的通路，mma_dte 每种数据类型支持
 }
 
-
-
 {
 答案追加到 like-useful/answer_claude_v2.md 里面
 
@@ -5296,3 +5294,8 @@ cd /share/users/like/package/oplib/mma_dte_tile_tensor
 BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test 
 用经过实际测试的例子，重新完善 like-useful/answer_codex_v4.md, 把mxint8, mxfp8, mxfp6,mxfp4 的M,N,K 的 [min_value, max_value, step] 补充完善。 
 }
+
+
+
+
+
