@@ -5165,56 +5165,63 @@ simo以 editable方式安装
 {
 答案追加到 like-useful/answer_claude_v2.md 里面
 
+问题背景 :
 sipu 是自定义的一种AI芯片
-sipu sdk 位于 /share_data/sicx_sdk/release/2609151958
+sipu sdk 位于 /share_data/sicx_sdk/release/v0.4.2
 sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
 sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
-
 vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
 vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
 vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
 vllm-sipu 测试mxin8 gemm算子的例子在 vllm-sipu code base tests/kernels/quantization/test_mxint8_unpack_pytest.py
+mma_dte_tile_tensor 是 sikernel 的一个 submodule, sikernel 代码仓库位于 /share/users/like/package/sikernel/
+为方便 debug mma_dte_tile_tensor,  mma_dte_tile_tensor 单独 clone到   独立目录: /share/users/like/package/oplib/mma_dte_tile_tensor
+注意； 本次任务  mma_dte_tile_tensor 代码 都用   /share/users/like/package/oplib/mma_dte_tile_tensor 里面的代码. mma_dte_tile_tensor 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
 
-mma_dte_tile_tensor 是 sikernel 的一个 submodule 
-最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
-其中有一个 submodule mma_dte_tile_tensor 位于 /share/users/like/package/sikernel/mma_dte_tile_tensor, 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
-其构建方式是 
-cd /share/users/like/package/sikernel/
-source setup.sh
-cd /share/users/like/package/sikernel/mma_dte_tile_tensor
-BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test 
-
-构建日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log.nodir
+mma_dte_tile_tensor构建方式是 :
+. /share/users/like/miniconda3/bin/activate  vllm_dev
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+cd /share/users/like/package/oplib/mma_dte_tile_tensor
+BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test > temp/build.test.log 2>&1  &
+BUILD_JOBS=80 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --all > temp/build.all.log 2>&1  &
+bash build_release.sh --skip-build > temp/build_release.log 2>&1 &  
+构建日志位于 /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.all.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.test.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build_release.log
 
 mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 会调用 mma_dte include/simma.h 180行 void mma_dte(mma_dte_api::Operation transa, mma_dte_api::Operation transb 函数.
 下面约定，include/simma.h 180行 void mma_dte 叫做 mma_dte
 sipu tile format 一个 tile 可以是8行，16行，32行,对应的mma有 R8 mma_dte, R16 mma_dte, R32 mma_dte
-
+你的任务是:
 完善like-useful/answer_codex_v4.md 12.4 MXINT8, 在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加的时候，步长分别是多少?
 比如 MXINT8 表格, row family=R8, 允许用户输入 A 矩阵 大于8并且是8的整数倍吗？
 比如 MXINT8 表格, row family=R32 1x4, 最小M,N,K=128,128,32 允许用户输入 K > 32 吗? K > 32意味着 K>1个 tile.
 比如 MXINT8 表格, row family=R32 2x2, 最小M,N,K=64 	64 	64, 允许用户输入 K > 64 吗? K > 64意 味着 K>2个 tile.
 
-"最小 M"  一列改成:[M_min_value, M_max_value, M_step], M_min_value, M_max_value 的区间是 "左闭右闭" 区间，M_step表示的增加步长, 如果没有上界，用 inf 表示上界, 比如[8, inf, 8]表示最小8，没有上界，step=8. 如果M只允许唯一的值，则上界和下界相同，step=None,比如写成[M_min_value=8, M_max_value=0, M_step=None]
-"最小 N"  一列同样方式修改[min_value, max_value, step].
-"最小 K"  一列同样方式修改[min_value, max_value, step].
-
+表格"最小 M"  一列改成:[M_min_value, M_max_value, M_step], M_min_value, M_max_value 的区间是 "左闭右闭" 区间，M_step表示的增加步长, 如果没有上界，用 inf 表示上界, 比如[8, inf, 8]表示最小8，没有上界，step=8. 如果M只允许唯一的值，则上界和下界相同，step=None,比如写成[M_min_value=8, M_max_value=0, M_step=None]
+表格"最小 N"  一列同样方式修改成 [min_value, max_value, step]的形式.
+表格"最小 K"  一列同样方式修改成 [min_value, max_value, step]的形式.
 
 完善like-useful/answer_codex_v4.md 12.5 MXFP8 ,  在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
-"最小 M"  一列同样方式修改[min_value, max_value, step].
-"最小 N"  一列同样方式修改[min_value, max_value, step].
-"最小 K"  一列同样方式修改[min_value, max_value, step].
+表格"最小 M"  一列同样方式修改成 [min_value, max_value, step]的形式.
+表格"最小 N"  一列同样方式修改成 [min_value, max_value, step]的形式.
+表格"最小 K"  一列同样方式修改成 [min_value, max_value, step]的形式.
 
 完善like-useful/answer_codex_v4.md 12.6 MXFP6,  在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
-"最小 M"  一列同样方式修改[min_value, max_value, step].
-"最小 N"  一列同样方式修改[min_value, max_value, step].
-"最小 K"  一列同样方式修改[min_value, max_value, step].
+表格"最小 M"  一列同样方式修改成 [min_value, max_value, step]的形式.
+表格"最小 N"  一列同样方式修改成 [min_value, max_value, step]的形式.
+表格"最小 K"  一列同样方式修改成 [min_value, max_value, step]的形式.
 
 完善like-useful/answer_codex_v4.md 12.7 MXFP4,  在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
-"最小 M"  一列同样方式修改[min_value, max_value, step].
-"最小 N"  一列同样方式修改[min_value, max_value, step].
-"最小 K"  一列同样方式修改[min_value, max_value, step].
+表格"最小 M"  一列同样方式修改成 [min_value, max_value, step]的形式.
+表格"最小 N"  一列同样方式修改成 [min_value, max_value, step]的形式.
+表格"最小 K"  一列同样方式修改成 [min_value, max_value, step]的形式.
 
-
-重新完善 like-useful/answer_codex_v4.md 最后一节
+理论上分析代码是不够的，要实际修改测试例子，我允许你修改 /share/users/like/package/sikernel/mma_dte_tile_tensor/testcase/ 里面的使用 gtest 测试的 代码，验证 我提出的mxint8, mxfp8, mxfp6,mxfp4 的M,N,K 的 [min_value, max_value, step].
+修改完成，构建测试例子的构建方式是 ：
+. /share/users/like/miniconda3/bin/activate  vllm_dev
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+cd /share/users/like/package/oplib/mma_dte_tile_tensor
+BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test 
+用经过实际测试的例子，重新完善 like-useful/answer_codex_v4.md, 把mxint8, mxfp8, mxfp6,mxfp4 的M,N,K 的 [min_value, max_value, step] 补充完善。 
 }
