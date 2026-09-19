@@ -4077,7 +4077,7 @@ R32 的最小 Pareto 形状仍是：
 1x4: (M,N,K) = (128,128, 32)
 ```
 
-R32 2x2 的 K 单点上界来自 `kernel/detail/mma_dte_tiled_tensor_layout_contracts.hpp:139-145 / mma_dte_mx_2x2_shape_supported` 的 `k == 2 * mma_dte_physical_tile_k()`。R32 1x4 的 K 单点是当前实现的实测边界：`testcase/func_test/test_mx_shape_bounds_host/test_mx_shape_bounds_host.cpp:... / MxInt8R32OneByFour.KAboveSingleTileProducesInvalidResult`。
+R32 2x2 的 K 单点上界来自 `kernel/detail/mma_dte_tiled_tensor_layout_contracts.hpp:139-145 / mma_dte_mx_2x2_shape_supported` 的 `k == 2 * mma_dte_physical_tile_k()`；新增 death test 入口见 `testcase/func_test/test_mx_shape_bounds_host/test_mx_shape_bounds_host.cpp:288 / MxInt8R32TwoByTwo.KAboveSingleSupertileIsRejected`。R32 1x4 的 K 单点是当前实现的实测边界，MXINT8 负例见 `testcase/func_test/test_mx_shape_bounds_host/test_mx_shape_bounds_host.cpp:305 / MxInt8R32OneByFour.KAboveSingleTileProducesInvalidResult`。
 
 MXINT8 的 batch testcase 用 `testcase/func_test/test_bf16_mxint8_host/batch_test.py:64-68 / SUPERTILE_LAYOUT_B`、`:110-140 / resolve_layout_c、resolve_layout_a` 生成这三类 input layout 和 C layout。
 
@@ -4151,15 +4151,15 @@ MXFP6 的 `mxfloat6e2m3` 与 `mxfloat6e3m2` 使用相同的 tile geometry。当�
 
 MXINT4 是 `sifmt::mxint4`。当前显式实例化位于 `kernel/instantiations/mxint4/inst_mxint4.su:27-61 / mma_dte`。
 
-| row family | layoutA | layoutB | 最小 M | 最小 N | 最小 K |
+| row family | layoutA | layoutB | M | N | K |
 |---|---|---|---:|---:|---:|
-| R8 | `(256,8,4,1,1)` | `(64,32,4,1,1)` | 8 | 32 | 1024 |
-| R16 | `(128,16,4,1,1)` | `(64,32,4,1,1)` | 16 | 32 | 512 |
-| R32 standard 4x1 | `(64,32,4,1,1)` | `(64,32,4,1,1)` | 32 | 32 | 256 |
-| R32 2x2 | `(64,32,2,2,1)` | `(64,32,2,2,1)` | 64 | 64 | 128 |
-| R32 1x4 | `(64,32,1,4,1)` | `(64,32,1,4,1)` | 128 | 128 | 64 |
+| R8 | `(256,8,4,1,1)` | `(64,32,4,1,1)` | `[8,8,None]` | `[32,inf,32]` | `[1024,inf,1024]` |
+| R16 | `(128,16,4,1,1)` | `(64,32,4,1,1)` | `[16,16,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| R32 standard 4x1 | `(64,32,4,1,1)` | `(64,32,4,1,1)` | `[32,inf,32]` | `[32,inf,32]` | `[256,inf,256]` |
+| R32 2x2 | `(64,32,2,2,1)` | `(64,32,2,2,1)` | `[64,inf,64]` | `[64,inf,64]` | `[128,128,None]` |
+| R32 1x4 | `(64,32,1,4,1)` | `(64,32,1,4,1)` | `[128,inf,128]` | `[128,inf,128]` | `[64,64,None]` |
 
-MXINT4 与 MXFP4 的 tile geometry 相同，所以最小 M/N/K 完全相同；差别是输入数值编码和 TensorMap dtype，不是 shape contract。MXINT4 testcase 的枚举在：
+MXINT4 与 MXFP4 的 tile geometry 和当前边界范围相同，所以 M/N/K 区间也相同；差别是输入数值编码和 TensorMap dtype，不是 shape contract。MXINT4 testcase 的枚举在：
 
 - `testcase/func_test/test_bf16_mxi4_r8_host/test_bf16_mxi4_r8_host.cpp:42-48 / M_VALUES、N_VALUES_TILED_OUT、N_VALUES_LINEAR_OUT、K_VALUES`。
 - `testcase/func_test/test_bf16_mxi4_r16_host/test_bf16_mxi4_r16_host.cpp:43-47 / M_VALUES、N_VALUES、K_VALUES`。
@@ -4232,18 +4232,30 @@ MXINT4 与 MXFP4 的 tile geometry 相同，所以最小 M/N/K 完全相同；�
 ### 12.11 最终工程结论
 
 ```text
-MXINT8: R8  (8,32,512), R16 (16,32,256), R32 4x1 (32,32,128)
-        R32 2x2 (64,64,64), R32 1x4 (128,128,32)
+MXINT8:
+  R8  M=[8,8,None],     N=[32,inf,32],   K=[512,inf,512]
+  R16 M=[16,16,None],   N=[32,inf,32],   K=[256,inf,256]
+  R32 4x1 M=[32,inf,32],   N=[32,inf,32],   K=[128,inf,128]
+  R32 2x2 M=[64,inf,64],   N=[64,inf,64],   K=[64,64,None]
+  R32 1x4 M=[128,inf,128], N=[128,inf,128], K=[32,32,None]
 
-MXFP8 : 与 MXINT8 相同；R32 1x4 另外要求 K <= 32
+MXFP8: 与 MXINT8 的范围相同；R32 1x4 的 K=32 是明确 planner 上界。
 
-MXFP6 : R8  (8,32,2048), R16 (16,32,1024), R32 4x1 (32,32,512)
-        R32 2x2 (64,64,256), R32 1x4 (128,128,128)
+MXFP6:
+  R8  M=[8,8,None],     N=[32,inf,32],   K=[2048,inf,2048]
+  R16 M=[16,16,None],   N=[32,inf,32],   K=[1024,inf,1024]
+  R32 4x1 M=[32,inf,32],   N=[32,inf,32],   K=[512,inf,512]
+  R32 2x2 M=[64,inf,64],   N=[64,inf,64],   K=[256,256,None]
+  R32 1x4 M=[128,inf,128], N=[128,inf,128], K=[128,128,None]
 
-MXFP4 : R8  (8,32,1024), R16 (16,32,512), R32 4x1 (32,32,256)
-        R32 2x2 (64,64,128), R32 1x4 (128,128,64)
+MXFP4:
+  R8  M=[8,8,None],     N=[32,inf,32],   K=[1024,inf,1024]
+  R16 M=[16,16,None],   N=[32,inf,32],   K=[512,inf,512]
+  R32 4x1 M=[32,inf,32],   N=[32,inf,32],   K=[256,inf,256]
+  R32 2x2 M=[64,inf,64],   N=[64,inf,64],   K=[128,128,None]
+  R32 1x4 M=[128,inf,128], N=[128,inf,128], K=[64,64,None]
 
-MXINT4: 与 MXFP4 相同
+MXINT4: tile geometry and current range behavior match MXFP4.
 ```
 
 因此，对“Linear output 和 tiled output 是否相同”的简短答案是：
@@ -4277,6 +4289,64 @@ validation API：R8 + 非 MXFP8 + BF16/FP16 linear output 仍额外要求 N >= 6
 ```
 
 该次运行结果为 6 个测试全部通过，覆盖三种 R32 input supertile 和两种 C output format。MXFP8 三个最小 shape 也分别通过对应的 R8、R32 2x2、R32 1x4 testcase。
+
+### 12.13 M/N/K 范围边界的实际 GTest 验证（2026-09-19）
+
+新增测试工程：
+
+```text
+testcase/func_test/test_mx_shape_bounds_host/CMakeLists.txt
+testcase/func_test/test_mx_shape_bounds_host/test_mx_shape_bounds_host.cpp
+```
+
+测试源直接链接当前仓库的 MXINT8、MXFP8、MXFP6、MXFP4 `.su` 实例，覆盖 R8、R16、R32 4x1、R32 2x2、R32 1x4。核心执行函数为 `test_mx_shape_bounds_host/test_mx_shape_bounds_host.cpp:66-166 / run_shape`，每个 shape 都经过 SiTe input pack、`sipu::tensor::mm_mnk` gold、H2D、`mma_dte`、D2H 和逐元素比较。
+
+按题目要求执行了：
+
+```bash
+. /share/users/like/miniconda3/bin/activate vllm_dev
+cd /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+cd /share/users/like/package/oplib/mma_dte_tile_tensor
+BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
+```
+
+最终增量构建日志为：
+
+```text
+temp/build.test.shape_bounds.final.log
+```
+
+聚合 testcase 构建成功，并发布了 82 个 testcase binary。边界 executable 为：
+
+```text
+build/testcase/v0.4.2_2609111541/sipu_150/default/specialized/test_mx_shape_bounds_host
+```
+
+运行日志为：
+
+```text
+temp/run_mx_shape_bounds3.log
+```
+
+结果：
+
+```text
+[==========] 36 tests from 20 test suites ran.
+[  PASSED  ] 36 tests.
+```
+
+验证覆盖：
+
+| 维度/路径 | 实际验证 |
+|---|---|
+| R8 | M 超过单 input tile 时 SiTe packer 拒绝；N 增加一个及多个 tile；K 增加多个 tile |
+| R16 | M 超过单 input tile 时 SiTe packer 拒绝；N/K 多 tile 通过 |
+| R32 4x1 | M、N、K 各增加一步及多个 tile 均通过 |
+| R32 2x2 | M/N 增加通过；K 增加到下一个值由 death test 拒绝 |
+| R32 1x4 | M/N 增加通过；K 增加后 MXINT8/MXFP6/MXFP4 输出错误，MXFP8 planner 拒绝 |
+
+因此表中的 `inf` 不是声称已经穷举到无限大，而是表示当前代码没有有限的 shape 上界；本次测试至少覆盖了多个 M/N tile 和多个 K tile。R32 1x4 的 K 被写成单点，是因为当前实现对多 K tile 不可用，不能仅依据 `M/N/K` 模运算检查得出“可继续增长”。
 
 ## 13. release DSO 的区别、应用链接方式和无 GTest 调用示例（2026-09-18）
 
