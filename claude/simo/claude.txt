@@ -5160,3 +5160,69 @@ simo以 editable方式安装
 回答问题时候，答案追加到 like-useful/answer_codex_v3.md
 
 }
+
+
+{
+答案追加到 like-useful/answer_claude_v2.md 里面
+
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/2609151958
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+vllm-sipu 依赖的 sikernel 在 /share/users/like/package/vllm-sipu/.deps/sikernel-src
+vllm-sipu 测试mxin8 gemm算子的例子在 vllm-sipu code base tests/kernels/quantization/test_mxint8_unpack_pytest.py
+
+mma_dte_tile_tensor 是 sikernel 的一个 submodule 
+最新的独立的 sikernel 代码仓库位于 /share/users/like/package/sikernel/
+其中有一个 submodule mma_dte_tile_tensor 位于 /share/users/like/package/sikernel/mma_dte_tile_tensor, 这里面是更高性能的 gemm 算子，  vllm-sipu使用的  vllm-sipu code base .deps/sikernel-src/include/sikernel.h:mma_bf16_mxi8_universal 不是最高性能的 gemm算子
+其构建方式是 
+cd /share/users/like/package/sikernel/
+source setup.sh
+cd /share/users/like/package/sikernel/mma_dte_tile_tensor
+BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test 
+
+构建日志位于 /share/users/like/package/sikernel/mma_dte_tile_tensor/temp/cxx.log.nodir
+
+mma_dte_tile_tensor/testcase/func_test/test_bf16_mxint8_host/test_bf16_mxi8_host.cpp 会调用 mma_dte include/simma.h 180行 void mma_dte(mma_dte_api::Operation transa, mma_dte_api::Operation transb 函数.
+下面约定，include/simma.h 180行 void mma_dte 叫做 mma_dte
+sipu tile format 一个 tile 可以是8行，16行，32行,对应的mma有 R8 mma_dte, R16 mma_dte, R32 mma_dte
+
+完善like-useful/answer_codex_v4.md 12.4 MXINT8, 在解释最小M,N,K的基础上，在表格补充信息： M,N,K 有没有上界? M,N,K 增加，步长分别是多少?
+比如 MXINT8 表格, row family=R8, 允许用户输入 A 矩阵 大于8并且是8的整数倍吗？
+比如 MXINT8 表格, row family=R32 1x4, 最小M,N,K=128,128,32 允许用户输入 K > 32 吗? K > 32意味着 K>1个 tile.
+比如 MXINT8 表格, row family=R32 2x2, 最小M,N,K=64 	64 	64, 允许用户输入 K > 64 吗? K > 64意 味着 K>2个 tile.
+
+现在讨论 新的 void mma_dte  接口在不同数据类型下，不同row对齐下，支持的最小M,N,K形状
+
+对于 A/B 矩阵都是 mxint8，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+
+对于 A/B 矩阵都是 mxfp8，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+
+对于 A/B 矩阵都是 mxfp6，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+
+
+对于 A/B 矩阵都是 mxfp4，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+
+
+ 对于 A/B 矩阵都是 mxint4，
+R8 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R16 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+R32 mma_dte 支持的最小M, N, K是多少 ？Linear output 和 tiled output 是否相同?
+
+重新完善 like-useful/answer_codex_v4.md 最后一节
+}
