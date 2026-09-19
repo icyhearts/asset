@@ -4057,21 +4057,19 @@ linear 和 tiled 的**逻辑矩阵结果相同**，但 C 的物理内存排列�
 
 当前 layout 来源包括 `kernel/instantiations/mxint8/inst_mxint8_r8.su:21-27 / mma_dte`、`inst_mxint8_r16.su:21-27 / mma_dte` 以及 `inst_mxint8_r32_4x1.su:21-27 / mma_dte`、`inst_mxint8_r32_2x2.su:21-27 / mma_dte`、`inst_mxint8_r32_1x4.su:21-27 / mma_dte`。
 
-| row family | layoutA | layoutB | 最小 M | 最小 N | 最小 K |
+本节三元组统一写成 `[min_value,max_value,step]`，区间为左闭右闭。`inf` 表示当前 dtype/layout contract 没有有限上界；仍受正 `int` 参数、内存、地址和 `uint32_t total_Chunks` 等工程限制。唯一允许值写成 `[x,x,None]`。用户示例中的 `[8,0,None]` 与左闭右闭语义矛盾，这里采用 `[8,8,None]`。
+
+| row family | layoutA | layoutB | M | N | K |
 |---|---|---|---:|---:|---:|
-| R8 | `(128,8,4,1,1)` | `(32,32,4,1,1)` | 8 | 32 | 512 |
-| R16 | `(64,16,4,1,1)` | `(32,32,4,1,1)` | 16 | 32 | 256 |
-| R32 standard 4x1 | `(32,32,4,1,1)` | `(32,32,4,1,1)` | 32 | 32 | 128 |
-| R32 2x2 | `(32,32,2,2,1)` | `(32,32,2,2,1)` | 64 | 64 | 64 |
-| R32 1x4 | `(32,32,1,4,1)` | `(32,32,1,4,1)` | 128 | 128 | 32 |
+| R8 | `(128,8,4,1,1)` | `(32,32,4,1,1)` | `[8,8,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| R16 | `(64,16,4,1,1)` | `(32,32,4,1,1)` | `[16,16,None]` | `[32,inf,32]` | `[256,inf,256]` |
+| R32 standard 4x1 | `(32,32,4,1,1)` | `(32,32,4,1,1)` | `[32,inf,32]` | `[32,inf,32]` | `[128,inf,128]` |
+| R32 2x2 | `(32,32,2,2,1)` | `(32,32,2,2,1)` | `[64,inf,64]` | `[64,inf,64]` | `[64,64,None]` |
+| R32 1x4 | `(32,32,1,4,1)` | `(32,32,1,4,1)` | `[128,inf,128]` | `[128,inf,128]` | `[32,32,None]` |
 
-对当前主 `mma_dte` 入口：
+实际含义：R8/R16 的 M 被当前 SiTe short-M MX packer 固定为单 tile；N/K 可以按步长增加。R32 4x1 的 M/N/K 都可以增加。R32 2x2 的 M/N 可以增加，但 K 严格固定为单个 2x2 supertile 的 K。R32 1x4 当前实现只有单 K tile 的正确结果，K 增加到 64 时实际结果错误。
 
-```text
-R8/R16/R32 的 tiled C 和 linear C 使用相同的 M/N/K 最小值。
-```
-
-R32 的三个 layout 是三组 Pareto 形状，不能组合成 `(32,32,32)`：
+R32 的最小 Pareto 形状仍是：
 
 ```text
 4x1: (M,N,K) = (32, 32,128)
@@ -4079,21 +4077,23 @@ R32 的三个 layout 是三组 Pareto 形状，不能组合成 `(32,32,32)`：
 1x4: (M,N,K) = (128,128, 32)
 ```
 
-MXINT8 的 batch testcase 用 `testcase/func_test/test_bf16_mxint8_host/batch_test.py:64-68 / SUPERTILE_LAYOUT_B`、`:110-140 / resolve_layout_c、resolve_layout_a` 生成这三类输入 layout 和 linear/tiled C layout。
+R32 2x2 的 K 单点上界来自 `kernel/detail/mma_dte_tiled_tensor_layout_contracts.hpp:139-145 / mma_dte_mx_2x2_shape_supported` 的 `k == 2 * mma_dte_physical_tile_k()`。R32 1x4 的 K 单点是当前实现的实测边界：`testcase/func_test/test_mx_shape_bounds_host/test_mx_shape_bounds_host.cpp:... / MxInt8R32OneByFour.KAboveSingleTileProducesInvalidResult`。
+
+MXINT8 的 batch testcase 用 `testcase/func_test/test_bf16_mxint8_host/batch_test.py:64-68 / SUPERTILE_LAYOUT_B`、`:110-140 / resolve_layout_c、resolve_layout_a` 生成这三类 input layout 和 C layout。
 
 ### 12.5 MXFP8
 
 MXFP8 的 `e4m3` 与 `e5m2` 使用相同的 layout 几何，因此最小 M/N/K 相同。当前 layout 定义可见 `kernel/instantiations/mxfp8/inst_mxfp8_r8_bf16.su:4-7 / mma_dte`、`inst_mxfp8_r16_bf16.su:4-7 / mma_dte` 以及 R32 的 `inst_mxfp8_r32_4x1_bf16.su:4-7 / mma_dte`、`inst_mxfp8_r32_2x2_bf16.su:4-7 / mma_dte`、`inst_mxfp8_r32_1x4_bf16.su:4-7 / mma_dte`。
 
-| row family | layoutA | layoutB | 最小 M | 最小 N | 最小 K |
+| row family | layoutA | layoutB | M | N | K |
 |---|---|---|---:|---:|---:|
-| R8 | `(128,8,4,1,1)` | `(32,32,4,1,1)` | 8 | 32 | 512 |
-| R16 | `(64,16,4,1,1)` | `(32,32,4,1,1)` | 16 | 32 | 256 |
-| R32 standard 4x1 | `(32,32,4,1,1)` | `(32,32,4,1,1)` | 32 | 32 | 128 |
-| R32 2x2 | `(32,32,2,2,1)` | `(32,32,2,2,1)` | 64 | 64 | 64 |
-| R32 1x4 | `(32,32,1,4,1)` | `(32,32,1,4,1)` | 128 | 128 | 32 |
+| R8 | `(128,8,4,1,1)` | `(32,32,4,1,1)` | `[8,8,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| R16 | `(64,16,4,1,1)` | `(32,32,4,1,1)` | `[16,16,None]` | `[32,inf,32]` | `[256,inf,256]` |
+| R32 standard 4x1 | `(32,32,4,1,1)` | `(32,32,4,1,1)` | `[32,inf,32]` | `[32,inf,32]` | `[128,inf,128]` |
+| R32 2x2 | `(32,32,2,2,1)` | `(32,32,2,2,1)` | `[64,inf,64]` | `[64,inf,64]` | `[64,64,None]` |
+| R32 1x4 | `(32,32,1,4,1)` | `(32,32,1,4,1)` | `[128,inf,128]` | `[128,inf,128]` | `[32,32,None]` |
 
-linear/tiled C 的最小 M/N/K 在当前主入口相同。R32 1x4 还存在一个 MXFP8 特有的上界约束：`kernel/detail/mma_dte_tiled_tensor_planner.hpp:546-559 / validate_layout_k_contract` 要求该 layout 只使用一个 K tile，即 `K <= layoutA.tile_dim0`；因此该 layout 的 MXFP8 K 只能从 32 开始，并不能像普通 layout 一样任意增加到多个 K tile。
+linear/tiled C 的最小 M/N/K 在当前主入口相同。MXFP8 R32 1x4 的单点 K 上界由 `kernel/detail/mma_dte_tiled_tensor_planner.hpp:546-559 / validate_layout_k_contract` 明确限制为一个 K tile，即 `K <= layoutA.tile_dim0`，因此是 `[32,32,None]`。R32 2x2 的 K 也由 `mma_dte_mx_2x2_shape_supported` 固定为单点；R8/R16 的 M 单点上界由 SiTe short-M input packing 实测确认。
 
 对应 testcase 包括：
 
@@ -4107,15 +4107,15 @@ linear/tiled C 的最小 M/N/K 在当前主入口相同。R32 1x4 还存在一�
 
 MXFP6 的 `mxfloat6e2m3` 与 `mxfloat6e3m2` 使用相同的 tile geometry。当前 batch 配置明确说明 B 的 tile K 为 128，而不是 MXINT8 的 32：`testcase/func_test/test_mxfp6e2m3_host/batch_test.py:65-69 / SUPERTILE_LAYOUT_B`，A 的 layout 选择在 `:133-143 / resolve_layout_a`。
 
-| row family | layoutA | layoutB | 最小 M | 最小 N | 最小 K |
+| row family | layoutA | layoutB | M | N | K |
 |---|---|---|---:|---:|---:|
-| R8 | `(512,8,4,1,1)` | `(128,32,4,1,1)` | 8 | 32 | 2048 |
-| R16 | `(256,16,4,1,1)` | `(128,32,4,1,1)` | 16 | 32 | 1024 |
-| R32 standard 4x1 | `(128,32,4,1,1)` | `(128,32,4,1,1)` | 32 | 32 | 512 |
-| R32 2x2 | `(128,32,2,2,1)` | `(128,32,2,2,1)` | 64 | 64 | 256 |
-| R32 1x4 | `(128,32,1,4,1)` | `(128,32,1,4,1)` | 128 | 128 | 128 |
+| R8 | `(512,8,4,1,1)` | `(128,32,4,1,1)` | `[8,8,None]` | `[32,inf,32]` | `[2048,inf,2048]` |
+| R16 | `(256,16,4,1,1)` | `(128,32,4,1,1)` | `[16,16,None]` | `[32,inf,32]` | `[1024,inf,1024]` |
+| R32 standard 4x1 | `(128,32,4,1,1)` | `(128,32,4,1,1)` | `[32,inf,32]` | `[32,inf,32]` | `[512,inf,512]` |
+| R32 2x2 | `(128,32,2,2,1)` | `(128,32,2,2,1)` | `[64,inf,64]` | `[64,inf,64]` | `[256,256,None]` |
+| R32 1x4 | `(128,32,1,4,1)` | `(128,32,1,4,1)` | `[128,inf,128]` | `[128,inf,128]` | `[128,128,None]` |
 
-因此 MXFP6 的三个 R32 Pareto 形状是：
+因此 MXFP6 的三个 R32 Pareto 形状的最小值是：
 
 ```text
 4x1: (32, 32, 512)
@@ -4123,19 +4123,21 @@ MXFP6 的 `mxfloat6e2m3` 与 `mxfloat6e3m2` 使用相同的 tile geometry。当�
 1x4: (128,128, 128)
 ```
 
+本次边界测试验证了 R32 4x1 的 K 可以从 512 增加到 1024/4096；R32 2x2 的 K=512 被拒绝；R32 1x4 的 K=256 虽可进入当前 dispatch，但输出与 SiTe gold 不一致，所以当前可用上界仍是 K=128。R8/R16 的 M 是 SiTe short-M 单点，N/K 按表中步长增加。
+
 当前配置文件同时覆盖 linear/tiled 两种 C format、BF16/FP16/FP32 三种 outputT，并覆盖 2x2/1x4 的小 K：`testcase/func_test/test_mxfp6e2m3_host/test_config_mxfp6e2m3.md:103-143 / 配置说明`。所以对 MXFP6，linear/tiled 的逻辑结果相同，主入口的最小 M/N/K 也相同。
 
 ### 12.7 MXFP4
 
 这里的 MXFP4 是 `sifmt::mxfloat4e2m1`，不是 MXINT4。当前显式实例化位于 `kernel/instantiations/mxfp4/inst_mxfp4.su:23-57 / mma_dte`，包含 R8、R16、R32 standard/2x2/1x4，并分别生成 tiled C 与 linear C 的 BF16 输出。
 
-| row family | layoutA | layoutB | 最小 M | 最小 N | 最小 K |
+| row family | layoutA | layoutB | M | N | K |
 |---|---|---|---:|---:|---:|
-| R8 | `(256,8,4,1,1)` | `(64,32,4,1,1)` | 8 | 32 | 1024 |
-| R16 | `(128,16,4,1,1)` | `(64,32,4,1,1)` | 16 | 32 | 512 |
-| R32 standard 4x1 | `(64,32,4,1,1)` | `(64,32,4,1,1)` | 32 | 32 | 256 |
-| R32 2x2 | `(64,32,2,2,1)` | `(64,32,2,2,1)` | 64 | 64 | 128 |
-| R32 1x4 | `(64,32,1,4,1)` | `(64,32,1,4,1)` | 128 | 128 | 64 |
+| R8 | `(256,8,4,1,1)` | `(64,32,4,1,1)` | `[8,8,None]` | `[32,inf,32]` | `[1024,inf,1024]` |
+| R16 | `(128,16,4,1,1)` | `(64,32,4,1,1)` | `[16,16,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| R32 standard 4x1 | `(64,32,4,1,1)` | `(64,32,4,1,1)` | `[32,inf,32]` | `[32,inf,32]` | `[256,inf,256]` |
+| R32 2x2 | `(64,32,2,2,1)` | `(64,32,2,2,1)` | `[64,inf,64]` | `[64,inf,64]` | `[128,128,None]` |
+| R32 1x4 | `(64,32,1,4,1)` | `(64,32,1,4,1)` | `[128,inf,128]` | `[128,inf,128]` | `[64,64,None]` |
 
 当前 MXFP4 testcase 的最小 shape 枚举在：
 
@@ -4143,7 +4145,7 @@ MXFP6 的 `mxfloat6e2m3` 与 `mxfloat6e3m2` 使用相同的 tile geometry。当�
 - `testcase/func_test/test_bf16_mxfp4_r16_host/test_bf16_mxfp4_r16_host.cpp:34-38 / M_VALUES、N_VALUES、K_VALUES`。
 - `testcase/func_test/test_bf16_mxfp4_r32_host/test_bf16_mxfp4_r32_host.cpp:34-48 / M_VALUES、N_VALUES、K_VALUES、2x2/1x4 参数`。
 
-这些 testcase 仍把 R8 16-bit linear 的 N 从 64 开始列举；这是旧 validation/test 约束，不改变主 `mma_dte` 入口的 layout 对齐公式。见本节 12.10。
+这些 testcase 仍把 R8 16-bit linear 的 N 从 64 开始列举；本次边界测试对 R8 使用 tiled C，避免把旧 linear-store validation 差异混入 shape contract。R8/R16 的 M 单点上界、R32 2x2 的 K 单点上界和 R32 1x4 的 K 单点上界均由新增边界测试实测。
 
 ### 12.8 MXINT4
 
@@ -4167,41 +4169,41 @@ MXINT4 与 MXFP4 的 tile geometry 相同，所以最小 M/N/K 完全相同；�
 
 下面只列 direct `mma_dte` 主入口的 layout/API 最小值；R32 的每一行是独立 input layout。
 
-| MX input | row/layout | 最小 M | 最小 N | 最小 K |
+| MX input | row/layout | M | N | K |
 |---|---|---:|---:|---:|
-| MXINT8 | R8 | 8 | 32 | 512 |
-| MXINT8 | R16 | 16 | 32 | 256 |
-| MXINT8 | R32 4x1 | 32 | 32 | 128 |
-| MXINT8 | R32 2x2 | 64 | 64 | 64 |
-| MXINT8 | R32 1x4 | 128 | 128 | 32 |
-| MXFP8 | R8 | 8 | 32 | 512 |
-| MXFP8 | R16 | 16 | 32 | 256 |
-| MXFP8 | R32 4x1 | 32 | 32 | 128 |
-| MXFP8 | R32 2x2 | 64 | 64 | 64 |
-| MXFP8 | R32 1x4 | 128 | 128 | 32 |
-| MXFP6 | R8 | 8 | 32 | 2048 |
-| MXFP6 | R16 | 16 | 32 | 1024 |
-| MXFP6 | R32 4x1 | 32 | 32 | 512 |
-| MXFP6 | R32 2x2 | 64 | 64 | 256 |
-| MXFP6 | R32 1x4 | 128 | 128 | 128 |
-| MXFP4 | R8 | 8 | 32 | 1024 |
-| MXFP4 | R16 | 16 | 32 | 512 |
-| MXFP4 | R32 4x1 | 32 | 32 | 256 |
-| MXFP4 | R32 2x2 | 64 | 64 | 128 |
-| MXFP4 | R32 1x4 | 128 | 128 | 64 |
-| MXINT4 | R8 | 8 | 32 | 1024 |
-| MXINT4 | R16 | 16 | 32 | 512 |
-| MXINT4 | R32 4x1 | 32 | 32 | 256 |
-| MXINT4 | R32 2x2 | 64 | 64 | 128 |
-| MXINT4 | R32 1x4 | 128 | 128 | 64 |
+| MXINT8 | R8 | `[8,8,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| MXINT8 | R16 | `[16,16,None]` | `[32,inf,32]` | `[256,inf,256]` |
+| MXINT8 | R32 4x1 | `[32,inf,32]` | `[32,inf,32]` | `[128,inf,128]` |
+| MXINT8 | R32 2x2 | `[64,inf,64]` | `[64,inf,64]` | `[64,64,None]` |
+| MXINT8 | R32 1x4 | `[128,inf,128]` | `[128,inf,128]` | `[32,32,None]` |
+| MXFP8 | R8 | `[8,8,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| MXFP8 | R16 | `[16,16,None]` | `[32,inf,32]` | `[256,inf,256]` |
+| MXFP8 | R32 4x1 | `[32,inf,32]` | `[32,inf,32]` | `[128,inf,128]` |
+| MXFP8 | R32 2x2 | `[64,inf,64]` | `[64,inf,64]` | `[64,64,None]` |
+| MXFP8 | R32 1x4 | `[128,inf,128]` | `[128,inf,128]` | `[32,32,None]` |
+| MXFP6 | R8 | `[8,8,None]` | `[32,inf,32]` | `[2048,inf,2048]` |
+| MXFP6 | R16 | `[16,16,None]` | `[32,inf,32]` | `[1024,inf,1024]` |
+| MXFP6 | R32 4x1 | `[32,inf,32]` | `[32,inf,32]` | `[512,inf,512]` |
+| MXFP6 | R32 2x2 | `[64,inf,64]` | `[64,inf,64]` | `[256,256,None]` |
+| MXFP6 | R32 1x4 | `[128,inf,128]` | `[128,inf,128]` | `[128,128,None]` |
+| MXFP4 | R8 | `[8,8,None]` | `[32,inf,32]` | `[1024,inf,1024]` |
+| MXFP4 | R16 | `[16,16,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| MXFP4 | R32 4x1 | `[32,inf,32]` | `[32,inf,32]` | `[256,inf,256]` |
+| MXFP4 | R32 2x2 | `[64,inf,64]` | `[64,inf,64]` | `[128,128,None]` |
+| MXFP4 | R32 1x4 | `[128,inf,128]` | `[128,inf,128]` | `[64,64,None]` |
+| MXINT4 | R8 | `[8,8,None]` | `[32,inf,32]` | `[1024,inf,1024]` |
+| MXINT4 | R16 | `[16,16,None]` | `[32,inf,32]` | `[512,inf,512]` |
+| MXINT4 | R32 4x1 | `[32,inf,32]` | `[32,inf,32]` | `[256,inf,256]` |
+| MXINT4 | R32 2x2 | `[64,inf,64]` | `[64,inf,64]` | `[128,128,None]` |
+| MXINT4 | R32 1x4 | `[128,inf,128]` | `[128,inf,128]` | `[64,64,None]` |
 
 ### 12.10 Linear output 和 tiled output 是否相同
 
 要分成三个层次回答：
 
-1. **主 `mma_dte` 入口的最小 M/N/K 是否相同？**
+1. **主 `mma_dte` 入口的 M/N/K 范围是否因 C format 改变？**
 
-   是。对上述五类 MX input，`layoutC.tensor_format=0` 和 `1` 不参与 A/B 的 M/N/K 对齐计算；所以在当前主执行路径中，linear C 与 tiled C 的最小 M/N/K 相同。R8 主 dispatch 会显式计算 `remainder_n_tile`，见 `kernel/detail/mma_dte_tiled_tensor_dispatch_entrypoints.hpp:1211-1226 / mma_r8_dte`，并按 linear/tiled 选择不同 store case，见 `:299-323 / DEFINE_FUSED_IMPL_FIXED_CK_R8_DUAL`。
+   不改变。对上述 MX input，`layoutC.tensor_format=0` 和 `1` 不参与 A/B 的 M/N/K 对齐计算；因此本节表中的 M/N/K 范围对 linear/tiled C 相同。R8 主 dispatch 会显式计算 `remainder_n_tile`，见 `kernel/detail/mma_dte_tiled_tensor_dispatch_entrypoints.hpp:1211-1226 / mma_r8_dte`，并按 linear/tiled 选择不同 store case，见 `:299-323 / DEFINE_FUSED_IMPL_FIXED_CK_R8_DUAL`。本次新增边界测试为避免旧 R8 linear-store validation 差异，R8 范围测试使用 tiled C；这不改变 API shape contract 的结论。
 
 2. **逻辑数值是否相同？**
 
@@ -4225,7 +4227,7 @@ MXINT4 与 MXFP4 的 tile geometry 相同，所以最小 M/N/K 完全相同；�
    | linear BF16/FP16、MXFP8 | `N=32` 可进入 | validation 也放行，因为 MXFP8 被排除在旧限制之外 |
    | linear FP32 | `N=32` 可进入 | 32-bit output 不触发该限制 |
 
-   这说明当前仓库存在**主执行入口和独立 validation API 的行为不一致**。若上层先调用 `mma_dte_validate_inputs()`，再调用 `mma_dte()`，非 MXFP8 的 R8 16-bit linear `N=32` 会被辅助验证 API 拦住；若直接调用主模板，则入口本身没有该 shape reject。旧 MXFP4/MXINT4 testcase 仍在 `test_bf16_mxfp4_r8_host/test_bf16_mxfp4_r8_host.cpp:34-40 / M_VALUES、N_VALUES_LINEAR_OUT、K_VALUES` 和 `test_bf16_mxi4_r8_host/test_bf16_mxi4_r8_host.cpp:42-48 / M_VALUES、N_VALUES_LINEAR_OUT、K_VALUES` 中从 `N=64` 开始，这反映的是旧限制和测试覆盖策略，不是 A/B layout 的基本 N alignment。
+   这说明当前仓库存在**主执行入口和独立 validation API 的行为不一致**。若上层先调用 `mma_dte_validate_inputs()`，再调用 `mma_dte()`，非 MXFP8 的 R8 16-bit linear `N=32` 会被辅助验证 API 拦住；若直接调用主模板，则入口本身没有该 shape reject。旧 MXFP4/MXINT4 testcase 仍在 `test_bf16_mxfp4_r8_host/test_bf16_mxfp4_r8_host.cpp:34-40 / M_VALUES、N_VALUES_LINEAR_OUT、K_VALUES` 和 `test_bf16_mxi4_r8_host/test_bf16_mxi4_r8_host.cpp:42-48 / M_VALUES、N_VALUES_LINEAR_OUT、K_VALUES` 中从 `N=64` 开始，这反映的是旧限制和测试覆盖策略，不是 A/B layout 的基本 N alignment。另一个独立事实是：R8/R16 的 M 单点上界来自 SiTe input packing；R32 2x2 和当前 R32 1x4 的 K 单点上界来自 layout/dispatch 实际能力，已在新增边界测试中验证。
 
 ### 12.11 最终工程结论
 
