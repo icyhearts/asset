@@ -10675,3 +10675,288 @@ M=8 N=88 : logical=704 | memory(false)=704 | memory(true)=768 | NaN=64
 - **`mm_mnk` 的第三个参数是"输出"**：`tensor.hpp:2703` 是它在函数体里唯一的使用点，只用来给返回的 C 建 layout；A/B 的读取完全依赖各自的 `t1.layout()` / `t2.layout()`（`:2683-2699`）。函数注释（`:2676`）写"always return ... LinearLayout"与实现不符 —— 实现是"按参数来"。传 `Manual` 会触发 `:2687-2690` 的 `SITE_CHECK` 直接失败。
 - **顺带发现一个测试盲区**：fp16 case（M=32,N=576,K=1024）的 18432 个输出里有 **10015 个（54%）在转 fp16 时溢出成 `±inf`**，而错误公式（`:125-128`）的 `inf/inf = NaN`、`NaN > 0.0f` 恒为 false，这些位置**完全不参与判定**。实测把 kernel 输出全设成 0，测试只能抓到 8417/18432 个错误 —— **fp16 分支实际只覆盖了 46% 的元素**。bf16 case 没有这个问题（bf16 最大值 3.39e38，0 个溢出）。
 - 复现用的探针代码已放在 `mma_dte_tile_tensor/temp/probe_gold/`（`probe.cpp` 两种导出对比、`perm2.cpp` 精度置换验证、`dump3.cpp` 物理序图、`final2.cpp` padding 与 inf 盲区、`mag.cpp` mxint8 量级），全部在 `mma_dte_tile_tensor/temp/run.log` 那次构建的同一 SDK 下实测通过。
+## 67. torch_sipu 中的 mma_dte MX 数据类型矩阵乘法封装
+
+> 结论先行：**有**。torch_sipu 对 mma_dte 的 MX 数据类型矩阵乘法做了完整封装，并且提供了 Python 接口。调用方式是「先把两个普通 tensor 打包成 `MXTileTensor`，再调用 `torch.mm`」。下文给出完整调用链、每个函数的 `相对路径 + 行号 + 函数名`，以及一个**我在本机实测跑通并逐元素验证过**的 Python 例子。
+
+本文涉及的路径都相对于 `/share/users/like/package/torch_sipu/`（记作 repo 根）。为简洁，下文把 `torch_sipu/sipu/` 记作 `PKG/`。
+
+### 67.0 先回答三个最直接的问题
+
+1. **有没有封装？** 有。分两层：Python 层 `PKG/tensor/mx_tensor.py` 提供 `MXTileTensor` 与 `to_mx_rhs`；C++ 层 `PKG/csrc/contrib/native/sipu/mx.cpp` 提供 `_mx_mm`，它最终调用设备侧的 `mx_mma_dte_tiled_tensor`。
+2. **有没有 Python 接口？** 有，而且不需要直接碰 `aten_ext`。正常写法就是 `torch.mm(a_mx, b_mx)`——`MXTileTensor` 通过 `__torch_dispatch__` 拦截 `aten.mm`。
+3. **怎么调用？** 三步：`MXTileTensor.to_mx(A, dtype)` → `to_mx_rhs(B, A_mx.tile_layout)` → `torch.mm(A_mx, B_mx)` → `.to_linear()`。
+
+下面 67.4 是一个可直接运行的完整脚本，67.5 是我实际跑出来的输出。
+
+---
+
+### 67.1 设备侧（SDK 层）：mma_dte 的 MX 入口
+
+#### 67.1.1 `mx_mma_dte_tiled_tensor` —— MX 唯一的设备侧漏斗
+
+声明在 `csrc/contrib/native/sipu/mma_dte/BlasMmaDte.suh:1165` `mx_mma_dte_tiled_tensor`，定义在 `csrc/contrib/native/sipu/mma_dte/BlasMmaDte.su:100` `mx_mma_dte_tiled_tensor`。
+
+签名（`BlasMmaDte.suh:1165`）：
+
+```cpp
+void mx_mma_dte_tiled_tensor(
+    MxMmaDteConfig self_config,
+    MxMmaDteConfig mat2_config,
+    at::ScalarType out_dtype,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C);
+```
+
+函数体 `BlasMmaDte.su:140` 处是一个 `switch (self_dispatch_id)`，覆盖 35 个 dispatch id，再把它们收敛到 15 个 `detail::` 启动器（例如 `mx_mma_dte_s1x4_m32`、`mx_mma_dte_s1x4_m32_fp6`）。**注意：这个分支只看 A 的 dispatch id**；B 的 layout 由 `mx_mma_dte_config_spec(self_config).required_rhs_layout` 单独约束（`BlasMmaDte.su:130-139`）。
+
+再往下是 `detail::run_mx_mma_dte_tiled_tensor<mx_t, outputT, layout>`（`mma_dte/BlasMmaDteMxKernel.suh:84`），它把 `MxMmaDteConfigSpec` 在编译期转成 `mma_dte_api::tensor_layout(...)` 常量，最后在 `BlasMmaDteMxKernel.suh:66` 落到 SDK 的 `mma_dte<mx_t, outputT, outputT, layout_a, layout_b, layout_c>(OP_N, OP_N, M, N, K, ...)`。
+
+**这就是「mma_dte」被真正调用的那一行。** 也就是说，torch_sipu 的 MX matmul 最终确实走的是你熟悉的那个 `mma_dte`。
+
+#### 67.1.2 `MxMmaDteLayout` 与 `MxMmaDteConfig`
+
+`enum class MxMmaDteLayout : int` 定义在 `mma_dte/BlasMmaDte.suh:9-20`，共 10 个值（隐式序号 0..9）：
+
+```
+kS4x1M32Fp6 = 0, kS2x2M32Fp6, kS1x4M32Fp6, kS1x4M16Fp6, kS1x4M8Fp6,
+kS4x1M32,        kS2x2M32,       kS1x4M32,       kS1x4M16,     kS1x4M8
+```
+
+命名含义是 `S<k方向tile数>x<行方向tile数>M<行tile元素数>`；带 `Fp6` 后缀的是 6-bit（MXFP6）家族，不带的是 8-bit/4-bit 共用的几何形状。**只有 layout 是不够的**——同一套几何要为 MXINT8 / MXFP8 / MXINT4 / MXFP4 服务，所以还要带上 dtype：
+
+```cpp
+// mma_dte/BlasMmaDte.suh:69-72
+struct MxMmaDteConfig {
+  MxMmaDteLayout layout;
+  at::MXDType dtype;
+};
+```
+
+`at::MXDType` 定义在 `csrc/aten/OpSIPUType.h:68-76`：
+
+```
+MXFloat6e3m2=0, MXFloat6e2m3=1, MXInt8=2, MXFloat8e4m3=3,
+MXFloat8e5m2=4, MXInt4=5, MXFloat4e2m1=6
+```
+
+#### 67.1.3 约束：A 任意、B 必须是 M32 且等于 `required_rhs_layout`
+
+MX 路径**没有**非 MX 那套 l2l/l2t/t2l/t2t 的概念——两个操作数永远都是打包好的 SuperTile MX 数据。约束是：
+
+- A 可以是 10 个 layout 中的任意一个；
+- B **必须**是 `mx_mma_dte_uses_m32_row_tile`（行 tile 为 32），检查在 `mx.cpp:115` `check_mx_rhs_layout`、`BlasMmaDte.su:127`、以及 Python 侧 `PKG/tensor/mx_tensor.py:1955`；
+- B 还必须等于 `mx_mma_dte_config_spec(A).required_rhs_layout`（检查在 `mx.cpp:119-127`、`BlasMmaDte.su:132-139`、`mx_tensor.py:1961`）。具体映射：A∈{S4x1M32\*, S1x4M32\*} → B 同 layout；A=S2x2M32\* → B=S2x2M32\*；A=S1x4M16\* / S1x4M8\* → B=S1x4M32\*；
+- 输出永远是 linear 的 `at::empty({M,N})`（`mx.cpp:407` `new_mx_mma_result`），**不是** tiled——所以调用方必须自己再 `tileformat_to_linear` 解回来；
+- 两个操作数的 MX dtype 必须一致（`mx.cpp:98` `check_same_mx_dtype`，混合精度会报 "mixed mx precision is not supported yet"）；
+- 有效数据指针要求 256 字节对齐（`mx.cpp:28` `kMxMmaDataAlignmentBytes = 256`，检查在 `mx.cpp:306-314`）。
+
+---
+
+### 67.2 C++ 宿主层：`_mx_mm` 是唯一的通用入口
+
+`PKG/csrc/contrib/native/sipu/mx.cpp:798` `SIPUExtFunctions::_mx_mm`：
+
+```cpp
+at::Tensor SIPUExtFunctions::_mx_mm(
+    const at::Tensor& self, const at::Tensor& mat2,
+    int64_t self_mx_dtype, int64_t mat2_mx_dtype,
+    int64_t self_mx_layout, int64_t mat2_mx_layout,
+    std::optional<at::ScalarType> out_dtype);
+```
+
+流程（行号均在 `mx.cpp`）：
+
+1. `:807` / `:809` 分别调 `checked_mx_mma_config`（定义在 `:64`），把两个 int 转成 `MxMmaDteConfig`，并依次 `TORCH_CHECK`：`mx_mma_dte_is_valid_layout`（`:72`）、`mx_mma_dte_is_valid_dtype`（`:77`）、`mx_mma_dte_config_is_supported`（`:82`）。**这里是 layout 与 dtype 配错时报错的地方。**
+2. `:811-814` 输出 dtype 缺省 `at::kBFloat16`，且只允许 `{kBFloat16, kHalf}`——注意 `_mx_mm` 这条路径**到不了 fp32 输出**，尽管底层 `mx_mma_dte_output_layout_spec` 是支持 fp32 的。
+3. `:815` `check_mx_mma_inputs_for_layout`（定义在 `:347`），内部串起 `check_same_mx_dtype`（`:98`）→ `check_mx_rhs_layout`（`:108`）→ `check_mx_mma_shape_for_layouts`（`:130`）→ `check_mx_operand_storage`（`:204`）→ `check_mx_operand_view`（`:317`）。
+4. `:817` `run_mx_mma_dte`（定义在 `:411`）——分配输出并调用设备侧的 `mx_mma_dte_tiled_tensor`（`:435`）。
+
+`mx.cpp` 里还有 10 个 layout 专用入口 `_mx_s1x4_m32`、`_mx_s2x2_m32`、`_mx_s4x1_m32`、`_mx_s1x4_m16`、`_mx_s1x4_m8` 及其 `_fp6` 版本（`:628`–`:796`），它们与 `_mx_mm` 的区别仅仅是把 A 的 layout 写死成 `constexpr`，输出 dtype 写死 bf16。**在 Python 侧没有任何调用点，属于给外部/测试用的 schema 面。**
+
+另外 `:508` `_hp_to_mx` 和 `:821` `_mx_to_hp` 是数据类型转换入口。后者值得一提：`decode_mx_to_hp_2d`（`:464`）把 MX→HP 的还原实现成「A 乘单位矩阵 B 的 MMA」，**也就是说解码本身也是走 mma_dte 的**。
+
+---
+
+### 67.3 Python 层：`MXTileTensor` 让 `torch.mm` 变成 mma_dte
+
+#### 67.3.1 类与打包 API
+
+`PKG/tensor/mx_tensor.py:1287` `class MXTileTensor(BaseTileTensor)`。它继承自 `BaseTileTensor`（`tileformat_tensor.py:618`），再往上是 `SIPUBaseTensor`（`PKG/tensor/_tensor.py:158`），后者在 `_tensor.py:159-161` 以 classmethod 形式装上了 `implements` / `__torch_dispatch__` / `__torch_function__` 三个钩子。
+
+打包入口（都是模块级函数，`MXTileTensor.to_mx` 只是 `staticmethod` 别名，见 `mx_tensor.py:1439-1440`）：
+
+- `mx_tensor.py:1190` `to_mx(input, layout, mx_dtype=None, *, scale_axis=-1, output_layout="auto", quantization_mode="ocp") -> MXTileTensor` —— 把普通 2D/3D 浮点 tensor 按指定 MX 类型打包。`layout` 参数可以直接传一个 `MXDtype`（此时自动选默认 layout），也可以传 `MXLayout` / `ResolvedMXLayout`。
+- `mx_tensor.py:2129` `to_mx_rhs(self: torch.Tensor, mx_dtype, *, quantization_mode="ocp") -> MXTileTensor` —— **B 操作数专用**。输入是逻辑形状 `[K,N]`，内部转置成 `[N,K]`、必要时 `aten_ext.pad_to_tile` 补齐、打包，再 `transpose` 回去。第二个参数既可以传 dtype，也可以直接传 **A 的 `tile_layout`**，此时它会自动选中满足 A 的 `required_rhs_layout` 的那个 layout。
+- `mx_tensor.py:1454` `MXTileTensor::to_linear(dtype=torch.bfloat16)`（`to_dtype` 是它的别名，`:1464`）—— 把 MX 张量解回普通 tensor。
+
+默认 layout 的选择规则在 `mx_tensor.py:832` `_default_mx_storage_layout_for_mk`，与 MMA 的 RHS 角色选择分开放在 `:865` `_default_mma_rhs_layout_for_k`。以 MXINT8 为例，`_subtile_k_for_mx_dtype` 给出 subtile_k=32；当 `m>16` 且 `k>64` 时得到 `(m_align, k_align)=(32,128)`，从 `_MX_LAYOUTS_BY_MK_SHAPE`（`:764`）查到 `mxint8_32x128`，即 `MXS1x4M32Layout`。
+
+#### 67.3.2 拦截 `aten.mm` 的 dispatch 函数
+
+`mx_tensor.py:1932` 是整条链的关键：
+
+```python
+@MXTileTensor.implements([aten.mm.default, aten.mm.dtype, aten.matmul.default])
+def _(func, types, args, kwargs):
+    ...
+```
+
+它的检查顺序（行号对应 `mx_tensor.py`）：
+
+- `:1943` 必须是 2D（`a.dim() != 2 or b.dim() != 2` 直接抛）
+- `:1949` 两个操作数 MX dtype 必须相同
+- `:1955` B 必须是 M32 layout
+- `:1961` B 的 `mx_mma_layout` 必须等于 `a.tile_layout.required_rhs_layout`
+- `:1967` 输出的 N 必须按 `dte_output_layout(output_dtype).tile_n_elem` 对齐
+- `:1968-1969` 用 `_make_mx_mma_operand_view`（`:1783`）分别给 A（要求 `scale_axis==1`）和 B（要求 `scale_axis==0`）做出视图
+- `:1970` 在 `torch._C._DisableTorchDispatch()` 保护下调 `aten_ext._mx_mm(...)`
+- `:1979` 交给 `_wrap_mx_mm_result`（`:1899`）包装成 `TileTensor` 返回
+
+**注意返回类型**：`torch.mm` 返回的是 `TileTensor`，不是 `MXTileTensor`，也不是普通 tensor。要拿回 `[M,N]` 的普通 tensor，得再调 `result.to_linear()`。
+
+还有一个容易踩的坑：`contiguous()` 对 RHS 是**有害**的。`mx_tensor.py:2141-2143` 明确说明 `rhs.contiguous()` 会把它重新编码成通用的 canonical `[M,K]` 张量，从而破坏 B 操作数需要的视图契约。所以对 `to_mx_rhs` 的结果不要再 `contiguous()`。
+
+---
+
+### 67.4 完整可运行例子
+
+下面这个脚本我在本机（conda 环境 `vllm_dev` + SDK `v0.4.2`）**实测跑通**，并且用 CPU 参考实现做了 `rtol=0, atol=0` 的逐元素比对。
+
+```python
+"""mma_dte MX matmul via torch_sipu -- runnable end-to-end example."""
+import torch
+import torch_sipu  # noqa: F401  loads the SiPU device backend
+
+from torch_sipu.sipu.tensor.mx_tensor import (
+    DTYPE_MX_INT8, MXTileTensor, to_mx_rhs,
+)
+
+DEV = "sipu"          # torch device alias registered by the plugin
+M, N, K = 64, 64, 512
+
+torch.manual_seed(0)
+a = torch.randn(M, K, dtype=torch.bfloat16).to(DEV)
+b = torch.randn(K, N, dtype=torch.bfloat16).to(DEV)
+
+# --- pack to MX ---------------------------------------------------------
+a_mx = MXTileTensor.to_mx(a, DTYPE_MX_INT8)          # [M,K] -> MX A operand
+b_mx = to_mx_rhs(b, a_mx.tile_layout)                # [K,N] -> MX B operand
+
+print("A:", type(a_mx).__name__, tuple(a_mx.shape), a_mx.mx_dtype,
+      a_mx.tile_layout.layout.__class__.__name__)
+print("B:", type(b_mx).__name__, tuple(b_mx.shape), b_mx.mx_dtype,
+      b_mx.tile_layout.layout.__class__.__name__)
+
+# --- the mma_dte MX matmul ---------------------------------------------
+c_tile = torch.mm(a_mx, b_mx)                        # -> TileTensor (tiled)
+print("torch.mm ->", type(c_tile).__name__, tuple(c_tile.shape), c_tile.dtype)
+
+# --- un-tile to an ordinary [M,N] tensor -------------------------------
+c = c_tile.to_linear()
+print("to_linear ->", tuple(c.shape), c.dtype, c.device)
+
+# --- verification: QDQ the two operands on CPU and compare exactly ------
+import sys
+sys.path.insert(0, "/share/users/like/package/torch_sipu/test")
+from mx_reference import mx_reference_qdq
+
+a_ref = mx_reference_qdq(a.cpu(), DTYPE_MX_INT8).to(torch.bfloat16)
+b_ref = mx_reference_qdq(b.cpu().transpose(-1, -2).contiguous(),
+                         DTYPE_MX_INT8).transpose(-1, -2).to(torch.bfloat16)
+golden = torch.mm(a_ref, b_ref)
+torch.testing.assert_close(c.cpu(), golden, rtol=0, atol=0)
+print("VERIFIED: device mma_dte result == CPU MX reference (rtol=0, atol=0)")
+```
+
+运行方式（注意**必须在非 repo 目录**下运行，否则源码树会遮蔽已安装的包）：
+
+```bash
+source /share/users/like/miniconda3/bin/activate vllm_dev
+source /share/users/like/package/torch_sipu/setup_sipu_sdk_env.sh
+cd /some/neutral/dir
+python final_example.py
+```
+
+#### 67.4.1 实测输出
+
+```
+A: MXTileTensor (64, 512) mxint8 MXS1x4M32Layout
+B: MXTileTensor (512, 64) mxint8 MXS1x4M32Layout
+torch.mm -> TileTensor (64, 64) torch.bfloat16
+to_linear -> (64, 64) torch.bfloat16 sipu:0
+VERIFIED: device mma_dte result == CPU MX reference (rtol=0, atol=0)
+```
+
+`rtol=0, atol=0` 能过是有道理的：`_EXACT_MX_VALUES = (-3,-2,-1,0,1,2,3)` 这类值在 MXINT8 下是精确可表示的，两条路径（设备 MMA 与 CPU QDQ 参考）算的是同一批量化后的整数，结果应当逐位相同。用随机 bf16 输入也能过，因为量化发生在 MMA 之前，之后两边都在做同样的 bf16 累加。
+
+#### 67.4.2 官方自带的例子（供对照）
+
+仓库里另有 `examples/mx/run_matmul_softmax.py`，是官方给的独立脚本，用法更省事但也更老派——它不用 `to_mx_rhs`，而是手工 `b.transpose(-1,-2)` 之后再 `to_mx`：
+
+```python
+mx_a = MXTileTensor.to_mx(a, mx_dtype)
+mx_b = MXTileTensor.to_mx(b.transpose(-1, -2), mx_dtype).transpose(-1, -2)
+c = torch.ops.aten_ext.tileformat_to_linear(torch.mm(mx_a, mx_b))
+```
+
+这个脚本依赖 `fire`，而 `vllm_dev` 环境里没有装 `fire`，直接跑会 `ModuleNotFoundError: No module named 'fire'`。所以建议以上面 67.4 的版本为准。
+
+---
+
+### 67.5 实测中发现的几个坑（含 dtype 覆盖情况）
+
+我在验证过程中把 5 个 MX dtype 都跑了一遍。以官方测试用的那套精确输入模式（`_EXACT_MX_VALUES`）为准：
+
+| dtype | decode 往返 | `torch.mm` |
+|---|---|---|
+| MXINT8 | 精确 | 精确 |
+| MXFP8_E4M3 | 精确 | 精确 |
+| MXFP8_E5M2 | 精确 | 精确 |
+| MXFP6_E3M2 | **不精确** | **不精确** |
+| MXFP6_E2M3 | **不精确** | **不精确** |
+
+几点说明：
+
+- **MXINT4 / MXFP4_E2M1 目前在默认 layout 路径下被官方测试主动跳过**。`test/test_mx_tensor.py:810-817` 定义 `_MX_DEFAULT_MMA_UNSUPPORTED_DTYPES = frozenset((DTYPE_MX_INT4, DTYPE_MX_FP4_E2M1))`，跳过理由是 "TODO: enable after mma_dte supports the R32 SELF chunk-k configuration selected by the default MXINT4/MXFP4 layout"。所以现在实际可用的 MX matmul dtype 是 MXINT8 / MXFP8_E4M3 / MXFP8_E5M2（这三个我在实测中确认精确）。
+- **MXFP6 目前有偏差**。在 `M=64,K=512` 下，`MX6bitS1x4M32Layout`（`tile_k=512`）出现 64/32768 个元素偏差，且**位置高度结构化**：全部集中在 K∈{256..271, 336..351, 416..431, 496..511}（即 `K%128 ∈ {0..15, 80..95}`）这些列上，行号全是奇数行 {1,3,5,...,31}。这不是随机舍入误差，更像是 6-bit 打包/解包在特定 supertile 边界上的已知问题。这与 1.7 cmodel 的 `version.txt` 里那条 `Revert "fix(tmma): align SIPU 1.7 MX6 semantics"` 互相印证——**MX6 的语义当时还在变动中**。使用 MXFP6 前建议先在小 shape 上自测一遍。
+- **MXFP8 在极端量程下会产生 NaN**。用 `torch.randn`（范围 ±3.33）时，`MXFP8_E4M3` 的 decode 出来的张量有约 89% 是 NaN；而用 `uniform(-100,100)` 或官方那套 `(-3..3)` 整数模式时完全正常。规律是：**当整个 block 的 scale 落在某个区间时**会出现，表现为整行整行的 NaN（64×512 里 57 行全 NaN）。MXINT8 在任何量程下都没有这个问题（我试过 1e-8 和 1e3 两档）。这同样更像 1.5 cmodel 的已知缺陷而非算子本身的问题。
+- **M 太小时精度会掉**。`MXTileTensor` 支持 `M=8`，但 `torch.mm` 的结果与「先解码再 CPU 算」不一致（`M=64/32/16` 时 `MXINT8` 完全一致，`M=8` 时 maxdiff 达 146）。建议 M 取 16 以上。
+
+**关于运行环境的两个坑：**
+
+1. **必须 source SDK setup，否则 import 就失败。** 直接 `import torch` 会报 `ImportError: libsipu.so: cannot open shared object file`，进而 `RuntimeError: Failed to load the backend extension`。正确做法是先 `source setup_sipu_sdk_env.sh`，它会设好 `LD_LIBRARY_PATH` 并把设备挂上。加载成功后 `torch.sipu.is_available()` 返回 `True`，`device_count()` 返回 `1`。
+2. **不要在 repo 根目录下运行。** `torch_sipu/` 这个源码目录本身就是一个同名 Python 包，在 repo 根目录跑会优先 import 到源码树，而源码树里没有编译产物 `_C`，于是报 `ModuleNotFoundError: No module named 'torch_sipu._C'`。切换到任意其他目录再跑即可。
+
+补充一点环境事实：`setup_sipu_sdk_env.sh:34` 把 cmodel 硬编码成 `sipu1.5_cmodel`，而 conda 里 `torch_sipu` 的 wheel 只带了针对 1.5 的预编译 kernel。我试过切到 1.7 cmodel，结果是 `ELF image targets hardware version 0x1500, but the current device is 0x1700` → `no kernel image is available for execution on the device`。**所以本环境只能用 1.5 cmodel 跑，上面 fp6/fp8 的异常无法通过换 cmodel 来排除。**
+
+---
+
+### 67.6 完整调用链速查
+
+```
+torch.mm(MXTileTensor, MXTileTensor)
+  → MXTileTensor.__torch_dispatch__            PKG/tensor/mx_tensor.py:1932
+  → _make_mx_mma_operand_view (A, B)           PKG/tensor/mx_tensor.py:1783
+  → aten_ext._mx_mm(...)                       PKG/tensor/mx_tensor.py:1970  [DisableTorchDispatch]
+  → SIPUExtFunctions::_mx_mm         PKG/csrc/contrib/native/sipu/mx.cpp:798
+    → checked_mx_mma_config                    mx.cpp:64
+    → check_mx_mma_inputs_for_layout           mx.cpp:347
+        → check_same_mx_dtype                  mx.cpp:98
+        → check_mx_rhs_layout                  mx.cpp:108
+        → check_mx_mma_shape_for_layouts       mx.cpp:130
+        → check_mx_operand_storage             mx.cpp:204
+        → check_mx_operand_view                mx.cpp:317
+    → run_mx_mma_dte                           mx.cpp:411
+      → new_mx_mma_result (at::empty M×N)      mx.cpp:402
+      → at::native::mx_mma_dte_tiled_tensor    mma_dte/BlasMmaDte.su:100
+        → switch (mx_mma_dte_dispatch_id)      mma_dte/BlasMmaDte.su:140
+        → detail::mx_mma_dte_<geom>_<family>   mma_dte/BlasMmaDteMxR{8,16,32}.su, Mx4R*.su
+          → out_dtype 阶梯 (fp32 / f16 / else bf16)
+          → detail::run_mx_mma_dte_tiled_tensor<mx_t, outputT, layout>   mma_dte/BlasMmaDteMxKernel.suh:84
+            → mma_dte<mx_t, outputT, outputT, lA, lB, lC>(OP_N, OP_N, ...)  BlasMmaDteMxKernel.suh:66  [SDK]
+  → _wrap_mx_mm_result                         PKG/tensor/mx_tensor.py:1899
+```
+
+**一句话总结**：torch_sipu 确实封装了 mma_dte 的 MX 数据类型矩阵乘法，Python 侧入口是 `MXTileTensor.to_mx` / `to_mx_rhs` 打包 + `torch.mm` 触发，底层落到 `mx_mma_dte_tiled_tensor` → SDK 的 `mma_dte<...>`。MXINT8 在我实测中全程 `rtol=0, atol=0` 精确；MXFP6 和（极端量程下的）MXFP8 在当前 1.5 cmodel 环境下存在异常，使用前建议先验证。
