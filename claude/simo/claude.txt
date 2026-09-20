@@ -5419,6 +5419,7 @@ final: m,n,k=16,32,256
 
 
 
+# R32 系列
 如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=31, origin_k: int=2)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 
 
 
