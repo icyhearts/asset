@@ -5270,14 +5270,20 @@ sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
 vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
 vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
 
-simo:
+simo 现状:
 simo 代码位于 /share_data/users/like/package/simo_conda_vllm_sipu/, simo 以 editable 方式安装在 vllm_dev 环境中。
 simo code base setup.py get_build_backend 会区分当前环境是 cuda 还是 sipu环境。
 simo code base simo/csrc/quantization/cpu/quantize_fp.cpp 提供 c++ 函数 fake_quantize_to_low_precision_fp,  ./simo/ops/fake_quant.py 调用 output = _get_native_ops().fake_quantize_to_low_precision_fp, 这样实现了 python 调用 c++ 函数.
+simo code base simo/__init__.py  _get_native_ops()函数返回 return torch.ops.simo
+
 
 hpc-ops:
 
-torch_sipu:
+torch_sipu 是 pytorch 的 sipu  设备扩展:
+torch-sipu 已经通过 pip wheel 安装到 vllm_dev conda 环境 /share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/
+为了分析 torch-sipu c++ 代码, torch_sipu 完整源码位于  /share/users/like/package/torch_sipu
+vllm_dev conda 环境安装的 torch-sipu 和 源码可能不是同一个 git commit，但是大致功能应该差别不大。分析 torch_sipu 源码时，以 /share/users/like/package/torch_sipu 为主
+torch_sipu code base 的 torch_sipu/csrc/contrib/native/sipu/mma_dte/BlasMmaDteMxKernel.suh
 它生成的 .so 会显式依赖 libmma_dte.so吗? 
 torch_sipu 集成 mma_dte_tile_tensor，构建系统是采用的下面哪种方案？
 a)  torch_sipu  build 过程中用自己的构建系统构建 mma_dte_tile_tensor 的c++代码，完全无视mma_dte_tile_tensor的 CMakeLists.txt
