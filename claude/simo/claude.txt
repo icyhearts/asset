@@ -5339,8 +5339,20 @@ ab_dtype: A矩阵 and B矩阵的类型，可以是 mxint8 mxfloat8e4m3 mxfloat8e
 /softhome/like/asset/code/arch/tile_format_my.py 是一个参考代码，里面的shape tuple是 [col, row]的顺序，从这个实现看， 给定 [col, row], 返回的tile format的 tile_row, tile_column是唯一的, super_tile_row,  super_tile_col是唯一的。
 
 c++ wrapper侧,  (pad_m, pad_n, pad_k) 一旦确定, mma_dte_api::tensor_layout里面的 uint32_t tile_dim0; uint32_t tile_dim1; uint32_t supertile_shape0; uint32_t supertile_shape1;可以唯一确定吗?
+c++ wrapper 侧，可以去掉  a_layout + b_layout 两个参数，自己根据  (pad_m, pad_n, pad_k) 推理出来 A矩阵+B矩阵的 uint32_t tile_dim0; uint32_t tile_dim1; uint32_t supertile_shape0; uint32_t supertile_shape1;  吗?
+
 以 like-useful/answer_codex_v4.md "12.4 MXINT8" 一节为例.
 
+如果 pad_origin_mnk_to_mma_dte_align的参:数(ab_dtype: str=mxint8, origin_m: int=7, origin_n: int=31, origin_k: int=500)  只能返回(pad_m=8, pad_n=32, pad_k=512)吗? 
+c++ wrapper 侧，接受到 (pad_m=8, pad_n=32, pad_k=512) 的shape, 是不是只能选择 row family = R8, layout A = (128,8,4,1,1), layout B= (32,32,4,1,1)?
+
+
+如果 pad_origin_mnk_to_mma_dte_align的参:数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=1, origin_k: int=3)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 
+c++ wrapper 侧，接受到 (pad_m=16, pad_n=32, pad_k=256)   的shape, 是不是只能选择 row family = R16, layout A = (64,16,4,1,1) , layout B= (32,32,4,1,1)?
+
+
+如果 pad_origin_mnk_to_mma_dte_align的参:数(ab_dtype: str=mxint8, origin_m: int=, origin_n: int=, origin_k: int=)  只能返回 (pad_m=, pad_n=, pad_k=)吗? 
+c++ wrapper 侧，接受到 (pad_m=, pad_n=, pad_k=)   的shape, 是不是只能选择 row family = , layout A =  , layout B= ?
 1)
 2)
 
