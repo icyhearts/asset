@@ -5477,3 +5477,5 @@ cd /share_data/users/like/package/simo_conda_vllm_sipu
 pip install -e . --no-build-isolation
 安装后 运行你的测试例子
 }
+
+simo安装不要editable安装了，改成正式安装 pip install . --no-build-isolation
