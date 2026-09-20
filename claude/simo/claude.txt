@@ -5328,3 +5328,9 @@ hpc-ops 项目位于 /share/users/like/package/hpc-ops
 
 综合对比各种项目，把终极目标的方案设计出来.  答案 追加到 like-useful/answer_codex_v4.md
 }
+
+
+{
+
+帮我实现这个方案，
+}
