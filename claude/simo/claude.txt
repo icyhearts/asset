@@ -5331,6 +5331,14 @@ hpc-ops 项目位于 /share/users/like/package/hpc-ops
 
 
 {
+让 python 用户感知 mma_dte_tile_tensor  code base include/simma.h tensor_layout, 让 python 用户手动设置 uint32_t tile_dim0; uint32_t tile_dim1; uint32_t supertile_shape0; uint32_t supertile_shape1;, 他们很容易设置出错。
+应该设计一个 pad_origin_mnk_to_mma_dte_align(ab_dtype: str, origin_m: int, origin_n: int, origin_k: int) -> Tuple[int, int, int], 返回 (pad_m, pad_n, pad_k) int tuple, (pad_m, pad_n, pad_k) 是合法的 mma
+以 like-useful/answer_codex_v4.md "12.4 MXINT8" 一节为例.
 
-帮我实现这个方案，
+1)
+2)
+
+
+帮我在 /share_data/users/like/package/simo_conda_vllm_sipu 实现这个方案, 
+要有测试, 
 }
