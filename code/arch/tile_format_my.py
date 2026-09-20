@@ -78,6 +78,8 @@ def tile_shape_config(global_dim: list, # in number of elements
     print("Subtile Dim (in elements, [K, M]) = {}".format(subtile_dim))
     print("Tile Dim (in elements, [K, M]) = {}".format(tile_dim))
     print("SuperTile Dim (in tiles, [K, M]) = {}".format(supertile_dim))
+    global_dim_pad_base = [tile_dim[0] * supertile_dim[0], tile_dim[1] * supertile_dim[1],]
+    print("! global_dim_pad_base(in elements, [K, M]) = {}".format(global_dim_pad_base))
 
     # tile-level padding
     for dim in range(2):
@@ -94,7 +96,7 @@ def tile_shape_config(global_dim: list, # in number of elements
             print("supertile_level padding: dim {} pad {} tiles".format(dim, supertile_padding_tiles[dim]))
 
 
-    print("\n\n")
+    print("\n")
 
 
 def main():
