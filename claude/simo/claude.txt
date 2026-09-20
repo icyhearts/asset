@@ -5457,4 +5457,14 @@ mxfp4 直接写死 a_layout, b_layout, 只支持 like-useful/answer_codex_v4.md 
 mxint4 直接写死 a_layout, b_layout, 只支持 like-useful/answer_codex_v4.md  12.8 MXINT4 R32 standard 4x1 (64,32,4,1,1) (64,32,4,1,1) [32,inf,32] [32,inf,32] [256,inf,256], Python 用户调用 siinfer hp_to_mx 前，把数据padding到 M,N,K= 32,32,256 的整数倍, 然后把 hp_to_mx 量化后的 数据传给  把torch.ops.simo.mma_dte
 这样, torch.ops.simo.mma_dte python接口不需要 a_layout, b_layout, c++ wrapper 把 a_layout, b_layout写死成 row_family=R32 standard 4x1的 layout,第一版先做简化处理.
 
+submodule需要你自己加:``` [submodule "third_party/mma_dte_tile_tensor"] path = third_party/mma_dte_tile_tensor url = git@gitlabsoft.siorigin.com:oplib/mma_dte_tile_tensor.git ```
+支持的 input数据类型和 output 数据类型参考 like-useful/answer_codex_v4.md "15.6 当前 MMA release 的真实 output dtype 支持矩阵"部分
+
+要有测试例子, 能支持的输入类型和输出类型都要覆盖到.
+测试例子中要实现如下功能:
+用户输入任意形状 A/B linear pytorch tensor -> copy到  sipu设备上->  padding 到 row_family=R32 standard 4x1 的合法的 M,N,K形状，-> siinfer hp_to_mx 量化成 mx数据类型的tensor -> torch.ops.simo.mma_dte 做矩阵乘法 得到 padded result_C -> 用户去掉padding部分，得到真实的 result_C
+用户的 A/B linear tensor 直接在cpu上做 浮点数矩阵乘法 gold_C -> result_C 和 gold_C 进行相似度对比，对比 cosine similarity, relative l2 norm, absolute error, relative error.
+
+
+代码写在 /share_data/users/like/package/simo_conda_vllm_sipu
 }
