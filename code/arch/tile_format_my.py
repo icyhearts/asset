@@ -141,5 +141,13 @@ def main():
     tile_shape_config([513, 7], 8)
     tile_shape_config([513, 31], 8)
 
+
+    tile_shape_config([1024, 8], 8)
+    tile_shape_config([1024, 32], 8)
+
+
+    tile_shape_config([2, 15], 8)
+    tile_shape_config([2, 2], 8)
+
 if __name__ == '__main__':
     main()

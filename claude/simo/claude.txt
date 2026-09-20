@@ -5343,8 +5343,8 @@ c++ wrapper 侧，可以去掉  a_layout + b_layout 两个参数，自己根据 
 
 以 like-useful/answer_codex_v4.md "12.4 MXINT8" 一节为例.
 
-如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=7, origin_n: int=31, origin_k: int=513)  只能返回(pad_m=8, pad_n=32, pad_k=512)吗? 
-c++ wrapper 侧，接受到 (pad_m=8, pad_n=32, pad_k=512) 的shape, 是不是只能选择 row family = R8, layout A = (128,8,4,1,1), layout B= (32,32,4,1,1)?
+如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=7, origin_n: int=31, origin_k: int=513)  只能返回(pad_m=8, pad_n=32, pad_k=1024)吗? 
+c++ wrapper 侧，接受到 (pad_m=8, pad_n=32, pad_k=1024,) 的shape, 是不是只能选择 row family = R8, layout A = (128,8,4,1,1), layout B= (32,32,4,1,1)?
 
 /softhome/like/asset/code/arch/tile_format_my.py 运行显示
 
@@ -5374,9 +5374,10 @@ global row base = tile_dim1*supertile_shape1=8*1=8, -> origin_m=7, pad_m=8的整
 可以得到B 矩阵 global dim padding shape:
 global column base= tile_dim0*supertile_shape0=32*4=128, -> origin_k = 513, pad_k=128的整数倍
 global row base = tile_dim1*supertile_shape1=32*1=32, -> origin_n=31, pad_n=32的整数倍，pad_n=32
-origin_k=513 -> 根据 like-useful/answer_codex_v4.md "12.2 形状约束来源和计算公式" ，K_min = lcm(layoutA.tile_dim0 * layoutA.supertile_shape0, layoutB.tile_dim0 * layoutB.supertile_shape0)=lcm(512,128)=512-> pad_k = 512整数倍=ceil(513/512)*512=1024
+pad_k需要求lcm(512,128), origin_k=513 -> 根据 like-useful/answer_codex_v4.md "12.2 形状约束来源和计算公式" ，K_min = lcm(layoutA.tile_dim0 * layoutA.supertile_shape0, layoutB.tile_dim0 * layoutB.supertile_shape0)=lcm(512,128)=512-> pad_k = 512整数倍=ceil(513/512)*512=1024
 
-c++ 侧，得到上面 pad_m=8,pad_n=32,pad_k=1024后,
+c++ 侧，得到上面 pad_m=8,pad_n=32,pad_k=1024后, 同样可以按照 /softhome/like/asset/code/arch/tile_format_my.py 的逻辑，反推出 A matrix Tile Dim (in elements, [K, M]) = [128, 8], SuperTile Dim (in tiles, [K, M]) = [4, 1]
+B matrix Tile Dim (in elements, [K, M]) = [32, 32], SuperTile Dim (in tiles, [K, M]) = [4, 1]
 
 
 
