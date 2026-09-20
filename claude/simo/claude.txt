@@ -5344,6 +5344,7 @@ c++ wrapper 侧，可以去掉  a_layout + b_layout 两个参数，自己根据 
 
 以 like-useful/answer_codex_v4.md "12.4 MXINT8" 一节为例.
 
+# R8 系列
 如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=7, origin_n: int=31, origin_k: int=513)  只能返回(pad_m=8, pad_n=32, pad_k=1024)吗? 
 c++ wrapper 侧，接受到 (pad_m=8, pad_n=32, pad_k=1024,) 的shape, 是不是只能选择 row family = R8, layout A = (128,8,4,1,1), layout B= (32,32,4,1,1)?
 
@@ -5382,6 +5383,7 @@ B matrix Tile Dim (in elements, [K, M]) = [32, 32], SuperTile Dim (in tiles, [K,
 
 
 
+# R16 系列
 如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=31, origin_k: int=2)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 
 /softhome/like/asset/code/arch/tile_format_my.py
 *** global_dim [K, M] = [2, 15], datatype_bit = 8 ***
@@ -5415,6 +5417,9 @@ pad n=32*1=32
 padk = lcm(256,128)=256
 final: m,n,k=16,32,256
 
+
+
+如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=31, origin_k: int=2)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 
 
 
 sdk目录, 
