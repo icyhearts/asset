@@ -5283,14 +5283,17 @@ torch_sipu 是 pytorch 的 sipu  设备扩展:
 torch-sipu 已经通过 pip wheel 安装到 vllm_dev conda 环境 /share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/
 为了分析 torch-sipu c++ 代码, torch_sipu 完整源码位于  /share/users/like/package/torch_sipu
 vllm_dev conda 环境安装的 torch-sipu 和 源码可能不是同一个 git commit，但是大致功能应该差别不大。分析 torch_sipu 源码时，以 /share/users/like/package/torch_sipu 为主
-torch_sipu code base 的 torch_sipu/csrc/contrib/native/sipu/mma_dte/BlasMmaDteMxKernel.suh
-它生成的 .so 会显式依赖 libmma_dte.so吗? 
+torch_sipu code base 的 torch_sipu/csrc/contrib/native/sipu/mma_dte/BlasMmaDteMxKernel.suh 会显式调用 mma_dte 但是它写死了输出是 tile format, 我想要 linear format output,所以它的输出不符合我的要求。
+回答问题 ： torch_sipu 生成的 .so,可以通过 /share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu里面 会显式依赖 libmma_dte.so吗? 
+like-useful/answer_codex_v4.md 13. release DSO 的区别、应用链接方式和无 GTest 调用示例 部分，提到了主库和 component DSO, torch_sipu 的 .so, 依赖的是 libtile_mma_dte.so主库还是 component DSO ?
+
 torch_sipu 集成 mma_dte_tile_tensor，构建系统是采用的下面哪种方案？
 a)  torch_sipu  build 过程中用自己的构建系统构建 mma_dte_tile_tensor 的c++代码，完全无视mma_dte_tile_tensor的 CMakeLists.txt
 b) torch_sipu  build 先用 mma_dte_tile_tensor  CMakeLists.txt 构建出 libtile_mma_dte.so, 然后 torch_sipu 自己的 c++ wrapper 去 link libtile_mma_dte.so.
 
 siinfer:
-
+siinfer 本身已经通过 pip wheel 安装方式，安装到 /share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/siinfer/
+为了分析 c++ 代码, siinfer 原始代码位于  /share/users/like/package//si-infer/, pip 安装的版本可能和原始代码不一致，大致功能应该差别不大。
 
 
 mma_dte:
