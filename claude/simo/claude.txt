@@ -5331,6 +5331,7 @@ hpc-ops 项目位于 /share/users/like/package/hpc-ops
 
 
 {
+// TODO: 把  layout 选择加进来.
 让 python 用户感知 mma_dte_tile_tensor  code base include/simma.h tensor_layout, 让 python 用户手动设置 uint32_t tile_dim0; uint32_t tile_dim1; uint32_t supertile_shape0; uint32_t supertile_shape1;, 他们很容易设置出错。
 应该设计一个 pad_origin_mnk_to_mma_dte_align(ab_dtype: str, origin_m: int, origin_n: int, origin_k: int) -> Tuple[int, int, int],
 ab_dtype: A矩阵 and B矩阵的类型，可以是 mxint8 mxfloat8e4m3 mxfloat8e5m2 mxfloat6e2m3 mxfloat6e3m2 mxfloat4e2m1 mxint4, ( origin_m: int, origin_n: int, origin_k: int)是没有对齐的原始的m,n,k
@@ -5407,7 +5408,45 @@ Tile Dim (in elements, [K, M]) = [32, 32]
 SuperTile Dim (in tiles, [K, M]) = [4, 1]
 
 
-帮我在 /share_data/users/like/package/simo_conda_vllm_sipu 实现这个方案, 
+
 sdk目录, 
 要有测试, 
+}
+
+
+
+{
+
+答案追加到 like-useful/answer_claude_v2.md 里面
+问题背景 :
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/v0.4.2
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+
+simo 现状:
+simo 代码位于 /share_data/users/like/package/simo_conda_vllm_sipu/, simo 以 editable 方式安装在 vllm_dev 环境中。
+
+siinfer:
+siinfer 本身已经通过 pip wheel 安装方式，安装到 /share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/siinfer/
+为了分析 c++ 代码, siinfer 原始代码位于  /share/users/like/package//si-infer/, pip 安装的版本可能和原始代码不一致，大致功能应该差别不大。
+siinfer  /share/users/like/package/si-infer/siinfer/quantization.py 提供 hp_to_mx函数，接受 linear fp16 or bf16 input tensor, 输出 mxint8 or mxfp8 or mxfp6 or mxint4 or mxfp4  tile format output tensor, siinfer hp_to_mx 在本次任务中的角色是: 为 mma_dte  python 接口提供 mx 数据类型 tile format input
+
+
+mma_dte:
+mma_dte_tile_tensor code base位于: /share/users/like/package/oplib/mma_dte_tile_tensor
+本次任务依赖的核心 sipu设备的c++ 矩阵乘法  host wrapper 和 device code.  host 接口位于 code base include/simma.h  mma_dte函数: template <class inputT, class outputT, class scalarT, mma_dte_api::tensor_layout layoutA, mma_dte_api::tensor_layout layoutB, mma_dte_api::tensor_layout layoutC>  void mma_dte(mma_dte_api::Operation transa, mma_dte_api::Operation transb, int M, int N, int K, scalarT alpha, void *A, int lda, void *B, int ldb, scalarT beta, void *C, int ldc, sipuStream_t stream = nullptr);
+mma_dte_tile_tensor构建方式是 :
+. /share/users/like/miniconda3/bin/activate  vllm_dev
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+cd /share/users/like/package/oplib/mma_dte_tile_tensor
+BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test > temp/build.test.log 2>&1  &
+BUILD_JOBS=80 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --all > temp/build.all.log 2>&1  &
+bash build_release.sh --skip-build > temp/build_release.log 2>&1 &  
+构建日志位于 /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.all.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.test.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build_release.log
+
+帮我在 /share_data/users/like/package/simo_conda_vllm_sipu 实现这个方案, 但是把torch.ops.simo.mma_dte接口的 A矩阵+B矩阵的 layout 参数 
 }
