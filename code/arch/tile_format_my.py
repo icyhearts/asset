@@ -130,7 +130,9 @@ def main():
     tile_shape_config([128, 32], 8)
     tile_shape_config([64, 64], 8)
     tile_shape_config([512, 8], 8)
-    tile_shape_config([511, 7], 8)
+
+    tile_shape_config([1000, 7], 8)
+    tile_shape_config([1000, 31], 8)
 
     tile_shape_config([63, 31], 8)
     tile_shape_config([63, 63], 8)
