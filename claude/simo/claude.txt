@@ -5276,8 +5276,12 @@ simo code base setup.py get_build_backend 会区分当前环境是 cuda 还是 s
 simo code base simo/csrc/quantization/cpu/quantize_fp.cpp 提供 c++ 函数 fake_quantize_to_low_precision_fp,  ./simo/ops/fake_quant.py 调用 output = _get_native_ops().fake_quantize_to_low_precision_fp, 这样实现了 python 调用 c++ 函数.
 simo code base simo/__init__.py  _get_native_ops()函数返回 return torch.ops.simo
 
+本次任务的终极目标: 设计一种在 simo 代码中通过 python 函数调用 mma_dte mxint8/mxfp8/mxfp6/mxfp4/mxint4 矩阵乘法的 方案,  只考虑 aot, 不考虑jit方案。
+期望的接口是: torch.ops.simo.mma_dte, 接受 device=sipu的PyTorch Tensor, tensor layout 是 siinfer hp_to_mx 量化过的mx tile format tensor, 返回  linear layout tensor, output tensor dtype = bf16 or fp16 or fp32.
+当前 simo 项目完全没有 CMakeLists.txt, 全靠 setup.py 编译 c++代码，要提供 mma_dte 的 python接口， simo 需要增加 CMakeLists.txt 吗？需要 tvm-ffi依赖吗？需要pybind11吗？ 我希望本次设计的方案引入最小的依赖。
 
-hpc-ops:
+
+下面是一些关联项目，并有一些你需要回答的问题:
 
 torch_sipu 是 pytorch 的 sipu  设备扩展:
 torch-sipu 已经通过 pip wheel 安装到 vllm_dev conda 环境 /share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/
@@ -5294,11 +5298,24 @@ b) torch_sipu  build 先用 mma_dte_tile_tensor  CMakeLists.txt 构建出 libtil
 siinfer:
 siinfer 本身已经通过 pip wheel 安装方式，安装到 /share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/siinfer/
 为了分析 c++ 代码, siinfer 原始代码位于  /share/users/like/package//si-infer/, pip 安装的版本可能和原始代码不一致，大致功能应该差别不大。
+siinfer  /share/users/like/package/si-infer/siinfer/quantization.py 提供 hp_to_mx函数，接受 linear fp16 or bf16 input tensor, 输出 mxint8 or mxfp8 or mxfp6 or mxint4 or mxfp4  tile format output tensor, siinfer hp_to_mx 在本次任务中的角色是: 为 mma_dte  python 接口提供 mx 数据类型 tile format input
 
 
 mma_dte:
-mma_dte_tile_tensor,  mma_dte_tile_tensor 单独 clone到   独立目录: /share/users/like/package/oplib/mma_dte_tile_tensor
+mma_dte_tile_tensor code base位于: /share/users/like/package/oplib/mma_dte_tile_tensor
+本次任务依赖的核心 sipu设备的c++ 矩阵乘法  host wrapper 和 device code.  host 接口位于 code base include/simma.h  mma_dte函数:
+```
+179 template <class inputT, class outputT, class scalarT, mma_dte_api::tensor_layout layoutA, mma_dte_api::tensor_layout layoutB, mma_dte_api::tensor_layout layoutC> //T:input data type; 0:linear, 1:tiled
+180 void mma_dte(mma_dte_api::Operation transa, mma_dte_api::Operation transb,
+181              int M, int N, int K,
+182              scalarT alpha,
+183              void *A, int lda,
+184              void *B, int ldb,
+185              scalarT beta,
+186              void *C, int ldc,
+187              sipuStream_t stream = nullptr);
 
+```
 mma_dte_tile_tensor构建方式是 :
 . /share/users/like/miniconda3/bin/activate  vllm_dev
 cd  /share/users/like/package/vllm-sipu
@@ -5310,9 +5327,7 @@ bash build_release.sh --skip-build > temp/build_release.log 2>&1 &
 构建日志位于 /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.all.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.test.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build_release.log
 
 
-本次任务的终极目标: 设计一种在 simo 代码中通过 python 函数调用 mma_dte mxint8/mxfp8/mxfp6/mxfp4/mxint4 矩阵乘法的 方案。
-期望的接口是: torch.ops.simo.mma_dte, 接受 device=sipu的PyTorch Tensor, tensor layout 是 siinfer hp_to_mx 量化过的mx tile format tensor, 返回  linear layout tensor, 返回 tensor dtype = bf16 or fp16 or fp32.
-当前 simo 项目完全没有 CMakeLists.txt, 全靠 setup.py 编译 c++代码，要提供 mma_dte 的 python接口， simo 需要增加 CMakeLists.txt 吗？
+hpc-ops:
 
 }
 
