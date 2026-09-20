@@ -5420,7 +5420,7 @@ final: m,n,k=16,32,256
 
 
 # R32 系列
-如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=31, origin_k: int=2)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 
+如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=31, origin_n: int=31, origin_k: int=31,)  只能返回 (pad_m=, pad_n=, pad_k=,)吗? 
 
 
 sdk目录, 
@@ -5493,3 +5493,6 @@ pip install -e . --no-build-isolation
 }
 
 simo安装不要editable安装了，改成正式安装 pip install . --no-build-isolation
+把修改的和增加的代码做一个git commit.
+把本次实现发现的nan问题，误差情况进行问红，答案 追加到 like-useful/answer_codex_v4.md
+
