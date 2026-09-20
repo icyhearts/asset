@@ -4805,3 +4805,428 @@ run_case 实际调用次数 = 2 + 1 + 1 = 4
 ```
 
 日志末尾 `temp/run_mxfp8.log:40-44` 也确认了 `3 tests passed`、`3 tests skipped`。若运行前设置 `SITEST_CASE_LEVEL=daily`，3 个 daily-only 参数才会继续进入 `run_param` 和 `run_case`。
+
+## 15. simo 通过 Python 调用 MMA DTE 的 AOT 方案设计（2026-09-20）
+
+### 15.1 结论先行
+
+本次目标可以实现为：
+
+```text
+Python
+  -> torch.ops.simo.mma_dte
+  -> simo::_C 中的 TORCH_LIBRARY_IMPL(simo, PrivateUse1, ...)
+  -> simo 的 C++ host wrapper
+  -> mma_dte<MX_T, OUT_T, OUT_T, LayoutA, LayoutB, LayoutCLinear>(...)
+  -> libtile_mma_dte.so umbrella
+  -> 同目录的 libtile_mma_dte_*.so component DSO
+  -> SIPU runtime / SIPU device kernel
+  -> linear layout 的 BF16/FP16/FP32 output Tensor
+```
+
+推荐方案如下：
+
+1. 保留 `simo` 当前的 `setuptools + torch.utils.cpp_extension`，继续构建现有的 CPU/CUDA/SIPU host C++ extension。
+2. 新增 `third_party/mma_dte_tile_tensor` git submodule。
+3. 新增一个很小的 MMA DTE AOT CMake 子工程，或者在现有 `setup.py` 的 `build_ext` 中调用 mma 子模块自己的 CMake。CMake 负责生成 MMA DTE 的 umbrella 和 component DSO；它不是因为 `torch.ops` 强制要求，而是因为 `.su` device code 的 AOT 构建需要 SIPU 编译器、device object、device fatbin 和 component DSO 管理。
+4. 新增一个普通 C++ host wrapper，并将其注册为 `torch.ops.simo.mma_dte`。这个 wrapper 只调用公开的 `include/simma.h` API，不复制 `mma_dte_tile_tensor` 的 device kernel 实现。
+5. 不引入 `tvm-ffi`；不新增 pybind11 绑定。PyTorch dispatcher 的 `TORCH_LIBRARY_FRAGMENT`/`TORCH_LIBRARY_IMPL` 已足够。
+6. 第一个版本必须显式接收 `M/N/K`、MX dtype 和 MMA layout。`siinfer.hp_to_mx` 返回的是一维物理 `uint8` buffer，buffer 本身不携带这些元数据，不能只传两个 Tensor 让 C++ 自动猜测。
+
+严格来说，`simo` **不因为 Python custom op 而必须新增 CMakeLists.txt**：如果已经有预编译的 `libtile_mma_dte.so`，普通 `CppExtension` 加 `-L/-l` 也能完成 host wrapper 的链接。但是本题要求把 `mma_dte_tile_tensor` 以 submodule 源码方式纳入，并且只考虑 AOT，因此建议增加最小的 CMake 构建入口。否则 `setup.py` 必须自己复制 `scc` 的 host/device 双 pass、device ELF link、component DSO staging 等逻辑，维护成本更高。
+
+### 15.2 simo 当前代码适合如何接入
+
+#### 15.2.1 现有 native extension 入口
+
+`setup.py:36-42 / get_build_backend` 根据 `torch.sipu.is_available()`、`torch.cuda.is_available()` 和 CPU fallback 选择 `sipu`、`cuda` 或 `cpu`。`setup.py:45-100 / get_extensions` 当前用 `CppExtension`/`CUDAExtension` 收集 `simo/csrc/**/*.cpp` 和 CUDA 源文件；`setup.py:103-119 / SimoBuildExtension::run` 在普通 extension 构建后才处理 CUDA ONNX runtime。
+
+因此 MMA DTE 不能作为无条件的普通 `.cpp` 加入所有 backend：
+
+- CPU build 不应 include `simma.h`，也不应链接 `libtile_mma_dte.so`。
+- CUDA build 不应尝试 SIPU `.su` 或 SIPU DSO。
+- SIPU build 才执行 MMA DTE 的 CMake/AOT 子构建，并把 host wrapper 加入 `_C`。
+
+建议的源文件边界：
+
+```text
+third_party/mma_dte_tile_tensor/       # git submodule
+cmake/mma_dte.cmake                    # simo 的最小构建 glue
+simo/csrc/sipu/mma_dte.cpp             # 仅 SIPU host wrapper
+simo/csrc/sipu/mma_dte_layout.h        # dtype/layout 到模板的映射
+simo/ops/mma_dte.py                    # Python 薄封装
+simo/csrc/torch_bindings.cpp           # schema 注册
+```
+
+当前 `simo/csrc/torch_bindings.cpp:18-27 / TORCH_LIBRARY_FRAGMENT` 已经为 `simo` namespace 定义 schema；`simo/csrc/quantization/cpu/quantize_fp.cpp:43-45 / TORCH_LIBRARY_IMPL(simo, CPU, m)` 已经展示了按 dispatch key 注册实现的模式。因此不需要另建 Python C API。
+
+#### 15.2.2 推荐的 build 顺序
+
+建议把 `SimoBuildExtension` 扩展为以下顺序：
+
+```text
+SimoBuildExtension::run/build_extensions
+  1. 如果 backend != sipu，跳过 MMA DTE
+  2. 检查 third_party/mma_dte_tile_tensor/include/simma.h
+  3. 调用 mma 子工程 CMake configure/build
+  4. 得到：
+       build/mma_dte/lib/libtile_mma_dte.so
+       build/mma_dte/lib/libtile_mma_dte_*.so
+  5. 编译 simo._C host wrapper，并 link -ltile_mma_dte
+  6. 将 umbrella 与所有所需 component DSO 复制到：
+       editable: source tree 下的 simo/mma_dte/
+       wheel:    build_lib/simo/mma_dte/
+```
+
+`libtile_mma_dte.so` 和所有 `libtile_mma_dte_*.so` 必须放在同一个运行时目录。umbrella DSO 的实现会根据自身位置寻找 component DSO；只复制主库、不复制 component DSO 会导致第一次调用某些模板实例时 `dlopen` 失败。
+
+推荐给 `_C` 设置相对 RPATH：
+
+```text
+$ORIGIN/mma_dte
+```
+
+不要把构建机的绝对路径写入 wheel。SIPU SDK 的 `libsipu.so`、`libsipurt.so` 等仍属于运行环境依赖，不应把 SDK 全部复制进 simo wheel；安装/运行环境应通过 SIPU SDK setup 或 torch_sipu 的运行环境提供它们。
+
+### 15.3 `tvm-ffi` 和 pybind11 是否需要
+
+#### 15.3.1 tvm-ffi：不需要
+
+`torch.ops.simo.mma_dte` 的调用协议由 PyTorch dispatcher 管理。当前 `simo/__init__.py:7-13 / _get_native_ops` 只需要 import `simo._C`，然后返回 `torch.ops.simo`；这正是本次新 op 可以复用的机制。
+
+引入 tvm-ffi 会增加：
+
+- 一个额外的运行时/编译依赖；
+- 一套与 PyTorch dispatcher 并行的 schema/registration 机制；
+- wheel、editable 和 ABI 的额外兼容面。
+
+本题没有需要 tvm-ffi 才能解决的问题，所以不建议引入。
+
+#### 15.3.2 pybind11：不需要新增
+
+`simo/csrc/torch_bindings.cpp:1-14 / PYBIND11_MODULE` 当前为了暴露 `RoundingMode` enum 已经使用 pybind11；但 `mma_dte` 本身不需要写新的 `py::def`。
+
+推荐由 dispatcher 完成：
+
+```cpp
+TORCH_LIBRARY_FRAGMENT(simo, m) {
+  m.def("mma_dte(Tensor a, Tensor b, int m, int n, int k, "
+        "str mx_dtype, int a_layout, int b_layout, ScalarType out_dtype) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(simo, PrivateUse1, m) {
+  m.impl("mma_dte", &mma_dte_entry);
+}
+```
+
+这里的 `PrivateUse1` 是 torch_sipu 的 SIPU device dispatch key。`vllm-sipu` 的 AOT binding generator 也在 `tools/generate_aot_bindings.py:120-149 / generate` 中使用 `torch::kPrivateUse1` 注册 SIPU operator，这与 simo 应采用的方向一致。
+
+### 15.4 建议的 Python/C++ API
+
+#### 15.4.1 第一版 schema
+
+建议第一版先使用显式、可验证的 schema：
+
+```text
+torch.ops.simo.mma_dte(
+    a: Tensor,                 # MX tiled physical uint8 buffer
+    b: Tensor,                 # MX tiled physical uint8 buffer
+    m: int,
+    n: int,
+    k: int,
+    mx_dtype: str,             # mxint8/mxfloat8e4m3/.../mxint4
+    a_layout: int,             # MMA DTE layout family
+    b_layout: int,             # must equal layout contract's required RHS layout
+    out_dtype: torch.dtype,    # bfloat16 / float16 / float32
+) -> Tensor                  # [m, n], contiguous linear layout
+```
+
+`mx_dtype` 应使用具体格式名，而不是模糊的 `mxfp8`/`mxfp6`：
+
+```text
+mxint8
+mxfloat8e4m3
+mxfloat8e5m2
+mxfloat6e2m3
+mxfloat6e3m2
+mxfloat4e2m1
+mxint4
+```
+
+`a_layout`/`b_layout` 可以先用整数枚举，后续 Python 层再提供字符串常量：
+
+```text
+S4x1M32
+S2x2M32
+S1x4M32
+S1x4M16
+S1x4M8
+```
+
+这些 layout 的几何和 required RHS layout 应直接复用 `mma_dte_tile_tensor` 的 layout contract，不要在 simo 中重新维护一套 M/N/K 规则。`torch_sipu/torch_sipu/csrc/contrib/native/sipu/mma_dte/BlasMmaDte.suh:227-323 / mx_mma_dte_*_config_spec` 已经展示了按 MX6、8 bit、4 bit 家族选择几何的现成模式；如果 simo 直接链接独立 MMA release，则应在 simo wrapper 中做一个最小、同步的枚举映射。
+
+Python 薄封装可以是：
+
+```python
+def mma_dte(a, b, m, n, k, mx_dtype, a_layout, b_layout,
+            out_dtype=torch.bfloat16):
+    return torch.ops.simo.mma_dte(
+        a, b, m, n, k, mx_dtype, a_layout, b_layout, out_dtype
+    )
+```
+
+#### 15.4.2 C++ wrapper 的职责
+
+建议 `simo/csrc/sipu/mma_dte.cpp:mma_dte_entry` 只做以下事情：
+
+1. 检查 `a`、`b` 在 `PrivateUse1`，且在同一个 SIPU device。
+2. 检查 `a.scalar_type() == b.scalar_type() == torch::kUInt8`、contiguous、非空指针和 64-byte 对齐。
+3. 检查 `M/N/K` 为正数并能转换为 `int`。
+4. 根据 `mx_dtype + a_layout + b_layout + out_dtype` 选择一个**已显式实例化**的 C++ 模板。
+5. 检查 input 的 physical byte capacity 足够；不能只检查 `Tensor.numel()` 是否等于 `M*K`，因为它是 tile physical storage。
+6. 创建 `at::empty({M, N}, a.options().dtype(out_dtype))`。
+7. 使用 `c10::sipu::getCurrentSIPUStream(a.device().index()).stream()` 获取当前 stream。
+8. 调用 `mma_dte`，其中 `layoutC.tensor_format` 固定为 `0`，`alpha=1`，`beta=0`，`ldc=N`。
+9. 调用 SIPU launch check，然后返回 output Tensor。
+
+`torch_sipu/torch_sipu/csrc/contrib/native/sipu/mma_dte/BlasMmaDteMxKernel.suh:57-81 / run_mx_mma_dte_tiled_tensor` 是 stream、`M/N/K`、`lda/ldb/ldc` 传递方式的直接参考；`mma_dte_tile_tensor/kernel/mma_dte_tiled_tensor.hpp:51-119 / mma_dte_implement_with_control` 是底层 shape/layout 校验和 R8/R16/R32 dispatch 入口。
+
+这里必须明确：
+
+```text
+layoutC.tensor_format = 0  -> linear output
+layoutC.tensor_format = 1  -> tiled output
+```
+
+不要调用 torch_sipu 现有只固定 tiled C 的旧 wrapper；应使用独立 MMA 库已经显式实例化的 linear-C 模板。
+
+### 15.5 `hp_to_mx` 输出与接口元数据问题
+
+`si-infer/siinfer/quantization.py:10-42 / hp_to_mx` 的 Python docstring 虽然称返回 tiled MX physical buffer，但返回值没有附带 dtype/layout/shape 对象。
+
+native 层 `si-infer/csrc/native/bindings.cpp:8974-9023 / hp_to_mx_native` 明确：
+
+- 输入要求是 `[batch, dim0, dim1]`；
+- 输出默认是 `torch.uint8`；
+- 输出是 contiguous 1-D buffer；
+- `required_bytes` 由 `hp_to_mx_storage_size` 计算。
+
+device wrapper `si-infer/csrc/quantization/kernels/sipu150/hp_to_mx/hp_to_mx.su:25-85 / hp_to_mx` 会根据 `dim0` 选择 Rows=8/16/32；`hp_to_mx_tensormap.hpp:84-113 / hp_to_mx_direct_shape_supported` 和 `hp_to_mx_physical_extents` 决定物理 tile/supertile 尺寸。
+
+所以 `mma_dte` 不能从 `a.shape`/`b.shape` 自动恢复完整契约。推荐调用方保留如下 metadata：
+
+```text
+MxTensor {
+    storage: uint8 Tensor
+    logical_shape: (rows, k)
+    mx_dtype: string
+    mma_layout: enum
+    input_layout: tiled
+}
+```
+
+如果当前不想引入 `MxTensor` Python class，至少把 `(M, N, K, mx_dtype, a_layout, b_layout)` 显式传给 `torch.ops.simo.mma_dte`。
+
+特别注意：MMA DTE 对 B 的 layout 有约束。`torch_sipu/torch_sipu/csrc/contrib/native/sipu/mx.cpp:108-127 / check_mx_rhs_layout` 要求 B 使用 M32 row tile，并且必须等于 A layout 对应的 `required_rhs_layout`。因此不能简单地对任意 `[N, K]` 调用 `hp_to_mx(..., input_layout="tiled")` 后直接当作 MMA B：当 N 很小时，`hp_to_mx.su:81-85 / hp_to_mx` 可能选择 R8/R16，而当前 MMA layout contract 需要 R32 B。调用层应按 MMA layout 先 padding/选择正确的 quantization shape，并保存 layout metadata。
+
+### 15.6 当前 MMA release 的真实 output dtype 支持矩阵
+
+用户期望的“所有 MX dtype 都支持 BF16/FP16/FP32”不能仅靠 simo wrapper 达成。当前 `/share/users/like/package/oplib/mma_dte_tile_tensor` 源码的显式实例化情况是：
+
+| MX input | 当前独立 MMA 源码的 linear-C output | 证据 |
+|---|---|---|
+| MXINT8 | BF16、FP16、FP32 | `kernel/instantiations/mxint8/inst_mxint8_r32_4x1.su:21-40`，R8/R16 结构相同 |
+| MXFP8 E4M3/E5M2 | BF16、FP16；当前没有 FP32 实例 | `kernel/instantiations/mxfp8/inst_mxfp8_r32_4x1_bf16.su:6-48` 及对应 `f16` 文件 |
+| MXFP6 E2M3/E3M2 | BF16、FP16、FP32 | `kernel/instantiations/mxfloat6e2m3/inst_mxfloat6e2m3_r32_4x1.su:21-39`，E3M2 结构相同 |
+| MXFP4 E2M1 | BF16；当前没有 FP16/FP32 实例 | `kernel/instantiations/mxfp4/inst_mxfp4.su:23-61` |
+| MXINT4 | BF16；当前没有 FP16/FP32 实例 | `kernel/instantiations/mxint4/inst_mxint4.su:27-61` |
+
+因此建议分两阶段：
+
+```text
+第一阶段：simo 暴露当前 release 已存在的组合，unsupported 组合明确报错。
+第二阶段：如果业务必须要求 MXFP8/MXFP4/MXINT4 的 FP32/FP16 output，
+          先在 mma_dte_tile_tensor 中新增对应 .su 显式实例化和必要 device path，
+          再更新 simo 的 dispatch manifest；不要在 simo wrapper 中伪造支持。
+```
+
+### 15.7 `torch_sipu` 的 `.so` 是否依赖 `libtile_mma_dte.so`
+
+#### 15.7.1 当前安装包的 ELF 事实
+
+检查目录：
+
+```text
+/share_data/users/like/miniconda3/envs/vllm_dev/lib/python3.10/site-packages/torch_sipu/
+```
+
+当前 `lib/150/` 中没有 `libtile_mma_dte.so` umbrella，只有多个 `libtile_mma_dte_*.so` component DSO。
+
+`readelf -d` 得到的关键依赖是：
+
+| 文件 | 直接 `DT_NEEDED` 中的 MMA 依赖 |
+|---|---|
+| `libtorch_sipu.so` | 没有 `libtile_mma_dte.so`，也没有 `libtile_mma_dte_*.so`；它直接包含 torch_sipu 自己编译出的 `mma_dte` 符号 |
+| `_C.cpython-310-*.so` | 主要依赖 `libtorch_sipu.so` |
+| `libsiblas.so` | 依赖 `libsiblas_kernel_150.so`，不直接依赖 tile MMA DSO |
+| `libsiblas_gemm_dte_external_adapter_150.so` | 直接依赖 `libtile_mma_dte_bf16_r16.so`、`libtile_mma_dte_bf16_r32_bf16out.so`、`libtile_mma_dte_bf16_r8.so`、对应 FP16 component |
+
+因此对问题“torch_sipu 生成的 `.so` 是否显式依赖 `libtile_mma_dte.so`”的回答是：
+
+```text
+libtorch_sipu.so：否。
+torch_sipu 安装包中的 siBLAS external adapter：不依赖 umbrella，直接依赖若干 component DSO。
+当前安装目录：没有 libtile_mma_dte.so umbrella。
+```
+
+这是安装包级事实，不应把之前独立 mma release 中存在的 umbrella 和 torch_sipu 当前 wheel 混为一谈。
+
+#### 15.7.2 `torch_sipu` 源码实际采用 a 还是 b
+
+对用户给出的二选一，必须分两层回答：
+
+**torch_sipu 主库的 MMA wrapper 是 a。**
+
+- `torch_sipu/cmake/public/mma_dte.cmake:90-106` 明确把 MMA DTE 标成 `header-only`，这里只提供 include dirs，不设置 `libtile_mma_dte.so` link target。
+- `torch_sipu/torch_sipu/CMakeLists.txt:90-98` 从 torch_sipu 自己的 `csrc/.../*.su` 收集 SIPU source。
+- `torch_sipu/torch_sipu/CMakeLists.txt:344-443` 对每个 `.su` 单独执行 host-only 和 device-only 编译。
+- `torch_sipu/torch_sipu/CMakeLists.txt:462-480` 把 device objects link 成 `torch_sipu-sipu-sipu150.elf`。
+- `torch_sipu/torch_sipu/CMakeLists.txt:507-520` 将 host objects 和 device ELF 通过 `--override-image=sipu=...` link 进 `libtorch_sipu.so`。
+
+因此主库不是先通过 mma 子模块 CMake 生成 umbrella，再让 torch_sipu wrapper link umbrella；而是把 `mma_dte_tile_tensor` 的 header/device template 纳入 torch_sipu 自己的 AOT 构建图。
+
+**同一个 torch_sipu 发布包中的 siBLAS external DTE adapter 是另一条路径。**
+
+- `torch_sipu/third_party/siblas/CMakeLists.txt:535-618` 会把 MMA 子模块作为子构建，生成 component DSO。
+- `:548-551` 明确说明 siBLAS runtime path 不使用 umbrella。
+- `:877-915` 的 `siblas_gemm_dte_external_adapter_<arch>` 直接 link 选中的 component library。
+- `torch_sipu/torch_sipu/CMakeLists.txt:936-952` 安装 adapter 和 `libtile_mma_dte_*.so` component。
+
+所以更准确的结论是：
+
+```text
+torch_sipu 自己的 MMA operator：方案 a。
+torch_sipu 同步构建的 siBLAS external adapter：子模块 CMake + component DSO，
+                    但不是 link umbrella 的方案 b。
+```
+
+### 15.8 simo 应该链接 umbrella 还是 component DSO
+
+对于 simo，不建议复制 siBLAS 的内部策略，也不建议直接依赖 component DSO 名称。建议：
+
+```text
+simo host wrapper -> link libtile_mma_dte.so umbrella
+libtile_mma_dte.so -> 运行时在同目录 dlopen 对应 component DSO
+```
+
+原因：
+
+1. `mma_dte_tile_tensor/CMakeLists.txt:318-392` 的正式发布结构就是 component DSO 加 umbrella trampoline。
+2. `include/simma.h:121-187 / mma_dte` 是对外 host API；pkg-config 文件的 `Libs` 也只写 `-ltile_mma_dte`。
+3. component 文件名和实例拆分是实现细节；直接 link component 会把 simo 绑定到当前 delivery profile 的内部拆分。
+4. umbrella 能通过完整 C++ symbol 把调用转给正确 component，simo wrapper 不需要自己维护 component 选择表。
+
+只有在确认组件 DSO ABI 永远稳定、并且需要极限缩小 wheel 体积时，才考虑直接 link selected component；那应作为后续优化，不作为第一版架构。
+
+### 15.9 与 hpc-ops 的构建和注册模式对比
+
+`hpc-ops` 的可复用部分是 operator registration，不是 CUDA 构建细节：
+
+- `hpc-ops/src/C/C.cc:3-5` 用空的 `TORCH_LIBRARY(hpc, m)` 创建 namespace。
+- `hpc-ops/src/group_gemm/entry.cc:397-421 / TORCH_LIBRARY_FRAGMENT` 定义 schema 并用 `m.impl(..., torch::kCUDA, ...)` 绑定 C++ entry。
+- `hpc-ops/hpc/group_gemm.py:110-131 / group_gemm_fp8` 只是调用 `torch.ops.hpc.group_gemm_fp8`。
+- `hpc-ops/hpc/group_gemm.py:200-225` 通过 `register_fake` 提供 fake/meta shape。
+- `hpc-ops/setup.py:17-70 / CMakeExtension、CMakeBuild::build_extension` 用 setuptools 作为外层入口、CMake 作为真正的 native build driver。
+- `hpc-ops/CMakeLists.txt:117-215` 构建 Python MODULE 并 link PyTorch/CUDA 库。
+
+simo 应采用同样的分层：
+
+```text
+setup.py       -> Python packaging/build orchestration
+CMake          -> SIPU AOT MMA DTE build and DSO staging
+torch_bindings -> schema/dispatch registration
+mma_dte.cpp    -> device-aware host wrapper
+mma_dte.py     -> optional Python convenience API
+```
+
+但不应照搬 hpc-ops 的 `CUDAExtension`、SM architecture loop 或 `py_limited_api`；SIPU 的 `.su`/device ELF/RPATH 规则不同。
+
+### 15.10 推荐的 simo 调用链
+
+```text
+pip install -e .
+  -> setup.py:get_build_backend
+  -> backend == sipu
+  -> setup.py:SimoBuildExtension
+  -> CMake configure third_party/mma_dte_tile_tensor
+  -> CMake build tile_mma_dte
+       -> scc compile .su
+       -> link libtile_mma_dte_<type>.so
+       -> generate umbrella trampoline
+       -> link libtile_mma_dte.so
+  -> CppExtension builds simo._C
+       -> torch_bindings.cpp defines simo::mma_dte
+       -> mma_dte.cpp registers PrivateUse1 implementation
+       -> link libtile_mma_dte.so
+  -> copy simo/mma_dte/*.so beside simo._C
+  -> import simo
+  -> simo._get_native_ops(): import simo._C
+  -> torch.ops.simo.mma_dte(a, b, M, N, K, ...)
+  -> mma_dte_entry
+       -> validate PrivateUse1/uint8/layout/shape/storage
+       -> allocate linear C [M,N]
+       -> current SIPU stream
+       -> mma_dte<... layoutC.tensor_format=0>
+       -> return C
+```
+
+### 15.11 AOT 构建中需要避免的方案
+
+#### 方案一：运行时用 `torch.utils.cpp_extension.load` 编译
+
+不采用。这是 JIT，和本题只考虑 AOT 的目标冲突，也会在 vLLM worker 启动时引入编译、缓存目录和并发问题。
+
+#### 方案二：在 simo 里复制 torch_sipu 的全部 `.su` wrapper
+
+不作为第一版。它会同时复制：
+
+- MX dtype/layout dispatch 表；
+- R8/R16/R32 wrapper；
+- host/device 双 pass CMake custom command；
+- device ELF `--override-image` link；
+- stream/error handling；
+- 未来每次 mma 子模块更新的实例同步。
+
+这条路能避免 component DSO，但代码重复和维护面明显大于“link umbrella + 同目录 component”。
+
+#### 方案三：直接调用 torch_sipu 的私有 `SIPUExtFunctions::_mx_mm`
+
+不采用。它不是 simo 的稳定公共 ABI；而且 `torch_sipu/torch_sipu/csrc/contrib/native/sipu/mx.cpp:798-819 / SIPUExtFunctions::_mx_mm` 当前只允许 BF16/FP16 output，并依赖 torch_sipu 内部 MX Tensor view/layout 约定。用户要求的是 simo 自己的 `torch.ops.simo.mma_dte` 和 linear-C 契约，直接耦合 torch_sipu 私有实现会把两个项目绑定在一起。
+
+### 15.12 验证计划
+
+第一阶段至少应有以下验证：
+
+1. 构建验证：`readelf -d simo._C*.so` 能看到 `libtile_mma_dte.so`，且 RPATH 指向 `$ORIGIN/mma_dte`。
+2. 依赖验证：`libtile_mma_dte.so` 和所需 `libtile_mma_dte_*.so` 均存在；`ldd -r` 不出现未解析的 host symbol。
+3. dispatcher 验证：导入 `simo` 后，`torch.ops.simo.mma_dte.default` 存在，并且 `PrivateUse1` dispatch kernel 已注册。
+4. layout 验证：A/B 使用 `siinfer.hp_to_mx(..., input_layout="tiled")` 生成的 physical buffer；A layout 和 B required RHS layout 正确匹配。
+5. output 验证：返回 Tensor 为 SIPU device、shape `[M,N]`、contiguous、stride `(N,1)`、`layoutC.tensor_format=0`。
+6. 数值验证：每个已支持的 MX dtype、R8/R16/R32 layout、BF16/FP16/FP32 output 组合，使用独立 dequant/reference GEMM 对比。
+7. 异步语义验证：wrapper 不调用 device synchronize；只使用当前 SIPU stream，并在 launch 后做轻量 error check。
+8. wheel/editable 验证：editable 结果从 source tree 加载 DSO；wheel 解压到干净目录后，`simo._C` 能通过相对 RPATH 找到 umbrella 和 component。
+
+当前环境在做 Python import smoke test 时还遇到既有运行环境问题：`libtorch_sipu.so` 要求 `GCC_13.0.0`，而当前 `/lib/x86_64-linux-gnu/libgcc_s.so.1` 不提供该 symbol。这个错误发生在 `torch_sipu._C` 加载阶段，不是 simo MMA DTE 设计本身的错误；在正式运行验证前需要先加载与 torch_sipu wheel 匹配的 GCC runtime。
+
+### 15.13 最终决策
+
+```text
+是否需要 tvm-ffi：不需要。
+是否需要新增 pybind11 绑定：不需要；沿用现有 torch_bindings.cpp。
+是否建议新增 CMakeLists.txt：建议。不是 torch.ops 的要求，而是 AOT SIPU .su/DSO 构建的要求。
+torch_sipu 主库采用 a 还是 b：主库是 a；siBLAS external adapter 是 component DSO 路径，不是 umbrella b。
+simo 应链接什么：优先 link libtile_mma_dte.so umbrella，并把 component DSO 放在同目录。
+输入 API 是否只接收两个 Tensor：不可以；必须显式传 M/N/K、具体 MX dtype 和 layout metadata。
+output 是否固定 linear：是；模板 layoutC 的 tensor_format 固定为 0。
+是否当前五类 MX 都能输出三种 hp dtype：不能直接宣称；当前源码的支持矩阵必须如 15.6 所列，缺失组合先报 unsupported 或先扩展 mma 子模块。
+```
