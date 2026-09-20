@@ -5381,25 +5381,30 @@ B matrix Tile Dim (in elements, [K, M]) = [32, 32], SuperTile Dim (in tiles, [K,
 
 
 
-如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=1, origin_k: int=3)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 
-c++ wrapper 侧，接受到 (pad_m=16, pad_n=32, pad_k=256)   的shape, 是不是只能选择 row family = R16, layout A = (64,16,4,1,1) , layout B= (32,32,4,1,1)?
+如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=31, origin_k: int=2)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 
+/softhome/like/asset/code/arch/tile_format_my.py
+*** global_dim [K, M] = [2, 15], datatype_bit = 8 ***
+Subtile Dim (in elements, [K, M]) = [32, 8]
+Tile Dim (in elements, [K, M]) = [64, 16]
+SuperTile Dim (in tiles, [K, M]) = [4, 1]
+A column align to  64*4=256, A row align to 16*1=16
 
+*** global_dim [K, M] = [2, 31], datatype_bit = 8 ***
+Subtile Dim (in elements, [K, M]) = [32, 8]
+Tile Dim (in elements, [K, M]) = [32, 32]
+SuperTile Dim (in tiles, [K, M]) = [1, 4]
+B column align to 32*1=32, B row align to 32*4=128
+pad_m = 16整数倍=16
+pad_k=lcm(256,32)=256
+重新运行, orig_m=15,orig_n=31,orig_k=128
+经过调整,
+*** global_dim [K, M] = [128, 15], datatype_bit = 8 ***
+Tile Dim (in elements, [K, M]) = [64, 16]
+SuperTile Dim (in tiles, [K, M]) = [4, 1]
 
-如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=31, origin_n: int=31, origin_k: int=127)  只能返回 (pad_m=, pad_n=, pad_k=)吗? 
-c++ wrapper 侧，接受到 (pad_m=, pad_n=, pad_k=)   的shape, 是不是只能选择 row family = , layout A =  , layout B= ?
-
-如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=31, origin_n: int=63, origin_k: int=63, )  只能返回 (pad_m=64, pad_n=64, pad_k=64,)吗? 
-c++ wrapper 侧，接受到 (pad_m=64, pad_n=64, pad_k=64,)   的shape, 是不是只能选择 row family = R32 2x2, layout A =  (32,32,2,2,1), layout B= (32,32,2,2,1) ,?
-
-/softhome/like/asset/code/arch/tile_format_my.py global_dim [K, M] = [63, 31], datatype_bit = 8, Tile Dim (in elements, [K, M]) = [32, 32], SuperTile Dim (in tiles, [K, M]) = [2, 2], 这种选择是唯一的.
-/softhome/like/asset/code/arch/tile_format_my.py global_dim [K, M] = [63, 63], 8 bit, Tile Dim (in elements, [K, M]) = [32, 32] SuperTile Dim (in tiles, [K, M]) = [2, 2] 这种选择是唯一的。
-
-
-如果 pad_origin_mnk_to_mma_dte_align的参:数(ab_dtype: str=mxint8, origin_m: int=, origin_n: int=, origin_k: int=, )  只能返回 (pad_m=, pad_n=, pad_k=,)吗? 
-c++ wrapper 侧，接受到 (pad_m=, pad_n=, pad_k=)   的shape, 是不是只能选择 row family = , layout A =  , layout B= ?
-
-1)
-2)
+*** global_dim [K, M] = [128, 31], datatype_bit = 8 ***
+Tile Dim (in elements, [K, M]) = [32, 32]
+SuperTile Dim (in tiles, [K, M]) = [4, 1]
 
 
 帮我在 /share_data/users/like/package/simo_conda_vllm_sipu 实现这个方案, 
