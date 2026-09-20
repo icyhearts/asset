@@ -324,6 +324,179 @@ SIMO 的 MLA pool 用 `uint8` 保存打包后的量化 payload 和 scale bytes�
 "disable_chunked_prefix_cache": true
 ```
 
+## 16. simo AOT MMA DTE 实现落地、验证结果与问题总结（2026-09-20）
+
+### 16.1 本次实际落地内容
+
+本次实现落在当前可见的 simo code base：
+
+```text
+/share/users/like/package/simo_conda_sglang
+```
+
+用户指定的 `/share_data/users/like/package/simo_conda_vllm_sipu` 在本次执行环境中不存在，因此没有向该路径写入代码。
+
+新增 `third_party/mma_dte_tile_tensor` submodule，URL 为：
+
+```text
+git@gitlabsoft.siorigin.com:oplib/mma_dte_tile_tensor.git
+```
+
+构建和安装入口位于 `setup.py:98-144 / _require_mma_dte_artifacts`、`setup.py:162-251 / get_extensions` 和 `setup.py:254-262 / SimoBuildExtension::run`：
+
+1. 只在 `torch.sipu.is_available()` 时构建 MMA DTE AOT library。
+2. CMake 只选择本次需要的 7 个 component：MXINT8、MXFP8 BF16/FP16、MXFP6 E2M3/E3M2、MXFP4、MXINT4。
+3. `libtile_mma_dte.so`、`libtile_mma_dte.so.1` 和 component DSO 安装到 `simo/mma_dte/`。
+4. `_C` 显式链接 `libtile_mma_dte.so` 和 `libtorch_sipu.so`，并使用 `$ORIGIN` RPATH。
+5. SIPU SDK 头文件使用 C++20 concepts，因此 SIPU host extension 需要 `-std=c++20`。
+
+`simo/csrc/torch_bindings.cpp:18-32 / TORCH_LIBRARY_FRAGMENT` 注册的最终 schema 是：
+
+```text
+mma_dte(Tensor a, Tensor b, int m, int n, int k,
+        str mx_dtype, ScalarType out_dtype) -> Tensor
+```
+
+A/B layout 参数没有暴露给 Python，C++ wrapper 在 `simo/csrc/sipu/mma_dte.cpp:12-16` 中固定为用户要求的 R32 standard 4x1：
+
+```text
+MXINT8/MXFP8: (32, 32, 4, 1, 1), K multiple of 128
+MXFP6:         (128, 32, 4, 1, 1), K multiple of 512
+MXFP4/MXINT4:  (64, 32, 4, 1, 1), K multiple of 256
+C: linear layout
+```
+
+Python 薄封装位于 `simo/ops/mma_dte.py:12-27 / mma_dte`，直接调用 `torch.ops.simo.mma_dte`。
+
+### 16.2 构建和安装中发现并修复的问题
+
+正式安装命令：
+
+```bash
+pip install . --no-build-isolation
+```
+
+首次构建遇到以下问题，均已修复：
+
+| 阶段 | 问题 | 修复 |
+|---|---|---|
+| host 编译 | SDK `deprecated.h` 使用 C++20 `concept`，PyTorch `CppExtension` 默认用 C++17 | SIPU backend 加 `-std=c++20` |
+| `_C` import | `c10::sipu::SIPUStream::stream()` unresolved symbol | 显式链接 `libtorch_sipu.so` |
+| wheel runtime | `_C` 依赖 `libtile_mma_dte.so.1`，只复制 `libtile_mma_dte.so` 会缺少 SONAME 文件 | staging 时保留 umbrella 的版本文件和 symlink |
+| 测试输入 | `siinfer.hp_to_mx(..., input_layout="tiled")` 要求输入已经 tile reorder；直接传 linear tensor 会得到错误结果 | 用户 linear A/B 使用 `input_layout="linear"` |
+
+安装后 smoke test 已验证：
+
+```text
+import simo._C                         成功
+torch.ops.simo.mma_dte                 存在
+PrivateUse1 dispatch kernel            已注册
+```
+
+### 16.3 正确 linear 输入路径的通过结果
+
+测试文件：`tests/sipu_mma_dte/test_mma_dte.py:112-174 / test_mma_dte_matches_cpu_gold`。
+
+测试流程是：CPU 任意形状 A/B -> SIPU -> padding -> `siinfer.hp_to_mx(input_layout="linear", zero_output=True)` -> `torch.ops.simo.mma_dte` -> 裁剪 C -> CPU gold 对比。
+
+输入原始形状为 `A[37,129]`、`B[45,129]`，padding 后按 MX 类型得到合法的 `M=64`、`N=64` 和对应 K。
+
+通过的组合和实际指标如下：
+
+| MX dtype / output | cosine | relative L2 | absolute error | mean relative error |
+|---|---:|---:|---:|---:|
+| MXINT8 / BF16 | 0.999926 | 0.012152 | 0.513222 | 0.062958 |
+| MXINT8 / FP16 | 0.999928 | 0.011977 | 0.480101 | 0.062842 |
+| MXINT8 / FP32 | 0.999928 | 0.011977 | 0.480040 | 0.062843 |
+| MXFP6 E2M3 / BF16 | 0.999190 | 0.040245 | 1.594976 | 0.180213 |
+| MXFP6 E2M3 / FP16 | 0.999194 | 0.040141 | 1.587164 | 0.180155 |
+| MXFP6 E2M3 / FP32 | 0.999194 | 0.040146 | 1.587164 | 0.180159 |
+| MXFP6 E3M2 / BF16 | 0.997216 | 0.074779 | 3.585276 | 0.435489 |
+| MXFP6 E3M2 / FP16 | 0.997225 | 0.074653 | 3.593088 | 0.435287 |
+| MXFP6 E3M2 / FP32 | 0.997225 | 0.074653 | 3.592600 | 0.435282 |
+| MXFP4 E2M1 / BF16 | 0.987775 | 0.156019 | 6.666809 | 0.793068 |
+| MXINT4 / BF16 | 0.983928 | 0.181130 | 7.227488 | 1.170379 |
+
+测试命令使用 `pytest -o addopts=''`，因为当前环境没有 `pytest-cov`，项目 `pyproject.toml:39` 的全局 `addopts=--cov --cov-report` 会导致 pytest 在收集前退出；这不是 MMA DTE 测试失败。
+
+最终结果：
+
+```text
+5 passed, 2 xfailed
+```
+
+### 16.4 MXFP8 NaN 问题
+
+MXFP8 E4M3/E5M2 的 BF16/FP16 组合都实际调用了 simo MMA DTE，但当前 SDK stack 产生非有限值，因此测试标记为 `xfail`，不是静默跳过。
+
+复现现象：
+
+```text
+MXFP8 E4M3 -> BF16: NaN
+MXFP8 E4M3 -> FP16: NaN
+MXFP8 E5M2 -> BF16: NaN/Inf
+MXFP8 E5M2 -> FP16: NaN/Inf
+```
+
+这个问题不是 simo wrapper 独有：
+
+1. `siinfer.hp_to_mx(..., "mxfloat8e4m3/e5m2", input_layout="linear")` 生成的 MX buffer，经 `torch_sipu` `MXTileTensor.to_mx(...).to_linear()` 也得到 NaN。
+2. 使用 `torch_sipu` 自己的 `MXTileTensor` 和 `_mx_mm`，同样的 MXFP8 输入也得到 NaN。
+3. MXINT8、MXFP6、MXFP4、MXINT4 使用同样的 AOT wrapper、stream、C layout 和测试流程时结果正常。
+
+因此当前证据指向 `SIPU SDK v0.4.2 / siinfer hp_to_mx / torch_sipu MXFP8 conversion or hardware model` 这一层，而不是 `simo::mma_dte` 的 dispatcher、DSO 链接或 C++ output dispatch。需要 SDK/torch_sipu 维护者进一步用原始 MMA DTE testcase 和 MXFP8 packed bytes 定位是 quantization header、scale 编码、TensorMap 或 device kernel 问题。
+
+### 16.5 错误输入 layout 的结果
+
+早期测试把普通 row-major linear A/B 直接传给：
+
+```python
+siinfer.hp_to_mx(..., input_layout="tiled")
+```
+
+此路径的 MXINT8 结果为：
+
+```text
+cosine similarity: 0.003040
+relative L2:       1.164662
+absolute error:    53.346035
+```
+
+改为：
+
+```python
+siinfer.hp_to_mx(..., input_layout="linear")
+```
+
+后 MXINT8 cosine 变为 `0.999926`。这说明 `input_layout="tiled"` 并不是“输出 tile format”的开关，而是声明输入地址已经按 tile 输入布局排列；普通 linear 输入必须使用 `input_layout="linear"`，或者调用方先显式做 tile reorder。
+
+### 16.6 当前限制和后续注意事项
+
+1. 第一版只支持 SIPU AOT、固定 R32 standard 4x1，不支持 R8/R16、2x2、1x4、运行时 layout 参数或 mixed A/B dtype。
+2. raw `uint8` MX buffer 不携带逻辑 shape、MX dtype 或 layout metadata，因此 `M/N/K`、`mx_dtype` 必须显式传入。
+3. 输出固定为 linear layout，C 的 `tensor_format=0`；返回 shape 是 padded `[M,N]`，由 Python 调用方裁剪真实输出。
+4. 当前 output dtype 支持矩阵由 MMA release 的显式实例化决定：MXINT8 和 MXFP6 支持 BF16/FP16/FP32；MXFP8 支持 BF16/FP16；MXFP4/MXINT4 当前只支持 BF16。
+5. `check_physical_storage` 位于 `simo/csrc/sipu/mma_dte.cpp:71-99 / check_physical_storage`，按 MX family 检查 physical buffer 容量和 256-byte pointer alignment；不再只检查 `Tensor.numel()>0`。
+6. wheel 不携带完整 SIPU SDK，也不修改 Conda 环境；运行前仍需要加载匹配的 SIPU SDK 和 `torch_sipu` runtime。
+7. 当前 `mma_dte_tile_tensor` 的 MXFP8 独立 testcase 命名与 layout 元组存在需要核对之处：部分 `test_mxfp8_r32_shape_4x1.cpp` 使用 `(32,32,1,4,1)`，而本次用户要求及 production instantiation 使用 `(32,32,4,1,1)`。扩展 MXFP8 支持前应统一该命名和 `tensor_layout` 维度语义。
+
+### 16.7 本次代码提交范围
+
+本次 commit 只包含：
+
+```text
+.gitmodules
+setup.py
+simo/csrc/torch_bindings.cpp
+simo/csrc/sipu/mma_dte.cpp
+simo/mma_dte/__init__.py
+simo/ops/mma_dte.py
+tests/sipu_mma_dte/test_mma_dte.py
+third_party/mma_dte_tile_tensor (submodule pointer)
+```
+
+工作区中已有的模型、日志、临时目录、编辑器文件和其他未跟踪脚本不会进入本次 commit。
+
 这是一个正确性和防御性设置，原因有三点：
 
 1. 它明确记录了 SIMO 当前不支持该上游路径，不依赖模型识别或 backend 白名单的隐式结果；

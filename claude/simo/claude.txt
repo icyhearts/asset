@@ -5493,6 +5493,6 @@ pip install -e . --no-build-isolation
 }
 
 simo安装不要editable安装了，改成正式安装 pip install . --no-build-isolation
-把修改的和增加的代码做一个git commit.
-把本次实现发现的nan问题，误差情况进行问红，答案 追加到 like-useful/answer_codex_v4.md
+1. 把修改的和增加的代码做一个git commit.
+2. 把本次实现发现的nan问题，pass/fail的例子, 误差情况, 局限性等, sdk/torch_sipu/torch/ 发现的bug等，进行总结，答案 追加到 like-useful/answer_codex_v4.md
 
