@@ -5226,12 +5226,6 @@ BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test
 用经过实际测试的例子，重新完善 like-useful/answer_codex_v4.md, 把mxint8, mxfp8, mxfp6,mxfp4 的M,N,K 的 [min_value, max_value, step] 补充完善。 
 }
 {
-
-
-# 本次任务，先打通 PyTorch Tensor -> mma_dte c++ 函数调用的通路，mma_dte 每种数据类型支持
-}
-
-{
 答案追加到 like-useful/answer_claude_v2.md 里面
 
 问题背景 :
@@ -5266,6 +5260,34 @@ vllm_dev conda 环境安装的 torch-sipu 不一样和 源码是同一个 commit
 
 答案 追加到 like-useful/answer_codex_v4.md
 }
+{
+
+问题背景 :
+sipu 是自定义的一种AI芯片
+sipu sdk 位于 /share_data/sicx_sdk/release/v0.4.2
+sipu ISA 文档位于 /softhome/like/asset/code/isa/index.html
+sipu 编译器代码位于  /share/users/like/package/compiler-toolchain
+vllm-sipu 代码位于  /share/users/like/package/vllm-sipu, 是 在 开源 github vllm 基础上做的 sipu 插件.
+vllm-sipu conda 环境位于  /share_data/users/like/miniconda3/envs/vllm_dev/
+
+simo 代码位于 /share_data/users/like/package/simo_conda_vllm_sipu/, simo 以 editable 方式安装在 vllm_dev 环境中。
+
+
+mma_dte_tile_tensor,  mma_dte_tile_tensor 单独 clone到   独立目录: /share/users/like/package/oplib/mma_dte_tile_tensor
+
+mma_dte_tile_tensor构建方式是 :
+. /share/users/like/miniconda3/bin/activate  vllm_dev
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+cd /share/users/like/package/oplib/mma_dte_tile_tensor
+BUILD_JOBS=64 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --test > temp/build.test.log 2>&1  &
+BUILD_JOBS=80 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --all > temp/build.all.log 2>&1  &
+bash build_release.sh --skip-build > temp/build_release.log 2>&1 &  
+构建日志位于 /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.all.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.test.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build_release.log
+
+# 本次任务，先打通 PyTorch Tensor -> mma_dte c++ 函数调用的通路，mma_dte 每种数据类型支持
+}
+
 
 
 
