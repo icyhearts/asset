@@ -5448,7 +5448,7 @@ BUILD_JOBS=80 BUILD_CXX=/usr/bin/c++ bash build-modify.sh --all > temp/build.all
 bash build_release.sh --skip-build > temp/build_release.log 2>&1 &  
 构建日志位于 /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.all.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build.test.log /share/users/like/package/oplib/mma_dte_tile_tensor/temp/build_release.log
 
-帮我在 /share_data/users/like/package/simo_conda_vllm_sipu 实现这个方案, 但是把torch.ops.simo.mma_dte接口的 A矩阵+B矩阵的 layout 参数 a_layout, b_layout去掉，暂时只支持如下:
+任务: 帮我在 /share_data/users/like/package/simo_conda_vllm_sipu 实现 like-useful/answer_codex_v4.md "15. simo 通过 Python 调用 MMA DTE 的 AOT 方案设计" 这个方案, 但是把torch.ops.simo.mma_dte接口的 A矩阵+B矩阵的 layout 参数 a_layout, b_layout去掉，暂时只支持如下:
 
 mxint8 直接写死 a_layout, b_layout, 只支持 like-useful/answer_codex_v4.md  12.4 MXINT8 R32 standard 4x1 (32,32,4,1,1) (32,32,4,1,1) [32,inf,32] [32,inf,32] [128,inf,128], python 用户调用 siinfer hp_to_mx 前，把数据padding到 M,N,K=32,32,128的整数倍, 然后把 hp_to_mx 量化后的 数据传给  把torch.ops.simo.mma_dte
 mxfp8 直接写死 a_layout, b_layout, 只支持 like-useful/answer_codex_v4.md 12.5 MXFP8 R32 standard 4x1 (32,32,4,1,1) (32,32,4,1,1) [32,inf,32] [32,inf,32] [128,inf,128],  Python 用户调用 siinfer hp_to_mx 前，把数据padding到 M,N,K=32,32,128的整数倍, 然后把 hp_to_mx 量化后的 数据传给  把torch.ops.simo.mma_dte
@@ -5466,5 +5466,14 @@ submodule需要你自己加:``` [submodule "third_party/mma_dte_tile_tensor"] pa
 用户的 A/B linear tensor 直接在cpu上做 浮点数矩阵乘法 gold_C -> result_C 和 gold_C 进行相似度对比，对比 cosine similarity, relative l2 norm, absolute error, relative error.
 
 
-代码写在 /share_data/users/like/package/simo_conda_vllm_sipu
+代码写在 /share_data/users/like/package/simo_conda_vllm_sipu, 
+激活环境的方式是 ：
+. /share/users/like/miniconda3/bin/activate  vllm_dev
+cd  /share/users/like/package/vllm-sipu
+source sipu_sdk_setup.sh
+激活环境后， 安装 simo 的方式是
+
+cd /share_data/users/like/package/simo_conda_vllm_sipu
+pip install -e . --no-build-isolation
+安装后 运行你的测试例子
 }
