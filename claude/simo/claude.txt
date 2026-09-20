@@ -5365,16 +5365,14 @@ tile_level padding: dim 0 pad 24 elements
 tile_level padding: dim 1 pad 1 elements
 
 可以得到 A矩阵 global dim padding shape:
-global column= tile_dim0*supertile_shape0=128*4=512
-global row = tile_dim1*supertile_shape1=8*1=8, 
+global column base= tile_dim0*supertile_shape0=128*4=512, -> origin_k = 1000, pad_k=512的整数倍, pad_k=1024
+global row base = tile_dim1*supertile_shape1=8*1=8, -> origin_m=7, pad_m=8的整数倍，pad_m=8
 
 
-*** global_dim [K, M] = [500, 31], datatype_bit = 8 ***
-Subtile Dim (in elements, [K, M]) = [32, 8]
-Tile Dim (in elements, [K, M]) = [32, 32]
-SuperTile Dim (in tiles, [K, M]) = [4, 1]
-tile_level padding: dim 0 pad 12 elements
-tile_level padding: dim 1 pad 1 elements
+可以得到B 矩阵 global dim padding shape:
+global column base= tile_dim0*supertile_shape0=32*4=128, -> origin_k = 1000, pad_k=128的整数倍, pad_k=1024
+global row base = tile_dim1*supertile_shape1=32*1=32, -> origin_n=31, pad_n=32的整数倍，pad_n=32
+
 
 
 如果 pad_origin_mnk_to_mma_dte_align的参数(ab_dtype: str=mxint8, origin_m: int=15, origin_n: int=1, origin_k: int=3)  只能返回 (pad_m=16, pad_n=32, pad_k=256)吗? 

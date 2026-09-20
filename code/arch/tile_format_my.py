@@ -137,5 +137,9 @@ def main():
     tile_shape_config([63, 31], 8)
     tile_shape_config([63, 63], 8)
 
+
+    tile_shape_config([513, 7], 8)
+    tile_shape_config([513, 31], 8)
+
 if __name__ == '__main__':
     main()
