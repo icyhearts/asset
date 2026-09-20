@@ -5397,6 +5397,7 @@ SuperTile Dim (in tiles, [K, M]) = [1, 4]
 B column align to 32*1=32, B row align to 32*4=128
 pad_m = 16整数倍=16
 pad_k=lcm(256,32)=256
+
 重新运行, orig_m=15,orig_n=31,orig_k=128
 经过调整,
 *** global_dim [K, M] = [128, 15], datatype_bit = 8 ***
