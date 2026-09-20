@@ -150,8 +150,8 @@ def main():
     tile_shape_config([2, 31], 8)
 
 
-    tile_shape_config([128, 15], 8)
-    tile_shape_config([128, 31], 8)
+    tile_shape_config([256, 15], 8)
+    tile_shape_config([256, 31], 8)
 
 if __name__ == '__main__':
     main()

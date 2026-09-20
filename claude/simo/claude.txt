@@ -5398,15 +5398,22 @@ B column align to 32*1=32, B row align to 32*4=128
 pad_m = 16整数倍=16
 pad_k=lcm(256,32)=256
 
-重新运行, orig_m=15,orig_n=31,orig_k=128
+重新运行, orig_m=15,orig_n=31,orig_k=256
 经过调整,
-*** global_dim [K, M] = [128, 15], datatype_bit = 8 ***
+*** global_dim [K, M] = [256, 15], datatype_bit = 8 ***
 Tile Dim (in elements, [K, M]) = [64, 16]
 SuperTile Dim (in tiles, [K, M]) = [4, 1]
 
-*** global_dim [K, M] = [128, 31], datatype_bit = 8 ***
+pad k=64*4=256 pad,
+pad m = 16*1=16 pad
+
+*** global_dim [K, M] = [256, 31], datatype_bit = 8 ***
 Tile Dim (in elements, [K, M]) = [32, 32]
 SuperTile Dim (in tiles, [K, M]) = [4, 1]
+pad k = 32*4=128
+pad n=32*1=32
+padk = lcm(256,128)=256
+final: m,n,k=16,32,256
 
 
 
